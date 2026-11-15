@@ -80,7 +80,9 @@ the getting-started guide), or the `setup_sharing` agent tool, connects a comput
    Dropbox again**, for another account). Both run with `config_auth_no_browser=true`, so rclone
    opens no browser, and `--no-output`, and rclone's standard output stays closed: it would end
    with the remote, token included. From rclone's notices SlopBar takes only its loopback link
-   (`http://127.0.0.1:53682/auth?state=…`, exactly that form), which it opens in the browser, and
+   (`http://127.0.0.1:53682/auth?state=…`, exactly that form), which it opens in the browser (with a
+   notification that opens it again: Windows can keep a page opened from the background behind
+   other windows), and
    the reason a failed sign-in gives: `denied` (not allowed on Dropbox's page), `stale_page`
    (Allow clicked on a page from an earlier try), `port_busy` or `port_reserved` (port 53682 held
    by another program, or reserved by Windows). The user has 10 minutes. Stopped before Allow,
@@ -91,7 +93,7 @@ the getting-started guide), or the `setup_sharing` agent tool, connects a comput
    (`uses_folder`) rather than moved off it.
 
 rclone and the tunnel below run in the app's job object, so they end with SlopBar, and an
-automatic update waits while a setup runs.
+automatic update waits while a setup runs here or the tunnel for another computer is open.
 
 **Another computer, over SSH.** `setup_sharing` with `ssh_host` sets up that computer from this
 one, with nobody at its screen. Its SlopBar gets rclone and starts the sign-in without a browser;
