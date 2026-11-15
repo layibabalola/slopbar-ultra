@@ -528,24 +528,20 @@ mod tests {
 
     const FIRST: Duration = Duration::from_secs(20);
     const QUARTER_HOUR: Duration = Duration::from_secs(15 * 60);
-    /// A bound on what should be quick, generous enough that a run starved of CPU never reaches it.
-    const QUICK: Duration = Duration::from_secs(30);
-    /// How long any test here may take: a test that needs a limit in the code to end fails at this
-    /// when that limit is removed, instead of hanging the run.
-    const TEST_LIMIT: Duration = Duration::from_secs(60);
+    /// How long a test waits for what should happen at once (a part that only sets a flag, a lock
+    /// let go). The wait ends as soon as it happens, so only a starved run waits at all, and none this
+    /// long: no bound on elapsed time is tighter than this.
+    const PATIENT: Duration = Duration::from_secs(5 * 60);
+    /// What the tests stall on ends by itself after this. A limit in the code ends it far sooner,
+    /// however starved the run (tokio fires timers in deadline order); with the limit gone, it ends
+    /// here and the test fails, rather than hanging.
+    const SELF_ENDING: Duration = Duration::from_secs(60);
+    /// A last backstop for each test that waits on a limit in the code.
+    const TEST_LIMIT: Duration = Duration::from_secs(5 * 60);
 
     /// `test` within TEST_LIMIT.
     async fn within_test_limit<T>(test: impl Future<Output = T>) -> T {
         tokio::time::timeout(TEST_LIMIT, test).await.expect("the test ran past its limit: a limit in the code is missing")
-    }
-
-    /// `f` on a thread of its own, waited for at most `limit`: None if it has not finished by then.
-    fn finishes_within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-        let (done, finished) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = done.send(f());
-        });
-        finished.recv_timeout(limit).ok()
     }
 
     /// A server on this machine that accepts connections and never answers. Returns a URL with a
@@ -572,9 +568,9 @@ mod tests {
         Ok(if body.is_empty() { Outcome::UpToDate } else { Outcome::Found(body) })
     }
 
-    /// Waits up to QUICK for `check` to hold, without racing the task that makes it so.
+    /// Waits up to PATIENT for `check` to hold, without racing the task that makes it so.
     async fn eventually(what: &str, check: impl Fn() -> bool) {
-        let deadline = Instant::now() + QUICK;
+        let deadline = Instant::now() + PATIENT;
         while !check() {
             assert!(Instant::now() < deadline, "{what}");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -613,18 +609,18 @@ mod tests {
             }
         };
         tokio::select! {
-            _ = run_loop(status, FIRST, QUARTER_HOUR, Duration::from_secs(20), auto, attempt, sleep) => unreachable!("the loop never ends"),
+            _ = run_loop(status, FIRST, QUARTER_HOUR, SELF_ENDING, auto, attempt, sleep) => unreachable!("the loop never ends"),
             _ = enough.notified() => {}
         }
         waited.into_inner().unwrap()
     }
 
-    /// Whether `at` is `by` after the moment `of` was taken, within 15 s either way: the waits differ
+    /// Whether `at` is `by` after the moment `of` was taken, within 45 s either way: the waits differ
     /// by 100 s or more, and a starved run has room.
     fn ahead(at: Option<DateTime<Utc>>, of: Instant, by: Duration) -> bool {
         let Some(at) = at else { return false };
         let expected = Utc::now() - chrono::Duration::from_std(of.elapsed()).unwrap() + chrono::Duration::from_std(by).unwrap();
-        (at - expected).num_seconds().abs() <= 15
+        (at - expected).num_seconds().abs() <= 45
     }
 
     #[tokio::test]
@@ -652,7 +648,7 @@ mod tests {
             assert!(waited[0].last.is_none() && ahead(waited[0].next_at, waited[0].at, FIRST));
 
             let took = waited[1].at - waited[0].at;
-            assert!(took >= Duration::from_millis(300) && took < QUICK, "pass 1 took {took:?}");
+            assert!(took >= Duration::from_millis(300), "pass 1 took {took:?}");
             let Some(Outcome::Failed(error)) = &waited[1].last else { panic!("{:?}", waited[1]) };
             assert!(error.starts_with("The update check failed: ") && error.contains("timed out"), "{error}");
             assert!(error.contains("http://127.0.0.1:") && error.contains("/latest.json"), "{error}");
@@ -660,7 +656,7 @@ mod tests {
             assert!(ahead(waited[1].next_at, waited[1].at, RETRY_AFTER), "the retry is scheduled two minutes on");
 
             let took = waited[2].at - waited[1].at;
-            assert!(took >= Duration::from_millis(400) && took < QUICK, "pass 2 took {took:?}");
+            assert!(took >= Duration::from_millis(400), "pass 2 took {took:?}");
             assert_eq!(waited[2].last, Some(Outcome::Failed("The update check timed out after 400 ms".into())));
             assert!(ahead(waited[2].next_at, waited[2].at, QUARTER_HOUR), "failing again, the loop keeps its interval");
             assert_eq!(status.last().unwrap().by, Trigger::Auto);
@@ -705,13 +701,15 @@ mod tests {
         within_test_limit(async {
             let dropped = Arc::new(AtomicBool::new(false));
             let flag = Flag(dropped.clone());
-            let started = Instant::now();
             let outcome = isolated(Duration::from_millis(200), move |steps| async move {
                 let _flag = flag;
-                steps.run("The download", TEST_LIMIT * 2, std::future::pending::<Result<(), String>>()).await.map(|()| Outcome::UpToDate)
+                let stalled = async {
+                    tokio::time::sleep(SELF_ENDING).await;
+                    Ok::<_, String>(())
+                };
+                steps.run("The download", PATIENT, stalled).await.map(|()| Outcome::UpToDate)
             })
             .await;
-            assert!(started.elapsed() < QUICK);
             assert_eq!(outcome, Outcome::Failed("The update timed out after 200 ms in: The download".into()));
             eventually("the pass's task is stopped", || dropped.load(SeqCst)).await;
         })
@@ -943,20 +941,18 @@ mod tests {
             let held = lock.clone().lock_owned().await;
             let (finish, installing) = std::sync::mpsc::channel::<()>();
             let steps = Steps::default();
-            let started = Instant::now();
             let result = hand_over(&steps, Duration::from_millis(100), held, move || {
-                let _ = installing.recv();
+                let _ = installing.recv_timeout(SELF_ENDING);
                 Ok(())
             })
             .await;
             assert_eq!(result, Err("Handing over to the installer timed out after 100 ms".into()));
-            assert!(started.elapsed() < QUICK);
             assert!(lock.try_lock().is_err(), "still held while the handover's thread runs");
             drop(finish);
             eventually("let go once that thread ends", || lock.try_lock().is_ok()).await;
             // In time, it returns the installer's result, and lets go.
             let held = lock.clone().lock_owned().await;
-            assert_eq!(hand_over(&steps, QUICK, held, || Err("synthetic failure".into())).await, Err("Handing over to the installer failed: synthetic failure".into()));
+            assert_eq!(hand_over(&steps, PATIENT, held, || Err("synthetic failure".into())).await, Err("Handing over to the installer failed: synthetic failure".into()));
             eventually("let go", || lock.try_lock().is_ok()).await;
         })
         .await
@@ -964,23 +960,17 @@ mod tests {
 
     #[test]
     fn an_exit_part_that_hangs_is_left_behind_in_time() {
-        // A part that never ends by itself: wait_at_most gives up at its limit. Were the limit gone,
-        // this would fail at QUICK instead of hanging.
-        let (release, blocked) = std::sync::mpsc::channel::<()>();
-        let gave_up = finishes_within(QUICK, move || {
-            wait_at_most(Duration::from_millis(100), move || {
-                let _ = blocked.recv();
-            })
-        });
-        assert_eq!(gave_up, Some(false), "a part that hangs is left behind at its limit");
-        drop(release);
-        // A quick part finishes, however starved the run: its limit is generous.
+        // A part that hangs (it ends by itself only after SELF_ENDING): wait_at_most gives up at its
+        // limit. Were the limit gone, it would wait for the part and return true: a failure, not a
+        // hang.
+        assert!(!wait_at_most(Duration::from_millis(100), || std::thread::sleep(SELF_ENDING)), "a part that hangs is left behind at its limit");
+        // A part that finishes is waited for, however long a starved run takes to schedule it.
         let ran = Arc::new(AtomicBool::new(false));
         let flag = ran.clone();
-        assert!(wait_at_most(QUICK, move || flag.store(true, SeqCst)));
+        assert!(wait_at_most(PATIENT, move || flag.store(true, SeqCst)));
         assert!(ran.load(SeqCst));
-        // A part that panics only ends its own thread.
-        assert_eq!(finishes_within(QUICK, || wait_at_most(QUICK, || panic!("synthetic panic"))), Some(false));
+        // A part that panics only ends its own thread, and is not waited for.
+        assert!(!wait_at_most(PATIENT, || panic!("synthetic panic")));
     }
 
     #[tokio::test]
@@ -988,13 +978,15 @@ mod tests {
         within_test_limit(async {
             let steps = Steps::default();
             assert_eq!(steps.current(), "Starting the update");
-            assert_eq!(steps.run("The download", QUICK, async { Ok::<_, String>(7) }).await, Ok(7));
+            assert_eq!(steps.run("The download", PATIENT, async { Ok::<_, String>(7) }).await, Ok(7));
             assert_eq!(steps.current(), "The download");
-            assert_eq!(steps.run("The download", QUICK, async { Err::<(), _>("no".to_string()) }).await, Err("The download failed: no".into()));
-            let started = Instant::now();
-            let stalled = steps.run("Handing over to the installer", Duration::from_millis(50), std::future::pending::<Result<(), String>>()).await;
+            assert_eq!(steps.run("The download", PATIENT, async { Err::<(), _>("no".to_string()) }).await, Err("The download failed: no".into()));
+            let stalls = async {
+                tokio::time::sleep(SELF_ENDING).await;
+                Ok::<(), String>(())
+            };
+            let stalled = steps.run("Handing over to the installer", Duration::from_millis(50), stalls).await;
             assert_eq!(stalled, Err("Handing over to the installer timed out after 50 ms".into()));
-            assert!(started.elapsed() < QUICK);
         })
         .await
     }

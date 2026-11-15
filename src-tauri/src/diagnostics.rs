@@ -1352,26 +1352,27 @@ mod tests {
     fn a_stuck_writer_holds_up_shutdown_for_seconds_at_most() {
         let dir = TempDir::new();
         let (release, stuck) = std::sync::mpsc::channel::<()>();
-        // The writer's saves never return until the test lets them.
-        let r = std::sync::Arc::new(Recorder::with_writer(dir.0.join("history"), move |_, _| {
-            let _ = stuck.recv();
+        // The writer's first save is stuck until the test lets it go, or for a minute at most, so a
+        // flush without its deadline fails this test (it would return only after that save) rather
+        // than hanging it. Whether the save had ended when the flush returned tells which happened,
+        // however slowly a starved run goes.
+        let saved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (calls, done) = (std::sync::atomic::AtomicUsize::new(0), saved.clone());
+        let r = Recorder::with_writer(dir.0.join("history"), move |_, _| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                let _ = stuck.recv_timeout(Duration::from_secs(60));
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             true
-        }));
-        r.start();
-        // On a thread of its own, so a flush without its deadline fails this test instead of hanging
-        // the run.
-        let (done, recorded) = std::sync::mpsc::channel();
-        let recorder = r.clone();
-        std::thread::spawn(move || {
-            let started = Instant::now();
-            recorder.record(None, None, Event::Shutdown);
-            let _ = done.send(started.elapsed());
         });
-        let waited = recorded.recv_timeout(FLUSH_WAIT + Duration::from_secs(30));
-        drop(release);
-        let waited = waited.expect("recording the shutdown returns after FLUSH_WAIT, whatever the disk does");
+        r.start();
+        let started = Instant::now();
+        r.record(None, None, Event::Shutdown);
+        let waited = started.elapsed();
+        assert!(!saved.load(std::sync::atomic::Ordering::SeqCst), "recording the shutdown waited for a stuck writer ({waited:?}) instead of FLUSH_WAIT");
         assert!(waited >= FLUSH_WAIT, "{waited:?}");
         assert!(r.shared.state.lock().unwrap().history.clean_shutdown, "the shutdown is still recorded");
+        drop(release);
     }
     #[test]
     fn rotation_corruption_and_disk_failure_are_visible_and_nonfatal() {
