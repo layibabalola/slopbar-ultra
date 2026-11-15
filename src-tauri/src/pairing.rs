@@ -559,7 +559,7 @@ fn setup_remote_sharing(door: &dyn Door, ssh: &dyn Remote, host: &str, args: &Va
             return Ok(json!({
                 "phase": "dropbox",
                 "browser": "this computer",
-                "next": "Dropbox's page opened in this computer's browser. The user signs in with the Dropbox account their other computers use and clicks Allow on dropbox.com; then call get_sharing_setup with this ssh_host, wait_seconds: 45 and since: the last revision, until phase is done or failed.",
+                "next": "Dropbox's page opened in this computer's browser, and a notification here opens it again (a page opened while nobody uses SlopBar can stay behind other windows: tell the user to look for it). The user signs in with the Dropbox account their other computers use and clicks Allow on dropbox.com; then call get_sharing_setup with this ssh_host, wait_seconds: 45 and since: the last revision, until phase is done or failed.",
             }));
         }
         if !setup_running(&link) {
