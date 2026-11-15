@@ -267,11 +267,12 @@ fn catalog() -> Vec<Tool> {
                 "tool": { "type": "string", "enum": crate::pairing::REMOTE_TOOLS },
                 "arguments": { "type": "object", "description": "The tool's own arguments." },
             }), &["ssh_host", "tool"]), false, true, false, true),
-        tool("setup_sharing", "Set up sharing with Dropbox", "Connects in-use sharing to the user's Dropbox, so each of their computers sees which accounts the others use: gets rclone if no recent one (v1.60 or later) is installed (a fixed, checksum-verified download from rclone's own site into SlopBar's folder, never another installer), runs rclone's own Dropbox sign-in (rclone keeps the token in its own config; SlopBar and agents never see it), turns sharing on with that rclone remote and lists the other computers sharing there. A remote of that name that already works is used as it is; one whose access ended is signed in again, and so is one with reconnect: true (to use another Dropbox account). Only when the user asked to set up sharing: without confirm: true nothing starts and the answer says what would happen. The user signs in and clicks Allow on dropbox.com themselves (never click Allow, sign in or approve for them). rclone's access covers their whole Dropbox; SlopBar only uses its SlopBar folder there. Refused on a computer that shares through a folder (uses_folder). Answers at once: follow it with get_sharing_setup. Without ssh_host, Dropbox's page opens in this computer's browser (refused while its desktop is locked or not shown). With ssh_host, sets up that computer from this one: its SlopBar gets rclone and starts the sign-in, and the page opens in this computer's browser through an SSH tunnel to that computer's rclone, so nobody needs to be at its screen; the token goes straight to that computer's rclone. That computer takes this one's remote name when this one shares through a Dropbox remote. If that computer is still getting rclone after about 150 seconds, the call answers with its state; calling again joins the same setup. cancel stops a running setup (with ssh_host, that computer's).",
+        tool("setup_sharing", "Set up sharing with Dropbox", "Connects in-use sharing to the user's Dropbox, so each of their computers sees which accounts the others use: gets rclone if no recent one (v1.60 or later) is installed (a fixed, checksum-verified download from rclone's own site into SlopBar's folder, never another installer), runs rclone's own Dropbox sign-in (rclone keeps the token in its own config; SlopBar and agents never see it), turns sharing on with that rclone remote and lists the other computers sharing there. A remote of that name that already works is used as it is; one whose access ended is signed in again, and so is one with reconnect: true (to use another Dropbox account). Only when the user asked to set up sharing: without confirm: true nothing starts and the answer says what would happen. The user signs in and clicks Allow on dropbox.com themselves (never click Allow, sign in or approve for them). rclone's access covers their whole Dropbox; SlopBar only uses its SlopBar folder there. Refused on a computer that shares through a folder (uses_folder). Answers at once: follow it with get_sharing_setup. Dropbox's page opens on the computer being set up, in its own default browser with a notification there (refused while its desktop is locked or not shown). With ssh_host, sets up that computer from this one: its SlopBar gets rclone and opens the page on its screen, so the user signs in there; the token stays with that computer's rclone, and it takes this computer's remote name when this one shares through a Dropbox remote. Only when the user asks for the page on this computer because that computer's screen is out of reach, open_here: true opens it in this computer's browser instead, through an SSH tunnel to that computer's rclone (the token still goes straight to that computer's rclone); if that computer is still getting rclone after about 150 seconds, the call answers with its state, and calling again joins the same setup. cancel stops a running setup (with ssh_host, that computer's).",
             schema(json!({
                 "confirm": { "type": "boolean", "description": "true to start; without it nothing starts and the answer says what would happen." },
                 "ssh_host": { "type": "string", "description": "Set up this other computer instead, as ssh reaches it; the sign-in page opens here." },
                 "remote": { "type": "string", "description": "The rclone remote to create or use. Default: the one this computer shares through already (with ssh_host: this computer's Dropbox remote), else \"dropbox\". Keep the same name on every computer." },
+                "open_here": { "type": "boolean", "description": "With ssh_host: open Dropbox's page in this computer's browser through an SSH tunnel, instead of on that computer's screen. Only when the user asks for it." },
                 "reconnect": { "type": "boolean", "description": "Sign in to Dropbox again even when the remote works, to use another Dropbox account (the one the user's other computers use)." },
                 "cancel": { "type": "boolean", "description": "Stop a running setup." },
                 "via_tunnel": { "type": "boolean", "description": "Set by the computer that runs setup_sharing with ssh_host: the sign-in is finished in its browser, so this computer's desktop need not be shown." },
@@ -303,7 +304,7 @@ fn local_args(name: &str) -> Option<(&'static [&'static str], &'static [&'static
         "get_machine_readiness" => Some((&["ssh_host", "wait_seconds", "since"], &[])),
         "pair_machine" => Some((&["ssh_host", "replace_key"], &["ssh_host"])),
         "run_on_machine" => Some((&["ssh_host", "tool", "arguments"], &["ssh_host", "tool"])),
-        "setup_sharing" => Some((&["ssh_host", "remote", "cancel", "via_tunnel", "confirm", "reconnect"], &[])),
+        "setup_sharing" => Some((&["ssh_host", "remote", "cancel", "via_tunnel", "confirm", "reconnect", "open_here"], &[])),
         "get_sharing_setup" => Some((&["ssh_host", "wait_seconds", "since"], &[])),
         _ => None,
     }
@@ -320,11 +321,11 @@ fn check_local(name: &str, args: &Value) -> Option<Result<(), String>> {
     }
     let typed = map.iter().all(|(k, v)| match k.as_str() {
         "arguments" => v.is_object(),
-        "replace_key" | "confirm" | "reconnect" | "cancel" | "via_tunnel" => v.is_boolean(),
+        "replace_key" | "confirm" | "reconnect" | "cancel" | "via_tunnel" | "open_here" => v.is_boolean(),
         "wait_seconds" | "since" => v.is_u64(),
         _ => v.is_string(),
     });
-    Some(if typed { Ok(()) } else { Err("Invalid arguments: ssh_host, tool and remote are strings, arguments an object, replace_key, confirm, reconnect, cancel and via_tunnel true or false, wait_seconds and since whole numbers".into()) })
+    Some(if typed { Ok(()) } else { Err("Invalid arguments: ssh_host, tool and remote are strings, arguments an object, replace_key, confirm, reconnect, cancel, via_tunnel and open_here true or false, wait_seconds and since whole numbers".into()) })
 }
 
 /// The door request for a tool call, or a message for the agent when the arguments are wrong.
@@ -471,12 +472,12 @@ fn explain(error: &str) -> String {
         "bad_remote" => "remote must be an rclone remote name of up to 64 characters: letters, digits, spaces and . _ - + @, not starting with - or a space.".into(),
         "sharing_setup_busy" => "A sharing setup is already running on this computer: follow it with get_sharing_setup, or stop it with setup_sharing cancel: true.".into(),
         "update_slopbar_there" => "The other computer's SlopBar predates the guided sharing setup: update it there (with automatic updates on, it updates itself), then try again.".into(),
-        "tunnel_failed" => "The SSH tunnel for the Dropbox sign-in did not open: port 53682 is in use on this computer (another rclone sign-in is waiting), or SSH could not connect. The setup on the other computer was stopped; try again once the port is free.".into(),
+        "tunnel_failed" => "The SSH tunnel for the Dropbox sign-in (open_here) did not open: port 53682 is in use on this computer (another rclone sign-in is waiting), or SSH could not connect. The setup on the other computer was stopped; try again once the port is free.".into(),
         "bad_state" | "no_sign_in_waiting" => "No Dropbox sign-in is waiting (it finished, failed or was cancelled): see get_sharing_setup.".into(),
         "not_from_a_remote_call" => "A computer reached over SSH cannot reach on to another one.".into(),
         e if e.starts_with("ssh_failed") => format!("SSH could not run the command ({}). Check key auth with: ssh -o BatchMode=yes <host> hostname; see the README's field guide.",
             e.trim_start_matches("ssh_failed").trim_start_matches(':').trim().chars().filter(|c| !c.is_control()).take(200).collect::<String>()),
-        e if e.starts_with("remote_missing_here: ") => format!("The other computer has no working rclone remote named {} (rclone missing, or the remote not configured): connect it with setup_sharing (ssh_host and confirm: true), which opens the Dropbox sign-in in this computer's browser, then pair again.",
+        e if e.starts_with("remote_missing_here: ") => format!("The other computer has no working rclone remote named {} (rclone missing, or the remote not configured): connect it with setup_sharing (ssh_host and confirm: true), which opens the Dropbox sign-in on that computer's screen, then pair again.",
             e.trim_start_matches("remote_missing_here: ").chars().filter(|c| !c.is_control()).take(64).collect::<String>()),
         e if e.starts_with("target: ") => format!("On the other computer: {}", explain(e.trim_start_matches("target: "))),
         other => other.chars().filter(|c| !c.is_control()).take(MAX_TEXT).collect(),

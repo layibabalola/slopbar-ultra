@@ -500,7 +500,7 @@ pub fn check_remote(tool: &str, arguments: &Value) -> Result<(), String> {
 const SETUP_START: Duration = Duration::from_secs(150);
 
 /// What `setup_sharing` answers without `confirm: true`.
-const SETUP_SHARING_PREVIEW: &str = "Nothing was started. With confirm: true, SlopBar gets rclone if no recent one is installed (a fixed, checksum-verified download from rclone's own site into SlopBar's folder), opens Dropbox's consent page in this computer's browser for the user to sign in and click Allow themselves, and turns in-use sharing on with that rclone remote. rclone's access covers the user's whole Dropbox; SlopBar only uses its SlopBar folder there. Confirm only when the user asked for this setup.";
+const SETUP_SHARING_PREVIEW: &str = "Nothing was started. With confirm: true, SlopBar gets rclone if no recent one is installed (a fixed, checksum-verified download from rclone's own site into SlopBar's folder), opens Dropbox's consent page in the default browser of the computer being set up (with ssh_host: on that computer's screen) for the user to sign in and click Allow themselves, and turns in-use sharing on with that rclone remote. rclone's access covers the user's whole Dropbox; SlopBar only uses its SlopBar folder there. Confirm only when the user asked for this setup.";
 
 /// How long `--sharing-state` waits on the other computer for its sign-in before answering, in
 /// seconds: each ask over SSH starts a shell there, so it asks seldom and the waiting is done there.
@@ -520,11 +520,15 @@ fn own_dropbox_remote(door: &dyn Door) -> Option<String> {
     remotes.iter().any(|r| r["name"] == name && r["kind"] == "dropbox").then(|| name.to_string())
 }
 
-/// `setup_sharing` for another computer: its SlopBar gets rclone and starts rclone's Dropbox
-/// sign-in without anyone at its screen (`via_tunnel`), and this computer's app opens an SSH tunnel
-/// to its rclone and this computer's browser on the link, built here from the state value alone.
-/// Dropbox's answer reaches that computer's rclone through the tunnel; no token passes here, and
-/// the state value never appears in a result. `get_sharing_setup` with `ssh_host` follows it.
+/// `setup_sharing` for another computer. By default that computer's SlopBar runs the setup as if it
+/// was started at its screen: Dropbox's page opens in its own browser, with its notification, and
+/// it is refused while nobody can see that desktop (the owner's ruling: the page opens on the
+/// computer being set up). Only with `open_here` (that computer's screen is out of reach) does its
+/// SlopBar start rclone's sign-in without a browser (`via_tunnel`), while this computer's app opens
+/// an SSH tunnel to its rclone and this computer's browser on the link, built here from the state
+/// value alone: Dropbox's answer reaches that computer's rclone through the tunnel, no token passes
+/// here, and the state value never appears in a result. `get_sharing_setup` with `ssh_host`
+/// follows either.
 fn setup_remote_sharing(door: &dyn Door, ssh: &dyn Remote, host: &str, args: &Value) -> Result<Value, String> {
     let cancel_there = || remote_call(ssh, host, "setup_sharing", &json!({ "cancel": true }));
     let close_here = || door.call(&Request::SharingTunnel { host: host.into(), state: None, close: true });
@@ -533,7 +537,11 @@ fn setup_remote_sharing(door: &dyn Door, ssh: &dyn Remote, host: &str, args: &Va
         return cancel_there();
     }
     // The user's go-ahead given here covers that computer's part.
-    let mut start = json!({ "via_tunnel": true, "confirm": true });
+    let open_here = args.get("open_here").and_then(Value::as_bool) == Some(true);
+    let mut start = json!({ "confirm": true });
+    if open_here {
+        start["via_tunnel"] = true.into();
+    }
     let remote = args.get("remote").and_then(Value::as_str).map(str::to_owned).or_else(|| own_dropbox_remote(door));
     if let Some(remote) = remote {
         start["remote"] = remote.into();
@@ -541,12 +549,20 @@ fn setup_remote_sharing(door: &dyn Door, ssh: &dyn Remote, host: &str, args: &Va
     if args.get("reconnect").and_then(Value::as_bool) == Some(true) {
         start["reconnect"] = true.into();
     }
-    match remote_call(ssh, host, "setup_sharing", &start) {
+    let started = match remote_call(ssh, host, "setup_sharing", &start) {
+        Ok(state) => Some(state),
         // One already runs there (this call came again while it got rclone): this one joins it.
-        Err(e) if e.contains("sharing_setup_busy") => {}
+        Err(e) if e.contains("sharing_setup_busy") => None,
         Err(e) if e.contains("nknown tool") => return Err("update_slopbar_there".into()),
-        Err(e) => return Err(e),
-        Ok(_) => {}
+        Err(e) => return Err(format!("target: {e}")),
+    };
+    if !open_here {
+        let mut there = match started {
+            Some(state) => state,
+            None => remote_call(ssh, host, "get_sharing_setup", &json!({}))?,
+        };
+        there["next"] = json!("That computer's SlopBar gets rclone if needed and opens Dropbox's page in its own browser, on its screen, with a notification there. The user signs in there with the Dropbox account their other computers use and clicks Allow; follow it with get_sharing_setup with this ssh_host, wait_seconds: 45 and since: the last revision, until phase is done or failed.");
+        return Ok(there);
     }
     let deadline = std::time::Instant::now() + SETUP_START;
     loop {
@@ -794,11 +810,13 @@ mod tests {
         link: Value,
         /// A setup already runs there: starting another is refused.
         busy: bool,
+        /// Starting is refused with this error (its desktop is locked, say).
+        refuse: Option<&'static str>,
         commands: RefCell<Vec<String>>,
     }
 
     fn target(link: Value) -> SharingTarget {
-        SharingTarget { link, busy: false, commands: RefCell::default() }
+        SharingTarget { link, busy: false, refuse: None, commands: RefCell::default() }
     }
 
     fn call_b64(tool: &str, arguments: Value) -> String {
@@ -812,6 +830,8 @@ mod tests {
                 json!({ "ok": self.link })
             } else if command == call_b64("get_sharing_setup", json!({})) {
                 json!({ "ok": { "phase": "done", "found": ["DESK-2"] } })
+            } else if let Some(error) = self.refuse {
+                json!({ "error": error })
             } else if self.busy && !command.contains(&call_b64("setup_sharing", json!({ "cancel": true }))) {
                 json!({ "error": "sharing_setup_busy" })
             } else {
@@ -822,24 +842,27 @@ mod tests {
     }
 
     #[test]
-    fn another_computers_sign_in_opens_here_and_its_state_never_reaches_the_agent() {
+    fn another_computers_page_opens_on_its_own_screen_by_default() {
         let here = FakeApp::new(json!({}));
         let there = target(json!({ "phase": "dropbox", "state": "Ab-9_x" }));
         let out = setup_remote_sharing(&here, &there, "box", &json!({})).unwrap();
-        assert_eq!(out["phase"], "dropbox");
-        assert!(!out.to_string().contains("Ab-9_x"), "{out}");
-        assert_eq!(there.commands.borrow()[0], call_b64("setup_sharing", json!({ "via_tunnel": true, "confirm": true })), "that computer's browser is not needed");
-        let seen = here.seen.borrow();
-        assert!(matches!(&seen[..], [Request::ListSharingLocations, Request::SharingTunnel { host, state: Some(s), close: false }] if host == "box" && s == "Ab-9_x"), "{seen:?}");
+        assert_eq!(out["phase"], "rclone", "that computer's own state: {out}");
+        assert!(out["next"].as_str().unwrap().contains("its own browser"), "{out}");
+        assert_eq!(*there.commands.borrow(), [call_b64("setup_sharing", json!({ "confirm": true }))], "no tunnel, no state asked for");
+        assert!(matches!(&here.seen.borrow()[..], [Request::ListSharingLocations]), "nothing opens here");
 
-        // Already connected there (no sign-in to wait for): its own state answers, and no tunnel opens.
+        // One already runs there: its state answers.
         let here = FakeApp::new(json!({}));
-        let there = target(json!({ "phase": "done", "state": null }));
-        assert_eq!(setup_remote_sharing(&here, &there, "box", &json!({ "remote": "dropbox", "reconnect": false })).unwrap()["found"], json!(["DESK-2"]));
-        assert!(here.seen.borrow().is_empty());
-        assert_eq!(there.commands.borrow()[0], call_b64("setup_sharing", json!({ "via_tunnel": true, "confirm": true, "remote": "dropbox" })));
+        let there = SharingTarget { busy: true, ..target(json!({})) };
+        assert_eq!(setup_remote_sharing(&here, &there, "box", &json!({ "remote": "dropbox" })).unwrap()["found"], json!(["DESK-2"]));
+        assert_eq!(there.commands.borrow()[0], call_b64("setup_sharing", json!({ "confirm": true, "remote": "dropbox" })));
 
-        // Cancelling stops it there and closes the tunnel here.
+        // Nobody can see that desktop: refused there, and said to be about that computer.
+        let here = FakeApp::new(json!({}));
+        let there = SharingTarget { refuse: Some("desktop_locked"), ..target(json!({})) };
+        assert_eq!(setup_remote_sharing(&here, &there, "box", &json!({})).unwrap_err(), "target: desktop_locked");
+
+        // Cancelling stops it there (and closes any tunnel here).
         let here = FakeApp::new(json!({}));
         let there = target(json!({}));
         setup_remote_sharing(&here, &there, "box", &json!({ "cancel": true })).unwrap();
@@ -848,25 +871,44 @@ mod tests {
     }
 
     #[test]
-    fn another_computer_takes_this_ones_dropbox_remote_and_a_second_call_joins_its_setup() {
-        // This computer shares through a Dropbox remote: that computer uses the same name.
-        let here = FakeApp { remotes: vec!["work-dropbox"], ..FakeApp::new(json!({ "presence_remote": "work-dropbox" })) };
+    fn with_open_here_another_computers_sign_in_opens_here_and_its_state_never_reaches_the_agent() {
+        let here = FakeApp::new(json!({}));
         let there = target(json!({ "phase": "dropbox", "state": "Ab-9_x" }));
-        setup_remote_sharing(&here, &there, "box", &json!({ "reconnect": true })).unwrap();
-        assert_eq!(there.commands.borrow()[0], call_b64("setup_sharing", json!({ "via_tunnel": true, "confirm": true, "remote": "work-dropbox", "reconnect": true })));
+        let out = setup_remote_sharing(&here, &there, "box", &json!({ "open_here": true })).unwrap();
+        assert_eq!(out["phase"], "dropbox");
+        assert!(!out.to_string().contains("Ab-9_x"), "{out}");
+        assert_eq!(there.commands.borrow()[0], call_b64("setup_sharing", json!({ "confirm": true, "via_tunnel": true })), "that computer's browser is not needed");
+        let seen = here.seen.borrow();
+        assert!(matches!(&seen[..], [Request::ListSharingLocations, Request::SharingTunnel { host, state: Some(s), close: false }] if host == "box" && s == "Ab-9_x"), "{seen:?}");
 
-        // Not a Dropbox one: that computer keeps its own default.
-        let here = FakeApp { remotes: vec!["gdrive"], ..FakeApp::new(json!({ "presence_remote": "gdrive" })) };
-        let there = target(json!({ "phase": "dropbox", "state": "Ab-9_x" }));
-        setup_remote_sharing(&here, &there, "box", &json!({})).unwrap();
-        assert_eq!(there.commands.borrow()[0], call_b64("setup_sharing", json!({ "via_tunnel": true, "confirm": true })));
+        // Already connected there (no sign-in to wait for): its own state answers, and no tunnel opens.
+        let here = FakeApp::new(json!({}));
+        let there = target(json!({ "phase": "done", "state": null }));
+        assert_eq!(setup_remote_sharing(&here, &there, "box", &json!({ "open_here": true, "remote": "dropbox", "reconnect": false })).unwrap()["found"], json!(["DESK-2"]));
+        assert!(here.seen.borrow().is_empty());
+        assert_eq!(there.commands.borrow()[0], call_b64("setup_sharing", json!({ "confirm": true, "via_tunnel": true, "remote": "dropbox" })));
 
         // A setup already running there (still getting rclone when the first call gave up) is
         // joined: its sign-in opens here once it waits.
         let here = FakeApp::new(json!({}));
         let there = SharingTarget { busy: true, ..target(json!({ "phase": "dropbox", "state": "Ab-9_x" })) };
-        assert_eq!(setup_remote_sharing(&here, &there, "box", &json!({})).unwrap()["phase"], "dropbox");
+        assert_eq!(setup_remote_sharing(&here, &there, "box", &json!({ "open_here": true })).unwrap()["phase"], "dropbox");
         assert!(here.seen.borrow().iter().any(|r| matches!(r, Request::SharingTunnel { state: Some(_), .. })));
+    }
+
+    #[test]
+    fn another_computer_takes_this_ones_dropbox_remote() {
+        // This computer shares through a Dropbox remote: that computer uses the same name.
+        let here = FakeApp { remotes: vec!["work-dropbox"], ..FakeApp::new(json!({ "presence_remote": "work-dropbox" })) };
+        let there = target(json!({}));
+        setup_remote_sharing(&here, &there, "box", &json!({ "reconnect": true })).unwrap();
+        assert_eq!(there.commands.borrow()[0], call_b64("setup_sharing", json!({ "confirm": true, "remote": "work-dropbox", "reconnect": true })));
+
+        // Not a Dropbox one: that computer keeps its own default.
+        let here = FakeApp { remotes: vec!["gdrive"], ..FakeApp::new(json!({ "presence_remote": "gdrive" })) };
+        let there = target(json!({}));
+        setup_remote_sharing(&here, &there, "box", &json!({})).unwrap();
+        assert_eq!(there.commands.borrow()[0], call_b64("setup_sharing", json!({ "confirm": true })));
     }
 
     #[test]
