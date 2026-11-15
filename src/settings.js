@@ -346,7 +346,7 @@ listen("account-added", () => { $("add-hint").hidden = true; });
 // The verdicts come from the backend (subscriptions.rs); this page only words them.
 
 let report = null;
-const NOTIFY_KINDS = ["usage", "resets", "switches", "renewals", "extra_usage", "burn", "reset_credits", "unexpected_use", "multi_machine", "digest"];
+const NOTIFY_KINDS = ["usage", "resets", "switches", "renewals", "extra_usage", "burn", "reset_credits", "unexpected_use", "multi_machine", "sharing_sign_in", "digest"];
 const VERDICT_TONE = { exhausted_weekly: "bad", unused: "warn", underused: "warn", healthy: "ok", insufficient_data: "" };
 
 function verdictLines(e) {
@@ -973,6 +973,7 @@ async function render() {
   $("crash-records").checked = settings.crash_records;
   $("auto-monitoring").checked = settings.auto_connect_monitoring;
   $("switch-desktop").checked = settings.switch_desktop;
+  $("sharing-open-browser").checked = settings.sharing_open_browser;
   $("compact-flyout").checked = settings.compact_flyout;
   $("compact-flyout-hint").textContent = snapshot.accounts.length > COMPACT_SUGGEST_ABOVE && !settings.compact_flyout
     ? t("compactFlyoutSuggested", { n: snapshot.accounts.length }) : t("compactFlyoutHint");
@@ -1022,6 +1023,7 @@ $("export-diagnostics").addEventListener("click", async () => {
 $("crash-records").addEventListener("change", (e) => update({ crash_records: e.target.checked }));
 $("auto-monitoring").addEventListener("change", (e) => update({ auto_connect_monitoring: e.target.checked }));
 $("switch-desktop").addEventListener("change", (e) => update({ switch_desktop: e.target.checked }));
+$("sharing-open-browser").addEventListener("change", (e) => update({ sharing_open_browser: e.target.checked }));
 $("wsl-accounts").addEventListener("change", (e) => update({ wsl_accounts: e.target.value }));
 $("signin-window").addEventListener("change", (e) => update({ signin_window: e.target.value }));
 // Reads every WSL distro once, starting stopped ones, then refreshes.

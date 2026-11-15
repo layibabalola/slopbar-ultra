@@ -82,7 +82,8 @@ the getting-started guide), or the `setup_sharing` agent tool, connects a comput
    with the remote, token included. From rclone's notices SlopBar takes only its loopback link
    (`http://127.0.0.1:53682/auth?state=…`, exactly that form), which it opens in the browser (with a
    notification that opens it again: Windows can keep a page opened from the background behind
-   other windows), and
+   other windows; Settings turns either off, `sharing_open_browser` and
+   `notifications.sharing_sign_in`, both on by default), and
    the reason a failed sign-in gives: `denied` (not allowed on Dropbox's page), `stale_page`
    (Allow clicked on a page from an earlier try), `port_busy` or `port_reserved` (port 53682 held
    by another program, or reserved by Windows). The user has 10 minutes. Stopped before Allow,
