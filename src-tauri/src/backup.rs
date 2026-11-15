@@ -334,8 +334,8 @@ pub struct Here<'a> {
     /// Accounts signed in here (provider, account id).
     pub known: &'a [(Provider, String)],
     pub updates_enabled: bool,
-    /// A pinned folder as this machine spells it, or None when it does not exist here.
-    pub folder: &'a dyn Fn(&str) -> Option<String>,
+    /// A pinned folder as this machine spells it, or why it is skipped (`pins::restored_folder`).
+    pub folder: &'a dyn Fn(&str) -> Result<String, &'static str>,
     /// Whether a sharing folder or calendar path from the backup can be used here.
     pub presence_folder_ok: &'a dyn Fn(&str) -> bool,
     pub calendar_path_ok: &'a dyn Fn(&str) -> bool,
@@ -411,15 +411,18 @@ pub fn merge(settings: &Settings, history: &History, ledger: &Ledger, backup: &C
 
     let mut pins = Changes::default();
     for pin in &from.project_pins {
-        let Some(folder) = (here.folder)(&pin.folder) else {
-            skipped.push(Skipped { what: format!("pin {}", pin.folder), reason: "folder_missing_here" });
-            continue;
+        let folder = match (here.folder)(&pin.folder) {
+            Ok(folder) => folder,
+            Err(reason) => {
+                skipped.push(Skipped { what: format!("pin {}", pin.folder), reason });
+                continue;
+            }
         };
         let pin = ProjectPin { folder, ..pin.clone() };
         let full = next.project_pins.len() >= crate::pins::MAX_PINS;
-        match next.project_pins.iter_mut().find(|p| p.provider == pin.provider && crate::pins::same_folder(&p.folder, &pin.folder)) {
-            Some(p) if *p == pin => {}
-            Some(p) => { pins.changed.push(pin.folder.clone()); *p = pin; }
+        match crate::pins::find_pin(&next.project_pins, pin.provider, &pin.folder) {
+            Some(i) if next.project_pins[i] == pin => {}
+            Some(i) => { pins.changed.push(pin.folder.clone()); next.project_pins[i] = pin; }
             None if full => skipped.push(Skipped { what: format!("pin {}", pin.folder), reason: "too_many_pins" }),
             None => { pins.added.push(pin.folder.clone()); next.project_pins.push(pin); }
         }
@@ -560,7 +563,7 @@ mod tests {
         Contents::new(&settings, &history, &ledger, accounts, "0.9.0", at(12))
     }
 
-    fn here_with<'a>(known: &'a [(Provider, String)], folder: &'a dyn Fn(&str) -> Option<String>) -> Here<'a> {
+    fn here_with<'a>(known: &'a [(Provider, String)], folder: &'a dyn Fn(&str) -> Result<String, &'static str>) -> Here<'a> {
         Here { known, updates_enabled: false, folder, presence_folder_ok: &|_| true, calendar_path_ok: &|_| true }
     }
 
@@ -637,7 +640,7 @@ mod tests {
             { "kind": "weekly", "resets_at": at(15), "peak": 70.0, "first_obs": at(8), "last_obs": at(15), "hours": 40, "days": 6 } ] })).unwrap());
         let ledger = Ledger { version: 1, ..Default::default() };
         let known = [(Provider::Claude, "a1".to_string())];
-        let (merged, preview) = merge(&current, &history, &ledger, &backup, &here_with(&known, &|_| None), at(22));
+        let (merged, preview) = merge(&current, &history, &ledger, &backup, &here_with(&known, &|_| Err("folder_missing_here")), at(22));
         assert_eq!(merged.settings.aliases["claude:a1"], "Work", "the backup wins where both have an entry");
         assert_eq!(merged.settings.aliases["claude:mine"], "Kept", "entries only here stay");
         assert_eq!(merged.settings.aliases["codex:gone"], "Old laptop");
@@ -660,7 +663,7 @@ mod tests {
         assert!(preview.note.contains("reconnect"));
 
         // Restoring the same backup again changes nothing per account.
-        let (twice, again) = merge(&merged.settings, &merged.history, &merged.ledger, &backup, &here_with(&known, &|_| None), at(22));
+        let (twice, again) = merge(&merged.settings, &merged.history, &merged.ledger, &backup, &here_with(&known, &|_| Err("folder_missing_here")), at(22));
         assert!(again.aliases.added.is_empty() && again.aliases.changed.is_empty() && again.ledger.changed.is_empty() && again.history.changed.is_empty(), "{again:?}");
         assert_eq!(twice.ledger.months["2026-10"].charges.len(), 1);
     }
@@ -669,23 +672,24 @@ mod tests {
     fn pins_restore_only_where_the_folder_exists_here() {
         let dir = TempDir::new();
         let mut contents = sample();
-        let here_folder = dir.0.display().to_string();
+        // As pinning saves it: in its long spelling, also where the temp folder is spelled short.
+        let here_folder = crate::pins::long_spelling(&dir.0.display().to_string());
         contents.settings.project_pins = vec![
             ProjectPin { folder: here_folder.clone(), provider: Provider::Claude, id: "a1".into() },
             ProjectPin { folder: "C:\\nowhere\\at\\all".into(), provider: Provider::Codex, id: "gone".into() },
         ];
-        let folder = |f: &str| crate::pins::normalize_folder(f).ok();
+        let folder = |f: &str| crate::pins::restored_folder(f);
         let (merged, preview) = merge(&Settings::default(), &History::default(), &Ledger::default(), &contents, &here_with(&[], &folder), at(22));
         assert_eq!(merged.settings.project_pins.len(), 1);
         assert_eq!(preview.pins.added.len(), 1);
         assert!(preview.skipped.iter().any(|s| s.what.contains("nowhere") && s.reason == "folder_missing_here"), "{:?}", preview.skipped);
     }
 
-    /// A pin saved in its 8.3 short spelling and the backup's pin on the same folder are one pin:
-    /// restoring takes the backup's (long) spelling instead of adding a second pin.
+    /// Restoring never expands a short spelling: in a backup it may name another folder here, so
+    /// such a pin is skipped. A pin saved short here is replaced by the backup's long one.
     #[cfg(windows)]
     #[test]
-    fn a_restored_pin_replaces_its_short_spelled_twin() {
+    fn restore_keeps_short_spellings_apart() {
         let dir = TempDir::new();
         let folder = dir.0.join("a folder with a long name");
         std::fs::create_dir_all(&folder).unwrap();
@@ -693,12 +697,17 @@ mod tests {
         let Some(short) = crate::test_support::short_spelling(&long) else {
             return crate::test_support::require_short_names(&long);
         };
+        let restored = |f: &str| crate::pins::restored_folder(f);
+        let mut contents = sample();
+        contents.settings.project_pins = vec![ProjectPin { folder: short.clone(), provider: Provider::Claude, id: "a1".into() }];
+        let (merged, preview) = merge(&Settings::default(), &History::default(), &Ledger::default(), &contents, &here_with(&[], &restored), at(22));
+        assert!(merged.settings.project_pins.is_empty(), "{:?}", merged.settings.project_pins);
+        assert!(preview.skipped.iter().any(|s| s.what.contains(&short) && s.reason == "short_spelling"), "{:?}", preview.skipped);
+
         let mut current = Settings::default();
         current.project_pins = vec![ProjectPin { folder: short, provider: Provider::Claude, id: "a1".into() }];
-        let mut contents = sample();
         contents.settings.project_pins = vec![ProjectPin { folder: long.clone(), provider: Provider::Claude, id: "a1".into() }];
-        let normalize = |f: &str| crate::pins::normalize_folder(f).ok();
-        let (merged, preview) = merge(&current, &History::default(), &Ledger::default(), &contents, &here_with(&[], &normalize), at(22));
+        let (merged, preview) = merge(&current, &History::default(), &Ledger::default(), &contents, &here_with(&[], &restored), at(22));
         let pins = &merged.settings.project_pins;
         assert!(pins.len() == 1 && pins[0].folder.eq_ignore_ascii_case(&long), "{pins:?}");
         assert!(preview.pins.added.is_empty() && preview.pins.changed.len() == 1, "{:?}", preview.pins);

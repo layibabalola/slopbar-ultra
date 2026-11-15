@@ -24,9 +24,22 @@ pub fn env_var(provider: Provider) -> &'static str {
     }
 }
 
-/// A folder as pins store it: trimmed, absolute, existing, in its long spelling (see
-/// [`long_spelling`]), without a trailing separator.
+/// A folder as pins store it when it is pinned: trimmed, absolute, existing, in its long spelling
+/// (see [`long_spelling`]), without a trailing separator.
 pub fn normalize_folder(folder: &str) -> Result<String, String> {
+    checked_folder(folder).map(|f| long_spelling(&f))
+}
+
+/// A pin's folder from a backup: checked like [`normalize_folder`], but never expanded, because a
+/// short name in the backup may belong to another folder here. A pin spelled with short names is
+/// skipped (`short_spelling`), for the user to pin that folder again.
+pub fn restored_folder(folder: &str) -> Result<String, &'static str> {
+    let checked = checked_folder(folder).map_err(|_| "folder_missing_here")?;
+    if long_spelling(&checked).eq_ignore_ascii_case(&checked) { Ok(checked) } else { Err("short_spelling") }
+}
+
+/// `folder` trimmed, absolute, existing and without a trailing separator, spelled as given.
+fn checked_folder(folder: &str) -> Result<String, String> {
     let trimmed = folder.trim();
     let refuse = || format!("folder must be an existing absolute folder (got {folder:?})");
     if trimmed.is_empty() || trimmed.len() > 1024 || trimmed.chars().any(char::is_control) {
@@ -40,15 +53,15 @@ pub fn normalize_folder(folder: &str) -> Result<String, String> {
     // One spelling per folder: Windows paths with backslashes only.
     let spelled = if cfg!(windows) { trimmed.replace('/', "\\") } else { trimmed.to_string() };
     let stripped = spelled.trim_end_matches(['\\', '/']);
-    Ok(if stripped.ends_with(':') || stripped.is_empty() { spelled.clone() } else { long_spelling(stripped) })
+    Ok(if stripped.ends_with(':') || stripped.is_empty() { spelled.clone() } else { stripped.to_string() })
 }
 
 /// `folder` with its 8.3 short names expanded: "C:\Users\RUNNER~1\repo" is
 /// "C:\Users\runneradmin\repo", the spelling Windows PowerShell reports for the current folder.
-/// A pin is expanded once, when it is made. A short name belongs to whichever folder holds it at
-/// the time, so expanding a saved pin later could point it at a folder nobody pinned. Like .NET,
-/// only a spelling with a `~` is expanded. Anything else comes back as given: a folder that is not
-/// there, a spelling with a NUL (Windows would read only the part before it), other systems.
+/// A pin is expanded once, when it is pinned: a short name belongs to whichever folder holds it at
+/// the time, so expanding a saved or restored pin could point it at a folder nobody pinned. Like
+/// .NET, only a spelling with a `~` is expanded. Anything else comes back as given: a folder that
+/// is not there, a spelling with a NUL (Windows would read only the part before it), other systems.
 #[cfg(windows)]
 pub fn long_spelling(folder: &str) -> String {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -75,10 +88,22 @@ pub fn long_spelling(folder: &str) -> String {
     folder.to_string()
 }
 
-/// Whether two pins name the same folder: on Windows case aside, and short names expanded where
-/// the folder is there, so a pin saved in its 8.3 spelling is still found by its long one.
+/// Whether two pins are spelled the same: on Windows case aside.
+fn same_spelling(a: &str, b: &str) -> bool {
+    if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b }
+}
+
+/// Whether two pins name the same folder: spelled the same, or the same once short names are
+/// expanded where the folder is there, so a pin saved in its 8.3 spelling is found by its long one.
 pub(crate) fn same_folder(a: &str, b: &str) -> bool {
-    if cfg!(windows) { a.eq_ignore_ascii_case(b) || long_spelling(a).eq_ignore_ascii_case(&long_spelling(b)) } else { a == b }
+    same_spelling(a, b) || (cfg!(windows) && long_spelling(a).eq_ignore_ascii_case(&long_spelling(b)))
+}
+
+/// Where `provider`'s pin on `folder` is in `pins`: one spelled the same first, and only when there
+/// is none, one whose short names name that folder (a short name may have moved to it since).
+pub(crate) fn find_pin(pins: &[ProjectPin], provider: Provider, folder: &str) -> Option<usize> {
+    pins.iter().position(|p| p.provider == provider && same_spelling(&p.folder, folder))
+        .or_else(|| pins.iter().position(|p| p.provider == provider && same_folder(&p.folder, folder)))
 }
 
 /// `pins` with `provider`'s pin on `folder` set to account `id`, or removed when `id` is None.
@@ -89,7 +114,14 @@ pub fn set(pins: &[ProjectPin], folder: &str, provider: Provider, id: Option<&st
         None => {
             let before = next.len();
             let folder = folder.trim().trim_end_matches(['\\', '/']);
-            next.retain(|p| !(p.provider == provider && same_folder(p.folder.trim_end_matches(['\\', '/']), folder)));
+            let trimmed = |p: &ProjectPin| p.folder.trim_end_matches(['\\', '/']).to_string();
+            // The pins spelled the same, if any: a short spelling may since have moved to a folder
+            // pinned under its long spelling, and removing this one must leave that pin alone.
+            if next.iter().any(|p| p.provider == provider && same_spelling(&trimmed(p), folder)) {
+                next.retain(|p| !(p.provider == provider && same_spelling(&trimmed(p), folder)));
+            } else {
+                next.retain(|p| !(p.provider == provider && same_folder(&trimmed(p), folder)));
+            }
             if next.len() == before {
                 return Err(format!("no {} pin on {folder:?}", provider.name()));
             }
@@ -100,7 +132,7 @@ pub fn set(pins: &[ProjectPin], folder: &str, provider: Provider, id: Option<&st
             }
             let folder = normalize_folder(folder)?;
             let pin = ProjectPin { folder: folder.clone(), provider, id: id.to_string() };
-            match next.iter().position(|p| p.provider == provider && same_folder(&p.folder, &folder)) {
+            match find_pin(&next, provider, &folder) {
                 Some(i) => next[i] = pin,
                 None if next.len() >= MAX_PINS => return Err(format!("at most {MAX_PINS} pins")),
                 None => next.push(pin),
@@ -208,10 +240,7 @@ if ($null -eq $provider) {{
 }}
 if ($rest.Count -eq 0) {{ $rest = @($provider) }}
 $var = if ($provider -eq 'claude') {{ 'CLAUDE_CONFIG_DIR' }} else {{ 'CODEX_HOME' }}
-$location = Get-Location
-$here = $location.ProviderPath
-# Pins keep folders in their long spelling; a drive whose root is spelled short reports it short.
-if ($location.Provider.Name -eq 'FileSystem' -and $here.Contains('~')) {{ try {{ $here = [IO.Path]::GetFullPath($here) }} catch {{ }} }}
+$here = (Get-Location).ProviderPath
 $best = $null
 $bestLength = -1
 foreach ($pin in $pins) {{
@@ -415,6 +444,10 @@ mod tests {
         let repinned = set(&old, &long, Provider::Claude, Some("user-3:org-1"), &known()).unwrap();
         assert!(repinned.len() == 1 && repinned[0].folder.eq_ignore_ascii_case(&long) && repinned[0].id == "user-3:org-1", "{repinned:?}");
         assert!(set(&old, &long, Provider::Claude, None, &known()).unwrap().is_empty());
+        // Spelling first: removing the short pin leaves a pin saved under the long spelling alone.
+        let both = [old[0].clone(), ProjectPin { folder: long.clone(), provider: Provider::Claude, id: "user-3:org-1".into() }];
+        let left = set(&both, &short, Provider::Claude, None, &known()).unwrap();
+        assert!(left.len() == 1 && left[0].folder == long, "{left:?}");
         let gone = format!("{short}\\not there");
         assert_eq!(long_spelling(&gone), gone, "a folder that is not there comes back as given");
         // Windows would read only the part before a NUL, which would widen the folder to its parent.
