@@ -94,6 +94,8 @@ pub struct AppState {
     settings_page: Mutex<Option<String>>,
     /// Accounts reserved for jobs (see `leases`); in memory only.
     pub(crate) leases: Mutex<leases::Leases>,
+    /// The last update check and the update loop's next run (see `update_check`); in memory only.
+    pub(crate) update_check: crate::update_check::Status,
 }
 
 pub(crate) const SWITCHER_LABEL: &str = "switcher";
@@ -677,6 +679,10 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::SetProjectPin { folder, provider, id } => value(set_project_pin(app.clone(), folder, provider, id).await?),
         R::CheckForUpdates => value(check_for_updates(app.clone()).await?),
         R::InstallUpdate => {
+            // One install at a time: a request while one runs hears so at once.
+            if let Some(reason) = updates::install_blocked(&app) {
+                return Ok(serde_json::json!({ "installing": false, "reason": reason }));
+            }
             let latest = check_for_updates(app.clone()).await?.latest;
             if latest.is_none() {
                 return Ok(serde_json::json!({ "installing": false, "reason": "SlopBar Ultra is up to date" }));
@@ -692,6 +698,8 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::GetAppInfo => Ok(serde_json::json!({
             "version": app_version(app.clone()),
             "updates_enabled": updates_enabled(),
+            // The last update check's time, result and error, and when the update loop runs next.
+            "update_check": updates::report(&app),
             "build": diagnostics::build_info(),
             // Which process answers the door (the installer quits exactly this one).
             "pid": std::process::id(),
@@ -3167,6 +3175,7 @@ pub fn run() {
         compact_item: Mutex::default(),
         settings_page: Mutex::default(),
         leases: Mutex::default(),
+        update_check: Default::default(),
     };
     tauri::Builder::default()
         // Must come first: a second launch hands over to the running instance and exits.
@@ -3363,15 +3372,22 @@ pub fn run() {
 }
 
 /// What SlopBar does as it exits: on Tauri's Exit, and before an update's installer replaces it
-/// (the updater ends the process itself, so no Exit event comes).
+/// (the updater ends the process itself, so no Exit event comes). Each part that can wait has a
+/// limit, so exiting never hangs on a stuck disk, network folder or lock.
 pub(crate) fn on_exit(app: &AppHandle) {
+    use crate::update_check::{wait_at_most, EXIT_PART_LIMIT};
     // Other machines stop showing this one's accounts as in use.
-    let settings = app.state::<AppState>().settings.lock().unwrap().clone();
-    if let Some(store) = presence::store(&settings) {
-        presence::withdraw(store.as_ref(), settings.refresh_minutes.max(1) as u64 * 60);
-    }
-    // A sign-in still open loses its browser and fresh profile with SlopBar.
-    signin::close_all();
+    let h = app.clone();
+    wait_at_most(EXIT_PART_LIMIT, move || {
+        let settings = h.state::<AppState>().settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(store) = presence::store(&settings) {
+            presence::withdraw(store.as_ref(), settings.refresh_minutes.max(1) as u64 * 60);
+        }
+    });
+    // A sign-in still open loses its browser and fresh profile with SlopBar (the next start deletes
+    // what it had no time for).
+    wait_at_most(EXIT_PART_LIMIT, signin::close_all);
+    // The journal waits for its writer a few seconds at most (`Recorder::flush`).
     app.state::<AppState>().diagnostics.record(None, None, diagnostics::Event::Shutdown);
 }
 
