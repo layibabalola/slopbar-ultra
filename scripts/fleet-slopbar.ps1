@@ -16,14 +16,24 @@ ssh runs through Start-Process with its output in files, a timeout and a tree ki
 machines an ssh.exe whose output is piped never exits.
 
 LastCheck is each machine's last update check (get_app_info's update_check): how long ago it ran,
-and what it found or its error. A build from before that record shows n/a, which is no problem,
-because machines update one by one.
+and what it found, why it was deferred, or its error, cut to 40 characters; the table is followed
+by each one that was cut, in full. A build from before that record shows n/a, which is no problem,
+because machines update one by one. The limits below come from each machine's own record: its
+update interval and the limit of one pass of its update loop.
 
 Problems (exit code 1): a local build (a version without -ultra., which takes no releases), a build
-without updates, "Update automatically" off, a failed last update check, no update check for over
-twice the update interval while "Update automatically" is on, a machine that does not answer, and
-an update that does not arrive. A machine without SlopBar is reported as not installed, which is no
-problem.
+without updates, "Update automatically" off, a machine that does not answer, an update that does not
+arrive, and, from the record:
+  - a failed last update check (a deferred one is no problem);
+  - no update check for longer than the interval plus a pass's limit while "Update automatically" is
+    on;
+  - an update loop whose next run is overdue by more than a pass's limit: it has stopped, even if a
+    check asked for since then shows a recent time;
+  - a machine still behind the channel longer than the interval plus a pass's limit after the
+    channel's release was published (latest.json's pub_date).
+A machine without SlopBar is reported as not installed, which is no problem.
+
+The functions are tested offline by scripts/test-fleet-slopbar.ps1, which dot-sources this file.
 #>
 param(
   [switch]$UpdateNow,
@@ -65,26 +75,41 @@ function Test-NewerVersion([string]$a, [string]$b) {
   return $packageA -gt $packageB -or ($packageA -eq $packageB -and $buildA -gt $buildB)
 }
 
-# A UTC time from get_app_info (ConvertFrom-Json may already have made it a [datetime]).
+# A UTC time from get_app_info or latest.json (ConvertFrom-Json may already have made it a
+# [datetime]); both always write UTC.
 function ConvertTo-UtcTime($value) {
   if ($null -eq $value -or "$value" -eq '') { return $null }
-  if ($value -is [datetime]) { return $value.ToUniversalTime() }
+  if ($value -is [datetime]) {
+    if ($value.Kind -eq [DateTimeKind]::Unspecified) { return [datetime]::SpecifyKind($value, [DateTimeKind]::Utc) }
+    return $value.ToUniversalTime()
+  }
   return [datetimeoffset]::Parse("$value", [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
 }
 
-# The app's last update check (get_app_info's update_check) as a short text, and the problem it
-# shows, if any. A build from before the record has no update_check: n/a, no problem. A failed check
-# is a problem, and so is none for over twice the update interval while "Update automatically" is on.
-function Get-LastCheck($check, $auto) {
-  if ($null -eq $check) { return [pscustomobject]@{ Text = 'n/a'; Problem = $null } }
-  $limit = 2 * [double]($check.interval_seconds ?? 900)
-  $now = [datetime]::UtcNow
+# $text cut to $max characters.
+function Get-Short([string]$text, [int]$max = 40) {
+  if ($text.Length -le $max) { return $text }
+  return $text.Substring(0, $max - 1) + '…'
+}
+
+# The app's last update check (get_app_info's update_check): its text, the problems it shows, and
+# the machine's update interval and pass limit, in seconds. A build from before the record has no
+# update_check: n/a, no problem. Problems: a failed check (a deferred one is none); no check for
+# longer than the interval plus a pass's limit while "Update automatically" is on; and an update
+# loop whose next run is overdue by more than a pass's limit, which means it has stopped, whatever
+# a check asked for since then shows.
+function Get-LastCheck($check, $auto, [datetime]$now = [datetime]::UtcNow) {
+  if ($null -eq $check) { return [pscustomobject]@{ Text = 'n/a'; Problems = @(); Interval = $null; PassLimit = $null } }
+  $interval = [double]($check.interval_seconds ?? 900)
+  $passLimit = [double]($check.pass_limit_seconds ?? 2140)
+  $problems = [Collections.Generic.List[string]]::new()
+  $due = ConvertTo-UtcTime $check.next_at
+  if ($null -ne $due -and ($now - $due).TotalSeconds -gt $passLimit + 60) {
+    $problems.Add("update loop stopped: next check $([int][Math]::Floor(($now - $due).TotalMinutes)) min overdue")
+  }
   $at = ConvertTo-UtcTime $check.at
   if ($null -eq $at) {
-    # None since SlopBar started: a problem once the update loop's first run is long overdue.
-    $due = ConvertTo-UtcTime $check.next_at
-    $late = $auto -ne $false -and $null -ne $due -and ($now - $due).TotalSeconds -gt $limit
-    return [pscustomobject]@{ Text = 'none yet'; Problem = $(if ($late) { 'no update check since SlopBar started' }) }
+    return [pscustomobject]@{ Text = 'none yet'; Problems = $problems.ToArray(); Interval = $interval; PassLimit = $passLimit }
   }
   $age = $now - $at
   $minutes = [int][Math]::Max(0, [Math]::Floor($age.TotalMinutes))
@@ -92,14 +117,13 @@ function Get-LastCheck($check, $auto) {
     'up_to_date' { 'up to date' }
     'found' { "found $($check.version)" }
     'installing' { "installing $($check.version)" }
+    'deferred' { "deferred: $($check.reason)" }
     'error' { "error: $($check.error)" }
     default { "$($check.result)" }
   }
-  $text = "$minutes min ago: $result"
-  if ($text.Length -gt 80) { $text = $text.Substring(0, 79) + '…' }
-  $problem = if ("$($check.result)" -eq 'error') { 'last update check failed' }
-    elseif ($auto -ne $false -and $age.TotalSeconds -gt $limit) { "no update check for $minutes min" }
-  return [pscustomobject]@{ Text = $text; Problem = $problem }
+  if ("$($check.result)" -eq 'error') { $problems.Add('last update check failed') }
+  elseif ($auto -ne $false -and $age.TotalSeconds -gt $interval + $passLimit) { $problems.Add("no update check for $minutes min") }
+  return [pscustomobject]@{ Text = "$minutes min ago: $result"; Problems = $problems.ToArray(); Interval = $interval; PassLimit = $passLimit }
 }
 
 # Starts one door call on a machine; Complete-Call collects it.
@@ -148,9 +172,11 @@ function Invoke-Everywhere([string[]]$machines, [string]$tool, [int]$seconds = $
   return $answers
 }
 
-function Get-Row([string]$machine, $info, $settings, [string]$channel) {
+# One machine's row. $published is when the channel's release was published (latest.json's
+# pub_date).
+function Get-Row([string]$machine, $info, $settings, [string]$channel, $published, [datetime]$now = [datetime]::UtcNow) {
   $row = [pscustomobject]@{ Machine = $(if ($machine -eq $here) { "$($machine.ToLowerInvariant()) (here)" } else { $machine })
-    Version = ''; AutoUpdate = ''; LastCheck = ''; Status = ''; Behind = $false; Problem = $false; Key = $machine }
+    Version = ''; AutoUpdate = ''; LastCheck = ''; Status = ''; Behind = $false; Problem = $false; Key = $machine; CheckText = '' }
   switch ($info.State) {
     'missing' { $row.Status = 'not installed' }
     'ok' {
@@ -166,9 +192,18 @@ function Get-Row([string]$machine, $info, $settings, [string]$channel) {
       else { $notes.Add('newer than the channel'); $row.Problem = $true }
       if ($auto -eq $false) { $notes.Add('auto-update off'); $row.Problem = $true }
       if ($settings.State -ne 'ok') { $notes.Add("settings unreadable ($($settings.State))"); $row.Problem = $true }
-      $last = Get-LastCheck $info.Value.update_check $auto
-      $row.LastCheck = $last.Text
-      if ($last.Problem) { $notes.Add($last.Problem); $row.Problem = $true }
+      $last = Get-LastCheck $info.Value.update_check $auto $now
+      $row.CheckText = $last.Text
+      $row.LastCheck = Get-Short $last.Text
+      foreach ($problem in $last.Problems) { $notes.Add($problem); $row.Problem = $true }
+      # Still behind long after the release: its update loop should have installed it by now.
+      $released = ConvertTo-UtcTime $published
+      if ($row.Behind -and $null -ne $last.Interval -and $null -ne $released) {
+        $since = $now - $released
+        if ($since.TotalSeconds -gt $last.Interval + $last.PassLimit) {
+          $notes.Add("still behind $([int][Math]::Floor($since.TotalMinutes)) min after the release"); $row.Problem = $true
+        }
+      }
       $row.Status = $notes -join '; '
     }
     default { $row.Status = "$($info.State): $($info.Message)"; $row.Problem = $true }
@@ -176,21 +211,37 @@ function Get-Row([string]$machine, $info, $settings, [string]$channel) {
   return $row
 }
 
-function Get-Report([string[]]$machines, [string]$channel) {
+function Get-Report([string[]]$machines, [string]$channel, $published) {
   $info = Invoke-Everywhere $machines 'get_app_info'
   $settings = Invoke-Everywhere $machines 'get_settings'
-  return @(foreach ($m in $machines) { Get-Row $m $info[$m] $settings[$m] $channel })
+  return @(foreach ($m in $machines) { Get-Row $m $info[$m] $settings[$m] $channel $published })
 }
+
+# The table, each last check cut to fit, then those that were cut, in full.
+function Write-Report($rows) {
+  $rows | Format-Table Machine, Version, AutoUpdate, LastCheck, Status -AutoSize | Out-String -Width 200 | Write-Output
+  $cut = @($rows | Where-Object { $_.CheckText -ne $_.LastCheck })
+  if ($cut) {
+    Write-Output 'Last checks in full:'
+    foreach ($row in $cut) { Write-Output "  $($row.Key): $($row.CheckText)" }
+    Write-Output ''
+  }
+}
+
+# Dot-sourced (scripts/test-fleet-slopbar.ps1): define the functions only.
+if ($MyInvocation.InvocationName -eq '.') { return }
 
 $scratch = Join-Path ([IO.Path]::GetTempPath()) "slopbar-fleet-$PID"
 $null = New-Item -ItemType Directory -Force $scratch
 try {
-  $channel = "$((Invoke-RestMethod "https://github.com/$Repo/releases/download/ultra-latest/latest.json" -TimeoutSec 30).version)"
+  $latest = Invoke-RestMethod "https://github.com/$Repo/releases/download/ultra-latest/latest.json" -TimeoutSec 30
+  $channel = "$($latest.version)"
+  $published = $latest.pub_date
   if ($channel -notmatch '^\d+\.\d+\.\d+-ultra\.\d+$') { throw "The channel holds '$channel', not an Ultra version." }
   $machines = @($here) + @(Get-FleetHosts $SshConfig)
   Write-Output "Channel: $channel. Machines: $($machines.Count) (this one and the ssh managed block)."
-  $rows = Get-Report $machines $channel
-  $rows | Format-Table Machine, Version, AutoUpdate, LastCheck, Status -AutoSize | Out-String -Width 300 | Write-Output
+  $rows = Get-Report $machines $channel $published
+  Write-Report $rows
 
   if ($UpdateNow) {
     $behind = @($rows | Where-Object Behind | ForEach-Object Key)
@@ -228,9 +279,9 @@ try {
         }
       }
       foreach ($m in $waiting) { Write-Output "  ${m}: still not on $channel after $InstallWaitSeconds s" }
-      $rows = Get-Report $machines $channel
+      $rows = Get-Report $machines $channel $published
       Write-Output ''
-      $rows | Format-Table Machine, Version, AutoUpdate, LastCheck, Status -AutoSize | Out-String -Width 300 | Write-Output
+      Write-Report $rows
     }
   }
   $problems = @($rows | Where-Object Problem)
