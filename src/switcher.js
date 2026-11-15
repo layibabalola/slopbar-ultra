@@ -1,6 +1,6 @@
 // The quick switcher (Ctrl+Alt+S by default, or the flyout's switch button): type part of an
 // email, nickname or provider, move with the arrows, Enter switches, Esc closes.
-import { t, translateDom, setLanguage, setSystemLocale, setThisMachine, errorText, windowLabel, placesText } from "./i18n.js";
+import { t, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, errorText, windowLabel, placesText } from "./i18n.js";
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 
@@ -50,7 +50,8 @@ function render() {
     const room = w ? `<b>${Math.max(0, Math.round(100 - w.used_percent))}%</b><small>${esc(t("switcherLeft", { window: windowLabel(w) }))}</small>`
       : `<b>—</b><small>${esc(t("usageUnknown"))}</small>`;
     // The machines it is in use on, so switching here does not land on another's account unawares.
-    const meta = [PROVIDER_NAME[a.provider], a.alias ? a.email : "", a.plan, placesText(a).short].filter(Boolean).join(" · ");
+    const places = placesText(a);
+    const meta = [PROVIDER_NAME[a.provider], a.alias ? a.email : "", a.plan, places.names.length ? places.short : ""].filter(Boolean).join(" · ");
     return `<li role="option" id="option-${i}" data-i="${i}" aria-selected="${i === selected}">
       <span class="mark-box" title="${PROVIDER_NAME[a.provider]}">${MARK[a.provider]}</span>
       <span class="who"><b>${esc(name(a))}</b><small>${esc(meta)}</small></span>
@@ -111,6 +112,7 @@ listen("usage-updated", (e) => { snapshot = e.payload; render(); });
 
 function applySettings(settings) {
   setLanguage(settings.language);
+  setSharing(settings);
   translateDom();
   $query.placeholder = t("switcherPlaceholder");
   $query.setAttribute("aria-label", t("switcherPlaceholder"));

@@ -152,7 +152,12 @@ pub fn dpi_at(r: crate::dock::Rect) -> u32 {
 }
 
 fn lang(app: &AppHandle) -> Lang {
-    Lang(crate::i18n::resolve(&app.state::<AppState>().settings.lock().unwrap().language))
+    let state = app.state::<AppState>();
+    let settings = state.settings.lock().unwrap();
+    // This PC is named only with in-use sharing on: only then are there other machines to tell it
+    // apart from (as `setSharing` in i18n.js).
+    let shared = settings.presence_folder.is_some() || settings.presence_remote.is_some();
+    Lang(crate::i18n::resolve(&settings.language), shared.then(crate::presence::this_machine).flatten())
 }
 
 /// The view for the app's current state: its snapshot, language, health and any notice.
@@ -499,7 +504,7 @@ fn redraw(hwnd: HWND) {
 }
 
 fn lang_of_app() -> Lang {
-    APP.get().map(lang).unwrap_or(Lang("en".into()))
+    APP.get().map(lang).unwrap_or(Lang("en".into(), None))
 }
 
 fn on_app(f: impl FnOnce(&AppHandle) + Send + 'static) {
