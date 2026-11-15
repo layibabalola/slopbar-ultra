@@ -35,6 +35,10 @@ Add accounts in **Settings → Accounts**: SlopBar opens the CLI's own sign-in (
 > [!NOTE]
 > A running Codex session keeps its account until you restart it.
 
+### Which computer uses which account
+
+Wherever SlopBar Ultra shows an account, it names the computers the account is in use on, this PC first and marked: "In use on DESK-1 (this PC, Desktop app), LAPTOP-2 (WSL: Ubuntu)". That is the account's tooltip in the flyout and in the taskbar widget, a short line under its name in the compact flyout, the cards in the full flyout and in Settings → Accounts, the notification about an account in use on two computers, and the quick switcher, where typing a computer's name finds the account it uses. Other computers appear with in-use sharing on (Settings → Data → Other computers); their names are the ones their sharing already carries, so nothing more is shared.
+
 ### One account on two computers
 
 With in-use sharing on (Settings → Data → Other computers), SlopBar Ultra flags an account that is in use on more than one of your computers at the same time: an amber "In use on 2 machines" line in the flyout and in Settings → Accounts, an amber badge on that provider's ring in the taskbar widget, a Health warning, and one notification per overlap (Settings → Notifications). Its limits drain that many times as fast, and the provider may sign sessions out. A computer counts only while it keeps writing its status, so one that was shut down drops out within about 15 minutes.

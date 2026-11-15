@@ -1,6 +1,6 @@
 // The quick switcher (Ctrl+Alt+S by default, or the flyout's switch button): type part of an
 // email, nickname or provider, move with the arrows, Enter switches, Esc closes.
-import { t, translateDom, setLanguage, setSystemLocale, errorText, windowLabel } from "./i18n.js";
+import { t, translateDom, setLanguage, setSystemLocale, setThisMachine, errorText, windowLabel, placesText } from "./i18n.js";
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 
@@ -23,9 +23,10 @@ let busy = false;
 const peak = (a) => a.windows.reduce((m, w) => (w.used_percent > (m?.used_percent ?? -1) ? w : m), null);
 const name = (a) => a.alias || a.email || t("unknownAccount");
 
-/** Every word typed must appear in the account's name, email, plan or provider. */
+/** Every word typed must appear in the account's name, email, plan or provider, or the name of a
+ * machine it is in use on. */
 export function matches(a, query) {
-  const text = [a.alias, a.email, a.plan, a.org, PROVIDER_NAME[a.provider]].filter(Boolean).join(" ").toLowerCase();
+  const text = [a.alias, a.email, a.plan, a.org, PROVIDER_NAME[a.provider], ...placesText(a).names].filter(Boolean).join(" ").toLowerCase();
   return query.toLowerCase().split(/\s+/).filter(Boolean).every((word) => text.includes(word));
 }
 
@@ -48,7 +49,10 @@ function render() {
     const w = a.stale || a.error ? null : peak(a);
     const room = w ? `<b>${Math.max(0, Math.round(100 - w.used_percent))}%</b><small>${esc(t("switcherLeft", { window: windowLabel(w) }))}</small>`
       : `<b>—</b><small>${esc(t("usageUnknown"))}</small>`;
-    const meta = [PROVIDER_NAME[a.provider], a.alias ? a.email : "", a.plan].filter(Boolean).join(" · ");
+    // The machines it is in use on, so switching here does not land on another's account unawares.
+    const machines = placesText(a).machines;
+    const meta = [PROVIDER_NAME[a.provider], a.alias ? a.email : "", a.plan, machines.length ? t("inUseOn", { list: machines.join(", ") }) : ""]
+      .filter(Boolean).join(" · ");
     return `<li role="option" id="option-${i}" data-i="${i}" aria-selected="${i === selected}">
       <span class="mark-box" title="${PROVIDER_NAME[a.provider]}">${MARK[a.provider]}</span>
       <span class="who"><b>${esc(name(a))}</b><small>${esc(meta)}</small></span>
@@ -117,6 +121,8 @@ function applySettings(settings) {
 }
 listen("settings-changed", (e) => applySettings(e.payload));
 invoke("system_locale").then(setSystemLocale, () => {}).finally(() => invoke("get_settings").then(applySettings));
+// This computer's name, to tell it apart from the other machines an account is in use on.
+invoke("this_machine").then((name) => { setThisMachine(name); render(); }, () => {});
 
 const theme = () => invoke("taskbar_theme").then((v) => (document.documentElement.dataset.theme = v));
 theme();

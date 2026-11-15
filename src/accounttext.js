@@ -70,7 +70,8 @@ export function accountTipLines(a, { sub = null, trail = null, creditAdvice = ""
   groups.push([
     a.alias && a.email ? `${name} (${a.email})` : name,
     [provider, a.plan, a.org].filter(Boolean).join(" · "),
-    places.inUse ? (a.active || a.desktop ? `${t("inUse")}: ${places.inUse}` : places.inUse) : "",
+    // Every machine it is in use on, by name: this one first and marked, then the others.
+    places.inUse,
     seatsText(a).line,
     ...overlapText(a).lines,
     ...places.seen,

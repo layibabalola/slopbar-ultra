@@ -2,7 +2,7 @@ import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { sparkline } from "./sparkline.js";
 import { money, pct, amount, renewalText, adviceText, creditsLine, extraUsageLine } from "./accounttext.js";
-import { t, translateDom, setLanguage, setSystemLocale, LANGUAGES, resetText, errorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText, overlapText, seatsText } from "./i18n.js";
+import { t, translateDom, setLanguage, setSystemLocale, setThisMachine, LANGUAGES, resetText, errorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText, overlapText, seatsText } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -82,7 +82,7 @@ function accountRow(p, a) {
   const windowResets = timedWindows.length
     ? `<div class="window-resets">${timedWindows.map(w => `<small class="window-reset" title="${esc(w.resets_at)}">${esc(windowLabel(w))}: ${Math.round(w.used_percent)}% ${t("used")} · ${esc(windowResetText(w, a.stale, a.fetched_at))}</small>`).join("")}</div>`
     : "";
-  // In use here and on the user's other computers (shared through a synced folder).
+  // In use here and on the user's other computers (shared through a synced folder), by machine.
   const places = placesText(a);
   const held = a.resets ?? [];
   const total = held.reduce((n, r) => n + r.count, 0);
@@ -97,9 +97,7 @@ function accountRow(p, a) {
         <input data-alias="${esc(key)}" value="${esc(settings.aliases[key] ?? "")}"
           placeholder="${esc(a.email ?? t("unknownAccount"))}" aria-label="${t("alias")}" title="${t("alias")}" />
         <small>
-          ${a.active ? `<em class="chip live" title="${esc(places.inUse)}">${t("inUse")}</em>`
-            : a.desktop ? `<em class="chip live" title="${esc(places.inUse)}">${t("desktopApp")}</em>`
-            : places.elsewhere ? `<em class="chip elsewhere" title="${esc(places.inUse)}">${esc(places.inUse)}</em>` : ""}
+          ${places.inUse ? `<em class="chip where ${a.active || a.desktop ? "live" : "elsewhere"}" title="${esc(places.inUse)}">${esc(places.inUse)}</em>` : ""}
           ${seatsChip(a)}
           ${overlapChip(a)}
           ${a.used_outside ? `<em class="chip outside" title="${esc(t("usedOutsideHint"))}">${t("usedOutside")}</em>` : ""}
@@ -107,7 +105,7 @@ function accountRow(p, a) {
           ${a.plan ? `<em class="chip">${esc(a.plan)}</em>` : ""}
           ${signInChips(p, a)}
           ${resets}
-          <span>${esc([seatsText(a).line, a.active && places.elsewhere ? places.inUse : "", ...places.seen, settings.aliases[key] ? a.email ?? "" : a.org ?? ""].filter(Boolean).join(" · "))}</span>
+          <span>${esc([seatsText(a).line, ...places.seen, settings.aliases[key] ? a.email ?? "" : a.org ?? ""].filter(Boolean).join(" · "))}</span>
         </small>
       </div>
       <div class="monitor-state">
@@ -1636,6 +1634,8 @@ applyAccent();
 window.addEventListener("focus", applyAccent);
 
 try { setSystemLocale(await invoke("system_locale")); } catch {}
+// This computer's name, to tell it apart from the other machines an account is in use on.
+try { setThisMachine(await invoke("this_machine")); } catch {}
 settings = await invoke("get_settings");
 updatesEnabled = await invoke("updates_enabled");
 snapshot = await invoke("get_usage");
