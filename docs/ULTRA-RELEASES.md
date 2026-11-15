@@ -55,6 +55,13 @@ then every 15 minutes (`ultra_release::CHECK_EVERY`; upstream builds keep 6 hour
 every machine about 10 minutes for the build plus at most 15 for the check after the push. To have
 every machine install now, run `pwsh scripts/fleet-slopbar.ps1 -UpdateNow` (below).
 
+Nothing can stall the checks: the request for `latest.json` has 30 seconds, the installer's download
+10 minutes, and a whole check and install 12½ minutes. A check that fails (no answer in time, a
+failed download, a sign-in that puts the install off) is tried again after 2 minutes, once, and then
+every 15 minutes as usual. `get_app_info` (door) reports the last check as `update_check`: its time
+(UTC), result (`up_to_date`, `found`, `installing` or `error`), version and error, and when the next
+one runs.
+
 The workflow runs the steps of `scripts/publish-ultra-release.ps1`. The script also publishes by
 hand, for example while Actions is down:
 
@@ -271,15 +278,21 @@ pwsh scripts/fleet-slopbar.ps1 -UpdateNow
   shell as long as the profile path has no spaces. ssh runs through `Start-Process` with its output
   in files, a timeout and a tree kill, because on some machines an `ssh.exe` whose output is piped
   never exits.
-- **What it reports:** version, "Update automatically", and current, behind or not installed. A
-  machine without SlopBar is "not installed", not an error.
-- **Updating:** `install_update` replies at once and installs in the background. The app drops the
-  install's error, and it puts an update off while a sign-in is open. So a machine still answering
-  on the old version after 90 seconds is asked again, up to three times in all.
+- **What it reports:** version, "Update automatically", the last update check (`LastCheck`: how
+  long ago, and what it found or its error), and current, behind or not installed. A machine without
+  SlopBar is "not installed", not an error. A build from before the update-check record shows n/a,
+  which is no problem, because machines update one by one.
+- **Updating:** `install_update` replies at once and installs in the background. The app records how
+  the install went in `update_check`, and it puts an update off while a sign-in is open. So a machine
+  still answering on the old version after 90 seconds says why and is asked again, up to three times
+  in all.
 - **Problems (exit code 1):**
   - a local build (a version without `-ultra.`, which takes no releases),
   - a build without updates,
   - "Update automatically" off,
+  - a failed last update check,
+  - no update check for over twice the update interval (30 minutes) while "Update automatically" is
+    on,
   - a machine that does not answer,
   - an update that does not arrive within 5 minutes.
 

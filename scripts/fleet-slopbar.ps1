@@ -15,9 +15,15 @@ works whether the remote shell is PowerShell or cmd, as long as the profile path
 ssh runs through Start-Process with its output in files, a timeout and a tree kill: on some
 machines an ssh.exe whose output is piped never exits.
 
+LastCheck is each machine's last update check (get_app_info's update_check): how long ago it ran,
+and what it found or its error. A build from before that record shows n/a, which is no problem,
+because machines update one by one.
+
 Problems (exit code 1): a local build (a version without -ultra., which takes no releases), a build
-without updates, "Update automatically" off, a machine that does not answer, and an update that
-does not arrive. A machine without SlopBar is reported as not installed, which is no problem.
+without updates, "Update automatically" off, a failed last update check, no update check for over
+twice the update interval while "Update automatically" is on, a machine that does not answer, and
+an update that does not arrive. A machine without SlopBar is reported as not installed, which is no
+problem.
 #>
 param(
   [switch]$UpdateNow,
@@ -57,6 +63,43 @@ function Test-NewerVersion([string]$a, [string]$b) {
   if ($b -notmatch $pattern) { return $false }
   $packageB = [version]$Matches[1]; $buildB = [int]$Matches[2]
   return $packageA -gt $packageB -or ($packageA -eq $packageB -and $buildA -gt $buildB)
+}
+
+# A UTC time from get_app_info (ConvertFrom-Json may already have made it a [datetime]).
+function ConvertTo-UtcTime($value) {
+  if ($null -eq $value -or "$value" -eq '') { return $null }
+  if ($value -is [datetime]) { return $value.ToUniversalTime() }
+  return [datetimeoffset]::Parse("$value", [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+}
+
+# The app's last update check (get_app_info's update_check) as a short text, and the problem it
+# shows, if any. A build from before the record has no update_check: n/a, no problem. A failed check
+# is a problem, and so is none for over twice the update interval while "Update automatically" is on.
+function Get-LastCheck($check, $auto) {
+  if ($null -eq $check) { return [pscustomobject]@{ Text = 'n/a'; Problem = $null } }
+  $limit = 2 * [double]($check.interval_seconds ?? 900)
+  $now = [datetime]::UtcNow
+  $at = ConvertTo-UtcTime $check.at
+  if ($null -eq $at) {
+    # None since SlopBar started: a problem once the update loop's first run is long overdue.
+    $due = ConvertTo-UtcTime $check.next_at
+    $late = $auto -ne $false -and $null -ne $due -and ($now - $due).TotalSeconds -gt $limit
+    return [pscustomobject]@{ Text = 'none yet'; Problem = $(if ($late) { 'no update check since SlopBar started' }) }
+  }
+  $age = $now - $at
+  $minutes = [int][Math]::Max(0, [Math]::Floor($age.TotalMinutes))
+  $result = switch ("$($check.result)") {
+    'up_to_date' { 'up to date' }
+    'found' { "found $($check.version)" }
+    'installing' { "installing $($check.version)" }
+    'error' { "error: $($check.error)" }
+    default { "$($check.result)" }
+  }
+  $text = "$minutes min ago: $result"
+  if ($text.Length -gt 80) { $text = $text.Substring(0, 79) + '…' }
+  $problem = if ("$($check.result)" -eq 'error') { 'last update check failed' }
+    elseif ($auto -ne $false -and $age.TotalSeconds -gt $limit) { "no update check for $minutes min" }
+  return [pscustomobject]@{ Text = $text; Problem = $problem }
 }
 
 # Starts one door call on a machine; Complete-Call collects it.
@@ -107,7 +150,7 @@ function Invoke-Everywhere([string[]]$machines, [string]$tool, [int]$seconds = $
 
 function Get-Row([string]$machine, $info, $settings, [string]$channel) {
   $row = [pscustomobject]@{ Machine = $(if ($machine -eq $here) { "$($machine.ToLowerInvariant()) (here)" } else { $machine })
-    Version = ''; AutoUpdate = ''; Status = ''; Behind = $false; Problem = $false; Key = $machine }
+    Version = ''; AutoUpdate = ''; LastCheck = ''; Status = ''; Behind = $false; Problem = $false; Key = $machine }
   switch ($info.State) {
     'missing' { $row.Status = 'not installed' }
     'ok' {
@@ -123,6 +166,9 @@ function Get-Row([string]$machine, $info, $settings, [string]$channel) {
       else { $notes.Add('newer than the channel'); $row.Problem = $true }
       if ($auto -eq $false) { $notes.Add('auto-update off'); $row.Problem = $true }
       if ($settings.State -ne 'ok') { $notes.Add("settings unreadable ($($settings.State))"); $row.Problem = $true }
+      $last = Get-LastCheck $info.Value.update_check $auto
+      $row.LastCheck = $last.Text
+      if ($last.Problem) { $notes.Add($last.Problem); $row.Problem = $true }
       $row.Status = $notes -join '; '
     }
     default { $row.Status = "$($info.State): $($info.Message)"; $row.Problem = $true }
@@ -144,7 +190,7 @@ try {
   $machines = @($here) + @(Get-FleetHosts $SshConfig)
   Write-Output "Channel: $channel. Machines: $($machines.Count) (this one and the ssh managed block)."
   $rows = Get-Report $machines $channel
-  $rows | Format-Table Machine, Version, AutoUpdate, Status -AutoSize | Out-String -Width 200 | Write-Output
+  $rows | Format-Table Machine, Version, AutoUpdate, LastCheck, Status -AutoSize | Out-String -Width 300 | Write-Output
 
   if ($UpdateNow) {
     $behind = @($rows | Where-Object Behind | ForEach-Object Key)
@@ -158,8 +204,9 @@ try {
         Write-Output "  ${m}: $(if ($r.State -eq 'ok') { 'installing' } else { "$($r.State) $($r.Message)" })"
       }
       # The app restarts into the new build; wait until each one reports it. It installs in the
-      # background and drops the error (it puts an update off while a sign-in is open, for example),
-      # so a machine still answering on the old version is asked again, up to three times in all.
+      # background and records how that went in get_app_info's update_check (it puts an update off
+      # while a sign-in is open, for example), so a machine still answering on the old version says
+      # why and is asked again, up to three times in all.
       $waiting = [Collections.Generic.List[string]]::new([string[]]$behind)
       $attempts = @{}
       foreach ($m in $behind) { $attempts[$m] = 1 }
@@ -175,7 +222,7 @@ try {
           $again = @($waiting | Where-Object { $attempts[$_] -lt 3 -and $now[$_].State -eq 'ok' })
           if ($again) {
             $null = Invoke-Everywhere $again 'install_update'
-            foreach ($m in $again) { $attempts[$m]++; Write-Output "  ${m}: still on $($now[$m].Value.version); asked again (attempt $($attempts[$m]))" }
+            foreach ($m in $again) { $attempts[$m]++; Write-Output "  ${m}: still on $($now[$m].Value.version), last check $((Get-LastCheck $now[$m].Value.update_check $null).Text); asked again (attempt $($attempts[$m]))" }
           }
           $asked = Get-Date
         }
@@ -183,7 +230,7 @@ try {
       foreach ($m in $waiting) { Write-Output "  ${m}: still not on $channel after $InstallWaitSeconds s" }
       $rows = Get-Report $machines $channel
       Write-Output ''
-      $rows | Format-Table Machine, Version, AutoUpdate, Status -AutoSize | Out-String -Width 200 | Write-Output
+      $rows | Format-Table Machine, Version, AutoUpdate, LastCheck, Status -AutoSize | Out-String -Width 300 | Write-Output
     }
   }
   $problems = @($rows | Where-Object Problem)
