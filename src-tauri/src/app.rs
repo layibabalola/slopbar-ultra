@@ -3212,6 +3212,8 @@ async fn readiness(app: &AppHandle) -> serde_json::Value {
             }
         }
     }
+    let ssh_shell = pairing::ssh_shell();
+    pairing::note_ssh_shell(ssh_shell, &mut problems, &mut next);
     let snapshot = state.snapshot.lock().unwrap().clone();
     let signin_window = state.settings.lock().unwrap().signin_window;
     let mut summary = roster.clone();
@@ -3221,7 +3223,7 @@ async fn readiness(app: &AppHandle) -> serde_json::Value {
         "app": { "running": true, "version": app_version(app.clone()), "build": diagnostics::build_info(), "pid": std::process::id() },
         // The id its roster carries: the computer asking notes which SSH host reaches it.
         "machine": presence::identity().map(|(id, name)| serde_json::json!({ "id": id, "name": name })),
-        "desktop": desktop, "idle_seconds": desktop::idle_seconds(), "browser": browser, "signin_window": signin_window,
+        "desktop": desktop, "idle_seconds": desktop::idle_seconds(), "browser": browser, "ssh_shell": ssh_shell, "signin_window": signin_window,
         "accounts": { "here": snapshot.accounts.len(), "unmonitored": bulk::unmonitored(&snapshot).len() },
         "roster": summary, "waiting": waiting,
         // Sign in all accounts as it runs: email g of emails, done of total, who is signing in

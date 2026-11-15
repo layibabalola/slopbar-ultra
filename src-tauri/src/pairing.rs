@@ -137,11 +137,16 @@ fn command_under(shell: &str, args: &[&str]) -> String {
 /// the script can print it, as the command line carries it only encoded. `input` goes to both
 /// tries; a shell that cannot start pwsh exits without reading it.
 fn run_there(remote: &dyn Remote, host: &str, args: &[&str], input: &[u8]) -> Result<Vec<u8>, String> {
+    run_there_noting(remote, host, args, input).map(|(out, _)| out)
+}
+
+/// `run_there`, also saying whether the script went to Windows PowerShell (pwsh never started it).
+fn run_there_noting(remote: &dyn Remote, host: &str, args: &[&str], input: &[u8]) -> Result<(Vec<u8>, bool), String> {
     let out = remote.run(host, &remote_command(args), input)?;
     if String::from_utf8_lossy(&out).contains(STARTED) {
-        return Ok(out);
+        return Ok((out, false));
     }
-    remote.run(host, &fallback_command(args), input)
+    Ok((remote.run(host, &fallback_command(args), input)?, true))
 }
 
 /// JSON with every non-ASCII character escaped, so no console code page on the way through SSH
@@ -252,7 +257,8 @@ impl Remote for Ssh {
         let mut child = cmd.spawn().map_err(|_| "ssh_missing".to_string())?;
         let mut stdin = child.stdin.take().ok_or("ssh_failed")?;
         let mut input = input.to_vec();
-        // The input may be a pairing key: this copy is wiped once sent, as `pair` wipes its own.
+        // The input may be a pairing key: this copy is wiped once sent, a best effort like `pair`'s
+        // and `receive`'s wipes (other copies of a key stay in memory until reused).
         let writer = std::thread::spawn(move || {
             let _ = stdin.write_all(&input);
             input.iter_mut().for_each(|b| *b = 0);
@@ -304,9 +310,37 @@ fn finished(out: Vec<u8>, code: Option<i32>, err: &[u8]) -> Result<Vec<u8>, Stri
 
 /// Runs one of the target's tools through its `slopbar-mcp --call`; its answer or its error.
 pub fn remote_call(remote: &dyn Remote, host: &str, tool: &str, arguments: &Value) -> Result<Value, String> {
+    answer(&run_there(remote, host, &["--call-b64", &asking(tool, arguments)], b"")?)
+}
+
+/// `--call-b64`'s argument: the tool and its arguments, as base64 JSON.
+fn asking(tool: &str, arguments: &Value) -> String {
     let ask = json!({ "tool": tool, "arguments": arguments });
-    let encoded = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, ask.to_string());
-    answer(&run_there(remote, host, &["--call-b64", &encoded], b"")?)
+    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, ask.to_string())
+}
+
+/// Readiness's code, and its advice, when Windows PowerShell ran SlopBar's command over SSH there.
+const NO_PWSH_OVER_SSH: &str = "no_pwsh_over_ssh";
+const NO_PWSH_ADVICE: &str = "Over SSH, PowerShell 7 did not start there, so SlopBar used Windows PowerShell: install PowerShell 7 there (winget install --id Microsoft.PowerShell).";
+
+/// Another computer's readiness over SSH, with what this side saw: which PowerShell ran SlopBar's
+/// command there (`ssh_powershell`). Where pwsh never started it, Windows PowerShell did, which is a
+/// problem of its own there (`no_pwsh_over_ssh`), noted after whether sign-ins can start was decided
+/// there, so it never stops them.
+pub fn remote_readiness(remote: &dyn Remote, host: &str, arguments: &Value) -> Result<Value, String> {
+    let (out, windows_powershell) = run_there_noting(remote, host, &["--call-b64", &asking("get_machine_readiness", arguments)], b"")?;
+    let mut answer = answer(&out)?;
+    if let Some(fields) = answer.as_object_mut() {
+        fields.insert("ssh_powershell".into(), (if windows_powershell { "windows_powershell" } else { "pwsh" }).into());
+        if windows_powershell {
+            if let Some(problems) = fields.get_mut("problems").and_then(Value::as_array_mut) {
+                problems.push(NO_PWSH_OVER_SSH.into());
+            }
+            let next = format!("{} {NO_PWSH_ADVICE}", fields.get("next").and_then(Value::as_str).unwrap_or_default());
+            fields.insert("next".into(), next.trim_start().into());
+        }
+    }
+    Ok(answer)
 }
 
 /// The JSON object a remote `slopbar-mcp` printed last: `{"ok": …}` or `{"error": …}`.
@@ -506,11 +540,87 @@ pub fn readiness_without_app(reason: &str) -> Value {
         problems.insert(0, "app_outdated");
         next = "The SlopBar running here predates readiness checks: update it, then ask again.".into();
     }
+    let shell = ssh_shell();
+    note_ssh_shell(shell, &mut problems, &mut next);
     json!({
         "app": { "running": reason == "unsupported_request", "installed": installed, "door": reason },
-        "desktop": desktop, "browser": browser, "ready_for_sign_in": ready && reason != "unsupported_request",
+        "desktop": desktop, "browser": browser, "ssh_shell": shell, "ready_for_sign_in": ready && reason != "unsupported_request",
         "problems": problems, "next": next,
     })
+}
+
+/// Readiness's code, and its advice, when this computer's SSH sessions start Windows PowerShell.
+const SSH_SHELL_WINDOWS_POWERSHELL: &str = "ssh_shell_windows_powershell";
+const SSH_SHELL_ADVICE: &str = "Its SSH shell is Windows PowerShell, which can outlive SSH sessions: set OpenSSH's DefaultShell to PowerShell 7 or remove it (docs/remote-setup.md).";
+
+/// Notes this computer's SSH shell in readiness: Windows PowerShell is a problem of its own, noted
+/// after whether sign-ins can start was decided, so it never stops them.
+pub fn note_ssh_shell(shell: Option<&str>, problems: &mut Vec<&'static str>, next: &mut String) {
+    if shell == Some("windows_powershell") {
+        problems.push(SSH_SHELL_WINDOWS_POWERSHELL);
+        next.push(' ');
+        next.push_str(SSH_SHELL_ADVICE);
+    }
+}
+
+/// The shell this computer's OpenSSH server starts for every SSH command, as it picks it
+/// (Win32-OpenSSH's `set_defaultshell`): the raw DefaultShell value under HKLM\SOFTWARE\OpenSSH in
+/// the 64-bit view, cmd when it is missing or empty. Only its kind is told (`shell_kind`), never
+/// the path: it can name a user, and any administrator there can write it. None without an OpenSSH
+/// server, or when it cannot be read.
+pub fn ssh_shell() -> Option<&'static str> {
+    #[cfg(windows)]
+    {
+        registry::hklm_string(r"SYSTEM\CurrentControlSet\Services\sshd", "ImagePath").ok().flatten()?;
+        let value = registry::hklm_string(r"SOFTWARE\OpenSSH", "DefaultShell").ok()?;
+        Some(shell_kind(value.as_deref(), |path| std::fs::symlink_metadata(path).is_ok()))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// What DefaultShell's value names: missing or empty is cmd; an absolute path to nothing starts no
+/// shell at all (`missing`); otherwise the program's file name tells pwsh, windows_powershell, cmd
+/// or other. `exists` sees a Store app's alias as there.
+fn shell_kind(value: Option<&str>, exists: impl Fn(&str) -> bool) -> &'static str {
+    let Some(value) = value.filter(|v| !v.is_empty()) else { return "cmd" };
+    let bytes = value.as_bytes();
+    let absolute = (bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/')) || value.starts_with(r"\\");
+    if absolute && !exists(value) {
+        return "missing";
+    }
+    let name = value.rsplit(['\\', '/']).next().unwrap_or(value).trim_matches(|c: char| c == '"' || c.is_whitespace()).to_ascii_lowercase();
+    match name.strip_suffix(".exe").unwrap_or(&name) {
+        "pwsh" => "pwsh",
+        "powershell" => "windows_powershell",
+        "cmd" => "cmd",
+        _ => "other",
+    }
+}
+
+#[cfg(windows)]
+mod registry {
+    /// A string value under HKEY_LOCAL_MACHINE as sshd reads DefaultShell: the 64-bit view, with no
+    /// %VAR% expansion. None when the key or the value is missing.
+    pub fn hklm_string(key: &str, value: &str) -> Result<Option<String>, u32> {
+        use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+        use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY};
+        let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let (key, value) = (wide(key), wide(value));
+        let mut data = vec![0u16; 1024];
+        let mut size = (data.len() * 2) as u32;
+        let status = unsafe {
+            RegGetValueW(HKEY_LOCAL_MACHINE, key.as_ptr(), value.as_ptr(), RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND | RRF_SUBKEY_WOW6464KEY,
+                std::ptr::null_mut(), data.as_mut_ptr().cast(), &mut size)
+        };
+        match status {
+            ERROR_SUCCESS => Ok(Some(String::from_utf16_lossy(&data[..(size as usize / 2).min(data.len())]).trim_end_matches('\0').to_string())),
+            ERROR_FILE_NOT_FOUND => Ok(None),
+            error => Err(error),
+        }
+    }
 }
 
 pub fn browser_name(kind: crate::signin::Kind) -> &'static str {
@@ -664,7 +774,7 @@ pub fn local_tool(name: &str, args: &Value, pipe: &str, remote_ok: bool) -> Resu
             // Waiting for a change is passed on: the other computer's app does the waiting.
             let wait: serde_json::Map<String, Value> = args.as_object().into_iter().flatten()
                 .filter(|(k, _)| matches!(k.as_str(), "wait_seconds" | "since")).map(|(k, v)| (k.clone(), v.clone())).collect();
-            let answer = remote_call(&Ssh, host, "get_machine_readiness", &Value::Object(wait))?;
+            let answer = remote_readiness(&Ssh, host, &Value::Object(wait))?;
             remember_answer(host, &answer);
             Ok(answer)
         }
@@ -718,10 +828,11 @@ pub fn local_tool(name: &str, args: &Value, pipe: &str, remote_ok: bool) -> Resu
             let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
             let arguments = args.get("arguments").cloned().unwrap_or(json!({}));
             check_remote(tool, &arguments)?;
-            let answer = remote_call(&Ssh, host, tool, &arguments)?;
-            if tool == "get_machine_readiness" {
-                remember_answer(host, &answer);
+            if tool != "get_machine_readiness" {
+                return remote_call(&Ssh, host, tool, &arguments);
             }
+            let answer = remote_readiness(&Ssh, host, &arguments)?;
+            remember_answer(host, &answer);
             Ok(answer)
         }
         _ => Err("Invalid arguments: ssh_host is required".into()),
@@ -1309,6 +1420,95 @@ mod tests {
         let (ready, problems, _) = assess(true, at(State::Active, None), true, &json!({ "enabled": false, "unreadable": 2 }));
         assert!(ready, "sign-ins can still run without a roster");
         assert_eq!(problems, ["roster_off", "no_sharing_location", "no_roster_key", "roster_unreadable"]);
+    }
+
+    #[test]
+    fn ssh_shells_are_told_by_their_kind_never_their_path() {
+        let there = |_: &str| true;
+        assert_eq!(shell_kind(None, there), "cmd", "OpenSSH's own default");
+        assert_eq!(shell_kind(Some(""), there), "cmd");
+        for pwsh in [r"C:\Program Files\PowerShell\7\pwsh.exe", "C:/Program Files/PowerShell/7/pwsh.exe", r"C:\Users\synthetic\AppData\Local\Microsoft\WindowsApps\pwsh.exe", "pwsh"] {
+            assert_eq!(shell_kind(Some(pwsh), there), "pwsh", "{pwsh}");
+        }
+        assert_eq!(shell_kind(Some(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\PowerShell.EXE"), there), "windows_powershell");
+        assert_eq!(shell_kind(Some(r"C:\Windows\System32\cmd.exe"), there), "cmd");
+        for other in [r"C:\Program Files\Git\bin\bash.exe", r"C:\tools\pwsh.cmd"] {
+            assert_eq!(shell_kind(Some(other), there), "other", "{other}");
+        }
+        // An absolute path to nothing: sshd then starts no shell at all.
+        for gone in [r"C:\Program Files\PowerShell\7\pwsh.exe", r"\\server\share\pwsh.exe"] {
+            assert_eq!(shell_kind(Some(gone), |_| false), "missing", "{gone}");
+        }
+        assert_eq!(shell_kind(Some("pwsh.exe"), |_| false), "pwsh", "a bare name is looked up, not checked");
+    }
+
+    #[test]
+    fn windows_powershell_as_the_ssh_shell_never_stops_sign_ins() {
+        use crate::desktop::{Desktop, State};
+        let roster = json!({ "enabled": true, "location": true, "passphrase_saved": true, "unreadable": 0 });
+        let at = |state, locked| Some(Desktop { session: 1, state, locked });
+        for (running, desktop, browser) in [(true, at(State::Active, Some(false)), true), (false, None, true), (true, at(State::Active, Some(true)), false), (true, at(State::Disconnected, None), true)] {
+            let (_, problems, next) = assess(running, desktop, browser, &roster);
+            for shell in [None, Some("pwsh"), Some("cmd"), Some("other"), Some("missing")] {
+                let (mut p, mut n) = (problems.clone(), next.clone());
+                note_ssh_shell(shell, &mut p, &mut n);
+                assert_eq!((&p, &n), (&problems, &next), "{shell:?} changes nothing");
+            }
+            let (mut p, mut n) = (problems.clone(), next.clone());
+            note_ssh_shell(Some("windows_powershell"), &mut p, &mut n);
+            assert_eq!(p.last(), Some(&SSH_SHELL_WINDOWS_POWERSHELL), "noted last");
+            assert_eq!(p[..p.len() - 1], problems[..], "after what decides sign-ins");
+            assert!(n.starts_with(&next) && n.ends_with(SSH_SHELL_ADVICE), "{n}");
+            // With the asking side's note as well, the advice still fits the door's text cap.
+            let both = format!("{n} {NO_PWSH_ADVICE}");
+            assert!(both.chars().count() <= crate::mcp::MAX_TEXT, "{} characters", both.chars().count());
+        }
+    }
+
+    #[test]
+    fn readiness_without_the_app_names_this_computers_ssh_shell() {
+        let readiness = readiness_without_app("not_running");
+        let shell = readiness.get("ssh_shell").expect("always there; null with no OpenSSH server");
+        assert_eq!(shell, &json!(ssh_shell()));
+        let noted = readiness["problems"].as_array().unwrap().iter().any(|p| p == SSH_SHELL_WINDOWS_POWERSHELL);
+        assert_eq!(noted, *shell == "windows_powershell");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_strings_read_as_sshd_reads_them() {
+        let build = registry::hklm_string(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "CurrentBuildNumber").unwrap().unwrap();
+        assert!(!build.is_empty() && build.chars().all(|c| c.is_ascii_digit()), "{build:?}");
+        assert_eq!(registry::hklm_string(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "SyntheticMissingValue").unwrap(), None);
+        assert_eq!(registry::hklm_string(r"SOFTWARE\SyntheticMissingKey", "DefaultShell").unwrap(), None);
+    }
+
+    #[test]
+    fn readiness_over_ssh_says_which_powershell_ran_it() {
+        let readiness = json!({ "ok": { "ready_for_sign_in": true, "problems": [], "next": "Ready: someone can complete sign-ins at this computer's screen." } });
+        let printed_readiness = format!("{STARTED}\r\n{}\r\n", ascii_json(&readiness));
+        // pwsh ran it: said so, nothing else changes.
+        let there = scripted(vec![printed(&printed_readiness)]);
+        let out = remote_readiness(&there, "box", &json!({})).unwrap();
+        assert_eq!(out["ssh_powershell"], "pwsh");
+        assert_eq!((&out["problems"], &out["next"]), (&readiness["ok"]["problems"], &readiness["ok"]["next"]));
+        // pwsh never started it there, so Windows PowerShell ran it: a problem of its own, which never
+        // stops sign-ins, with the same ask (waiting passed on) on the second try.
+        let there = scripted(vec![printed(""), printed(&printed_readiness)]);
+        let out = remote_readiness(&there, "box", &json!({ "wait_seconds": 30 })).unwrap();
+        assert_eq!(out["ssh_powershell"], "windows_powershell");
+        assert_eq!(out["problems"], json!([NO_PWSH_OVER_SSH]));
+        assert_eq!(out["ready_for_sign_in"], true);
+        let next = out["next"].as_str().unwrap();
+        assert!(next.starts_with("Ready:") && next.ends_with(NO_PWSH_ADVICE), "{next}");
+        let asked: Vec<_> = there.commands.borrow().iter().map(|c| { let (shell, args) = parts(c); (shell, tool_asked(&args)) }).collect();
+        let readiness_ask = Some(("get_machine_readiness".to_string(), json!({ "wait_seconds": 30 })));
+        assert_eq!(asked, [("pwsh".to_string(), readiness_ask.clone()), ("powershell".to_string(), readiness_ask)]);
+        // An answer that is not an object passes through untouched; an error stays an error.
+        let odd = format!("{STARTED}\r\n{{\"ok\":[1]}}\r\n");
+        assert_eq!(remote_readiness(&scripted(vec![printed(&odd)]), "box", &json!({})).unwrap(), json!([1]));
+        let failed = format!("{STARTED}\r\n{{\"error\":\"door_unavailable\"}}\r\n");
+        assert_eq!(remote_readiness(&scripted(vec![printed(&failed)]), "box", &json!({})).unwrap_err(), "door_unavailable");
     }
 
     #[test]
