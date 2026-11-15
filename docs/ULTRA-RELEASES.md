@@ -134,6 +134,10 @@ A push to `ultra` that changes the release tooling (the workflow, the script, it
   builds as the user whose profile holds the key files.
 - **Toolchain.** The runner has its own Rust, Node and Visual Studio versions, so two builds of one
   commit are not byte-identical. Both pass the same checks.
+- **Temp folder.** The runner's default `TEMP` has an 8.3 short name in it (`C:\Users\RUNNER~1\…`),
+  and two `pins` launcher tests fail under such a spelling. That is why the repository's Tests
+  workflow fails on GitHub. The workflow's Build step therefore points `TEMP` at the runner's
+  long-named temp folder, as the owner's machines have.
 
 ### Agents' MCP server (`slopbar-mcp.exe`)
 

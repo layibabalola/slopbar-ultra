@@ -103,6 +103,11 @@ jobs:
         shell: pwsh
         env:
           TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          # The runner's default TEMP has an 8.3 short name in it (C:\Users\RUNNER~1\...). Two pins
+          # launcher tests fail under such a spelling, so the unit tests get the runner's long-named
+          # temp folder, as on the owner's machines.
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         run: ./scripts/publish-ultra-release.ps1 -Step Build -Tag "$env:TAG" -Stage "$env:RUNNER_TEMP/ultra-release" -Repo $env:GITHUB_REPOSITORY
 
       # Offline, on synthetic repositories; signs with a throwaway key.
