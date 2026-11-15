@@ -20,6 +20,8 @@ const SIGN_IN_OPEN: &str = "A sign-in is open; the update waits for it to finish
 const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 #[cfg(feature = "ultra-updates")]
 const EVERY: Duration = crate::ultra_release::CHECK_EVERY;
+/// Why an automatic install waited (see `install_now`).
+const SHARING_SETUP_RUNS: &str = "waiting for the sharing setup to finish";
 
 #[derive(Clone, Serialize)]
 pub struct UpdateInfo {
@@ -110,6 +112,10 @@ async fn install_now(app: &AppHandle, by: Trigger, steps: &Steps) -> Result<Outc
     // never returns keeps refreshes waiting until SlopBar restarts.
     if crate::signin::any_active() {
         return Ok(Outcome::Deferred(SIGN_IN_OPEN.into()));
+    }
+    // An automatic install waits while a sharing setup runs: restarting would end its sign-in.
+    if matches!(by, Trigger::Auto) && crate::app::sharing_setup_running(app) {
+        return Ok(Outcome::Deferred(SHARING_SETUP_RUNS.into()));
     }
     // One install at a time, from its download to the end of its handover (a check takes no turn).
     let turn = match app.state::<AppState>().update_check.begin_install() {

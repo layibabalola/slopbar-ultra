@@ -266,6 +266,17 @@ fn catalog() -> Vec<Tool> {
                 "tool": { "type": "string", "enum": crate::pairing::REMOTE_TOOLS },
                 "arguments": { "type": "object", "description": "The tool's own arguments." },
             }), &["ssh_host", "tool"]), false, true, false, true),
+        tool("setup_sharing", "Set up sharing with Dropbox", "Connects in-use sharing to the user's Dropbox, so each of their computers sees which accounts the others use: gets rclone if no recent one (v1.60 or later) is installed (a fixed, checksum-verified download from rclone's own site into SlopBar Ultra's folder, never another installer), runs rclone's own Dropbox sign-in (rclone keeps the token in its own config; SlopBar Ultra and agents never see it), turns sharing on with that rclone remote and lists the other computers sharing there. A remote of that name that already works is used as it is; one whose access ended is signed in again, and so is one with reconnect: true (to use another Dropbox account). Only when the user asked to set up sharing: without confirm: true nothing starts and the answer says what would happen. The user signs in and clicks Allow on dropbox.com themselves (never click Allow, sign in or approve for them). rclone's access covers their whole Dropbox; SlopBar Ultra only uses its SlopBar folder there. Refused on a computer that shares through a folder (uses_folder). Answers at once: follow it with get_sharing_setup. Without ssh_host, Dropbox's page opens in this computer's browser (refused while its desktop is locked or not shown). With ssh_host, sets up that computer from this one: its SlopBar Ultra gets rclone and starts the sign-in, and the page opens in this computer's browser through an SSH tunnel to that computer's rclone, so nobody needs to be at its screen; the token goes straight to that computer's rclone. That computer takes this one's remote name when this one shares through a Dropbox remote. If that computer is still getting rclone after about 150 seconds, the call answers with its state; calling again joins the same setup. cancel stops a running setup (with ssh_host, that computer's).",
+            schema(json!({
+                "confirm": { "type": "boolean", "description": "true to start; without it nothing starts and the answer says what would happen." },
+                "ssh_host": { "type": "string", "description": "Set up this other computer instead, as ssh reaches it; the sign-in page opens here." },
+                "remote": { "type": "string", "description": "The rclone remote to create or use. Default: the one this computer shares through already (with ssh_host: this computer's Dropbox remote), else \"dropbox\". Keep the same name on every computer." },
+                "reconnect": { "type": "boolean", "description": "Sign in to Dropbox again even when the remote works, to use another Dropbox account (the one the user's other computers use)." },
+                "cancel": { "type": "boolean", "description": "Stop a running setup." },
+                "via_tunnel": { "type": "boolean", "description": "Set by the computer that runs setup_sharing with ssh_host: the sign-in is finished in its browser, so this computer's desktop need not be shown." },
+            }), &[]), false, true, false, true),
+        tool("get_sharing_setup", "Get sharing setup", "Where setup_sharing stands: phase (idle; rclone: finding or downloading it; dropbox: waiting for the user to allow access; sharing: turning it on; done; failed), remote, downloaded (rclone was downloaded), progress (the download's percent while it downloads), waiting (rclone waits for the browser), via_tunnel, error with failed_at (the phase it stopped in): download_failed, hash_mismatch, extract_failed, rclone_unsupported, rclone_failed, remote_taken (a remote of that name is not Dropbox), denied (the user did not allow access), stale_page (Allow was clicked on a page from an earlier try: use the newest page), port_busy (another program holds port 53682), port_reserved (Windows reserved port 53682; a restart usually frees it), timed_out (10 minutes without Allow), cancelled or settings_failed; found (the other computers sharing there, by name, once done) and revision. With ssh_host, asks that computer, closes this computer's tunnel once it has finished, and when it is done and this computer shares too, sees_this_computer says whether it sees this one (false: it may be signed in to another Dropbox account).",
+            schema(json!({ "ssh_host": { "type": "string", "description": "Ask this other computer, as ssh reaches it." } }), &[]), true, false, true, false),
         tool("list_diagnostic_exports", "List diagnostics exports", "The most recent diagnostics exports, newest first, with paths, sizes and times. Works while SlopBar Ultra is closed.", none(), true, false, true, false),
     ]
 }
@@ -287,6 +298,8 @@ fn local_args(name: &str) -> Option<(&'static [&'static str], &'static [&'static
         "get_machine_readiness" => Some((&["ssh_host", "wait_seconds", "since"], &[])),
         "pair_machine" => Some((&["ssh_host", "replace_key"], &["ssh_host"])),
         "run_on_machine" => Some((&["ssh_host", "tool", "arguments"], &["ssh_host", "tool"])),
+        "setup_sharing" => Some((&["ssh_host", "remote", "cancel", "via_tunnel", "confirm", "reconnect"], &[])),
+        "get_sharing_setup" => Some((&["ssh_host"], &[])),
         _ => None,
     }
 }
@@ -444,10 +457,16 @@ fn explain(error: &str) -> String {
         "pairing_unreadable" | "pairing_unsupported" => "The pairing offer could not be read: update SlopBar Ultra on both computers to the same version.".into(),
         "app_outdated" => "The SlopBar Ultra running there is older than its helper and does not check that someone can see its desktop; nothing was started. Update it (and restart it through restart_app), then try again.".into(),
         "target_has_other_key" => "The other computer already has a different roster passphrase, which its own other computers may share; nothing was changed. Ask the user whether to replace it (pair_machine with replace_key: true).".into(),
+        "uses_folder" => "This computer shares through a folder, so the Dropbox setup did not start: it would move sharing off that folder. To use Dropbox instead, the user turns folder sharing off first (update_settings presence_folder: null).".into(),
+        "bad_remote" => "remote must be an rclone remote name of up to 64 characters: letters, digits, spaces and . _ - + @, not starting with - or a space.".into(),
+        "sharing_setup_busy" => "A sharing setup is already running on this computer: follow it with get_sharing_setup, or stop it with setup_sharing cancel: true.".into(),
+        "update_slopbar_there" => "The other computer's SlopBar Ultra predates the guided sharing setup: update it there (with automatic updates on, it updates itself), then try again.".into(),
+        "tunnel_failed" => "The SSH tunnel for the Dropbox sign-in did not open: port 53682 is in use on this computer (another rclone sign-in is waiting), or SSH could not connect. The setup on the other computer was stopped; try again once the port is free.".into(),
+        "bad_state" | "no_sign_in_waiting" => "No Dropbox sign-in is waiting (it finished, failed or was cancelled): see get_sharing_setup.".into(),
         "not_from_a_remote_call" => "A computer reached over SSH cannot reach on to another one.".into(),
         e if e.starts_with("ssh_failed") => format!("SSH could not run the command ({}). Check key auth with: ssh -o BatchMode=yes <host> hostname; see the README's field guide.",
             e.trim_start_matches("ssh_failed").trim_start_matches(':').trim().chars().filter(|c| !c.is_control()).take(200).collect::<String>()),
-        e if e.starts_with("remote_missing_here: ") => format!("The other computer has no working rclone remote named {} (rclone missing, or the remote not configured): install rclone there and create the same remote (rclone config) at its screen, then pair again.",
+        e if e.starts_with("remote_missing_here: ") => format!("The other computer has no working rclone remote named {} (rclone missing, or the remote not configured): connect it with setup_sharing (ssh_host and confirm: true), which opens the Dropbox sign-in in this computer's browser, then pair again.",
             e.trim_start_matches("remote_missing_here: ").chars().filter(|c| !c.is_control()).take(64).collect::<String>()),
         e if e.starts_with("target: ") => format!("On the other computer: {}", explain(e.trim_start_matches("target: "))),
         other => other.chars().filter(|c| !c.is_control()).take(MAX_TEXT).collect(),
@@ -695,6 +714,13 @@ fn print_answer(outcome: Result<Value, String>) -> i32 {
     code
 }
 
+/// `slopbar-mcp --sharing-state`: the phase of this computer's sharing setup and the state value
+/// of rclone's waiting link, for the computer finishing the sign-in through a tunnel (see
+/// `pairing::setup_remote_sharing`). Not an MCP tool, so the value never lands in an agent's result.
+pub fn sharing_state() -> i32 {
+    print_answer(crate::door::call(&crate::door::pipe_name(), &Request::SharingSetupLink))
+}
+
 /// `slopbar-mcp --pair-receive`: the target's half of `pair_machine`, reading the offer from
 /// standard input (see `pairing::receive`). Prints the outcome, never the key.
 pub fn pair_receive() -> i32 {
@@ -791,7 +817,7 @@ mod tests {
     fn every_listed_tool_maps_to_a_door_operation() {
         let listed = rpc(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).unwrap();
         let tools = listed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 47);
+        assert_eq!(tools.len(), 49);
         let account = json!({ "provider": "claude", "id": "a1" });
         for t in tools {
             let name = t["name"].as_str().unwrap();
@@ -826,14 +852,14 @@ mod tests {
         assert_eq!(tool("lease_account", json!({ "provider": "claude" }), None)["result"]["isError"], true, "a purpose is required");
         assert_eq!(tool("release_lease", json!({}), None)["result"]["isError"], true);
         let marked = |hint: &str| -> Vec<&str> { tools.iter().filter(|t| t["annotations"][hint] == true).map(|t| t["name"].as_str().unwrap()).collect() };
-        assert_eq!(marked("destructiveHint"), ["recommend_account", "refresh_usage", "update_settings", "switch_account", "disconnect_monitoring", "remove_account", "revoke_account_sessions", "remove_lapsed_accounts", "set_project_pin", "install_update", "quit_app", "restore_backup", "set_roster_passphrase", "pair_machine", "run_on_machine"]);
+        assert_eq!(marked("destructiveHint"), ["recommend_account", "refresh_usage", "update_settings", "switch_account", "disconnect_monitoring", "remove_account", "revoke_account_sessions", "remove_lapsed_accounts", "set_project_pin", "install_update", "quit_app", "restore_backup", "set_roster_passphrase", "pair_machine", "run_on_machine", "setup_sharing"]);
         assert_eq!(tool("restore_backup", json!({ "path": "C:/b.slopbar-backup", "passphrase": "correct horse battery" }), None)["result"]["structuredContent"]["dry_run"], true, "restoring only previews by default");
         assert_eq!(tool("remove_lapsed_accounts", json!({}), None)["result"]["structuredContent"], json!({ "op": "remove_lapsed_accounts", "confirm": false }), "bulk tools only report by default");
         assert_eq!(tool("connect_monitoring_all", json!({}), None)["result"]["structuredContent"], json!({ "op": "connect_monitoring_all", "confirm": false }));
         assert_eq!(tool("revoke_account_sessions", json!({ "provider": "codex", "id": "a1" }), None)["result"]["structuredContent"],
             json!({ "op": "revoke_account_sessions", "provider": "codex", "id": "a1", "confirm": false, "remove_slot": false }), "revoking only reports by default");
         assert_eq!(tool("set_project_pin", json!({ "folder": "C:/a", "provider": "codex", "id": null }), None)["result"]["structuredContent"]["id"], Value::Null);
-        assert_eq!(marked("readOnlyHint"), ["get_usage", "get_headroom", "list_leases", "get_settings", "get_subscription_report", "get_plan_advice", "get_burn_alerts", "get_usage_breakdown", "get_health", "list_project_pins", "check_for_updates", "get_app_info", "inspect_window", "list_sharing_locations", "get_roster", "get_machine_readiness", "list_diagnostic_exports"]);
+        assert_eq!(marked("readOnlyHint"), ["get_usage", "get_headroom", "list_leases", "get_settings", "get_subscription_report", "get_plan_advice", "get_burn_alerts", "get_usage_breakdown", "get_health", "list_project_pins", "check_for_updates", "get_app_info", "inspect_window", "list_sharing_locations", "get_roster", "get_machine_readiness", "get_sharing_setup", "list_diagnostic_exports"]);
     }
 
     #[test]

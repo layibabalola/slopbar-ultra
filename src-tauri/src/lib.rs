@@ -26,6 +26,7 @@ mod usage_index;
 mod csv_export;
 mod presence;
 mod rclone;
+mod sharing_setup;
 mod roster;
 mod unexpected;
 mod health;
@@ -67,7 +68,7 @@ mod mcp_update;
 pub use instance::claim as claim_instance;
 mod mcp;
 pub use mcp::serve_stdio as serve_mcp;
-pub use mcp::{call_cli, pair_receive};
+pub use mcp::{call_cli, pair_receive, sharing_state};
 #[cfg(feature = "desktop")]
 mod dock;
 #[cfg(feature = "desktop")]
