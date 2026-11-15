@@ -25,10 +25,13 @@ On the **new computer** (the one being set up), in an elevated PowerShell:
 Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
 Start-Service sshd
 Set-Service sshd -StartupType Automatic
-# PowerShell 7 as the shell for SSH sessions, where it is installed; otherwise OpenSSH keeps cmd.
+# PowerShell 7 as the shell for SSH sessions, where it is installed; otherwise OpenSSH's cmd
+# (and an earlier version of this guide's Windows PowerShell setting is removed).
 $pwsh = "$env:ProgramFiles\PowerShell\7\pwsh.exe"
 if (Test-Path $pwsh) {
   New-ItemProperty -Path HKLM:\SOFTWARE\OpenSSH -Name DefaultShell -PropertyType String -Force -Value $pwsh
+} elseif ((Get-ItemProperty HKLM:\SOFTWARE\OpenSSH -ErrorAction SilentlyContinue).DefaultShell -match 'WindowsPowerShell') {
+  Remove-ItemProperty -Path HKLM:\SOFTWARE\OpenSSH -Name DefaultShell
 }
 ```
 

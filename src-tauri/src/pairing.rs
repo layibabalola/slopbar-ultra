@@ -132,11 +132,13 @@ fn command_under(shell: &str, args: &[&str]) -> String {
 /// the script (not installed there, or it could not start). Once the script printed `STARTED`
 /// under pwsh, its outcome stands, whatever came after, so no tool runs twice and 5.1 never starts
 /// where pwsh runs. The exit code cannot tell these apart: a PowerShell remote shell turns every
-/// failure into 1, and a shell may print its own lines first (cmd's AutoRun, a profile's
-/// greeting). `input` goes to both tries; a shell that cannot start pwsh exits without reading it.
+/// failure into 1. The marker is looked for anywhere in the output, since a shell may print its
+/// own text first, even without a line break (cmd's AutoRun, a profile's greeting, a title); only
+/// the script can print it, as the command line carries it only encoded. `input` goes to both
+/// tries; a shell that cannot start pwsh exits without reading it.
 fn run_there(remote: &dyn Remote, host: &str, args: &[&str], input: &[u8]) -> Result<Vec<u8>, String> {
     let out = remote.run(host, &remote_command(args), input)?;
-    if String::from_utf8_lossy(&out).lines().any(|line| line.trim() == STARTED) {
+    if String::from_utf8_lossy(&out).contains(STARTED) {
         return Ok(out);
     }
     remote.run(host, &fallback_command(args), input)
@@ -880,12 +882,17 @@ mod tests {
 
         // Once the script started under pwsh, its outcome stands, whatever came after: an answer, an
         // error answer, SlopBar missing there, or nothing more (slopbar-mcp crashed or was killed,
-        // which a PowerShell remote shell reports as exit 1, like a missing pwsh).
-        for rest in ["{\"ok\":{\"paired\":true}}\r\n", "{\"error\":\"target_has_other_key\"}\r\n", "{\"error\":\"slopbar_not_installed\"}\r\n", ""] {
-            let there = scripted(vec![printed(&format!("Welcome back\r\n{}", started(rest)))]);
-            run_there(&there, "box", &args, b"").unwrap();
-            assert_eq!(tried(&there), [("pwsh".to_string(), asked.clone())], "never twice: {rest:?}");
+        // which a PowerShell remote shell reports as exit 1, like a missing pwsh). The shell's own
+        // text before the marker counts for nothing, with or without a line break.
+        for before in ["", "Welcome back\r\n", "Hi ", "noise", "\u{1b}]0;title\u{7}"] {
+            for rest in ["{\"ok\":{\"paired\":true}}\r\n", "{\"error\":\"target_has_other_key\"}\r\n", "{\"error\":\"slopbar_not_installed\"}\r\n", ""] {
+                let there = scripted(vec![printed(&format!("{before}{}", started(rest)))]);
+                run_there(&there, "box", &args, b"").unwrap();
+                assert_eq!(tried(&there), [("pwsh".to_string(), asked.clone())], "never twice: {before:?} {rest:?}");
+            }
         }
+        let glued = scripted(vec![printed(&format!("Hi {}", started("{\"ok\":{\"paired\":true}}\r\n")))]);
+        assert_eq!(remote_call(&glued, "box", "get_roster", &json!({})).unwrap(), json!({ "paired": true }), "read once, from pwsh");
         let there = scripted(vec![printed(&started(""))]);
         assert_eq!(remote_call(&there, "box", "sign_in_all", &json!({ "confirm": true })).unwrap_err(), "remote_no_answer");
         // SSH itself failed or timed out: nothing is tried again.
