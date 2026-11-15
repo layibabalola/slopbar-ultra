@@ -71,8 +71,9 @@ the getting-started guide), or the `setup_sharing` agent tool, connects a comput
    takes it only when the zip's SHA-256 matches the one pinned in the code (as rclone's
    `SHA256SUMS` and winget's reviewed manifest publish it). It unpacks only `rclone.exe` with
    Windows' `tar.exe` (PowerShell's `Expand-Archive` where tar is missing), checks that it runs and
-   reports that version, then moves it into SlopBar's folder. The download shows its progress, has
-   no overall limit but fails after 30 seconds without data, and Cancel stops it.
+   reports that version, then moves it into SlopBar's folder. The download shows its progress, fails
+   after 30 seconds without data or 10 minutes in all, and Cancel stops it; unpacking and the version
+   check are killed after 3 minutes and 20 seconds.
 2. **Dropbox.** A remote of that name (the one sharing already uses, else `dropbox`) that reaches
    its storage is used as it is. Otherwise rclone signs in with its own flow:
    `rclone config create <remote> dropbox` for a new remote, `rclone config update <remote>
@@ -94,11 +95,16 @@ the getting-started guide), or the `setup_sharing` agent tool, connects a comput
    (`uses_folder`) rather than moved off it.
 
 rclone and the tunnel below run in the app's job object, so they end with SlopBar, and an
-automatic update waits while a setup runs here or the tunnel for another computer is open.
+automatic update waits while a setup runs here or the tunnel for another computer is open. Every
+step has a time limit, and a setup that panics ends as failed (`setup_failed`), so that wait always ends.
 
 **Another computer, over SSH.** `setup_sharing` with `ssh_host` sets up that computer from this
-one, with nobody at its screen. Its SlopBar gets rclone and starts the sign-in without a browser;
-this computer's SlopBar reads only the link's `state` value (`slopbar-mcp --sharing-state`, never
+one, and Dropbox's page opens on that computer's own screen, in its browser, as if the setup had
+started there (the owner's ruling: the page opens on the computer being set up). It is refused
+while nobody can see that desktop, like every sign-in SlopBar starts. Only with `open_here: true`,
+for a computer whose screen is out of reach, does the page open on this computer instead: that
+computer's SlopBar gets rclone and starts the sign-in without a browser, and this computer's
+SlopBar reads only the link's `state` value (`slopbar-mcp --sharing-state`, never
 a tool result), checks that it is letters, digits, `-` and `_`, opens an SSH tunnel
 (`ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:53682:127.0.0.1:53682 -L
 [::1]:53682:127.0.0.1:53682`; Dropbox sends the browser to `localhost`, which browsers try over

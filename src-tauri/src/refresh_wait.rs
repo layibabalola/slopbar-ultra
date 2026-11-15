@@ -598,9 +598,10 @@ mod tests {
         assert!(has(&app, "async fn door_reply(app: AppHandle, request: door::Request) -> Result<serde_json::Value, String> { refresh_wait::noted(door_call(app, request)).await }"),
             "noted exactly when a refresh waited");
         let switch = function(&app, "async fn agent_switch(");
-        assert!(has(switch, "let refreshed = refresh_within(app).await; let held = refresh_wait::switch_held(refreshed.as_ref(), provider, &id);")
-            && has(switch, "let mut result = serde_json::to_value(snapshot).map_err(|e| e.to_string())?; result[\"switched_to_requested\"] = held.into(); result[\"desktop\"] ="),
-            "unknown (null) when its refresh waited:\n{switch}");
+        assert!(has(switch, "let refreshed = refresh_within(app).await; let held = refresh_wait::switch_held(refreshed.as_ref(), provider, &id); \
+            let snapshot = refreshed.unwrap_or_else(|| app.state::<AppState>().snapshot.lock().unwrap().clone()); \
+            let mut result = serde_json::to_value(snapshot).map_err(|e| e.to_string())?; result[\"switched_to_requested\"] = held.into(); result[\"desktop\"] ="),
+            "the last numbers, and unknown (null), when its refresh waited:\n{switch}");
 
         let sync = function(&app, "async fn sync_roster(");
         assert!(has(sync, "let live = || sharing::Place::of(&h.state::<AppState>().settings.lock().unwrap()); sharing.sync_roster(&place, live, |sync| { \
@@ -613,5 +614,21 @@ mod tests {
         assert_eq!(app.matches("presence::withdraw(").count(), 1, "presence is withdrawn on exit, and otherwise by the refresh (sharing::Files), never by a save");
         assert!(has(function(&app, "pub(crate) fn on_exit("), "presence::withdraw("));
         assert!(!app.contains("roster::withdraw("), "the roster is withdrawn by the refresh (sharing::Files), never by a save");
+    }
+
+    /// `sharing`'s tests withdraw through a fake: the real withdrawals (`sharing::Files`) need this
+    /// machine's identity from the app's data folder, so this check reads them. Each opens the
+    /// stores of the place it is given (`Place::settings`, tested there) and withdraws there; and
+    /// forgetting the real roster sync is its whole reset.
+    #[test]
+    fn the_real_withdrawals_go_to_the_place_they_are_given() {
+        let sharing = normalized(include_str!("sharing.rs"));
+        let files = function(&sharing, "impl Withdraw for Files {");
+        assert!(has(files, "fn presence(&mut self, place: &Place) { if let Some(store) = crate::presence::store(&place.settings()) { \
+            crate::presence::withdraw(store.as_ref(), self.interval); } }"), "{files}");
+        assert!(has(files, "fn roster(&mut self, place: &Place) { if let Some(store) = crate::roster::store(&place.settings()) { \
+            let _ = crate::roster::withdraw(store.as_ref()); } }"), "{files}");
+        let forget = function(&sharing, "impl Forget for crate::roster::Syncer {");
+        assert!(has(forget, "fn forget(&mut self) { self.reset(); } }"), "{forget}");
     }
 }
