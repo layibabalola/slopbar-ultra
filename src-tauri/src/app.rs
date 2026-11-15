@@ -2971,7 +2971,16 @@ fn start_sharing_setup(app: &AppHandle, remote: Option<String>, via_tunnel: bool
     let _ = app.emit("sharing-setup", &started);
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(code) = run_sharing_setup(&app, remote, via_tunnel, reconnect).await {
+        // In a task of its own, so that a panic inside ends as a failed setup too, as does any exit
+        // that leaves it under way: a phase left running would hold the automatic update back
+        // until SlopBar restarts.
+        let run = {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move { run_sharing_setup(&app, remote, via_tunnel, reconnect).await })
+        };
+        let outcome = run.await.unwrap_or(Err("setup_failed"));
+        let stuck = app.state::<AppState>().sharing_setup.lock().unwrap().phase.running();
+        if let Err(code) = outcome.and_then(|()| if stuck { Err("setup_failed") } else { Ok(()) }) {
             publish_sharing(&app, |s| {
                 s.failed_at = Some(s.phase);
                 s.phase = Phase::Failed;
