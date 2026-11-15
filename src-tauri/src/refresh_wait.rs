@@ -334,6 +334,7 @@ mod tests {
     const BOUNDED: &str = "refresh_wait::tests::every_wait_for_the_refresh_lock_is_bounded_or_holds_nothing (src-tauri/src/refresh_wait.rs)";
     const SETTINGS: &str = "refresh_wait::tests::nothing_waits_while_holding_settings_lock (src-tauri/src/refresh_wait.rs)";
     const HANDS: &str = "refresh_wait::tests::the_app_hands_its_waits_to_the_helpers (src-tauri/src/refresh_wait.rs)";
+    const ROSTER: &str = "refresh_wait::tests::the_roster_is_waited_for_on_the_blocking_pool_only (src-tauri/src/refresh_wait.rs)";
     const REAL: &str = "refresh_wait::tests::the_real_withdrawals_go_to_the_place_they_are_given (src-tauri/src/refresh_wait.rs)";
 
     fn named(c: char) -> bool {
@@ -440,8 +441,8 @@ mod tests {
         let first = &locked[..read];
         let catch_up = one_call(first, "tauri::async_runtime::spawn_blocking", "refresh_locked in app.rs, before it reads the settings", BOUNDED);
         let [withdraw] = args(catch_up)[..] else { panic!("spawn_blocking takes one closure: {catch_up}") };
-        assert!(withdraw.starts_with("move||") && closure_body(withdraw) == Some(tokens("sharing.catch_up(&mut sharing::Files { interval })").as_str()),
-            "what saves left is withdrawn on the blocking pool. {}\n{first}", update(BOUNDED));
+        assert!(withdraw.starts_with("move||") && closure_body(withdraw) == Some(tokens("sharing.catch_up(&sharing::Files { interval }, sharing::WITHDRAW_LIMIT)").as_str()),
+            "what saves left is withdrawn on the blocking pool, within its limit. {}\n{first}", update(BOUNDED));
         let (before, after) = either_side(first, catch_up);
         assert!(before.ends_with(&tokens("let state = app.state::<AppState>(); state.cache_due.drain_into(&mut state.usage_cache.lock().unwrap()); \
             if state.sharing.is_due() { let interval = state.settings.lock().unwrap().refresh_minutes.max(1) as u64 * 60; \
@@ -542,10 +543,24 @@ mod tests {
         let next = &locked[unknown.as_ptr() as usize - locked.as_ptr() as usize + unknown.len()..];
         assert!(next.starts_with(&tokens("if !sharing::still(&place, &sharing::Place::of(&h.state::<AppState>().settings.lock().unwrap())) { return None; } let wrote = store.write(")),
             "a refresh's presence record only where the settings still share. {}\n{locked}", update(HANDS));
-        assert_eq!(count(&app, "presence::withdraw("), 1, "presence is withdrawn on exit, and otherwise by the refresh (sharing::Files), never by a save. {}", update(HANDS));
+        assert!(!has(&app, "presence::withdraw(") && !has(&app, "roster::withdraw("),
+            "this machine's files are withdrawn through sharing (sharing::Files): by the refresh and on exit, never by a save. {}", update(HANDS));
         let exit = function(&app, "app.rs", "pub(crate) fn on_exit(", HANDS);
-        assert!(has(exit, "presence::withdraw("), "{}\n{exit}", update(HANDS));
-        assert!(!has(&app, "roster::withdraw("), "the roster is withdrawn by the refresh (sharing::Files), never by a save. {}", update(HANDS));
+        assert!(has(exit, ".sharing.exit("), "the exit withdraws where sharing is and what saves left. {}\n{exit}", update(HANDS));
+    }
+
+    /// `Sharing::with_syncer`, `sync_roster` and `catch_up` wait for the roster's lock, which a sync
+    /// that hangs on a folder holds: app.rs calls them on the blocking pool only (`spawn_blocking`),
+    /// never on a thread of the runtime, which would then stay pinned. The exit's own part for
+    /// sharing runs on a thread of its own, within its limit (update_check's guard of `on_exit`).
+    #[test]
+    fn the_roster_is_waited_for_on_the_blocking_pool_only() {
+        let app = tokens(include_str!("app.rs"));
+        let blocking = calls(&app, "spawn_blocking");
+        for (method, at_least) in [(".with_syncer(", 2), (".sync_roster(", 1), (".catch_up(", 1)] {
+            let inside: usize = blocking.iter().map(|call| count(call, method)).sum();
+            assert!(inside == count(&app, method) && inside >= at_least, "`{method}` runs within spawn_blocking only ({inside} of {}). {}", count(&app, method), update(ROSTER));
+        }
     }
 
     /// `sharing`'s tests withdraw through a fake: the real withdrawals (`sharing::Files`) need this
@@ -556,9 +571,9 @@ mod tests {
     fn the_real_withdrawals_go_to_the_place_they_are_given() {
         let sharing = tokens(include_str!("sharing.rs"));
         let files = function(&sharing, "sharing.rs", "impl Withdraw for Files {", REAL);
-        assert!(has(files, "fn presence(&mut self, place: &Place) { if let Some(store) = crate::presence::store(&place.settings()) { \
+        assert!(has(files, "fn presence(&self, place: &Place) { if let Some(store) = crate::presence::store(&place.settings()) { \
             crate::presence::withdraw(store.as_ref(), self.interval); } }"), "{}\n{files}", update(REAL));
-        assert!(has(files, "fn roster(&mut self, place: &Place) { if let Some(store) = crate::roster::store(&place.settings()) { \
+        assert!(has(files, "fn roster(&self, place: &Place) { if let Some(store) = crate::roster::store(&place.settings()) { \
             let _ = crate::roster::withdraw(store.as_ref()); } }"), "{}\n{files}", update(REAL));
         let forget = function(&sharing, "sharing.rs", "impl Forget for crate::roster::Syncer {", REAL);
         assert!(has(forget, "fn forget(&mut self) { self.reset(); } }"), "{}\n{forget}", update(REAL));

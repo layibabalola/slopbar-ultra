@@ -521,7 +521,7 @@ fn span(d: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::source_guard::{calls, count, find, function, has, lost, tokens, update, words};
+    use crate::source_guard::{args, calls, count, find, function, has, lost, tokens, update, words};
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
@@ -871,7 +871,9 @@ mod tests {
     }
 
     /// The exit cleanup bounds each part that can wait, and the door answers at once while an
-    /// install runs (app.rs).
+    /// install runs (app.rs). The part for sharing withdraws this machine's presence where sharing
+    /// is now and what saves left that no refresh has withdrawn yet (`sharing::Sharing::exit`),
+    /// within a limit of its own inside the part's.
     #[test]
     fn the_exit_cleanup_and_the_door_keep_their_limits() {
         let app = tokens(include_str!("app.rs"));
@@ -880,10 +882,13 @@ mod tests {
         let bounded = calls(exit, "wait_at_most");
         assert!(bounded.len() == 2 && bounded.iter().all(|c| find(c, "(EXIT_PART_LIMIT, ") == Some(0)),
             "each part of the exit cleanup that can wait runs within wait_at_most(EXIT_PART_LIMIT, ..). {}\n{bounded:?}", update(EXIT));
-        for part in ["presence::withdraw(", "settings.lock()", "signin::close_all"] {
+        for part in ["settings.lock()", ".sharing.exit(", "signin::close_all"] {
             let inside: usize = bounded.iter().map(|c| count(c, part)).sum();
             assert!(inside == 1 && count(exit, part) == 1, "`{part}` runs within wait_at_most(EXIT_PART_LIMIT, ..). {}\n{exit}", update(EXIT));
         }
+        let shared = calls(exit, ".sharing.exit");
+        assert!(shared.len() == 1 && args(shared[0]).last() == Some(&"sharing::WITHDRAW_LIMIT") && crate::sharing::WITHDRAW_LIMIT < EXIT_PART_LIMIT,
+            "the part for sharing ends within WITHDRAW_LIMIT, inside the part's own limit. {}\n{shared:?}", update(EXIT));
         // The journal waits FLUSH_WAIT at most.
         for needle in [".settings.lock().unwrap_or_else(|e| e.into_inner())", "diagnostics.record(None, None, diagnostics::Event::Shutdown)"] {
             assert!(has(exit, needle), "{}\n{exit}", lost("on_exit in app.rs", needle, EXIT));
