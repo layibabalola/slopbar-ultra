@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 
 // i18n.js sets the page language on load.
 globalThis.document ??= { documentElement: {} };
-const { t, setLanguage, setThisMachine, setSharing, windowResetText, placesText, overlapText } = await import("../src/i18n.js");
+const { t, setLanguage, setThisMachine, setSharing, windowResetText, placesText, compactPlaces, overlapText } = await import("../src/i18n.js");
 const { accountTip, accountTipLines, adviceText } = await import("../src/accounttext.js");
 const { sparkline, sparklineText } = await import("../src/sparkline.js");
 setLanguage("en");
@@ -199,6 +199,24 @@ test("another record under this machine's name is not listed twice", () => {
   assert.equal(p.inUse, "In use on DESK-1 (this PC), LAPTOP-2 (WSL: Ubuntu)");
   assert.deepEqual(p.names, ["DESK-1", "LAPTOP-2"]);
   assert.equal(placesText(used({ remote: [twin] })).inUse, "In use on desk-1 (WSL: Ubuntu)", "not in use here: listed as it is");
+});
+
+test("the compact row names two machines in full, this one second, then how many more", () => {
+  const on = (machine) => ({ machine, where: ["Windows"], seen_at: iso(now), live: true });
+  const here = { active: true, sources: ["Windows"] };
+  assert.equal(compactPlaces(used({ remote: [on("BACHELOR"), on("PC-MINI1")] })), "BACHELOR, PC-MINI1");
+  assert.equal(compactPlaces(used(here)), "DESK-1 (this PC)");
+  // Listed with others, this machine comes second: a narrow row cuts its mark, not a name.
+  assert.equal(compactPlaces(used({ ...here, remote: [on("VIRTUAL-TEN")] })), "VIRTUAL-TEN, DESK-1 (this PC)");
+  assert.equal(compactPlaces(used({ ...here, remote: [on("VIRTUAL-TEN"), on("PC-MINI2")] })), "VIRTUAL-TEN, DESK-1 (this PC) +1");
+  assert.equal(compactPlaces(used({ remote: [on("A-1"), on("B-2"), on("C-3"), on("D-4")] })), "A-1, B-2 +2");
+  assert.equal(compactPlaces(used({})), "");
+  // Two records under one name are one machine, as the app's overlap badge counts them.
+  assert.equal(compactPlaces(used({ remote: [on("LAPTOP-2"), on("laptop-2"), on("OTHER-PC")] })), "LAPTOP-2, OTHER-PC");
+  assert.equal(compactPlaces(used({ ...here, remote: [on("LAPTOP-2"), on("LAPTOP-2")] })), "LAPTOP-2, DESK-1 (this PC)");
+  assert.deepEqual(placesText(used({ remote: [on("CLONE-VM"), on("CLONE-VM"), on("clone-vm")] })).machines, ["CLONE-VM"]);
+  // The full line keeps this machine first.
+  assert.equal(placesText(used({ ...here, remote: [on("VIRTUAL-TEN")] })).short, "In use on DESK-1 (this PC), VIRTUAL-TEN");
 });
 
 test("machine names are translated around, never translated themselves", () => {

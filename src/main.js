@@ -1,4 +1,4 @@
-import { t, windowResetText, windowLabel, errorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, duration, resetText, groupResets, visibleResetWindows, placesText, overlapText, seatsText } from "./i18n.js";
+import { t, windowResetText, windowLabel, errorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, duration, resetText, groupResets, visibleResetWindows, placesText, compactPlaces, overlapText, seatsText } from "./i18n.js";
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { creditAdviceText } from "./alerts.js";
@@ -235,14 +235,14 @@ function renderCompactList(snap) {
     const used = w ? `${Math.round(w.used_percent)}%` : "—";
     const usedText = w ? `${windowLabel(w)}: ${used} ${t("used")}` : t("usageUnknown");
     const tip = accountTip(a, { sub: subs[key], trail: trails[key], creditAdvice: creditAdvice[key] });
-    // Named machines only: a bare "this PC" would repeat "In use".
-    const machines = placesText(a).machines;
+    // Named machines only: a bare "this PC" would repeat "In use". Two in full, then how many more.
+    const where = compactPlaces(a);
     return `
       <div class="acct line ${a.active ? "active" : ""}" role="listitem" data-key="${a.provider}:${esc(a.id)}" title="${esc(tip)}" aria-describedby="tip-${i}">
         <span class="sr-only" id="tip-${i}">${esc(tip)}</span>
         <span class="provider-mark ${a.provider}" role="img" aria-label="${PROVIDER_NAME[a.provider]}">${MARK[a.provider]}</span>
-        <span class="who"><span class="name">${esc(accountName(a))}</span>${machines.length
-          ? `<small class="where"><span class="glyph" aria-hidden="true">\uE977</span>${esc(machines.join(", "))}</small>` : ""}</span>
+        <span class="who"><span class="name">${esc(accountName(a))}</span>${where
+          ? `<small class="where"><span class="glyph" aria-hidden="true">\uE977</span>${esc(where)}</small>` : ""}</span>
         ${problem ? `<span class="problem" role="img" aria-label="${esc(problem)}">!</span>` : ""}
         ${overlapBadge(a)}
         ${sparkline(trails[key], { tooltip: false })}
