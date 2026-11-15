@@ -140,7 +140,11 @@ The steps:
    fleet test is one second) and the workflow's one lane for that long, so a release pushed
    meanwhile waits behind it. Everything the workflow runs is in one of the two lists in
    `scripts/publish-ultra-release.ps1`, and its test fails if a script the workflow runs, or the
-   script under a test it runs, is in neither.
+   script under a test it runs, is in neither. It also fails if the lists share a file (the release
+   tooling wins, so a change to the fleet report would be released by tag and restart every machine
+   for nothing), if the workflow, the publisher and its test are not in the tooling list or the
+   fleet script and its test not in the fleet list, and if a listed path is spelled in another case
+   than the file's (git on the Linux runner reads it exactly).
 1. **Check.** The checkout is clean. By hand it must be exactly `origin/ultra`. On a push, it is the
    pushed commit, which must be on `ultra`. In both cases the version takes the next free build
    number, above every `ultra-v` tag and the channel's. On a tag, it is the tagged commit, on
@@ -349,22 +353,29 @@ pwsh scripts/fleet-slopbar.ps1 -UpdateNow
     channel's release was published (`pub_date` in `latest.json`). A build from before the record,
     whose old updater could stall, gets 15 minutes plus the new pass limit (50 2/3 minutes), so a
     machine stuck on it shows during a rollout,
-  - a machine that is behind while the release time is unknown: `latest.json` has no `pub_date`, or
-    one that is not a time. (A file without a `pub_date` still updates machines. The updater reads
-    one that is not RFC 3339 as an error and rejects the whole file, so then no machine can update.)
-    How long the machine has been behind cannot be told, and one that is stuck must not pass for
-    one mid-rollout, so it is a problem, reported as "release time unknown". The report goes on and
-    says so above the table. A machine that is current is not affected, so a bad `pub_date` alone
-    never fails a report whose machines are all current,
+  - a machine that is behind while the release time is unknown: `latest.json` has no `pub_date`, one
+    that is not a time, or one more than 5 minutes ahead of the clock of the computer that runs the
+    report. (A file without a `pub_date` still updates machines. The updater reads one that is not
+    RFC 3339 as an error and rejects the whole file, so then no machine can update. The 5 minutes
+    are the clock skew allowed between the publisher's clock and this computer's: synchronised
+    clocks differ by a second or so, and Windows itself tolerates 5 minutes between computers, so a
+    time ahead by no more than that is the release just published and counts. A time further ahead
+    is a wrong record, a time zone slip say, and used it would show a stuck machine as plain
+    "behind" until that time came.) How long the machine has been behind cannot be told, and one
+    that is stuck must not pass for one mid-rollout, so it is a problem, reported as "release time
+    unknown". The report goes on and says so above the table. A machine that is current is not
+    affected, so a bad `pub_date` alone never fails a report whose machines are all current,
   - and, from each machine's record, with its own interval and pass limit (15 minutes and 35 min 40 s
     on Ultra builds):
     - a failed last update check (a deferred one is no problem),
     - no update check for longer than the interval plus the pass limit (about 51 minutes) while
       "Update automatically" is on and the loop shows no next run to explain it: none at all, or one
-      overdue by more than the pass limit. A loop waiting for a next run that is ahead (or only just
-      due) is no problem: see the transient states below,
-    - an update loop whose next run is overdue by more than the pass limit: it has stopped, even if
-      a check asked for since then shows a recent time.
+      overdue by more than the pass limit plus 60 s. A loop waiting for a next run that is ahead (or
+      only just due) is no problem: see the transient states below,
+    - an update loop whose next run is overdue by more than the pass limit plus 60 s (2200 s, about
+      37 minutes, on Ultra builds): it has stopped, even if a check asked for since then shows a
+      recent time, and whether or not "Update automatically" is on, because the loop wakes at its
+      interval either way.
 - **Transient states** that look like problems for a while. The report reads only what
   `get_app_info` returns: the last check, the loop's next run (`next_at`, a clock time), the interval
   and the pass limit. It carries no uptime, no wake time and no reading of the machine's own clock.
@@ -372,16 +383,23 @@ pwsh scripts/fleet-slopbar.ps1 -UpdateNow
     and moves `next_at` on, but checks nothing, so the last check grows as old as the time it was
     off. For up to one interval after the switch, the last check is old and the next run is ahead.
     The report tells that from a stopped loop by the next run, and calls the old check no problem
-    while that run is ahead or less than a pass limit overdue. A stopped loop's next run is overdue
-    by more than that, and is reported as before.
+    while that run is ahead or no more than the pass limit plus 60 s overdue. A stopped loop's next
+    run is overdue by more than that, and is reported as before.
   - *A machine that has just woken from sleep* shows "update loop stopped" and "no update check"
-    until its next pass, and nothing `get_app_info` returns tells it from a dead loop: `next_at` is a
-    clock time that passed while the machine slept, exactly as for a loop that died, and no field
-    says when the machine woke. The loop runs again within about one interval of the wake (15
-    minutes on Ultra builds), which clears both. So a machine reported as stopped that may have been
-    asleep (a laptop, say) is asked again after an interval before it is called dead; one still
-    reported as stopped then is.
-- **Tested** offline by `pwsh scripts/test-fleet-slopbar.ps1`, on synthetic answers.
+    until its next pass, but only when it slept long enough. "Update loop stopped" appears once
+    `next_at` is more than about 37 minutes in the past (the pass limit plus 60 s: 2200 s on Ultra
+    builds), and "no update check" with it once the last check is more than about 51 minutes old
+    (the interval plus the pass limit: 3040 s). After a pass that succeeded or was deferred,
+    `next_at` is one interval after the last check, so the two come together. A machine whose next
+    run fell due less long ago than that shows neither. Once it shows them, nothing `get_app_info`
+    returns tells it from a dead loop: `next_at` is a clock time that passed while the machine slept,
+    exactly as for a loop that died, and no field says when the machine woke. The loop runs again
+    within about one interval of the wake (15 minutes on Ultra builds), which clears both. So a
+    machine reported as stopped that may have been asleep (a laptop, say) is asked again after an
+    interval before it is called dead; one still reported as stopped then is.
+- **Tested** offline by `pwsh scripts/test-fleet-slopbar.ps1`, on synthetic answers: each rule above
+  by its row's problem flag, and the script's main body (the line above the table, the summary and
+  the exit code) against stand-ins for `latest.json` and each machine.
 - **The two limits a machine may not report.** A build from before the update-check record (or a
   record from before the limit) reports no update interval and no pass limit, so the script judges it
   by Ultra's own: 15 minutes and 35 min 40 s, held in the script as `$OldBuildInterval` and
@@ -419,8 +437,8 @@ pwsh scripts/test-fleet-slopbar.ps1
 
 The second tests the publisher offline, against synthetic repositories and a stand-in for `gh`.
 After `pnpm install` it also signs with a throwaway key. The third tests the fleet report's rules
-on synthetic answers, and checks two constants of the Rust source against the script's copies
-(see "The fleet").
+and its main body on synthetic answers, and checks two constants of the Rust source against the
+script's copies (see "The fleet").
 
 Don't set the signing variables in a shell by hand: they pass to every process it starts. To sign,
 use `scripts/publish-ultra-release.ps1`, which gives the password to the signer's process alone.
