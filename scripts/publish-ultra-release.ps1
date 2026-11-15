@@ -20,7 +20,8 @@ Check    The checkout is clean. By hand: it is exactly origin/ultra. On a push: 
          ultra. Both take the next free build number, above every ultra-v tag and the channel. On a
          tag: the tagged commit, on ultra, under the tag's version. Always: the version is newer than
          the channel's, and the commit contains the one the channel's release was built from.
-Build    Unit tests, then the installer with ultra-updates, the installer hook that sets a running
+Build    Unit tests twice: without the desktop app, and with the features that ship (ultra-updates).
+         Then the installer with ultra-updates, the installer hook that sets a running
          slopbar-mcp.exe aside, and no signing key anywhere in the environment. The executable must
          report a clean build of this commit; the installer must carry slopbar-mcp.exe with the hook.
 Sign     `tauri signer sign`. Only the signer's process gets the key's password (and, in the
@@ -296,11 +297,16 @@ function Invoke-Build {
   } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $override
   $pnpm = Get-PnpmCommand
   $pnpmArgs = @($pnpm | Select-Object -Skip 1)
+  # The cargo features that ship, for the build and for a second test run: a test can pass without
+  # them and fail with them. `tauri build` also turns on tauri/custom-protocol, which no test reads.
+  # A new test configuration here needs a new rust-cache key in ultra-release.yml.
+  $features = 'ultra-updates'
   Push-Location $root
   try {
     Invoke-Checked 'pnpm install' { & $pnpm[0] @pnpmArgs install --frozen-lockfile }
-    Invoke-Checked 'Unit tests' { cargo test --locked --no-default-features --lib --manifest-path src-tauri/Cargo.toml }
-    Invoke-Checked 'Build' { & $pnpm[0] @pnpmArgs tauri build --features ultra-updates --config $override }
+    Invoke-Checked 'Unit tests without the desktop app' { cargo test --locked --no-default-features --lib --manifest-path src-tauri/Cargo.toml }
+    Invoke-Checked "Unit tests with $features" { cargo test --locked --features $features --lib --manifest-path src-tauri/Cargo.toml }
+    Invoke-Checked 'Build' { & $pnpm[0] @pnpmArgs tauri build --features $features --config $override }
   } finally { Pop-Location }
 
   $out = Join-Path $root 'src-tauri/target/release'

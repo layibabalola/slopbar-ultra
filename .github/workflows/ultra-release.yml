@@ -107,9 +107,12 @@ jobs:
           node-version: lts/*
           cache: pnpm
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      # The cache is saved only under a key it has not seen. When Build compiles a new configuration,
+      # change `key`, or that configuration's dependencies are compiled afresh on every run.
       - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri -> target
+          key: shipping-tests
 
       # A push: the pushed commit, under the next build number. A tag: its version, on its commit.
       - name: Check the source and version
@@ -120,7 +123,8 @@ jobs:
           $source = if ($env:TAG) { @{ Tag = $env:TAG } } else { @{ Auto = $true } }
           ./scripts/publish-ultra-release.ps1 -Step Check @source -Stage "$env:RUNNER_TEMP/ultra-release" -Repo $env:GITHUB_REPOSITORY
 
-      # Unit tests, the installer with the hook, and the provenance and installer checks.
+      # Unit tests without the desktop app and with the features that ship (ultra-updates), the
+      # installer with the hook, and the provenance and installer checks.
       # The runner's own TEMP, as in the Tests workflow: C:\Users\RUNNER~1\..., spelled with an 8.3
       # short name, which the pins tests need (in CI they fail rather than skip without one).
       - name: Build and check the installer
