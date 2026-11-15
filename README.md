@@ -113,7 +113,7 @@ command = 'C:\Users\<you>\AppData\Local\SlopBar\slopbar-mcp.exe'
 | `switch_account`, `remove_account` | Use or remove a saved account, as in Settings. |
 | `add_account`, `connect_monitoring`, `disconnect_monitoring` | Start the CLI's own sign-in for the user to complete, or revoke a monitoring sign-in. |
 | `revoke_account_sessions` | Revoke every sign-in SlopBar holds for an account (its monitoring session, at the provider and here), optionally removing the saved CLI login with `remove_slot`. Only reports unless `confirm: true`; the CLI's own sign-in is left to the CLI. |
-| `check_for_updates`, `install_update`, `get_app_info`, `open_settings` | Updates (builds with automatic updates only), version and build, and showing the Settings window. |
+| `check_for_updates`, `install_update`, `get_app_info`, `open_settings` | Updates (builds with automatic updates only), version and build, the last update check (time, result, and error or the reason it was deferred), and showing the Settings window. |
 | `quit_app`, `restart_app` | Quit as the tray's Quit does, or quit and start the installed executable again. |
 | `get_usage_breakdown` | Tokens on this PC by account and repository, model or day, with each provider's model mix and an hour-of-week heatmap, and how each account's tokens were attributed. |
 | `export_csv` | Write the weekly history, the usage breakdown and the subscription report as CSV files (default `Documents\SlopBar Exports`) and return their paths. |
@@ -247,6 +247,17 @@ The app is at `src-tauri/target/x86_64-pc-windows-msvc/release/slopbar.exe`.
 ## Releases
 
 The upstream release workflow publishes from `main` (`v0.2.<run>`), runs the telemetry tests on Windows, and enables signed upstream updates for those releases. Local builds use manual updates.
+
+Builds with updates check about 20 seconds after starting and then every 6 hours, and install what they find while **Update automatically** is on. What is bounded, and by how much:
+
+- the check's request: 30 seconds; any request, the download's included, without data: 60 seconds; the download: 30 minutes in all;
+- each step of an install, whose error then names it: the check 40 seconds, the download 31 minutes, handing over to the installer 1 minute;
+- a whole check and install: 35 minutes 40 seconds, in a task of its own, so a panic or this limit ends that attempt and nothing else;
+- SlopBar's exit cleanup: 15 seconds for each part that can wait, and 3 seconds for the diagnostics journal.
+
+The installer itself is a separate program that SlopBar does not bound once it has started. A handover that outlives its limit cannot be stopped: its thread carries on and keeps the install's turn until it ends. One install runs at a time, so another request is deferred, not failed, or fails once the running one is past the 35-minute limit. A failed attempt is tried again after 2 minutes, once, and then at the usual interval; a deferred one waits the interval.
+
+`get_app_info` reports the last check as `update_check`: its time, its result (`up_to_date`, `found`, `installing`, `deferred` or `error`), version, error or the reason it was deferred, and when the next check runs. The record is kept in memory only. After an install starts, its last word is `installing`, because the process that kept it exits, and the new version starts with no record until its first check.
 
 ## License
 
