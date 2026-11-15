@@ -417,7 +417,7 @@ pub fn merge(settings: &Settings, history: &History, ledger: &Ledger, backup: &C
         };
         let pin = ProjectPin { folder, ..pin.clone() };
         let full = next.project_pins.len() >= crate::pins::MAX_PINS;
-        match next.project_pins.iter_mut().find(|p| crate::pins::same_folder(&p.folder, &pin.folder) && p.provider == pin.provider) {
+        match next.project_pins.iter_mut().find(|p| p.provider == pin.provider && crate::pins::same_folder(&p.folder, &pin.folder)) {
             Some(p) if *p == pin => {}
             Some(p) => { pins.changed.push(pin.folder.clone()); *p = pin; }
             None if full => skipped.push(Skipped { what: format!("pin {}", pin.folder), reason: "too_many_pins" }),
@@ -679,6 +679,29 @@ mod tests {
         assert_eq!(merged.settings.project_pins.len(), 1);
         assert_eq!(preview.pins.added.len(), 1);
         assert!(preview.skipped.iter().any(|s| s.what.contains("nowhere") && s.reason == "folder_missing_here"), "{:?}", preview.skipped);
+    }
+
+    /// A pin saved in its 8.3 short spelling and the backup's pin on the same folder are one pin:
+    /// restoring takes the backup's (long) spelling instead of adding a second pin.
+    #[cfg(windows)]
+    #[test]
+    fn a_restored_pin_replaces_its_short_spelled_twin() {
+        let dir = TempDir::new();
+        let folder = dir.0.join("a folder with a long name");
+        std::fs::create_dir_all(&folder).unwrap();
+        let long = crate::pins::long_spelling(&folder.display().to_string());
+        let Some(short) = crate::test_support::short_spelling(&long) else {
+            return crate::test_support::require_short_names(&long);
+        };
+        let mut current = Settings::default();
+        current.project_pins = vec![ProjectPin { folder: short, provider: Provider::Claude, id: "a1".into() }];
+        let mut contents = sample();
+        contents.settings.project_pins = vec![ProjectPin { folder: long.clone(), provider: Provider::Claude, id: "a1".into() }];
+        let normalize = |f: &str| crate::pins::normalize_folder(f).ok();
+        let (merged, preview) = merge(&current, &History::default(), &Ledger::default(), &contents, &here_with(&[], &normalize), at(22));
+        let pins = &merged.settings.project_pins;
+        assert!(pins.len() == 1 && pins[0].folder.eq_ignore_ascii_case(&long), "{pins:?}");
+        assert!(preview.pins.added.is_empty() && preview.pins.changed.len() == 1, "{:?}", preview.pins);
     }
 
     #[test]
