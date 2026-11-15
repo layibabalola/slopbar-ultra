@@ -26,13 +26,20 @@ $h = gh pr view <top PR number> --repo thelioo/slopbar --json headRefOid --jq .h
 git diff --stat "$h" origin/claude/subscription-value      # work with no upstream PR yet (by content)
 git cherry -v "$h" origin/claude/subscription-value        # its commits ('+' lines; some are reworked copies)
 git worktree list                                           # leftover session worktrees
+# Is upstream awake? (Standing procedure: no new upstream PRs while it is dormant.)
+gh api "repos/thelioo/slopbar/commits?per_page=1" --jq '.[0].commit.committer.date'   # upstream main's newest commit
+gh pr list --repo thelioo/slopbar --author layibabalola --state open --limit 100 --json createdAt --jq 'min_by(.createdAt).createdAt'   # our oldest open PR
+gh api "search/issues?q=repo:thelioo/slopbar+is:pr+author:layibabalola+commenter:thelioo" --jq .total_count     # maintainer comments on our PRs
+gh api "search/issues?q=repo:thelioo/slopbar+is:pr+author:layibabalola+reviewed-by:thelioo" --jq .total_count   # maintainer reviews
+gh pr list --repo thelioo/slopbar --author layibabalola --state merged --json number --jq length                # our PRs merged
 ```
 
 Installed build and health on this PC, through the app's door (the slopbar MCP server, or the
 `door.ps1` helper in `~/.claude/ops/remote-slopbar/`): `get_app_info`, `get_health`.
 
-Other machines: `ssh ultramagnus` and `ssh virtualten` (key auth, PowerShell). Update and visually check
-them with `~/.claude/ops/remote-slopbar/README.md`.
+Other machines: by their ssh aliases over the fleet key mesh (key auth; memory
+`reference-other-machines-ssh` lists them and what breaks over ssh). Update and visually check them
+with `~/.claude/ops/remote-slopbar/README.md`.
 
 ## Standing procedure
 
@@ -52,16 +59,23 @@ them with `~/.claude/ops/remote-slopbar/README.md`.
   stacked on the previous one: cherry-pick the commits onto the previous PR's head, because the PR
   branches are linear copies, not ancestors of `claude/subscription-value` (so `git log $h..` overcounts).
   Update `docs/ROADMAP.md` on `ultra`.
+- While upstream is dormant, open no new upstream PRs (decisions log: "upstream PRs while upstream is
+  dormant"). Dormant means upstream `main`'s newest commit is older than our oldest open PR there,
+  and no PR of ours has a maintainer comment or review or has been merged (the derive block checks
+  all three). Keep `claude/subscription-value` upstream-clean meanwhile, with synthetic identities
+  only (AGENTS.md), so the backlog can be cut as stacked PRs as soon as upstream wakes: the pins fix
+  first, then the rest in merge order.
 - Never ask Layi to restart SlopBar: the install script restarts it through the door.
 - Never block on Layi with a question. A real decision gets an adversarial swarm: independent agents
   argue the options and try to break the favourite. Adjudicate, act, and record the ruling in the
-  shared notes' `decisions.md` (memory `feedback-no-owner-questions`). Owner-only steps are queued
-  there instead, while other work carries on: credentials, sign-in pages, someone at a screen,
-  security settings, purchases, force-pushes and unrecoverable deletes.
+  decisions log, which every machine has (memory `feedback-no-owner-questions` gives its path).
+  Owner-only steps are queued there instead, while other work carries on: credentials, sign-in
+  pages, someone at a screen, security settings, purchases, force-pushes and unrecoverable deletes.
 
 ## Known open items (re-derive; don't trust this list)
 
-- Work after the top upstream PR with no PR yet (the derive command above counts it).
+- Work after the top upstream PR with no PR yet (the derive command above counts it; it waits while
+  upstream is dormant).
 - Release channel and each machine's build: `pwsh scripts/fleet-slopbar.ps1` (on `ultra`), and the
   release runs: `gh run list -R layibabalola/slopbar-ultra --workflow ultra-release.yml`.
 - Leftover worktrees from finished sessions.

@@ -21,8 +21,8 @@ itself from them only. This is fork-only: it lives on the `ultra` branch and nev
   channel to itself.
 - **Fork key.** Updates must be signed with the fork's own updater key (key id
   `593D8A8B75A9A204`). Its public key is in `tauri.conf.json` and `src-tauri/src/ultra_release.rs`.
-  The private key is only on the owner's machine (BACHELOR) and in the fork's `ULTRA_UPDATER_KEY`
-  secrets.
+  The private key is only on one of the owner's machines (the owner's private notes name it) and in
+  the fork's `ULTRA_UPDATER_KEY` secrets.
 - **An Ultra install never updates to upstream SlopBar**, because of three separate checks:
   1. `updates.rs` pins the Ultra channel URL and fork key in code under `ultra-updates`, so a
      config change merged from upstream can't point the app back at `thelioo/slopbar`.
@@ -58,8 +58,8 @@ every machine install now, run `pwsh scripts/fleet-slopbar.ps1 -UpdateNow` (belo
 The workflow runs the steps of `scripts/publish-ultra-release.ps1`. The script also publishes by
 hand, for example while Actions is down:
 
-- **On the machine with the key** (`%USERPROFILE%\.slopbar-ultra\updater.key`, BACHELOR), the
-  script builds, signs and publishes on that machine.
+- **On the machine with the key** (`%USERPROFILE%\.slopbar-ultra\updater.key`), the script
+  builds, signs and publishes on that machine.
 - **From any machine**, `-ViaActions` has the workflow publish `origin/ultra`. When the push of
   `ultra` publishes the commit anyway, it follows that run instead of racing it with a tag.
 
