@@ -516,21 +516,28 @@ mod tests {
         assert!(install <= 1, "the install's, in builds that wait for a refresh");
 
         let app = normalized(include_str!("app.rs"));
+        // Each call is read with the statements around it, so one that is skipped (`if false`, a
+        // block that never runs) no longer reads the same.
         let within = function(&app, "async fn refresh_within(");
-        assert!(has(within, "let refreshed = refresh_wait::under(&state.refresh_lock, refresh_wait::LOCK_WAIT, || refresh_locked(app)).await;"), "{within}");
-        assert!(has(within, "if refreshed.is_none() { refresh_soon(app); } refreshed"), "a refresh that gave up is followed by one once the lock is free:\n{within}");
+        assert!(has(within, "let state = app.state::<AppState>(); \
+            let refreshed = refresh_wait::under(&state.refresh_lock, refresh_wait::LOCK_WAIT, || refresh_locked(app)).await; \
+            if refreshed.is_none() { refresh_soon(app); } refreshed }"), "a refresh that gave up is followed by one once the lock is free:\n{within}");
         let soon = function(&app, "fn refresh_soon(");
-        let spawned = soon.find(&normalized("tauri::async_runtime::spawn(async move {")).expect("nobody waits for it");
-        assert!(has(&soon[..spawned], "if !WAITING.ask() { return; }"), "one task however many ask:\n{soon}");
-        assert!(has(&soon[spawned..], "drop(app.state::<AppState>().refresh_lock.lock().await); WAITING.started(); do_refresh(&app).await;"), "{soon}");
-        assert!(has(&app, "static WAITING: refresh_wait::Coalesce = refresh_wait::Coalesce::new();"));
+        assert!(has(soon, "static WAITING: refresh_wait::Coalesce = refresh_wait::Coalesce::new(); if !WAITING.ask() { return; } \
+            let app = app.clone(); tauri::async_runtime::spawn(async move { \
+            drop(app.state::<AppState>().refresh_lock.lock().await); WAITING.started(); do_refresh(&app).await; }); }"),
+            "one task however many ask, which nobody waits for:\n{soon}");
         let fallback = function(&app, "async fn do_refresh(");
         assert!(has(fallback, "match refresh_within(app).await { Some(snapshot) => snapshot, None => app.state::<AppState>().snapshot.lock().unwrap().clone(), }"),
             "a refresh that gave up returns the last numbers:\n{fallback}");
         let locked = function(&app, "async fn refresh_locked(");
         let read = locked.find(&normalized("let settings = state.settings.lock().unwrap().clone();")).expect("the refresh reads the settings");
-        assert!(has(&locked[..read], "state.cache_due.drain_into(&mut state.usage_cache.lock().unwrap());"), "the cache changes left to it, first:\n{locked}");
-        assert!(has(&locked[..read], "sharing.catch_up(&mut sharing::Files { interval })"), "what saves left, before it reads the settings:\n{locked}");
+        assert!(has(&locked[..read], "let state = app.state::<AppState>(); state.cache_due.drain_into(&mut state.usage_cache.lock().unwrap()); \
+            if state.sharing.is_due() { let interval = state.settings.lock().unwrap().refresh_minutes.max(1) as u64 * 60; \
+            let sharing = state.sharing.clone(); \
+            let reset = tauri::async_runtime::spawn_blocking(move || sharing.catch_up(&mut sharing::Files { interval })).await.unwrap_or(false); \
+            if reset { *state.roster_seen.lock().unwrap() = roster::Seen::default(); } }"),
+            "first, under the lock: the cache changes left to it, then what saves left, before it reads the settings:\n{locked}");
     }
 
     /// `settings_lock` is never held while anything waits: `store_settings` cannot wait (it is no
@@ -574,27 +581,33 @@ mod tests {
     fn the_app_hands_its_waits_to_the_helpers() {
         let app = normalized(include_str!("app.rs"));
         let disconnect = function(&app, "async fn disconnect_one(");
-        let dropped = disconnect.find(&normalized("drop(operation);")).expect("the reservation ends");
-        assert!(dropped < disconnect.find(&normalized("retry_soon(app, monitoring::key(&slot));")).expect("its backoff is left to the next refresh"), "{disconnect}");
-        assert!(has(function(&app, "fn retry_soon("), "app.state::<AppState>().cache_due.retry(key);"), "a cleared backoff is queued for the next refresh");
-        assert!(has(function(&app, "async fn remove_one("), "app.state::<AppState>().cache_due.forget(monitoring::key(&slot));"), "so is a removed account's cache entry");
-        assert!(!function(&app, "async fn remove_one(").contains("usage_cache"), "and nothing else touches the cache there");
+        assert!(has(disconnect, "drop(operation); retry_soon(app, monitoring::key(&slot)); Ok(revoked) }"), "the reservation ends, then the backoff is left to the next refresh:\n{disconnect}");
+        assert!(has(&app, "fn retry_soon(app: &AppHandle, key: String) { app.state::<AppState>().cache_due.retry(key); }"), "a cleared backoff is queued for the next refresh");
+        let remove = function(&app, "async fn remove_one(");
+        assert!(has(remove, "app.state::<AppState>().monitor.disconnect(&slot, &http_client()).await?; app.state::<AppState>().cache_due.forget(monitoring::key(&slot)); }"),
+            "so is a removed account's cache entry:\n{remove}");
+        assert!(!remove.contains("usage_cache"), "and nothing else touches the cache there");
         let add = function(&app, "async fn start_add_account(");
-        let dropped = add.find(&normalized("drop(pending);")).expect("the reservation ends");
-        assert!(dropped > add.find("job.wait(").unwrap() && dropped < add.find(&normalized("do_refresh(&app).await")).unwrap(), "it covers the sign-in, not the refresh:\n{add}");
+        assert!(has(add, "let added = job.wait(&http_client()).await; drop(session); drop(pending); if let Some(slot) = added {")
+            && add.find("job.wait(") < add.find(&normalized("do_refresh(&app).await")), "it covers the sign-in, not the refresh:\n{add}");
         let login = function(&app, "async fn start_monitoring_login(");
-        assert!(has(login, "retry_soon(&app, key); refresh_soon(&app);"), "{login}");
+        assert!(has(login, "retry_soon(&app, key); refresh_soon(&app); outcome"), "{login}");
 
         assert!(has(&app, "door::serve(door::pipe_name(), move |request| door_reply(h.clone(), request))"), "the door answers through door_reply");
-        assert!(has(function(&app, "async fn door_reply("), "refresh_wait::noted(door_call(app, request)).await"), "noted exactly when a refresh waited");
+        assert!(has(&app, "async fn door_reply(app: AppHandle, request: door::Request) -> Result<serde_json::Value, String> { refresh_wait::noted(door_call(app, request)).await }"),
+            "noted exactly when a refresh waited");
         let switch = function(&app, "async fn agent_switch(");
         assert!(has(switch, "let refreshed = refresh_within(app).await; let held = refresh_wait::switch_held(refreshed.as_ref(), provider, &id);")
-            && has(switch, "result[\"switched_to_requested\"] = held.into();"), "unknown (null) when its refresh waited:\n{switch}");
+            && has(switch, "let mut result = serde_json::to_value(snapshot).map_err(|e| e.to_string())?; result[\"switched_to_requested\"] = held.into(); result[\"desktop\"] ="),
+            "unknown (null) when its refresh waited:\n{switch}");
 
         let sync = function(&app, "async fn sync_roster(");
-        assert!(has(sync, "sharing.sync_roster(&place, live, |sync| {"), "a roster sync only where the settings still share:\n{sync}");
+        assert!(has(sync, "let live = || sharing::Place::of(&h.state::<AppState>().settings.lock().unwrap()); sharing.sync_roster(&place, live, |sync| { \
+            if let Some(run) = run { sync.offer_run(run); } sync.sync(store.as_ref(), &passphrase, (id, name), &accounts, now, force, soon); sync.seen.clone() })"),
+            "a roster sync only where the settings still share:\n{sync}");
         let locked = function(&app, "async fn refresh_locked(");
-        assert!(has(locked, "if !sharing::still(&place, &sharing::Place::of(&h.state::<AppState>().settings.lock().unwrap())) { return None; }"),
+        assert!(has(locked, "let Some((id, name)) = presence::identity() else { return Some((vec![], false, false)) }; \
+            if !sharing::still(&place, &sharing::Place::of(&h.state::<AppState>().settings.lock().unwrap())) { return None; } let wrote = store.write("),
             "a refresh's presence record only where the settings still share:\n{locked}");
         assert_eq!(app.matches("presence::withdraw(").count(), 1, "presence is withdrawn on exit, and otherwise by the refresh (sharing::Files), never by a save");
         assert!(has(function(&app, "pub(crate) fn on_exit("), "presence::withdraw("));
