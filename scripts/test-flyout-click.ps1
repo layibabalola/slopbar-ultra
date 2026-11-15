@@ -9,15 +9,18 @@
   rectangle is captured again. If the two captures match, nothing of the flyout reached the
   screen (a blank or transparent panel).
 
-  PrintWindow is deliberately not used: it asks the window to repaint into a bitmap, which hides
-  exactly the bug this looks for (a flyout that is shown but never composited).
+  The capture is compared with the flyout's own pixels: PrintWindow (PW_RENDERFULLCONTENT) has
+  the flyout draw itself, web view included, into a bitmap. That rendering is only the
+  reference, never the capture: it looks right even when nothing reaches the screen, which is
+  exactly the bug the screen capture looks for (a flyout that is shown but never composited).
 
-  FAIL means: the flyout did not appear within -TimeoutMs (2 s), or other windows covered more
-  than 2% of it when it was captured, or the capture matches what is behind it by more than 50%,
-  or it has fewer than 20 distinct colours. Covering is checked with WindowFromPoint over a grid of
-  the flyout's client area: the colour checks alone once passed a capture that showed other
-  windows where the flyout should have been. The two PNGs are written to -OutDir (%TEMP% by
-  default), never into the repository.
+  FAIL means: the flyout did not appear within -TimeoutMs (2 s), or the screen matches the
+  flyout's own pixels on less than 90% of its client area, or other windows covered more than 2%
+  of it (WindowFromPoint over a grid of its client area), or the capture matches what is behind it
+  by more than 50%, or it has fewer than 20 distinct colours. The colour checks alone once passed
+  a capture that showed other windows where the flyout should have been. The PNGs (the capture,
+  what was behind, and the flyout's own rendering) are written to -OutDir (%TEMP% by default),
+  never into the repository.
 
   Run it in an unlocked, interactive desktop session. It refuses to run when there is no
   foreground window (a locked screen, a disconnected remote session): nothing composites then,
@@ -62,6 +65,7 @@ public static class FlyoutTest {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
   [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
   [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
   [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
@@ -127,6 +131,16 @@ function Click-Widget {
   [void]$T::PostMessage($widget, $WM_LBUTTONDOWN, [IntPtr]1, $lp)
   [void]$T::PostMessage($widget, $WM_LBUTTONUP, [IntPtr]0, $lp)
 }
+# What the flyout draws itself (PW_RENDERFULLCONTENT renders its web view too), as the reference
+# for the screen capture; $null when Windows cannot render it.
+function Own([IntPtr]$h, [FlyoutTest+RECT]$r) {
+  $bmp = New-Object Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T)
+  $g = [Drawing.Graphics]::FromImage($bmp); $hdc = $g.GetHdc()
+  $ok = $T::PrintWindow($h, $hdc, 2)
+  $g.ReleaseHdc($hdc); $g.Dispose()
+  if ($ok) { return $bmp }
+  $bmp.Dispose(); return $null
+}
 function Capture([FlyoutTest+RECT]$r) {
   $w = $r.R - $r.L; $h = $r.B - $r.T
   $bmp = New-Object Drawing.Bitmap $w, $h
@@ -159,6 +173,11 @@ $r = New-Object FlyoutTest+RECT; [void]$T::GetWindowRect($flyout, [ref]$r)
 Start-Sleep -Milliseconds 150
 $onTop = $T::OnTop($flyout, 16)
 $shot = Capture $r
+$own = Own $flyout $r
+# The client area within the captured window rectangle (its invisible borders show what is behind).
+$cr = New-Object FlyoutTest+RECT; [void]$T::GetClientRect($flyout, [ref]$cr)
+$co = New-Object FlyoutTest+POINT; [void]$T::ClientToScreen($flyout, [ref]$co)
+$cx = $co.X - $r.L; $cy = $co.Y - $r.T
 [void]$T::SetWindowPos($flyout, $HWND_NOTOPMOST, 0, 0, 0, 0, $SWP_NOSIZE_NOMOVE_NOACTIVATE)
 
 # A second click closes it, as for a user; then capture what was behind it.
@@ -183,21 +202,38 @@ $match = if ($n) { $same / $n } else { 1 }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 $shotPath = Join-Path $OutDir "slopbar-flyout-$stamp.png"
 $behindPath = Join-Path $OutDir "slopbar-flyout-$stamp-behind.png"
+# How much of the client area shows on screen what the flyout draws itself.
+$agree = 0; $m = 0
+if ($own) {
+  for ($y = $cy; $y -lt [Math]::Min($cy + $cr.B, $shot.Height); $y += 6) {
+    for ($x = $cx; $x -lt [Math]::Min($cx + $cr.R, $shot.Width); $x += 6) {
+      $a = $shot.GetPixel($x, $y); $b = $own.GetPixel($x, $y); $m++
+      if ([Math]::Abs($a.R - $b.R) + [Math]::Abs($a.G - $b.G) + [Math]::Abs($a.B - $b.B) -le 48) { $agree++ }
+    }
+  }
+}
+$drawn = if ($m) { $agree / $m } else { 0 }
 $shot.Save($shotPath, [Drawing.Imaging.ImageFormat]::Png); $behind.Save($behindPath, [Drawing.Imaging.ImageFormat]::Png)
+$ownPath = Join-Path $OutDir "slopbar-flyout-$stamp-own.png"
+if ($own) { $own.Save($ownPath, [Drawing.Imaging.ImageFormat]::Png); $own.Dispose() }
 $shot.Dispose(); $behind.Dispose()
 
 $reasons = @()
+if (-not $own) { $reasons += "the flyout's own rendering could not be read (PrintWindow failed)" }
+elseif ($drawn -lt 0.9) { $reasons += ("the screen shows the flyout's own pixels on only {0:P0} of it" -f $drawn) }
 if ($onTop -lt 0.98) { $reasons += ('other windows covered {0:P0} of the flyout when it was captured' -f (1 - $onTop)) }
 if ($match -gt 0.5) { $reasons += 'the capture matches what is behind the flyout by more than 50%' }
 if ($colors.Count -lt 20) { $reasons += 'the capture has fewer than 20 distinct colours' }
 Write-Host ("visible after:   {0} ms" -f $visibleMs)
 Write-Host ("flyout:          {0}x{1} at {2},{3}; fronted: {4}" -f ($r.R - $r.L), ($r.B - $r.T), $r.L, $r.T, $fronted)
+Write-Host ("own pixels:      {0:P0} of its area" -f $drawn)
 Write-Host ("on top:          {0:P0} of its area" -f $onTop)
 Write-Host ("distinct colours: {0}" -f $colors.Count)
 Write-Host ("match behind:    {0:P0}" -f $match)
 if (-not $closed) { Write-Host 'warning:         the flyout was still visible after the closing click, so the behind capture includes it' }
 Write-Host "shot:            $shotPath"
 Write-Host "behind:          $behindPath"
+if ($own) { Write-Host "own:             $ownPath" }
 if ($reasons) { Write-Host ('FAIL: ' + ($reasons -join '; ')); exit 1 }
 Write-Host 'PASS'
 exit 0
