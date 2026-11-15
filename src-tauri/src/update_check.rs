@@ -521,7 +521,7 @@ fn span(d: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::guard::{calls, find, function, has, lost, tokens, update, words};
+    use super::guard::{calls, count, find, function, has, lost, tokens, update, words};
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
@@ -881,9 +881,8 @@ mod tests {
         assert!(bounded.len() == 2 && bounded.iter().all(|c| find(c, "(EXIT_PART_LIMIT, ") == Some(0)),
             "each part of the exit cleanup that can wait runs within wait_at_most(EXIT_PART_LIMIT, ..). {}\n{bounded:?}", update(EXIT));
         for part in ["presence::withdraw(", "settings.lock()", "signin::close_all"] {
-            let needle = tokens(part);
-            let inside: usize = bounded.iter().map(|c| c.matches(&needle).count()).sum();
-            assert!(inside == 1 && exit.matches(&needle).count() == 1, "`{part}` runs within wait_at_most(EXIT_PART_LIMIT, ..). {}\n{exit}", update(EXIT));
+            let inside: usize = bounded.iter().map(|c| count(c, part)).sum();
+            assert!(inside == 1 && count(exit, part) == 1, "`{part}` runs within wait_at_most(EXIT_PART_LIMIT, ..). {}\n{exit}", update(EXIT));
         }
         // The journal waits FLUSH_WAIT at most.
         for needle in [".settings.lock().unwrap_or_else(|e| e.into_inner())", "diagnostics.record(None, None, diagnostics::Event::Shutdown)"] {
@@ -915,6 +914,22 @@ mod tests {
         assert_eq!(tokens(literals), r##"f("a  //  b ) {",'}','\'','"',r#"x ) "y" // z"#,b"(",&'a str,'label:loop{})"##);
         assert_eq!(calls(&tokens(literals), "f"), [tokens(literals)[1..].to_string()], "the call ends at its own bracket, past every literal");
         assert_eq!(tokens("a / *b"), "a/ *b", "no comment is made where there was none");
+        // A label stays apart from a character literal after it: run together, `'a '}'` would read
+        // as the literal `'a'` and a `}` that ends the body early (or, with `'"'`, a string that
+        // never ends), and a guard would pass on half a function.
+        for literal in ["'}'", "'\"'"] {
+            let body = format!("fn f() {{ let _k = 'a: {{ break 'a {literal}; }}; signin::close_all(); }}");
+            let code = tokens(&format!("{body}\nfn g() {{ wait(); }}"));
+            assert_eq!(function(&code, "the test's code", "fn f(", "guards_read_tokens_not_layout"), tokens(&body), "the body ends at its own brace");
+            assert_eq!(count(&code, "signin::close_all"), 1);
+        }
+        // Text in a literal is not code: a needle spelled there is not found, though a needle that
+        // is the whole literal is.
+        let spelled = tokens("fn f() { let s = \"update.download( turn \"; let c = '('; }");
+        assert!(!has(&spelled, "update.download("), "a needle spelled in a string");
+        assert_eq!((words(&spelled, "turn"), calls(&spelled, "update.download").len()), (0, 0), "a word, and a call, spelled in a string");
+        assert_eq!(find(&spelled, "\"update.download( turn \""), spelled.find('"'), "a whole literal");
+        assert_eq!(function(&spelled, "the test's code", "fn f(", "guards_read_tokens_not_layout"), spelled, "a bracket in a literal does not count");
         for source in [include_str!("updates.rs"), include_str!("app.rs"), include_str!("update_check.rs")] {
             let once = tokens(source);
             assert_eq!(tokens(&once), once, "reading tokens again changes nothing");
@@ -1114,8 +1129,9 @@ mod tests {
 /// Source guards: tests that read code for what no other test can see (the limit each step of an
 /// update runs within, where an install takes its turn, what the exit cleanup bounds). They read
 /// tokens, not layout (`tokens`), so rustfmt, a call broken over lines or a block indented anew
-/// reads the same. A rename does not, and then the failure names the text that went and the test
-/// to update (`lost`, `update`).
+/// reads the same; and only code: a needle spelled inside a string or character literal is not
+/// found there. A rename does not read the same, and then the failure names the text that went and
+/// the test to update (`lost`, `update`).
 #[cfg(test)]
 pub(crate) mod guard {
     fn word(c: char) -> bool {
@@ -1123,9 +1139,10 @@ pub(crate) mod guard {
     }
 
     /// `source` as a guard reads it, code and needles alike: no comments; whitespace only where it
-    /// keeps two words apart (or `/` from a `/` or `*` after it), as one space; and no comma right
-    /// before a closing bracket, which rustfmt adds when it breaks a call over lines. String and
-    /// character literals are kept as written.
+    /// keeps two words apart, a word from a quote after it (`break 'a '}'`, which run together
+    /// would read as the literal `'a'`), or `/` from a `/` or `*` after it, as one space; and no
+    /// comma right before a closing bracket, which rustfmt adds when it breaks a call over lines.
+    /// String and character literals are kept as written.
     pub fn tokens(source: &str) -> String {
         let mut out = String::with_capacity(source.len());
         let mut gap = false;
@@ -1147,7 +1164,7 @@ pub(crate) mod guard {
                     out.pop();
                 }
                 let last = out.chars().next_back();
-                if gap && ((word(c) && last.is_some_and(word)) || (last == Some('/') && matches!(c, '/' | '*'))) {
+                if gap && (((word(c) || c == '\'') && last.is_some_and(word)) || (last == Some('/') && matches!(c, '/' | '*'))) {
                     out.push(' ');
                 }
                 out.push_str(&source[i..end]);
@@ -1260,14 +1277,52 @@ pub(crate) mod guard {
         None
     }
 
-    /// Where `needle` starts in `code` (tokens), read as tokens itself.
+    /// The literals in `code`, in order: where each starts and where it ends.
+    fn literals(code: &str) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        let mut i = 0;
+        while let Some(c) = code[i..].chars().next() {
+            match literal_end(code, i) {
+                Some(end) => {
+                    spans.push((i, end));
+                    i = end;
+                }
+                None => i += c.len_utf8(),
+            }
+        }
+        spans
+    }
+
+    /// Where `pattern` occurs in `code` (tokens), but never inside a literal: text spelled in a
+    /// string or character literal is not code. A match that starts at a literal's opening quote
+    /// is the literal itself, and counts.
+    fn occurrences(code: &str, pattern: &str) -> Vec<usize> {
+        let spans = literals(code);
+        let inside = |at: usize| {
+            let k = spans.partition_point(|&(start, _)| start < at);
+            k > 0 && spans[k - 1].1 > at
+        };
+        code.match_indices(pattern).map(|(at, _)| at).filter(|&at| !inside(at)).collect()
+    }
+
+    /// Where `needle`, read as tokens itself, starts in `code` (tokens): every place, in order.
+    pub fn places(code: &str, needle: &str) -> Vec<usize> {
+        occurrences(code, &tokens(needle))
+    }
+
+    /// Where `needle` first starts in `code` (tokens), read as tokens itself.
     pub fn find(code: &str, needle: &str) -> Option<usize> {
-        code.find(&tokens(needle))
+        places(code, needle).first().copied()
     }
 
     /// Whether `code` (tokens) has `needle`, read as tokens itself.
     pub fn has(code: &str, needle: &str) -> bool {
         find(code, needle).is_some()
+    }
+
+    /// How often `code` (tokens) has `needle`, read as tokens itself.
+    pub fn count(code: &str, needle: &str) -> usize {
+        places(code, needle).len()
     }
 
     /// The function (or arm, or block) whose code starts `signature`, through the brace that closes
@@ -1279,21 +1334,23 @@ pub(crate) mod guard {
         &code[start..=close]
     }
 
-    /// Every call of `name` in `code` (tokens), each from its opening parenthesis to its closing one.
+    /// Every call of `name` in `code` (tokens), each from its opening parenthesis to its closing one;
+    /// a call spelled in a literal is none.
     pub fn calls<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
         let name = tokens(name);
         let named = |at: usize| name.starts_with(word) && code[..at].chars().next_back().is_some_and(word);
-        code.match_indices(name.as_str())
-            .map(|(at, _)| at + name.len())
+        occurrences(code, &name)
+            .into_iter()
+            .map(|at| at + name.len())
             .filter(|&open| code[open..].starts_with('(') && !named(open - name.len()))
             .map(|open| &code[open..=closing(code, open).unwrap_or_else(|| panic!("the call of `{name}` at byte {open} never closes"))])
             .collect()
     }
 
-    /// How often `name` stands alone in `code`, not inside a longer name.
+    /// How often `name` stands alone in `code`, not inside a longer name or a literal.
     pub fn words(code: &str, name: &str) -> usize {
         let named = |c: Option<char>| c.is_some_and(word);
-        code.match_indices(name).filter(|(at, _)| !named(code[..*at].chars().next_back()) && !named(code[at + name.len()..].chars().next())).count()
+        occurrences(code, name).into_iter().filter(|&at| !named(code[..at].chars().next_back()) && !named(code[at + name.len()..].chars().next())).count()
     }
 
     /// A guard's failure when `place` no longer has `needle`.
