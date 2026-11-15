@@ -53,6 +53,11 @@ them with `~/.claude/ops/remote-slopbar/README.md`.
   branches are linear copies, not ancestors of `claude/subscription-value` (so `git log $h..` overcounts).
   Update `docs/ROADMAP.md` on `ultra`.
 - Never ask Layi to restart SlopBar: the install script restarts it through the door.
+- Never block on Layi with a question. A real decision gets an adversarial swarm: independent agents
+  argue the options and try to break the favourite. Adjudicate, act, and record the ruling in the
+  shared notes' `decisions.md` (memory `feedback-no-owner-questions`). Owner-only steps are queued
+  there instead, while other work carries on: credentials, sign-in pages, someone at a screen,
+  security settings, purchases, force-pushes and unrecoverable deletes.
 
 ## Known open items (re-derive; don't trust this list)
 
