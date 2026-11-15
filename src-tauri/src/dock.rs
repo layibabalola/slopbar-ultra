@@ -946,7 +946,7 @@ mod tests {
         assert_eq!(dock_span(BAR, TRAY, &o, 98, 81), (2460, 10));
     }
 
-    // UltraMagnus's Windows 10 taskbar (physical px), where the weather is a window of its own.
+    // DESK-1's Windows 10 taskbar (physical px), where the weather is a window of its own.
     const BAR10: Rect = Rect { left: 0, top: 2100, right: 3840, bottom: 2160 };
     const TRAY10: Rect = Rect { left: 3440, top: 2100, right: 3840, bottom: 2160 };
 
