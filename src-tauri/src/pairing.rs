@@ -214,6 +214,7 @@ impl Door for LocalDoor {
 }
 
 /// What a command run on another computer printed on its standard output, and its exit code.
+#[derive(Debug)]
 pub struct Ran {
     pub out: Vec<u8>,
     pub code: Option<i32>,
@@ -283,15 +284,19 @@ impl Remote for Ssh {
                 }
             }
         };
-        let err = errors.join().unwrap_or_default();
-        // 255 is ssh's own failure (no connection, key refused, unknown host key); "**" lines are
-        // its banners (a key exchange warning), not the reason.
-        if status.code() == Some(255) {
-            let first = String::from_utf8_lossy(&err).lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("**")).unwrap_or("").chars().take(200).collect::<String>();
-            return Err(format!("ssh_failed: {first}"));
-        }
-        Ok(Ran { out, code: status.code() })
+        finished(out, status.code(), &errors.join().unwrap_or_default())
     }
+}
+
+/// What a finished `ssh` gives: the command's output and exit code, or ssh's own failure.
+fn finished(out: Vec<u8>, code: Option<i32>, err: &[u8]) -> Result<Ran, String> {
+    // 255 is ssh's own failure (no connection, key refused, unknown host key); "**" lines are
+    // its banners (a key exchange warning), not the reason.
+    if code == Some(255) {
+        let first = String::from_utf8_lossy(err).lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("**")).unwrap_or("").chars().take(200).collect::<String>();
+        return Err(format!("ssh_failed: {first}"));
+    }
+    Ok(Ran { out, code })
 }
 
 /// Runs one of the target's tools through its `slopbar-mcp --call`; its answer or its error.
@@ -758,6 +763,46 @@ mod tests {
         String::from_utf16(&units).unwrap()
     }
 
+    /// The shell a remote command names, and the arguments its script gives slopbar-mcp.
+    fn parts(cmd: &str) -> (String, Vec<String>) {
+        let script = script_of(cmd);
+        let line = script.lines().find_map(|l| l.strip_prefix("$out = & $exe ")).expect("runs slopbar-mcp");
+        let mut quoted = line.strip_suffix(" | ForEach-Object { $_ }").unwrap().chars().peekable();
+        let mut args = Vec::new();
+        while let Some(c) = quoted.next() {
+            if c != '\'' {
+                continue; // the space between two arguments
+            }
+            let mut arg = String::new();
+            loop {
+                match quoted.next() {
+                    Some('\'') if quoted.peek() == Some(&'\'') => {
+                        quoted.next();
+                        arg.push('\'');
+                    }
+                    Some('\'') | None => break,
+                    Some(c) => arg.push(c),
+                }
+            }
+            args.push(arg);
+        }
+        (cmd.split(' ').next().unwrap().to_string(), args)
+    }
+
+    /// The tool and arguments a `--call-b64` asks for.
+    fn tool_asked(args: &[String]) -> Option<(String, Value)> {
+        let [flag, b64] = args else { return None };
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, b64).ok()?;
+        let ask: Value = serde_json::from_slice(&bytes).ok()?;
+        (flag == "--call-b64").then(|| (ask["tool"].as_str().unwrap_or_default().to_string(), ask["arguments"].clone()))
+    }
+
+    /// What a command asks of slopbar-mcp: the tool for `--call-b64`, else its arguments.
+    fn asked_of(cmd: &str) -> String {
+        let (_, args) = parts(cmd);
+        tool_asked(&args).map_or_else(|| args.join(" "), |(tool, _)| tool)
+    }
+
     #[test]
     fn the_remote_command_carries_no_secret_and_quotes_its_arguments() {
         let cmd = remote_command(&["--call-b64", "it's"]);
@@ -765,14 +810,26 @@ mod tests {
         let script = script_of(&cmd);
         assert!(script.contains("$out = & $exe '--call-b64' 'it''s' | ForEach-Object { $_ }"), "{script}");
         assert!(script.contains("SlopBar\\slopbar-mcp.exe"));
+        assert_eq!(parts(&cmd), ("pwsh".to_string(), vec!["--call-b64".to_string(), "it's".to_string()]));
         let fallback = fallback_command(&["--call-b64", "it's"]);
         assert!(fallback.starts_with("powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "), "{fallback}");
         assert_eq!(script_of(&fallback), script, "the same script under Windows PowerShell");
         // Nothing any remote shell (cmd, Windows PowerShell, PowerShell 7) would read as quoting or
-        // an operator: a program name, its switches and base64.
+        // an operator: a program name, its switches and base64. The arguments are only in the script.
         for c in [&cmd, &fallback] {
             assert!(c.chars().all(|ch| ch.is_ascii_alphanumeric() || " -+/=".contains(ch)), "{c}");
+            assert!(!c.contains("call-b64"), "{c}");
         }
+    }
+
+    #[test]
+    fn ssh_hands_back_the_exit_code_or_its_own_failure() {
+        let ran = finished(Vec::new(), Some(1), b"'pwsh' is not recognized as an internal or external command,\r\n").unwrap();
+        assert!(ran.out.is_empty() && ran.code == Some(1), "a program the remote shell cannot find: {ran:?}");
+        let ran = finished(b"{\"ok\":{}}\r\n".to_vec(), Some(0), b"").unwrap();
+        assert_eq!((&ran.out[..], ran.code), (&b"{\"ok\":{}}\r\n"[..], Some(0)));
+        let refused = b"** WARNING: connection is not using a post-quantum key exchange algorithm.\r\n** This session may be vulnerable.\r\nssh: connect to host box port 22: Connection refused\r\n";
+        assert_eq!(finished(Vec::new(), Some(255), refused).unwrap_err(), "ssh_failed: ssh: connect to host box port 22: Connection refused");
     }
 
     /// Another computer's shell, answering each command with the next of `replies`.
@@ -786,7 +843,9 @@ mod tests {
         fn run(&self, _host: &str, command: &str, input: &[u8]) -> Result<Ran, String> {
             self.commands.borrow_mut().push(command.into());
             self.inputs.borrow_mut().push(input.to_vec());
-            self.replies.borrow_mut().remove(0)
+            let mut replies = self.replies.borrow_mut();
+            assert!(!replies.is_empty(), "tried again: {:?}", parts(command));
+            replies.remove(0)
         }
     }
 
@@ -800,27 +859,31 @@ mod tests {
 
     #[test]
     fn windows_powershell_runs_only_where_powershell_7_never_did() {
-        let args = ["--pair-receive"];
-        let (pwsh, fallback) = (remote_command(&args), fallback_command(&args));
+        let args = ["--call-b64", "it's"];
+        let asked = vec!["--call-b64".to_string(), "it's".to_string()];
+        let tried = |there: &Scripted| there.commands.borrow().iter().map(|c| parts(c)).collect::<Vec<_>>();
         let answer = "{\"ok\":{\"paired\":true}}\r\n";
         // A shell that finds no pwsh prints nothing and exits 1 (cmd, both PowerShells) or 127
         // (a POSIX shell): the same script and input go to Windows PowerShell.
         for code in [1, 127] {
             let there = scripted(vec![ran("", code), ran(answer, 0)]);
             assert_eq!(run_there(&there, "box", &args, b"offer\n").unwrap(), answer.as_bytes());
-            assert_eq!(*there.commands.borrow(), [pwsh.clone(), fallback.clone()]);
+            assert_eq!(tried(&there), [("pwsh".to_string(), asked.clone()), ("powershell".to_string(), asked.clone())]);
             assert_eq!(*there.inputs.borrow(), [b"offer\n".to_vec(), b"offer\n".to_vec()]);
         }
         // Blank lines are still nothing.
         let there = scripted(vec![ran("\r\n", 1), ran(answer, 0)]);
         assert_eq!(run_there(&there, "box", &args, b"").unwrap(), answer.as_bytes());
+        // The second try's own failure is the outcome.
+        let there = scripted(vec![ran("", 1), Err("ssh_timeout".into())]);
+        assert_eq!(run_there(&there, "box", &args, b"").unwrap_err(), "ssh_timeout");
 
         // Once the script ran under pwsh, its outcome stands, whatever it was: an answer, an error
         // answer, SlopBar missing there, or a crash that printed nothing.
         for (out, code) in [(answer, 0), ("{\"error\":\"target_has_other_key\"}\r\n", 1), ("{\"error\":\"slopbar_not_installed\"}\r\n", 3), ("", 101), ("", 0)] {
             let there = scripted(vec![ran(out, code)]);
             assert_eq!(run_there(&there, "box", &args, b"").unwrap(), out.as_bytes(), "{out:?} {code}");
-            assert_eq!(*there.commands.borrow(), [pwsh.clone()], "never twice: {out:?} {code}");
+            assert_eq!(tried(&there), [("pwsh".to_string(), asked.clone())], "never twice: {out:?} {code}");
         }
         // SSH itself failed or timed out: nothing is tried again.
         for e in ["ssh_failed: Connection refused", "ssh_timeout"] {
@@ -831,7 +894,23 @@ mod tests {
         // Neither PowerShell there: no answer, as before.
         let there = scripted(vec![ran("", 1), ran("", 1)]);
         assert_eq!(remote_call(&there, "box", "get_app_info", &json!({})).unwrap_err(), "remote_no_answer");
-        assert!(there.commands.borrow()[0].starts_with("pwsh ") && there.commands.borrow()[1].starts_with("powershell "));
+        assert_eq!(tried(&there).iter().map(|(shell, _)| shell.as_str()).collect::<Vec<_>>(), ["pwsh", "powershell"]);
+    }
+
+    /// Whether another computer's shell runs `command`'s script: with PowerShell 7 there, only
+    /// `pwsh` is ever asked for; without it, `pwsh` is a program its shell cannot find.
+    fn shell_runs(pwsh: bool, command: &str) -> bool {
+        match (pwsh, parts(command).0.as_str()) {
+            (true, "pwsh") | (false, "powershell") => true,
+            (false, "pwsh") => false,
+            (_, shell) => panic!("{shell} asked for where PowerShell 7 answers"),
+        }
+    }
+
+    /// What the target's shell gives for a program it cannot find: nothing on standard output, exit 1
+    /// (cmd's "'pwsh' is not recognized…" goes to standard error).
+    fn not_found() -> Result<Ran, String> {
+        Ok(Ran { out: Vec::new(), code: Some(1) })
     }
 
     #[test]
@@ -895,25 +974,25 @@ mod tests {
         fn run(&self, _host: &str, command: &str, input: &[u8]) -> Result<Ran, String> {
             self.commands.borrow_mut().push(command.into());
             self.inputs.borrow_mut().push(input.to_vec());
-            if !self.pwsh && command.starts_with("pwsh ") {
-                // Its shell says "'pwsh' is not recognized…" on standard error and exits 1.
-                return Ok(Ran { out: Vec::new(), code: Some(1) });
+            if !shell_runs(self.pwsh, command) {
+                return not_found();
             }
-            assert!(!self.pwsh || command.starts_with("pwsh "), "Windows PowerShell where PowerShell 7 answers: {command}");
-            let runs = if self.pwsh { remote_command } else { fallback_command };
-            let asked = |tool: &str| command == runs(&["--call-b64", &base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, json!({ "tool": tool, "arguments": {} }).to_string())]);
-            let out = if command == runs(&["--pair-receive"]) {
-                match receive(self.target, &mut &input[..], self.target.saved.map(|s| Passphrase(s.into()))) {
+            let (_, args) = parts(command);
+            let out = match tool_asked(&args) {
+                None if args == ["--pair-receive"] => match receive(self.target, &mut &input[..], self.target.saved.map(|s| Passphrase(s.into()))) {
                     Ok(v) => json!({ "ok": if self.echo { json!({ "leak": String::from_utf8_lossy(input) }) } else { v } }),
                     Err(e) => json!({ "error": e }),
+                },
+                Some((tool, _)) if tool == "list_sharing_locations" => {
+                    let mut places = self.target.call(&Request::ListSharingLocations).unwrap();
+                    places["current"] = json!({ "presence_remote": self.target.settings["presence_remote"] });
+                    json!({ "ok": places })
                 }
-            } else if asked("list_sharing_locations") {
-                let mut places = self.target.call(&Request::ListSharingLocations).unwrap();
-                places["current"] = json!({ "presence_remote": self.target.settings["presence_remote"] });
-                json!({ "ok": places })
-            } else {
-                let location = self.target.settings["presence_remote"].is_string() || self.target.settings["presence_folder"].is_string();
-                json!({ "ok": { "app": { "running": self.running }, "roster": { "location": location } } })
+                Some((tool, _)) if tool == "get_machine_readiness" => {
+                    let location = self.target.settings["presence_remote"].is_string() || self.target.settings["presence_folder"].is_string();
+                    json!({ "ok": { "app": { "running": self.running }, "roster": { "location": location } } })
+                }
+                _ => panic!("not asked of this computer: {args:?}"),
             };
             answered(&out)
         }
@@ -932,11 +1011,13 @@ mod tests {
         busy: bool,
         /// Starting is refused with this error (its desktop is locked, say).
         refuse: Option<&'static str>,
+        /// It has PowerShell 7 (see `FakeSsh::pwsh`).
+        pwsh: bool,
         commands: RefCell<Vec<String>>,
     }
 
     fn target(link: Value) -> SharingTarget {
-        SharingTarget { link, busy: false, refuse: None, commands: RefCell::default() }
+        SharingTarget { link, busy: false, refuse: None, pwsh: true, commands: RefCell::default() }
     }
 
     fn call_b64(tool: &str, arguments: Value) -> String {
@@ -946,16 +1027,19 @@ mod tests {
     impl Remote for SharingTarget {
         fn run(&self, _host: &str, command: &str, _input: &[u8]) -> Result<Ran, String> {
             self.commands.borrow_mut().push(command.into());
-            let out = if command == remote_command(&["--sharing-state", STATE_WAIT]) {
-                json!({ "ok": self.link })
-            } else if command == call_b64("get_sharing_setup", json!({})) {
-                json!({ "ok": { "phase": "done", "found": ["DESK-2"] } })
-            } else if let Some(error) = self.refuse {
-                json!({ "error": error })
-            } else if self.busy && !command.contains(&call_b64("setup_sharing", json!({ "cancel": true }))) {
-                json!({ "error": "sharing_setup_busy" })
-            } else {
-                json!({ "ok": { "phase": "rclone" } })
+            if !shell_runs(self.pwsh, command) {
+                return not_found();
+            }
+            let (_, args) = parts(command);
+            let out = match tool_asked(&args) {
+                None if args == ["--sharing-state", STATE_WAIT] => json!({ "ok": self.link }),
+                Some((tool, _)) if tool == "get_sharing_setup" => json!({ "ok": { "phase": "done", "found": ["DESK-2"] } }),
+                Some((tool, arguments)) if tool == "setup_sharing" => match self.refuse {
+                    Some(error) => json!({ "error": error }),
+                    None if self.busy && arguments["cancel"] != true => json!({ "error": "sharing_setup_busy" }),
+                    None => json!({ "ok": { "phase": "rclone" } }),
+                },
+                _ => panic!("not asked of this computer: {args:?}"),
             };
             answered(&out)
         }
@@ -1014,6 +1098,23 @@ mod tests {
         let there = SharingTarget { busy: true, ..target(json!({ "phase": "dropbox", "state": "Ab-9_x" })) };
         assert_eq!(setup_remote_sharing(&here, &there, "box", &json!({ "open_here": true })).unwrap()["phase"], "dropbox");
         assert!(here.seen.borrow().iter().any(|r| matches!(r, Request::SharingTunnel { state: Some(_), .. })));
+    }
+
+    #[test]
+    fn a_computer_without_powershell_7_is_set_up_through_windows_powershell() {
+        let here = FakeApp::new(json!({}));
+        let there = SharingTarget { pwsh: false, ..target(json!({ "phase": "dropbox", "state": "Ab-9_x" })) };
+        let out = setup_remote_sharing(&here, &there, "box", &json!({ "open_here": true })).unwrap();
+        assert_eq!(out["phase"], "dropbox");
+        assert!(!out.to_string().contains("Ab-9_x"), "{out}");
+        assert!(here.seen.borrow().iter().any(|r| matches!(r, Request::SharingTunnel { state: Some(s), .. } if s == "Ab-9_x")));
+        // Each ask tries PowerShell 7 first, then the same one under Windows PowerShell.
+        let commands = there.commands.borrow();
+        let tried: Vec<(String, String)> = commands.iter().map(|c| (parts(c).0, asked_of(c))).collect();
+        let step = |shell: &str, asked: &str| (shell.to_string(), asked.to_string());
+        let wait = format!("--sharing-state {STATE_WAIT}");
+        assert_eq!(tried, [step("pwsh", "setup_sharing"), step("powershell", "setup_sharing"), step("pwsh", &wait), step("powershell", &wait)]);
+        assert_eq!(script_of(&commands[0]), script_of(&commands[1]));
     }
 
     #[test]
@@ -1077,17 +1178,21 @@ mod tests {
             assert_eq!(target.key_set().as_deref(), Some(key.as_str()), "the target saved the same key");
             assert_eq!(source.patches(), [json!({ "account_roster": true })]);
             assert_eq!(target.patches(), [json!({ "presence_remote": "dropbox", "account_roster": true })]);
-            // The key is in ssh's input, never in a command line or the result: once, or once for
-            // each try where the target's shell finds no pwsh (that shell exits without reading it).
+            // The key is in ssh's input, never in a command line, its script or the result: once,
+            // or once for each try where the target's shell finds no pwsh (that shell exits
+            // without reading it).
             let commands = link.commands.borrow();
-            assert!(commands.iter().all(|c| !c.contains(&key)));
+            assert!(commands.iter().all(|c| !c.contains(&key) && !script_of(c).contains(&key)));
             let carried = link.inputs.borrow().iter().filter(|i| String::from_utf8_lossy(i).contains(&key)).count();
             assert_eq!(carried, if pwsh { 1 } else { 2 }, "sent as input only");
-            if pwsh {
-                assert!(commands.iter().all(|c| c.starts_with("pwsh ")), "never Windows PowerShell where PowerShell 7 runs");
+            let tried: Vec<(String, String)> = commands.iter().map(|c| (parts(c).0, asked_of(c))).collect();
+            let asks = ["get_machine_readiness", "list_sharing_locations", "--pair-receive"];
+            let expected: Vec<(String, String)> = if pwsh {
+                asks.iter().map(|a| ("pwsh".to_string(), a.to_string())).collect()
             } else {
-                assert_eq!(commands.iter().filter(|c| c.starts_with("powershell ")).count(), 3, "readiness, sharing locations, the key: {commands:?}");
-            }
+                asks.iter().flat_map(|a| [("pwsh".to_string(), a.to_string()), ("powershell".to_string(), a.to_string())]).collect()
+            };
+            assert_eq!(tried, expected, "PowerShell 7 first, every time; Windows PowerShell never where it runs");
             let shown = result.to_string();
             assert!(!shown.contains(&key) && !shown.contains(KEY_SHOWN), "{shown}");
             assert_eq!(result["key"], "generated");
