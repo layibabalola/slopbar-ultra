@@ -57,4 +57,47 @@ mod tests {
         assert!(!is_ultra_version("0.1.0-ultra.1.2"));
         assert!(!is_ultra_version("0.1-ultra.1"));
     }
+
+    /// updates.rs without whole-line comments (a line commented out does not count), and the part
+    /// from `signature` to the first line that is `}`.
+    fn updates_rs(signature: &str) -> (String, String) {
+        let code = include_str!("updates.rs").lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let start = code.find(signature).unwrap_or_else(|| panic!("updates.rs has no `{signature}`"));
+        let end = code[start..].find("\n}").map_or(code.len(), |e| start + e + 2);
+        let body = code[start..end].to_string();
+        (code, body)
+    }
+
+    /// The pins `updater_config_is_the_ultra_channel` checks in tauri.conf.json are also in code, so
+    /// a merged config change cannot point Ultra builds back at upstream.
+    #[test]
+    fn ultra_builds_pin_the_fork_updater_in_code() {
+        let (code, updater) = updates_rs("fn updater(");
+        for pin in [
+            "#[cfg(feature = \"ultra-updates\")]",
+            ".endpoints(vec![crate::ultra_release::UPDATE_ENDPOINT",
+            ".pubkey(crate::ultra_release::PUBKEY)",
+            "crate::ultra_release::is_ultra_version(&remote.version.to_string()) && remote.version > current",
+        ] {
+            assert!(updater.contains(pin), "updater() lost `{pin}`:\n{updater}");
+        }
+        assert!(code.contains("#[cfg(feature = \"ultra-updates\")]\nconst EVERY: Duration = crate::ultra_release::CHECK_EVERY;"), "Ultra builds check every CHECK_EVERY");
+    }
+
+    /// Installs wait for token rotation as named, bounded steps: an open sign-in defers the update
+    /// before the download and again before the handover, and a refresh in progress is waited for
+    /// within its limit; the exit cleanup runs before the installer ends SlopBar.
+    #[test]
+    fn ultra_updates_wait_for_token_rotation() {
+        let (_, updater) = updates_rs("fn updater(");
+        assert!(updater.contains(".on_before_exit(move || crate::app::on_exit(&h))"), "{updater}");
+        let (_, install) = updates_rs("async fn install_now(");
+        let at = |needle: &str| install.find(needle).unwrap_or_else(|| panic!("install_now lost `{needle}`:\n{install}"));
+        let deferral = "if crate::signin::any_active() {\n        return Ok(Outcome::Deferred(SIGN_IN_OPEN.into()));";
+        assert_eq!(install.matches(deferral).count(), 2, "{install}");
+        let (first, second) = (at(deferral), install.rfind(deferral).unwrap());
+        assert!(first < at("update.download("), "a sign-in defers before anything is downloaded");
+        assert!(at("update.download(") < at("refresh_lock.lock()") && at("refresh_lock.lock()") < second && second < at("spawn_blocking("));
+        assert!(install.contains("\"Waiting for a refresh to finish\", update_check::REFRESH_WAIT_LIMIT"), "{install}");
+    }
 }
