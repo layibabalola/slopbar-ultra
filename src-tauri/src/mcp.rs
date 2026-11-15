@@ -810,8 +810,8 @@ mod tests {
                 "set_roster_passphrase" => json!({ "passphrase": "correct horse battery" }),
                 "lease_account" => json!({ "provider": "codex", "purpose": "nightly tests", "minutes": 60, "expected_percent": 5 }),
                 "release_lease" => json!({ "lease_id": "lease-1" }),
-                "pair_machine" => json!({ "ssh_host": "virtualten" }),
-                "run_on_machine" => json!({ "ssh_host": "virtualten", "tool": "get_roster" }),
+                "pair_machine" => json!({ "ssh_host": "box" }),
+                "run_on_machine" => json!({ "ssh_host": "box", "tool": "get_roster" }),
                 _ => json!({}),
             };
             assert_eq!(tool(name, args, None)["result"]["isError"], false, "{name}");
@@ -857,12 +857,12 @@ mod tests {
             ("export_csv", json!({ "path": "C:\\x" })),
             ("export_backup", json!({ "path": "C:\\x" })),
             ("pair_machine", json!({})),
-            ("pair_machine", json!({ "ssh_host": "virtualten", "key": "k" })),
-            ("run_on_machine", json!({ "ssh_host": "virtualten" })),
+            ("pair_machine", json!({ "ssh_host": "box", "key": "k" })),
+            ("run_on_machine", json!({ "ssh_host": "box" })),
             ("get_machine_readiness", json!({ "ssh_host": 1 })),
             ("get_machine_readiness", json!({ "wait_seconds": "soon" })),
             ("get_machine_readiness", json!({ "since": -1 })),
-            ("run_on_machine", json!({ "ssh_host": "virtualten", "tool": "get_roster", "arguments": [] })),
+            ("run_on_machine", json!({ "ssh_host": "box", "tool": "get_roster", "arguments": [] })),
             ("restore_backup", json!({ "path": "C:\\x", "passphrase": "p", "confirm": true })),
         ] {
             assert_eq!(tool(name, args.clone(), None)["result"]["isError"], true, "{name} {args}");
@@ -886,11 +886,11 @@ mod tests {
     #[test]
     fn a_window_s_text_reaches_the_agent_whole_but_still_plain_and_bounded() {
         let inspect: crate::door::Request = serde_json::from_value(json!({ "op": "inspect_window", "window": "settings" })).unwrap();
-        let page = format!("Accounts\n\tSigning in on VIRTUAL-TEN\u{1b}[2J\n{}", "y".repeat(30_000));
+        let page = format!("Accounts\n\tSigning in on DESK-1\u{1b}[2J\n{}", "y".repeat(30_000));
         let answer = json!({ "window": "settings", "text": page, "org": "z".repeat(2000) });
         let clean = sanitize_answer(&inspect, answer.clone());
         let text = clean["text"].as_str().unwrap();
-        assert!(text.starts_with("Accounts\n\tSigning in on VIRTUAL-TEN[2J\n"), "line breaks kept, escapes dropped");
+        assert!(text.starts_with("Accounts\n\tSigning in on DESK-1[2J\n"), "line breaks kept, escapes dropped");
         assert_eq!(text.chars().count(), WINDOW_TEXT);
         assert_eq!(clean["org"].as_str().unwrap().chars().count(), MAX_TEXT, "other strings keep the short cap");
         // Any other request's `text` is an ordinary string.
