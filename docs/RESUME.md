@@ -39,14 +39,15 @@ them with `~/.claude/ops/remote-slopbar/README.md`.
 - Feature work goes on a branch cut from `origin/claude/subscription-value`, merged back with a normal
   merge, and pushed.
 - Then merge into `ultra` in `C:\code\slopbar-worktrees\ultra`. On conflict, keep ultra's
-  `tauri.conf.json` `plugins.updater` block and re-brand visible strings. Push `ultra`, then publish
-  a release with `scripts/publish-ultra-release.ps1` on the machine with the key, or with
-  `-ViaActions` from any machine once `gh secret list -R layibabalola/slopbar-ultra` shows both
-  `ULTRA_` secrets (`docs/ULTRA-RELEASES.md`, "Publishing a release"): all machines update
-  themselves from it. Don't run `scripts\install-local-build.ps1` on a machine that takes releases,
-  because its `0.1.0` outranks every `0.1.0-ultra.<n>`.
+  `tauri.conf.json` `plugins.updater` block and re-brand visible strings. Push `ultra`, and that is
+  the last step. When the push changes what ships, the release workflow publishes the next
+  `0.1.0-ultra.<n>` by itself, and every machine installs it at its next update check
+  (`docs/ULTRA-RELEASES.md`, "Publishing a release"). Nobody publishes or installs by hand. Don't
+  run `scripts\install-local-build.ps1` on a machine that takes releases, because its `0.1.0`
+  outranks every `0.1.0-ultra.<n>`.
 - Verify on screen before calling anything done: `scripts\test-flyout-click.ps1` must PASS, and you
-  look at the PNG. Unit tests alone are not verification.
+  look at the PNG. Unit tests alone are not verification. For a change you merged, check it once the
+  release has reached this machine (`get_app_info` reports its version).
 - Each feature goes upstream as a PR to thelioo/slopbar, cut as a pinned `pr/<name>` branch and
   stacked on the previous one: cherry-pick the commits onto the previous PR's head, because the PR
   branches are linear copies, not ancestors of `claude/subscription-value` (so `git log $h..` overcounts).

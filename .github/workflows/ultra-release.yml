@@ -1,80 +1,101 @@
 name: Ultra release
 
-# SlopBar Ultra (fork-only); see docs/ULTRA-RELEASES.md. A tag ultra-v<package version>-ultra.<build>
-# pushed on its own (`pwsh scripts/publish-ultra-release.ps1 -ViaActions` pushes one) is built,
-# signed with the fork's updater key and published here, and the update channel (the ultra-latest
-# release) moves to it. The jobs run the steps of scripts/publish-ultra-release.ps1, the same steps
-# the machine with the key runs, so both publishers make and check a release alike.
+# SlopBar Ultra (fork-only); see docs/ULTRA-RELEASES.md. Every push to ultra that changes what ships
+# ($shippingPaths in scripts/publish-ultra-release.ps1) is published here as the next
+# <package>-ultra.<n>: built, signed with the fork's updater key and released, and the update channel
+# (the ultra-latest release) moves to it. Installs pick it up within 15 minutes. A tag ultra-v<version>
+# pushed on its own (`publish-ultra-release.ps1 -ViaActions`) is published the same way. The jobs run
+# the steps of scripts/publish-ultra-release.ps1, which a machine with the key can also run by hand.
 #
-# One publisher per tag: that script creates its tag together with the tag's release, so a tag that
-# arrives with a release is published already, and this workflow stands down. It also stands down
-# while the ULTRA_ signing secrets are unset.
+# One run at a time, never cancelled, so each run takes its build number after the previous one has
+# finished. A newer waiting run replaces an older waiting one, and it carries that one's commits: a
+# push is compared with the channel's release, not with the push before it. A push that changes only
+# the release tooling rehearses Check and Build without publishing.
 #
-# A push to ultra that changes the release tooling rehearses Check and Build; it publishes nothing.
+# One publisher per tag: a tag made together with its release (by the script on the key's machine,
+# or by this workflow, whose token starts no runs) arrives with that release, and this workflow
+# leaves it alone. Only a tag pushed on its own is published here.
 
 on:
   push:
-    tags: ['ultra-v*']
     branches: [ultra]
-    paths:
-      - .github/workflows/ultra-release.yml
-      - scripts/publish-ultra-release.ps1
-      - scripts/test-publish-ultra-release.ps1
-      - src-tauri/nsis/**
+    tags: ['ultra-v*']
 
-# Each tag runs on its own; a newer rehearsal replaces an older one. Publishing itself takes turns
-# (the publish job's group).
 concurrency:
-  group: ultra-release-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+  group: ultra-release
+  cancel-in-progress: false
 
 permissions: {}
 
 jobs:
+  # mode: push (publish this push to ultra), tag (publish this tag), rehearsal, or none.
   gate:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
-      publish: ${{ steps.decide.outputs.publish }}
+      mode: ${{ steps.decide.outputs.mode }}
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - id: decide
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
           HAS_KEY: ${{ secrets.ULTRA_UPDATER_KEY != '' }}
           HAS_PASSWORD: ${{ secrets.ULTRA_UPDATER_KEY_PASSWORD != '' }}
           # The release workflow of older commits reads these names and publishes without the
           # installer hook or checks, so they must never be set.
           HAS_RETIRED: ${{ secrets.ULTRA_TAURI_SIGNING_PRIVATE_KEY != '' || secrets.ULTRA_TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' }}
         run: |
-          publish=false
-          if [ "$HAS_RETIRED" = true ]; then
-            echo "::error::Delete the secrets ULTRA_TAURI_SIGNING_PRIVATE_KEY and ULTRA_TAURI_SIGNING_PRIVATE_KEY_PASSWORD: the release workflow of older commits would publish with them, without the installer checks. The key belongs in ULTRA_UPDATER_KEY (docs/ULTRA-RELEASES.md)."
+          $mode = 'none'
+          $keys = @(@($env:HAS_KEY, $env:HAS_PASSWORD) -eq 'true').Count
+          if ($env:HAS_RETIRED -eq 'true') {
+            '::error::Delete the secrets ULTRA_TAURI_SIGNING_PRIVATE_KEY and ULTRA_TAURI_SIGNING_PRIVATE_KEY_PASSWORD: the release workflow of older commits would publish with them, without the installer checks. The key belongs in ULTRA_UPDATER_KEY (docs/ULTRA-RELEASES.md).'
             exit 1
-          elif [ "$GITHUB_REF_TYPE" != tag ]; then
-            echo "::notice::Rehearsal: the release tooling changed, so Check and Build run. Nothing is published."
-          elif [ "$HAS_KEY" != true ] && [ "$HAS_PASSWORD" != true ]; then
-            echo "::notice::No ULTRA_ signing secrets, so this workflow publishes nothing. Releases come from the machine with the key."
-          elif [ "$HAS_KEY" != true ] || [ "$HAS_PASSWORD" != true ]; then
-            echo "::error::Only one of the two ULTRA_ signing secrets is set; set both (docs/ULTRA-RELEASES.md)."
-            exit 1
-          elif author=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .author.login 2>gh.err); then
-            echo "::notice::$GITHUB_REF_NAME already has its release (published by $author), so this workflow publishes nothing."
-          elif grep -q 'HTTP 404' gh.err; then
-            publish=true
-          else
-            cat gh.err >&2
-            exit 1
-          fi
-          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          }
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            if ($keys -eq 0) {
+              '::notice::No ULTRA_ signing secrets, so this workflow publishes nothing.'
+            } elseif ($keys -eq 1) {
+              '::error::Only one of the two ULTRA_ signing secrets is set; set both (docs/ULTRA-RELEASES.md).'
+              exit 1
+            } else {
+              $author = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:GITHUB_REF_NAME" --jq .author.login 2> gh.err
+              if ($LASTEXITCODE -eq 0) {
+                "::notice::$env:GITHUB_REF_NAME already has its release (published by $author), so this workflow publishes nothing."
+              } elseif ((Get-Content gh.err -Raw) -match 'HTTP 404') {
+                $mode = 'tag'
+              } else {
+                Get-Content gh.err
+                exit 1
+              }
+            }
+          } else {
+            ./scripts/publish-ultra-release.ps1 -Step Decide -Before "$env:BEFORE" -Stage "$env:RUNNER_TEMP/decide" -Repo $env:GITHUB_REPOSITORY
+            $mode = Get-Content "$env:RUNNER_TEMP/decide/mode" -Raw
+            if ($mode -eq 'push' -and $keys -ne 2) {
+              '::error::This push changes what ships, but the two ULTRA_ signing secrets are not both set (docs/ULTRA-RELEASES.md).'
+              exit 1
+            }
+            if ($mode -eq 'none') { '::notice::Nothing that ships changed since the release the channel holds.' }
+          }
+          "mode=$mode" >> $env:GITHUB_OUTPUT
+          exit 0
 
   # No secrets and a read-only token: the build runs third-party build scripts.
   build:
     needs: gate
-    if: needs.gate.outputs.publish == 'true' || github.ref_type == 'branch'
+    if: needs.gate.outputs.mode != 'none'
     runs-on: windows-latest
     permissions:
       contents: read
+    env:
+      MODE: ${{ needs.gate.outputs.mode }}
+      TAG: ${{ needs.gate.outputs.mode == 'tag' && github.ref_name || '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -90,19 +111,19 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
-      # A tag: its version, on its commit. A rehearsal: the next build number, on the ultra tip.
+      # A push: the pushed commit, under the next build number. A tag: its version, on its commit.
       - name: Check the source and version
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-        run: ./scripts/publish-ultra-release.ps1 -Step Check -Tag "$env:TAG" -Stage "$env:RUNNER_TEMP/ultra-release" -Repo $env:GITHUB_REPOSITORY
+        run: |
+          $source = if ($env:TAG) { @{ Tag = $env:TAG } } else { @{ Auto = $true } }
+          ./scripts/publish-ultra-release.ps1 -Step Check @source -Stage "$env:RUNNER_TEMP/ultra-release" -Repo $env:GITHUB_REPOSITORY
 
       # Unit tests, the installer with the hook, and the provenance and installer checks.
       - name: Build and check the installer
         shell: pwsh
         env:
-          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           # The runner's default TEMP has an 8.3 short name in it (C:\Users\RUNNER~1\...). Two pins
           # launcher tests fail under such a spelling, so the unit tests get the runner's long-named
           # temp folder, as on the owner's machines.
@@ -116,7 +137,7 @@ jobs:
         run: ./scripts/test-publish-ultra-release.ps1
 
       - name: Keep the installer for the publish job
-        if: github.ref_type == 'tag'
+        if: env.MODE != 'rehearsal'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ultra-release
@@ -131,13 +152,12 @@ jobs:
   # token that can write.
   publish:
     needs: [gate, build]
-    if: needs.gate.outputs.publish == 'true'
+    if: needs.gate.outputs.mode == 'push' || needs.gate.outputs.mode == 'tag'
     runs-on: windows-latest
     permissions:
       contents: write
-    concurrency:
-      group: ultra-release-publish
-      cancel-in-progress: false
+    env:
+      TAG: ${{ needs.gate.outputs.mode == 'tag' && github.ref_name || '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -158,10 +178,10 @@ jobs:
         env:
           ULTRA_UPDATER_KEY: ${{ secrets.ULTRA_UPDATER_KEY }}
           ULTRA_UPDATER_KEY_PASSWORD: ${{ secrets.ULTRA_UPDATER_KEY_PASSWORD }}
-        run: ./scripts/publish-ultra-release.ps1 -Step Sign -Tag $env:GITHUB_REF_NAME -Stage "$env:RUNNER_TEMP/ultra-release" -Repo $env:GITHUB_REPOSITORY
+        run: ./scripts/publish-ultra-release.ps1 -Step Sign -Tag "$env:TAG" -Stage "$env:RUNNER_TEMP/ultra-release" -Repo $env:GITHUB_REPOSITORY
 
       - name: Publish and move the update channel
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: ./scripts/publish-ultra-release.ps1 -Step Publish -Tag $env:GITHUB_REF_NAME -Stage "$env:RUNNER_TEMP/ultra-release" -Repo $env:GITHUB_REPOSITORY
+        run: ./scripts/publish-ultra-release.ps1 -Step Publish -Tag "$env:TAG" -Stage "$env:RUNNER_TEMP/ultra-release" -Repo $env:GITHUB_REPOSITORY

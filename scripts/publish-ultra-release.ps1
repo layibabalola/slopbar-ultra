@@ -1,21 +1,25 @@
 #Requires -Version 7
 <#
 Publishes a SlopBar Ultra release and moves the update channel (release ultra-latest) to it. A run
-on the owner's machine and the release workflow (.github/workflows/ultra-release.yml) run the same
-steps of this script, so they build, check, sign and publish alike. See docs/ULTRA-RELEASES.md.
+on a machine and the release workflow (.github/workflows/ultra-release.yml) run the same steps of
+this script, so they build, check, sign and publish alike. See docs/ULTRA-RELEASES.md.
 
-On the machine with the fork's updater key (%USERPROFILE%\.slopbar-ultra):
-  pwsh scripts/publish-ultra-release.ps1              # next build number
-  pwsh scripts/publish-ultra-release.ps1 -Build 7     # a given one (must be higher than any before)
-From any machine, once the two ULTRA_ secrets are set on the fork:
-  pwsh scripts/publish-ultra-release.ps1 -ViaActions  # pushes the tag; the workflow publishes it
-The workflow, on a pushed tag (one step per call, sharing the -Stage folder):
-  pwsh scripts/publish-ultra-release.ps1 -Tag <tag> -Step Check|Build|Sign|Publish -Stage <folder>
+Normally nobody runs it: every push to ultra that changes what ships ($shippingPaths) is published
+by the workflow. By hand:
+  pwsh scripts/publish-ultra-release.ps1              # on the machine with the updater key
+  pwsh scripts/publish-ultra-release.ps1 -Build 7     # a given build number (higher than any before)
+  pwsh scripts/publish-ultra-release.ps1 -ViaActions  # any machine: pushes a tag; the workflow publishes it
+The workflow, one step per call, sharing the -Stage folder:
+  -Step Decide -Before <sha>             on a push to ultra: publish, rehearse, or nothing (mode file)
+  -Step Check -Auto | -Tag <tag>         a push to ultra, or a pushed tag
+  -Step Build|Sign|Publish [-Tag <tag>]
 
-Check    The checkout is clean. On a machine: it is exactly origin/ultra, and the version takes the
-         next free build number. In the workflow: it is the tagged commit, on ultra. Either way the
-         version must be newer than the channel's, and the commit must contain the one the channel's
-         release was built from.
+Decide   Publish when anything under $shippingPaths changed since the channel's release; rehearse
+         (Check and Build only) when only the release tooling changed in this push; else nothing.
+Check    The checkout is clean. By hand: it is exactly origin/ultra. On a push: the pushed commit, on
+         ultra. Both take the next free build number, above every ultra-v tag and the channel. On a
+         tag: the tagged commit, on ultra, under the tag's version. Always: the version is newer than
+         the channel's, and the commit contains the one the channel's release was built from.
 Build    Unit tests, then the installer with ultra-updates, the installer hook that sets a running
          slopbar-mcp.exe aside, and no signing key anywhere in the environment. The executable must
          report a clean build of this commit; the installer must carry slopbar-mcp.exe with the hook.
@@ -32,7 +36,9 @@ param(
   [int]$Build = 0,
   [switch]$ViaActions,
   [string]$Tag = '',
-  [ValidateSet('All', 'Check', 'Build', 'Sign', 'Publish')]
+  [switch]$Auto,
+  [string]$Before = '',
+  [ValidateSet('All', 'Decide', 'Check', 'Build', 'Sign', 'Publish')]
   [string]$Step = 'All',
   [string]$Stage = '',
   [string]$Repo = 'layibabalola/slopbar-ultra',
@@ -43,6 +49,10 @@ $root = Split-Path -Parent $PSScriptRoot
 $tauriCli = Join-Path $root 'node_modules/@tauri-apps/cli/tauri.js'
 $channelTag = 'ultra-latest'
 $workflow = 'ultra-release.yml'
+# What ships: everything the installer is built from. A change here is published.
+$shippingPaths = @('src', 'src-tauri', 'package.json', 'pnpm-lock.yaml')
+# The release tooling: a change here alone rehearses the build.
+$toolingPaths = @('.github/workflows/ultra-release.yml', 'scripts/publish-ultra-release.ps1', 'scripts/test-publish-ultra-release.ps1')
 # The workflow hands these secrets to the Sign step alone, under the same names.
 $secretNames = @('ULTRA_UPDATER_KEY', 'ULTRA_UPDATER_KEY_PASSWORD')
 # Never to be set: the release workflow of older commits reads these names, and it publishes without
@@ -123,25 +133,52 @@ function Save-Channel {
   throw "Could not read the update channel: $message"
 }
 
-# Refuses $version unless it is newer than the channel's. Returns the channel's version, or $null
-# when there is no channel yet.
-function Assert-NewerThanChannel([string]$version) {
+# The version the channel holds, or $null when there is no channel yet.
+function Get-ChannelVersion {
   $path = Save-Channel
   if (-not $path) { return $null }
   $current = (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json).version
   if ($current -notmatch '^\d+\.\d+\.\d+-ultra\.\d+$') { throw "The channel holds $current, not an Ultra version." }
-  if (-not (Test-NewerVersion $version $current)) { throw "The channel already holds $current; $version would not be newer." }
   return $current
+}
+
+function Assert-Newer([string]$version, [string]$current) {
+  if ($current -and -not (Test-NewerVersion $version $current)) { throw "The channel already holds $current; $version would not be newer." }
+}
+
+# Refuses $version unless it is newer than the channel's, as read now. Returns the channel's version,
+# or $null when there is no channel yet.
+function Assert-NewerThanChannel([string]$version) {
+  $current = Get-ChannelVersion
+  Assert-Newer $version $current
+  return $current
+}
+
+# The commit a local tag names; it must exist.
+function Get-TagCommit([string]$name) {
+  $commit = git -C $root rev-parse -q --verify "refs/tags/$name^{commit}"
+  if ($LASTEXITCODE -ne 0 -or -not $commit) { throw "Tag $name is not in this checkout." }
+  return $commit
+}
+
+function Test-Ancestor([string]$ancestor, [string]$commit) {
+  git -C $root merge-base --is-ancestor $ancestor $commit 2>$null
+  return $LASTEXITCODE -eq 0
+}
+
+# Whether anything under $paths differs between two commits.
+function Test-Changed([string]$from, [string]$to, [string[]]$paths) {
+  git -C $root diff --quiet $from $to -- @paths
+  if ($LASTEXITCODE -gt 1) { throw "git diff $from $to failed (exit $LASTEXITCODE)." }
+  return $LASTEXITCODE -eq 1
 }
 
 # Refuses a commit that lacks the one the channel's release was built from, so a newer build
 # number can never ship older code.
 function Assert-ContainsChannel([string]$commit, [string]$current) {
   if (-not $current) { return }
-  $built = git -C $root rev-parse -q --verify "refs/tags/ultra-v$current^{commit}"
-  if ($LASTEXITCODE -ne 0 -or -not $built) { throw "The channel holds $current, but tag ultra-v$current is not in this checkout." }
-  git -C $root merge-base --is-ancestor $built $commit
-  if ($LASTEXITCODE -ne 0) { throw "$commit does not contain $built, which the channel's $current was built from." }
+  $built = Get-TagCommit "ultra-v$current"
+  if (-not (Test-Ancestor $built $commit)) { throw "$commit does not contain $built, which the channel's $current was built from." }
 }
 
 # The commit a tag on origin names, or $null when origin has no such tag.
@@ -155,11 +192,33 @@ function Get-RemoteTagCommit([string]$name) {
   return ($line -split "`t")[0]
 }
 
-function Get-HighestBuild([string]$package) {
+# The highest build number taken for this package: by an ultra-v tag on origin, or by the channel.
+function Get-HighestBuild([string]$package, [string]$current) {
   $refs = @(git -C $root ls-remote --tags origin "refs/tags/ultra-v$package-ultra.*")
   if ($LASTEXITCODE -ne 0) { throw 'Could not list the ultra-v tags on origin.' }
-  $taken = $refs | ForEach-Object { if ($_ -match "refs/tags/ultra-v$([regex]::Escape($package))-ultra\.(\d+)$") { [int]$Matches[1] } }
+  $taken = @($refs | ForEach-Object { if ($_ -match "refs/tags/ultra-v$([regex]::Escape($package))-ultra\.(\d+)$") { [int]$Matches[1] } })
+  if ($current -match '^(\d+\.\d+\.\d+)-ultra\.(\d+)$' -and $Matches[1] -eq $package) { $taken += [int]$Matches[2] }
   return [int](($taken | Measure-Object -Maximum).Maximum ?? 0)
+}
+
+# 0. On a push to ultra (the workflow): publish, rehearse or nothing. Compared with the channel's
+# release, not the previous push, so the next run catches up whatever an earlier one did not publish.
+function Invoke-Decide {
+  Invoke-Checked 'git fetch' { git -C $root fetch -q origin ultra --tags }
+  $head = (git -C $root rev-parse HEAD).Trim()
+  $current = Get-ChannelVersion
+  $built = if ($current) { Get-TagCommit "ultra-v$current" }
+  if (-not $built -or (Test-Changed $built $head $shippingPaths)) {
+    $mode = 'push'
+    $why = if ($built) { "what ships changed since $current" } else { 'no release yet' }
+  } else {
+    # The tooling alone changed in this push (or, without a usable previous commit, since the release).
+    $since = if ($Before -match '^[0-9a-f]{40}$' -and $Before -notmatch '^0+$' -and (Test-Ancestor $Before $head)) { $Before } else { $built }
+    $mode = if (Test-Changed $since $head $toolingPaths) { 'rehearsal' } else { 'none' }
+    $why = if ($mode -eq 'rehearsal') { 'only the release tooling changed' } else { "nothing that ships changed since $current" }
+  }
+  Set-Content -LiteralPath (Join-Path $stageDir 'mode') -Value $mode -NoNewline
+  Write-Output "Decision for $($head): $mode ($why)."
 }
 
 # 1. Source and version.
@@ -169,30 +228,33 @@ function Invoke-Check {
   # origin/ultra and every tag, the channel's included (a fresh fetch, whatever the checkout fetched).
   Invoke-Checked 'git fetch' { git -C $root fetch -q origin ultra --tags }
   if (git -C $root status --porcelain) { throw 'The checkout has uncommitted changes.' }
+  $head = (git -C $root rev-parse HEAD).Trim()
+  $current = Get-ChannelVersion
   if ($Tag) {
-    # The workflow publishes a pushed tag: it names the version, and the checkout is its commit.
+    # A pushed tag names the version, and the checkout is its commit.
     if ($Tag -notmatch '^ultra-v(\d+\.\d+\.\d+)-ultra\.([1-9]\d*)$') {
       throw "Tag $Tag must look like ultra-v<package version>-ultra.<build>, e.g. ultra-v$package-ultra.1."
     }
     if ($Matches[1] -ne $package) { throw "Tag $Tag says $($Matches[1]) but the package version is $package." }
     $version = "$($Matches[1])-ultra.$($Matches[2])"
     $name = $Tag
-    $head = (git -C $root rev-parse HEAD).Trim()
     $tagged = git -C $root rev-parse -q --verify "refs/tags/$Tag^{commit}"
     if ($tagged -ne $head) { throw "The checkout is $head, but tag $Tag names $($tagged ?? 'no commit here')." }
-    git -C $root merge-base --is-ancestor $head origin/ultra
-    if ($LASTEXITCODE -ne 0) { throw "$head is not on the ultra branch." }
+    if (-not (Test-Ancestor $head origin/ultra)) { throw "$head is not on the ultra branch." }
   } else {
-    # A machine releases the pushed ultra tip under the next free build number.
-    $head = (git -C $root rev-parse HEAD).Trim()
-    if ($head -ne (git -C $root rev-parse origin/ultra).Trim()) { throw "HEAD $head is not origin/ultra; release only the pushed ultra tip." }
-    $highest = Get-HighestBuild $package
+    if ($Auto) {
+      # A push to ultra: the pushed commit (ultra may have moved on since; later runs publish that).
+      if (-not (Test-Ancestor $head origin/ultra)) { throw "$head is not on the ultra branch." }
+    } elseif ($head -ne (git -C $root rev-parse origin/ultra).Trim()) {
+      throw "HEAD $head is not origin/ultra; release only the pushed ultra tip."
+    }
+    $highest = Get-HighestBuild $package $current
     $n = if ($Build -eq 0) { $highest + 1 } else { $Build }
-    if ($n -le $highest) { throw "Build $n is not higher than ultra-v$package-ultra.$highest." }
+    if ($n -le $highest) { throw "Build $n is not higher than $package-ultra.$highest, the highest taken." }
     $version = "$package-ultra.$n"
     $name = "ultra-v$version"
   }
-  $current = Assert-NewerThanChannel $version
+  Assert-Newer $version $current
   Assert-ContainsChannel $head $current
   [ordered]@{ tag = $name; version = $version; commit = $head; pushed = [bool]$Tag; channel = $current } |
     ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stageDir 'release.json')
@@ -393,7 +455,7 @@ function Invoke-ViaActions {
     if ($LASTEXITCODE -eq 0 -and $json) { $run = @($json | ConvertFrom-Json)[0] }
   }
   if (-not $run) { throw "No workflow run started for $($release.tag); see https://github.com/$Repo/actions/workflows/$workflow." }
-  Write-Output "Waiting for $($run.url) (about 20 minutes)."
+  Write-Output "Waiting for $($run.url) (usually 10 to 20 minutes; runs take turns)."
   gh run watch $run.databaseId -R $Repo --exit-status --interval 30 | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "The workflow run failed: $($run.url)" }
   $back = Save-Channel
@@ -407,13 +469,15 @@ function Invoke-ViaActions {
 # Dot-sourced (scripts/test-publish-ultra-release.ps1): define the functions only.
 if ($MyInvocation.InvocationName -eq '.') { return }
 
-if ($Tag -and ($Step -eq 'All' -or $ViaActions -or $Build)) { throw '-Tag is for the workflow: one -Step at a time, with no -Build or -ViaActions.' }
+if (($Tag -or $Auto) -and ($Step -eq 'All' -or $ViaActions -or $Build)) { throw '-Tag and -Auto are for the workflow: one -Step at a time, with no -Build or -ViaActions.' }
+if ($Tag -and $Auto) { throw 'A run publishes either a pushed tag (-Tag) or a push to ultra (-Auto).' }
 if ($ViaActions -and $Step -ne 'All') { throw '-ViaActions runs the steps it needs itself.' }
 if ($Step -ne 'All' -and -not $Stage) { throw "-Step $Step needs -Stage, the folder the steps share." }
 $stageDir = if ($Stage) { $Stage } else { Join-Path ([IO.Path]::GetTempPath()) "slopbar-ultra-release-$PID" }
 $null = New-Item -ItemType Directory -Force $stageDir
 
 switch ($Step) {
+  'Decide' { Invoke-Decide }
   'Check' { Invoke-Check }
   'Build' { Invoke-Build }
   'Sign' { Invoke-Sign }
@@ -429,3 +493,6 @@ switch ($Step) {
     Invoke-Publish
   }
 }
+# Every native exit code that matters was checked. Without this, a caller that exits with
+# $LASTEXITCODE (as GitHub's pwsh steps do) would take the last one, such as `git diff --quiet`'s 1.
+exit 0

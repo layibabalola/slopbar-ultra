@@ -176,7 +176,7 @@ try {
   Invoke-Work push -q origin ultra
   $c2 = Invoke-Work rev-parse HEAD
   $Build = 1
-  Check 'a machine refuses a build number already taken' ((Get-Refusal { Invoke-Check }) -match 'not higher than ultra-v0\.1\.0-ultra\.1')
+  Check 'a machine refuses a build number already taken' ((Get-Refusal { Invoke-Check }) -match 'not higher than 0\.1\.0-ultra\.1')
   $Build = 0
 
   # The workflow publishes a tag pushed on its own (as -ViaActions pushes it).
@@ -258,6 +258,63 @@ try {
   $secrets = @('ULTRA_UPDATER_KEY', 'ULTRA_UPDATER_KEY_PASSWORD', 'ULTRA_TAURI_SIGNING_PRIVATE_KEY')
   Check '-ViaActions refuses while a secret under a retired name exists' ((Get-Refusal { Invoke-ViaActions }) -match 'Delete ULTRA_TAURI_SIGNING_PRIVATE_KEY' -and -not (Get-OriginTag $r.tag))
 
+  # On a push to ultra the workflow decides from what changed since the channel's release.
+  function Get-Decision([string]$previous) {
+    New-Stage
+    $script:Before = $previous
+    $null = Invoke-Decide
+    Get-Content (Join-Path $stageDir 'mode') -Raw
+  }
+  function Add-Commit([string]$path, [string]$message) {
+    $file = Join-Path $work $path
+    $null = New-Item -ItemType Directory -Force (Split-Path -Parent $file)
+    Add-Content $file $message
+    Invoke-Work add -A
+    Invoke-Work commit -q -m $message
+    Invoke-Work push -q origin ultra
+    Invoke-Work rev-parse HEAD
+  }
+  $zero = '0' * 40
+  Set-ChannelVersion '0.1.0-ultra.2'
+  $base = Invoke-Work rev-parse HEAD
+  $docs = Add-Commit 'docs/notes.md' 'docs only'
+  Check 'a docs-only push publishes nothing' ((Get-Decision $base) -eq 'none' -and (Get-Decision $zero) -eq 'none')
+  $tooling = Add-Commit 'scripts/publish-ultra-release.ps1' 'tooling only'
+  Check 'a push that changes only the release tooling rehearses' ((Get-Decision $docs) -eq 'rehearsal')
+  Check '...also when the previous commit is unknown' ((Get-Decision $zero) -eq 'rehearsal')
+  $shipping = Add-Commit 'src/app.js' 'what ships'
+  Check 'a push that changes what ships publishes' ((Get-Decision $tooling) -eq 'push')
+  $later = Add-Commit 'docs/notes.md' 'docs after a fix'
+  Check 'a later docs-only push still publishes a fix not yet released' ((Get-Decision $shipping) -eq 'push')
+  # Released up to here: then a change under src-tauri alone ships.
+  Invoke-Work push -q origin "$($later):refs/tags/ultra-v0.1.0-ultra.60"
+  Set-ChannelVersion '0.1.0-ultra.60'
+  Check 'once released, nothing more ships' ((Get-Decision $docs) -eq 'rehearsal' -and (Get-Decision $later) -eq 'none')
+  Add-Commit 'src-tauri/icons/note.txt' 'a src-tauri file' | Out-Null
+  Check 'anything under src-tauri ships' ((Get-Decision $later) -eq 'push')
+  Set-ChannelVersion '0.1.0-ultra.2'
+
+  # The workflow publishes a push to ultra under the next build number, even after ultra moved on.
+  New-Stage; $Tag = ''; $Auto = $true
+  $null = Invoke-Check
+  $r = Read-StageFile 'release.json'
+  $tip = Invoke-Work rev-parse HEAD
+  Check 'a push takes the next build number, made with its release' ($r.commit -eq $tip -and -not $r.pushed -and $r.version -eq "0.1.0-ultra.$((Get-HighestBuild '0.1.0' '') + 1)")
+  Invoke-Work checkout -q --detach $shipping
+  New-Stage
+  $null = Invoke-Check
+  Check 'a push is published even when ultra has moved on' ((Read-StageFile 'release.json').commit -eq $shipping)
+  Invoke-Work commit -q --allow-empty -m 'not on ultra'
+  New-Stage
+  Check 'a commit that is not on ultra is refused' ((Get-Refusal { Invoke-Check }) -match 'not on the ultra branch')
+  Invoke-Work checkout -q ultra
+  $Auto = $false
+  Check 'the build number counts the channel too' ((Get-HighestBuild '0.1.0' '0.1.0-ultra.70') -eq 70 -and (Get-HighestBuild '0.1.0' '0.2.0-ultra.90') -lt 70)
+  $publisher = Join-Path $PSScriptRoot 'publish-ultra-release.ps1'
+  $both = pwsh -NoProfile -File $publisher -Step Check -Tag ultra-v0.1.0-ultra.1 -Auto -Stage (Join-Path $tmp 'args') 2>&1 | Out-String
+  $all = pwsh -NoProfile -File $publisher -Auto -Stage (Join-Path $tmp 'args') 2>&1 | Out-String
+  Check 'a run is either a tag or a push, one step at a time' ($both -match 'either a pushed tag' -and $all -match 'one -Step at a time')
+
   # Sign, with a throwaway key: the real signer, its password handoff and the key check.
   if (Test-Path $tauriCli) {
     # (Not $keyDir: PowerShell names ignore case, and $KeyDir is the publisher's.)
@@ -298,3 +355,4 @@ try {
 }
 if ($failures) { Write-Output "$failures failed"; exit 1 }
 Write-Output 'all passed'
+exit 0

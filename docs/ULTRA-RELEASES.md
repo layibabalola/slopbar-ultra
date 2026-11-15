@@ -9,7 +9,7 @@ itself from them only. This is fork-only: it lives on the `ultra` branch and nev
 | Build | How it is made | Updates |
 | --- | --- | --- |
 | Local build (`scripts/install-local-build.ps1`) | `cargo build --release --features tauri/custom-protocol` | Manual only ("Manual updates only in this build") |
-| Ultra release | `scripts/publish-ultra-release.ps1`: on the machine with the key, or through the workflow on a pushed `ultra-v*` tag once its secrets are set | Automatic, from this fork only |
+| Ultra release | `.github/workflows/ultra-release.yml`, by itself, on every push to `ultra` that changes what ships (or `scripts/publish-ultra-release.ps1` by hand) | Automatic, from this fork only |
 | Upstream SlopBar | upstream's `release.yml` with `upstream-updates` | From `thelioo/slopbar` |
 
 - **Feature `ultra-updates`** (`src-tauri/Cargo.toml`) turns on automatic updates for Ultra
@@ -21,8 +21,8 @@ itself from them only. This is fork-only: it lives on the `ultra` branch and nev
   channel to itself.
 - **Fork key.** Updates must be signed with the fork's own updater key (key id
   `593D8A8B75A9A204`). Its public key is in `tauri.conf.json` and `src-tauri/src/ultra_release.rs`.
-  The private key is only on the owner's machine (BACHELOR) and, once they are added, in the fork's
-  `ULTRA_` secrets.
+  The private key is only on the owner's machine (BACHELOR) and in the fork's `ULTRA_UPDATER_KEY`
+  secrets.
 - **An Ultra install never updates to upstream SlopBar**, because of three separate checks:
   1. `updates.rs` pins the Ultra channel URL and fork key in code under `ultra-updates`, so a
      config change merged from upstream can't point the app back at `thelioo/slopbar`.
@@ -37,21 +37,30 @@ itself from them only. This is fork-only: it lives on the `ultra` branch and nev
 
 The package version stays as it is (`tauri.conf.json` `version`, currently `0.1.0`). An Ultra
 release adds a build suffix: version `0.1.0-ultra.<n>`, tag `ultra-v0.1.0-ultra.<n>`, release name
-`SlopBar Ultra 0.1.0-ultra.<n>`. `<n>` must go up with every release; the script picks the next free
-one. A release must also be newer than the channel's, and its commit must contain the one the
-channel's release was built from, so a higher number can never ship older code.
+`SlopBar Ultra 0.1.0-ultra.<n>`. `<n>` goes up with every release: each one takes the next free
+number, above every `ultra-v` tag and the channel's. A release must also be newer than the
+channel's, and its commit must contain the one the channel's release was built from, so a higher
+number can never ship older code.
 
 ## Publishing a release
 
-There are two ways to publish, and both run the same steps of `scripts/publish-ultra-release.ps1`,
-so they build and check a release alike:
+Releases publish themselves. Every push to `ultra` that changes what ships (anything under `src/`,
+`src-tauri/`, `package.json` or `pnpm-lock.yaml`) is published by `.github/workflows/ultra-release.yml`
+as the next `0.1.0-ultra.<n>`, and installed copies take it at their next check. A push that changes
+only docs, the roadmap or the README publishes nothing. After merging into `ultra` and pushing,
+nothing is left to do. To watch: `gh run list -R layibabalola/slopbar-ultra --workflow ultra-release.yml`.
+
+Installed copies pick the release up at their next check: about 20 seconds after SlopBar starts,
+then every 6 hours. A restart through the door (`restart_app`) makes the check happen now.
+
+The workflow runs the steps of `scripts/publish-ultra-release.ps1`. The script also publishes by
+hand, for example while Actions is down:
 
 - **On the machine with the key** (`%USERPROFILE%\.slopbar-ultra\updater.key`, BACHELOR), the
-  script builds, signs and publishes on that machine. No GitHub secret is needed.
-- **From any machine**, once the two `ULTRA_` secrets are set (below), `-ViaActions` pushes the tag
-  and `.github/workflows/ultra-release.yml` builds, signs and publishes it.
+  script builds, signs and publishes on that machine.
+- **From any machine**, `-ViaActions` pushes a tag, and the workflow publishes it.
 
-Run the script in a clean checkout whose `HEAD` is the pushed `origin/ultra`. A detached worktree
+By hand, run it in a clean checkout whose `HEAD` is the pushed `origin/ultra`. A detached worktree
 keeps the working `ultra` checkout free. Make it once per machine with
 `git -C C:\code\slopbar worktree add --detach C:\code\slopbar-worktrees\ultra-release origin/ultra`,
 then:
@@ -61,7 +70,7 @@ git -C C:\code\slopbar-worktrees\ultra-release fetch -q origin
 git -C C:\code\slopbar-worktrees\ultra-release checkout -q --detach origin/ultra
 # On the machine with the key:
 pwsh C:\code\slopbar-worktrees\ultra-release\scripts\publish-ultra-release.ps1
-# On any machine, once the secrets exist:
+# On any machine:
 pwsh C:\code\slopbar-worktrees\ultra-release\scripts\publish-ultra-release.ps1 -ViaActions
 ```
 
@@ -69,9 +78,15 @@ On a machine without the key, the first form stops before building and suggests 
 
 The steps:
 
-1. **Check.** The checkout is clean and exactly `origin/ultra`. The version takes the next free
-   build number. It must be newer than the channel's version, and the commit must contain the
-   channel's.
+0. **Decide** (the workflow, on a push to `ultra`). It publishes when anything that ships changed
+   since the release the channel holds. It rehearses (Check and Build, nothing kept) when only the
+   release tooling changed in this push: the workflow, the script or its test. Otherwise it does
+   nothing.
+1. **Check.** The checkout is clean. By hand it must be exactly `origin/ultra`. On a push, it is the
+   pushed commit, which must be on `ultra`. In both cases the version takes the next free build
+   number, above every `ultra-v` tag and the channel's. On a tag, it is the tagged commit, on
+   `ultra`, under the tag's version. Always: the version must be newer than the channel's, and the
+   commit must contain the channel's.
 2. **Build.** Unit tests, then `tauri build --features ultra-updates --config <override>`. The
    override sets the version, leaves the updater signature to step 3, and adds the installer hook
    for `slopbar-mcp.exe` (below). No signing variable is in the build's environment. The
@@ -86,47 +101,44 @@ The steps:
    again before moving, so it never goes back if another release moved it in the meantime.
 
 `-ViaActions` runs Check on your machine and makes sure both secrets exist. It then pushes the tag
-`ultra-v<version>` at `origin/ultra`, waits for the workflow run (about 20 minutes), and confirms
-that the channel then holds the version. You can push a tag by hand
+`ultra-v<version>` at `origin/ultra`, waits for the workflow run (usually 10 to 20 minutes), and
+confirms that the channel then holds the version. You can push a tag by hand
 (`git push origin origin/ultra:refs/tags/ultra-v0.1.0-ultra.<n>`), but then nothing picks the
 number or waits for the result.
 
-Installed copies pick the release up at their next check: about 20 seconds after SlopBar starts,
-then every 6 hours. A restart through the door (`restart_app`) makes the check happen now.
+### Order, and one publisher per release
 
-### One publisher per tag
+- **One run at a time.** The workflow's runs take turns and are never cancelled, so each takes its
+  build number after the previous one has finished. Two quick pushes publish one after the other
+  and never collide. While one run works, a newer push replaces an older waiting one, and it
+  publishes both, because every run compares with the channel's release, not with the push before.
+- **Tags.** A push's release and its tag appear together. The workflow makes them, and its token
+  starts no further runs. The script on the key's machine also makes its tag together with the
+  release, so the workflow finds the release on that tag and stands down. Only a tag pushed on its
+  own (`-ViaActions`) arrives without a release, and the workflow publishes it.
+- **Backstops.** `gh release create` refuses a tag that already has a release. On a pushed tag the
+  workflow also passes `--verify-tag`, so it never makes one. Every publisher refuses a tag that
+  appeared on `origin` while it was building, and checks the channel right before moving it.
 
-- When the script runs on the machine with the key, it creates the tag together with its release:
-  `gh release create` makes the tag only as it publishes the release. The workflow starts on that
-  tag too, finds the release, and stands down.
-- A tag pushed on its own has no release, so the workflow publishes it.
-- Until both `ULTRA_` secrets exist, the workflow stands down on every tag.
-
-Backstops: `gh release create` refuses a tag that already has a release (the workflow also passes
-`--verify-tag`, so it never makes a tag). The script refuses a tag that appeared on `origin` while
-it was building, because the workflow publishes that one.
-
-If a run fails after it created the release, publish the next build number. A re-run would find the
-release and stand down. A run that failed before that point can be re-run.
+If a run fails, the next push that changes what ships publishes everything pending, and so does
+re-running the failed run. A run on a tag that already has its release only stands down.
 
 ### The workflow
 
 `.github/workflows/ultra-release.yml` has three jobs:
 
-- `gate` takes a few seconds and stands down in the cases above.
+- `gate` takes seconds. On a push it runs Decide; on a tag, the stand-down checks above. It fails
+  while a secret under a retired name exists (below).
 - `build` runs on Windows with no secrets and a read-only token, because the build runs third-party
   build scripts. It runs Check and Build, then the publisher's offline tests, and keeps the
-  installer for `publish`.
+  installer for `publish` (except in a rehearsal).
 - `publish` runs on a fresh Windows runner. It installs the signer from the lockfile, then runs
   Sign, the only step that gets the secrets, and Publish, the only step whose token can write.
 
-A push to `ultra` that changes the release tooling (the workflow, the script, its test or
-`src-tauri/nsis/`) runs `gate` and `build` as a rehearsal. Nothing is kept or published.
+### What still differs between the workflow and a run by hand
 
-### What still differs between the two
-
-- **Which commit.** The script releases its checkout, which must be exactly `origin/ultra`. The
-  workflow releases the tagged commit, which must be on `ultra` and contain the channel's commit.
+- **Which commit.** By hand, the checkout, which must be exactly `origin/ultra`. The workflow
+  releases the pushed or tagged commit, which must be on `ultra` and contain the channel's commit.
 - **The key.** The script reads the key and password files. The workflow gets both from the
   secrets. Either way only the signer receives them, and the signature's key id is checked the same
   way.
@@ -159,9 +171,9 @@ local build reports version `0.1.0`, which SemVer ranks above every `0.1.0-ultra
 can't update itself. So that machine stops taking releases until a release build is installed over
 it again.
 
-### Add the GitHub secrets (to publish from any machine)
+### The GitHub secrets
 
-Run this on the machine with the key. The keypair was generated on 2026-10-22 and lives outside the
+The workflow signs with two secrets. To set or replace them, run this on the machine with the key. The keypair was generated on 2026-10-22 and lives outside the
 repository, readable only by your Windows user:
 
 - `%USERPROFILE%\.slopbar-ultra\updater.key`: private key (encrypted with the password)
