@@ -541,8 +541,8 @@ mod tests {
     }
 
     /// `settings_lock` is never held while anything waits: `store_settings` cannot wait (it is no
-    /// async fn), takes the lock's guard and lets go of it, and never refreshes; nothing refreshes
-    /// between taking the lock and handing it to `store_settings`.
+    /// async fn), takes the lock's guard and lets go of it, and never refreshes; nothing waits (for
+    /// I/O, a refresh or anything else) between taking the lock and handing it to `store_settings`.
     #[test]
     fn nothing_waits_while_holding_settings_lock() {
         let app = normalized(include_str!("app.rs"));
@@ -564,6 +564,7 @@ mod tests {
             for call in refreshes {
                 assert!(!held.contains(call), "a refresh (`{call}`) while settings_lock is held:\n{held}");
             }
+            assert!(!held["settings_lock.lock().await".len()..].contains(".await"), "a wait while settings_lock is held:\n{held}");
             assert!(app[store..].starts_with("store_settings(&app,held,") || app[store..].starts_with("store_settings(app,held,"), "the lock goes with the change:\n{}", around(&app, store, 80));
         }
         assert_eq!(taken, 7, "save_settings, update_settings, apply_backup, remove_one, set_project_pin, the compact toggle, the sharing setup");
