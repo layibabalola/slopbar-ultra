@@ -51,7 +51,9 @@ only docs, the roadmap or the README publishes nothing. After merging into `ultr
 nothing is left to do. To watch: `gh run list -R layibabalola/slopbar-ultra --workflow ultra-release.yml`.
 
 Installed copies pick the release up at their next check: about 20 seconds after SlopBar starts,
-then every 6 hours. A restart through the door (`restart_app`) makes the check happen now.
+then every 15 minutes (`ultra_release::CHECK_EVERY`; upstream builds keep 6 hours). So a fix reaches
+every machine about 10 minutes for the build plus at most 15 for the check after the push. To have
+every machine install now, run `pwsh scripts/fleet-slopbar.ps1 -UpdateNow` (below).
 
 The workflow runs the steps of `scripts/publish-ultra-release.ps1`. The script also publishes by
 hand, for example while Actions is down:
@@ -216,14 +218,42 @@ The names matter:
 2. Run it. The installer is per-user and needs no admin rights. It's unsigned (see below), so
    SmartScreen may say "Windows protected your PC": choose **More info → Run anyway**.
 3. Sign in to accounts in SlopBar Ultra as usual. On a fresh install, "Update automatically" is
-   on by default (Settings → Updates). The app
-   checks about 20 seconds after launch and then every 6 hours, and installs Ultra releases
-   quietly.
+   on by default (Settings → Updates). The app checks about 20 seconds after launch and then every
+   15 minutes, and installs Ultra releases quietly.
 
 On a machine that already runs a local build (`scripts/install-local-build.ps1`), installing a
 release over it makes updates possible. The saved settings keep "Update automatically" off,
 though, so turn it on under Settings → Updates. Running the local install script again later puts
 back a manual build.
+
+## The fleet
+
+`scripts/fleet-slopbar.ps1` reports every machine's SlopBar Ultra against the channel, and
+`-UpdateNow` makes each machine that is behind install the channel's release now, then waits until it
+reports the new version:
+
+```powershell
+pwsh scripts/fleet-slopbar.ps1
+pwsh scripts/fleet-slopbar.ps1 -UpdateNow
+```
+
+- **Machines:** this one, plus each stanza with a `HostName` in the managed block of `~/.ssh/config`
+  (between `# >>> fleet-ssh managed block` and `# <<< fleet-ssh managed block <<<`). No host names
+  or addresses are in the repository.
+- **How it asks:** each machine's own `slopbar-mcp.exe --call` (`get_app_info`, `get_settings`,
+  `install_update`), all machines at once. Over ssh the command is
+  `cmd /d /c if exist <door> <door> --call <tool>`, which works under a PowerShell or cmd remote
+  shell as long as the profile path has no spaces. ssh runs through `Start-Process` with its output
+  in files, a timeout and a tree kill, because on some machines an `ssh.exe` whose output is piped
+  never exits.
+- **What it reports:** version, "Update automatically", and current, behind or not installed. A
+  machine without SlopBar is "not installed", not an error.
+- **Problems (exit code 1):**
+  - a local build (a version without `-ultra.`, which takes no releases),
+  - a build without updates,
+  - "Update automatically" off,
+  - a machine that does not answer,
+  - an update that does not arrive within 5 minutes.
 
 ## Optional: Authenticode signing (paid, not purchased)
 

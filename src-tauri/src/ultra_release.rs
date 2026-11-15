@@ -11,6 +11,12 @@ pub const UPDATE_ENDPOINT: &str =
 #[cfg_attr(not(feature = "ultra-updates"), allow(dead_code))]
 pub const PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU5M0Q4QThCNzVBOUEyMDQKUldRRW9xbDFpNG85V1FlWnB3SUlyYjVqa1JvaFJQSll2SmxGeUVaajZBRktlZSsva2grVUJKSjkK";
 
+/// How often Ultra release builds look for an update after the first check; upstream builds look
+/// every 6 hours. Every push to `ultra` that changes what ships is published by itself, so a fix
+/// reaches every machine within a quarter of an hour of its release.
+#[cfg_attr(not(feature = "ultra-updates"), allow(dead_code))]
+pub const CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 /// Ultra versions are `<package version>-ultra.<build>`; anything else is not an Ultra release.
 #[cfg_attr(not(feature = "ultra-updates"), allow(dead_code))]
 pub fn is_ultra_version(version: &str) -> bool {
@@ -33,6 +39,12 @@ mod tests {
         assert_eq!(updater["endpoints"], serde_json::json!([UPDATE_ENDPOINT]));
         assert_ne!(PUBKEY, UPSTREAM_PUBKEY);
         assert!(!updater.to_string().contains("thelioo"));
+    }
+
+    #[test]
+    fn ultra_builds_check_every_quarter_hour() {
+        // The owner asked for checks every 15 to 30 minutes instead of every 6 hours.
+        assert_eq!(CHECK_EVERY, std::time::Duration::from_secs(15 * 60));
     }
 
     #[test]

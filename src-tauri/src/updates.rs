@@ -9,7 +9,12 @@ use tauri_plugin_updater::UpdaterExt;
 use crate::AppState;
 
 const FIRST_CHECK: Duration = Duration::from_secs(20);
+/// Upstream builds look for an update every 6 hours; Ultra release builds every 15 minutes
+/// (`ultra_release::CHECK_EVERY`), because their releases publish themselves.
+#[cfg(not(feature = "ultra-updates"))]
 const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+#[cfg(feature = "ultra-updates")]
+const EVERY: Duration = crate::ultra_release::CHECK_EVERY;
 
 #[derive(Clone, Serialize)]
 pub struct UpdateInfo {
@@ -61,7 +66,7 @@ pub async fn install(app: &AppHandle) -> Result<(), String> {
     app.restart();
 }
 
-/// Checks shortly after launch and then every few hours; installs when auto-update is on.
+/// Checks shortly after launch and then every `EVERY`; installs when auto-update is on.
 pub async fn run_loop(app: AppHandle) {
     tokio::time::sleep(FIRST_CHECK).await;
     loop {
