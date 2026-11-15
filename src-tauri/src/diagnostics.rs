@@ -501,6 +501,9 @@ pub struct Recorder {
     path: PathBuf,
     shared: Arc<Shared>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// How long `flush` waits for the writer: FLUSH_WAIT. Only tests wait longer, to read what an
+    /// export's own flush wrote however starved their run.
+    flush_wait: Duration,
 }
 pub struct Context {
     pub recorder: std::sync::Arc<Recorder>,
@@ -553,6 +556,7 @@ impl Recorder {
             path,
             shared,
             worker,
+            flush_wait: FLUSH_WAIT,
         }
     }
     // Start only in Tauri setup, AFTER single-instance handling. A second launch
@@ -709,13 +713,13 @@ impl Recorder {
             }
         }
     }
-    // Only export/shutdown wait for the background writer, and FLUSH_WAIT at most. Auth callers
-    // merely notify it.
+    // Only export/shutdown wait for the background writer, and FLUSH_WAIT (`flush_wait`) at most.
+    // Auth callers merely notify it.
     pub(crate) fn flush(&self) {
         if self.worker.is_none() {
             return;
         }
-        let deadline = Instant::now() + FLUSH_WAIT;
+        let deadline = Instant::now() + self.flush_wait;
         let mut s = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let target = s.generation;
         s.urgent_through = target;
@@ -1155,6 +1159,30 @@ mod crash_tests {
     }
 }
 
+/// How long a test waits at most for what a starved run only makes slow (the writer catching up,
+/// a thread getting to run, a server getting its request): no working code takes this long, so the
+/// wait ends a broken run rather than hangs it, and a slow one never fails.
+#[cfg(test)]
+pub(crate) const PATIENT: Duration = Duration::from_secs(5 * 60);
+
+#[cfg(test)]
+impl Recorder {
+    /// Flushes until the writer has written all that was recorded before. A flush waits FLUSH_WAIT
+    /// at most, which a starved run can outlast, so a test that reads what was written drains; it
+    /// fails after PATIENT, rather than hang, if the writer never catches up.
+    pub(crate) fn drain(&self) {
+        let target = self.shared.state.lock().unwrap().generation;
+        let deadline = Instant::now() + PATIENT;
+        loop {
+            self.flush();
+            if self.shared.state.lock().unwrap().completed >= target {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the journal's writer never caught up");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1273,7 +1301,7 @@ mod tests {
             origin: Origin::Monitoring,
             evidence: crate::providers::evidence::capture(crate::providers::evidence::Endpoint::CodexResetDetails, 200, &raw),
         });
-        r.flush();
+        r.drain();
         #[cfg(windows)]
         assert!(!std::fs::read(dir.0.join("history"))
             .unwrap()
@@ -1374,6 +1402,47 @@ mod tests {
         assert!(r.shared.state.lock().unwrap().history.clean_shutdown, "the shutdown is still recorded");
         drop(release);
     }
+    /// The cap leaves an ordinary write time to finish. The tests drain rather than trust one
+    /// flush, so nothing else would notice a cap cut too short: an exit, or an export, that keeps
+    /// none of what it just recorded.
+    #[test]
+    fn the_flush_cap_leaves_an_ordinary_write_time_to_finish() {
+        assert!(FLUSH_WAIT >= Duration::from_secs(1), "FLUSH_WAIT is {FLUSH_WAIT:?}");
+    }
+    #[test]
+    fn a_new_recorder_waits_flush_wait_for_its_writer() {
+        let dir = TempDir::new();
+        assert_eq!(Recorder::new(dir.0.join("history")).flush_wait, FLUSH_WAIT);
+    }
+    /// A flush keeps to its recorder's cap, not to FLUSH_WAIT. With a longer cap, and the writer
+    /// stuck in its first save until FLUSH_WAIT has passed, a flush that kept to FLUSH_WAIT would
+    /// return before the save is let go, and one that keeps to its cap returns after. Which came
+    /// first decides it, not how long anything took.
+    #[test]
+    fn a_flush_keeps_to_its_recorders_cap() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let dir = TempDir::new();
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let first = std::cell::Cell::new(true);
+        let mut r = Recorder::with_writer(dir.0.join("history"), move |_, _| {
+            if first.replace(false) {
+                let _ = stuck.recv_timeout(PATIENT);
+            }
+            true
+        });
+        r.flush_wait = PATIENT;
+        r.start();
+        let released = Arc::new(AtomicBool::new(false));
+        let flag = released.clone();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(FLUSH_WAIT + Duration::from_secs(1));
+            flag.store(true, SeqCst);
+            drop(release);
+        });
+        r.flush();
+        assert!(released.load(SeqCst), "the flush gave up at FLUSH_WAIT instead of at its recorder's cap");
+        releaser.join().unwrap();
+    }
     #[test]
     fn rotation_corruption_and_disk_failure_are_visible_and_nonfatal() {
         let dir = TempDir::new();
@@ -1393,6 +1462,8 @@ mod tests {
             s.history.events = VecDeque::from(vec![old; MAX_EVENTS + 1]);
         }
         r.record(None, None, Event::Shutdown);
+        // Its flush may give up first, and the file goes next: no write may be under way then.
+        r.drain();
         assert_eq!(r.shared.state.lock().unwrap().history.events.len(), 1);
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
@@ -1403,7 +1474,7 @@ mod tests {
                 gap_seconds: Some(900),
             },
         );
-        r.flush();
+        r.drain();
         let report: serde_json::Value = serde_json::from_slice(
             &r.report(&Snapshot::default(), &Settings::default())
                 .unwrap(),
@@ -1651,10 +1722,17 @@ mod tests {
     fn ordinary_polls_do_not_rewrite_the_journal_and_export_drains_the_writer() {
         let dir = TempDir::new();
         let path = dir.0.join("history");
-        let r = Recorder::new(path.clone());
+        // The writer also writes once FLUSH_INTERVAL has passed, never sooner after it started: a
+        // run starved for that long checks only what such a write cannot change.
+        let since = Instant::now();
+        let mut r = Recorder::new(path.clone());
+        // What the export reports is read after its own flush, which then waits for the writer
+        // however starved the run.
+        r.flush_wait = PATIENT;
         r.start();
-        r.flush();
+        r.drain();
         let writes = r.shared.state.lock().unwrap().write_attempts;
+        let urgent = r.shared.state.lock().unwrap().urgent_through;
         let on_disk = std::fs::read(&path).unwrap();
         for _ in 0..100 {
             r.poll_started(5);
@@ -1674,14 +1752,20 @@ mod tests {
                 },
             );
         }
-        assert_eq!(r.shared.state.lock().unwrap().write_attempts, writes);
-        assert_eq!(std::fs::read(&path).unwrap(), on_disk);
+        // Whether a record asks the writer to write now is settled as it is recorded, whatever the
+        // writer does next: no ordinary poll does.
+        assert_eq!(r.shared.state.lock().unwrap().urgent_through, urgent, "an ordinary poll asked for a write");
+        let (attempts, polled) = (r.shared.state.lock().unwrap().write_attempts, std::fs::read(&path).unwrap());
         let export = r
             .export(&Snapshot::default(), &Settings::default())
             .unwrap();
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(export).unwrap()).unwrap();
-        assert_eq!(report["journal_write_attempts"], writes + 1);
+        if since.elapsed() < FLUSH_INTERVAL {
+            assert_eq!(attempts, writes, "ordinary polls wrote the journal");
+            assert!(polled == on_disk, "ordinary polls rewrote the journal");
+            assert_eq!(report["journal_write_attempts"], writes + 1);
+        }
         assert!(report["suppressed_observations"].as_u64().unwrap() > 200);
         let history: History =
             serde_json::from_slice(&private_store::load_secret(&path).unwrap()).unwrap();
@@ -1696,7 +1780,7 @@ mod tests {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let first = std::cell::Cell::new(true);
-        let r = Arc::new(Recorder::with_writer(
+        let mut recorder = Recorder::with_writer(
             dir.0.join("history"),
             move |path, bytes| {
                 if first.replace(false) {
@@ -1705,9 +1789,15 @@ mod tests {
                 }
                 private_store::save_secret(path, bytes).is_ok()
             },
-        ));
+        );
+        // A record that waited for the writer would wait past the wait for it below, so it could
+        // not pass by waiting FLUSH_WAIT and returning.
+        recorder.flush_wait = PATIENT * 2;
+        let r = Arc::new(recorder);
+        // Dropped before the recorder, whose drop waits for its writer: a failure never hangs.
+        let release_tx = release_tx;
         r.start();
-        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        entered_rx.recv_timeout(PATIENT).expect("the writer starts its first save");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let observer = r.clone();
         let auth = std::thread::spawn(move || {
@@ -1722,14 +1812,16 @@ mod tests {
             );
             done_tx.send(()).unwrap();
         });
-        let result = done_rx.recv_timeout(Duration::from_secs(3));
+        // The writer stays in its save until the record has returned, however long a starved run
+        // takes to get it there; one that waited for the writer would not return before this ends.
+        let result = done_rx.recv_timeout(PATIENT);
         release_tx.send(()).unwrap();
         auth.join().unwrap();
         assert!(
             result.is_ok(),
             "authentication waited for diagnostic disk I/O"
         );
-        r.flush();
+        r.drain();
         let s = r.shared.state.lock().unwrap();
         assert_eq!(s.completed, s.generation);
         assert!(s
