@@ -71,8 +71,9 @@ async fn diagnostic_refresh_trace_is_secret_free_and_recording_failure_cannot_br
     assert_eq!(monitor.token_with(&expected, &transport, None, now()).await.err().as_deref(), Some("monitor_network"));
     assert_eq!(monitor.token_with(&expected, &transport, None, now() + chrono::Duration::minutes(6)).await.unwrap().0, "PRIVATE-new-access");
     // Storage failures are recorded asynchronously; wait for this write before
-    // asserting its result rather than racing the diagnostic worker.
-    recorder.flush();
+    // asserting its result rather than racing the diagnostic worker. A flush waits
+    // FLUSH_WAIT at most, which a starved run can outlast, so drain.
+    recorder.drain();
     let report = String::from_utf8(recorder.report(&crate::model::Snapshot::default(), &crate::settings::Settings::default()).unwrap()).unwrap();
     for private in ["PRIVATE", "monitor-access-1", "monitor-refresh-1", "cli-refresh", "account:org", "test@example.invalid"] { assert!(!report.contains(private)); }
     let data: serde_json::Value = serde_json::from_str(&report).unwrap();
@@ -991,8 +992,11 @@ mod http {
                 thread: Some(thread),
             }
         }
+        /// The next request the server read. It is sent before the reply, so it is there at once
+        /// for a client that got one; a starved run may only be slow to get it here, so the wait
+        /// is long, and a server that gave up ends it at once.
         fn request(&self) -> String {
-            self.requests.recv_timeout(Duration::from_secs(3)).unwrap()
+            self.requests.recv_timeout(crate::diagnostics::PATIENT).unwrap_or_else(|e| panic!("the server never got the request: {e}"))
         }
     }
     impl Drop for Server {
