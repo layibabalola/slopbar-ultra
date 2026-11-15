@@ -19,7 +19,9 @@ LastCheck is each machine's last update check (get_app_info's update_check): how
 and what it found, why it was deferred, or its error, cut to 40 characters; the table is followed
 by each one that was cut, in full. A build from before that record shows n/a there, which is no
 problem in itself, because machines update one by one. The limits below come from each machine's own
-record: its update interval and the limit of one pass of its update loop.
+record: its update interval and the limit of one pass of its update loop. A machine that reports
+none (a build from before the record) is judged by Ultra's own two values ($OldBuildInterval and
+$OldBuildPassLimit below), which the test reads from the Rust source, failing when they differ.
 
 Problems (exit code 1): a local build (a version without -ultra., which takes no releases), a build
 without updates, "Update automatically" off, a machine that does not answer, an update that does not
@@ -48,8 +50,11 @@ param(
 $ErrorActionPreference = 'Stop'
 $here = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [Environment]::MachineName }
 $door = '%LOCALAPPDATA%\SlopBar\slopbar-mcp.exe'
-# A build from before the update-check record has neither: Ultra's update interval and the pass
-# limit of the updater that records it, in seconds.
+# What a machine that does not report them is judged by, in seconds: Ultra's update interval
+# (ultra_release::CHECK_EVERY) and the limit of one pass of the update loop (update_check::PASS_LIMIT).
+# A build from before the update-check record has neither, and a record from before the limit has no
+# limit. A machine that reports its own is judged by those. scripts/test-fleet-slopbar.ps1 reads both
+# constants from the Rust source and fails when these two differ, so change them together.
 $OldBuildInterval = 900
 $OldBuildPassLimit = 2140
 
@@ -128,8 +133,8 @@ function Get-Short([string]$text, [int]$max = 40) {
 # a check asked for since then shows.
 function Get-LastCheck($check, $auto, [datetime]$now = [datetime]::UtcNow) {
   if ($null -eq $check) { return [pscustomobject]@{ Text = 'n/a'; Problems = @(); Interval = $null; PassLimit = $null } }
-  $interval = [double]($check.interval_seconds ?? 900)
-  $passLimit = [double]($check.pass_limit_seconds ?? 2140)
+  $interval = [double]($check.interval_seconds ?? $OldBuildInterval)
+  $passLimit = [double]($check.pass_limit_seconds ?? $OldBuildPassLimit)
   $problems = [Collections.Generic.List[string]]::new()
   $due = ConvertTo-UtcTime $check.next_at
   if ($null -ne $due -and ($now - $due).TotalSeconds -gt $passLimit + 60) {

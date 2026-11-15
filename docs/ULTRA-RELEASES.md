@@ -348,6 +348,14 @@ pwsh scripts/fleet-slopbar.ps1 -UpdateNow
     - an update loop whose next run is overdue by more than the pass limit: it has stopped, even if
       a check asked for since then shows a recent time.
 - **Tested** offline by `pwsh scripts/test-fleet-slopbar.ps1`, on synthetic answers.
+- **The two limits a machine may not report.** A build from before the update-check record (or a
+  record from before the limit) reports no update interval and no pass limit, so the script judges it
+  by Ultra's own: 15 minutes and 35 min 40 s, held in the script as `$OldBuildInterval` and
+  `$OldBuildPassLimit`. Nothing but the test ties those copies to the app: it reads
+  `ultra_release::CHECK_EVERY` and `update_check::PASS_LIMIT` from the Rust source and fails when
+  either differs. Change the constant and the script's copy in the same push, because the release
+  build runs this test, and a stale copy stops that release. A machine that reports its own interval
+  and pass limit is judged by those, never by the copies.
 
 ## Optional: Authenticode signing (paid, not purchased)
 
@@ -377,7 +385,8 @@ pwsh scripts/test-fleet-slopbar.ps1
 
 The second tests the publisher offline, against synthetic repositories and a stand-in for `gh`.
 After `pnpm install` it also signs with a throwaway key. The third tests the fleet report's rules
-on synthetic answers.
+on synthetic answers, and checks two constants of the Rust source against the script's copies
+(see "The fleet").
 
 Don't set the signing variables in a shell by hand: they pass to every process it starts. To sign,
 use `scripts/publish-ultra-release.ps1`, which gives the password to the signer's process alone.

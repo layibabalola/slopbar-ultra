@@ -2,7 +2,8 @@
 <#
 Tests fleet-slopbar.ps1 offline: how it reads each machine's last update check (get_app_info's
 update_check) and the problems it reports, on synthetic answers only. Nothing reaches a machine or
-GitHub.
+GitHub. It also reads two constants from the Rust source of the checkout (update_check::PASS_LIMIT
+and ultra_release::CHECK_EVERY) and fails when the script's copies of them differ.
 
   pwsh scripts/test-fleet-slopbar.ps1
 #>
@@ -104,8 +105,7 @@ Check 'behind 20 minutes after the release is not yet a problem' ($r.Behind -and
 # for one mid-rollout), and the report goes on. A current machine is not affected. pub_date arrives as
 # ConvertFrom-Json reads it: a string, a [datetime], or whatever a malformed file holds.
 function Published([string]$json) { ("{`"pub_date`": $json}" | ConvertFrom-Json).pub_date }
-# The row, or an object without a status when making it stopped with an error (so the check fails
-# instead of the whole test).
+# The row, or one without a status when making it threw (so that check fails, not the whole test).
 function TryRow($info, $published) {
   try { Row $info -published $published } catch { [pscustomobject]@{ Status = $null; Problem = $false; Behind = $false; Error = $_.Exception.Message } }
 }
@@ -146,6 +146,69 @@ Check 'the report says so above the table' ((Get-ReleaseTimeNote $null) -match '
   (Get-ReleaseTimeNote 'soon') -match 'not a time\)')
 Check 'and says nothing when the release time is known' ($null -eq (Get-ReleaseTimeNote (Published '"2026-11-15T11:00:00Z"')))
 Check 'short text is left alone' ((Get-Short 'up to date') -eq 'up to date')
+
+# A machine that reports neither its update interval nor its pass limit (a build from before the
+# record, or a record from before the limit) is judged by Ultra's own: the script holds copies of
+# ultra_release::CHECK_EVERY and update_check::PASS_LIMIT. Nothing but this test ties the copies to
+# the app, so it reads both from the Rust source (the release build's checkout) and fails when they
+# differ. A copy must change together with its constant.
+#
+# The constants are Duration::from_secs(<seconds>): whole numbers with + and *, and other constants'
+# .as_secs(), possibly over several lines. Anything else throws, so a constant rewritten in a form this
+# cannot read fails the test instead of passing it unread.
+function Get-RustSeconds([string]$source, [string]$name, [int]$depth = 0) {
+  if ($depth -gt 8) { throw "$name refers to other constants too deeply." }
+  $pattern = "(?s)\bconst\s+$([regex]::Escape($name))\s*:\s*(?:std::time::)?Duration\s*=\s*(?:std::time::)?Duration::from_secs\((?<expr>[^;]*?)\)\s*;"
+  $found = [regex]::Match($source, $pattern)
+  if (-not $found.Success) { throw "The source has no const $name of the form Duration::from_secs(...)." }
+  $expr = $found.Groups['expr'].Value.Trim().TrimEnd(',').Trim()
+  $expr = [regex]::Replace($expr, '\b([A-Z][A-Z0-9_]*)\.as_secs\(\)', { param($m) '(' + (Get-RustSeconds $source $m.Groups[1].Value ($depth + 1)) + ')' })
+  if ($expr -notmatch '^[\d\s+*()]+$') { throw "$name is '$expr', which this test cannot read." }
+  return [long][Data.DataTable]::new().Compute($expr, $null)
+}
+function Throws([scriptblock]$block) { try { $null = & $block; return $false } catch { return $true } }
+# The seconds, or $null when it cannot be read (so a check on a sample fails instead of the whole test).
+function TrySeconds([string]$source, [string]$name) { try { Get-RustSeconds $source $name } catch { $null } }
+
+$rust = @'
+pub const FIRST: Duration = Duration::from_secs(40);
+pub const HALF_HOUR_AND_A_BIT: Duration = Duration::from_secs(31 * 60);
+pub const QUARTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+pub const TOTAL: Duration = Duration::from_secs(
+    FIRST.as_secs() + HALF_HOUR_AND_A_BIT.as_secs() + 2 * 60 + 60,
+);
+pub const IN_MILLIS: Duration = Duration::from_millis(500);
+pub const COMPUTED: Duration = Duration::from_secs(minutes() * 60);
+pub const LOOP_A: Duration = Duration::from_secs(LOOP_B.as_secs());
+pub const LOOP_B: Duration = Duration::from_secs(LOOP_A.as_secs());
+'@
+Check 'a constant in seconds is read' ((TrySeconds $rust 'FIRST') -eq 40)
+Check 'a product is read' ((TrySeconds $rust 'HALF_HOUR_AND_A_BIT') -eq 1860)
+Check 'std::time:: paths are read' ((TrySeconds $rust 'QUARTER') -eq 900)
+Check 'a sum over other constants, over lines, with a trailing comma, is read' ((TrySeconds $rust 'TOTAL') -eq 40 + 1860 + 120 + 60)
+Check 'the end or the start of another constant''s name is not that constant' ((Throws { Get-RustSeconds $rust 'IRST' }) -and (Throws { Get-RustSeconds $rust 'FIR' }))
+foreach ($unreadable in 'ABSENT', 'IN_MILLIS', 'COMPUTED', 'LOOP_A') {
+  Check "$unreadable, which this cannot read, stops the test" (Throws { Get-RustSeconds $rust $unreadable })
+}
+
+$source = Join-Path $PSScriptRoot '../src-tauri/src'
+$passLimit = Get-RustSeconds (Get-Content -LiteralPath (Join-Path $source 'update_check.rs') -Raw) 'PASS_LIMIT'
+$checkEvery = Get-RustSeconds (Get-Content -LiteralPath (Join-Path $source 'ultra_release.rs') -Raw) 'CHECK_EVERY'
+Check "the pass limit of a machine that reports none is update_check::PASS_LIMIT (the script has $OldBuildPassLimit s, the source $passLimit s)" ($OldBuildPassLimit -eq $passLimit)
+Check "the interval of a machine that reports none is ultra_release::CHECK_EVERY (the script has $OldBuildInterval s, the source $checkEvery s)" ($OldBuildInterval -eq $checkEvery)
+Check 'no fallback is a number written out again' ((Get-Content -LiteralPath $fleet -Raw) -notmatch '\?\?\s*\d')
+
+# What a machine reports wins; without it, the two values above are used, in a record as in a row.
+$bare = Record @{ at = (Ago 5); result = 'up_to_date'; next_at = (Ago -10) }
+$bare.Remove('interval_seconds'); $bare.Remove('pass_limit_seconds')
+$last = Get-LastCheck (Info $bare).Value.update_check $true $now
+Check 'a record without the limits is judged by the two values' ($last.Interval -eq $OldBuildInterval -and $last.PassLimit -eq $OldBuildPassLimit)
+$last = Get-LastCheck (Info (Record @{ at = (Ago 5); result = 'up_to_date'; next_at = (Ago -10); interval_seconds = 21600; pass_limit_seconds = 600 })).Value.update_check $true $now
+Check "a machine's own interval and pass limit win" ($last.Interval -eq 21600 -and $last.PassLimit -eq 600)
+$r = Row (Info (Record @{ at = (Ago 2); result = 'up_to_date'; next_at = (Ago 12); pass_limit_seconds = 600 }))
+Check "a machine's own pass limit sets when its loop has stopped (12 minutes overdue, limit 10 min)" ($r.Problem -and $r.Status -eq 'current; update loop stopped: next check 12 min overdue')
+$r = Row (Info (Record @{ at = (Ago 2); result = 'up_to_date'; next_at = (Ago 12) }))
+Check '...where the default limit would still wait' (-not $r.Problem)
 
 if ($failures) { Write-Output "$failures failed"; exit 1 }
 Write-Output 'all passed'
