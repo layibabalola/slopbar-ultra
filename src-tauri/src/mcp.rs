@@ -275,8 +275,12 @@ fn catalog() -> Vec<Tool> {
                 "cancel": { "type": "boolean", "description": "Stop a running setup." },
                 "via_tunnel": { "type": "boolean", "description": "Set by the computer that runs setup_sharing with ssh_host: the sign-in is finished in its browser, so this computer's desktop need not be shown." },
             }), &[]), false, true, false, true),
-        tool("get_sharing_setup", "Get sharing setup", "Where setup_sharing stands: phase (idle; rclone: finding or downloading it; dropbox: waiting for the user to allow access; sharing: turning it on; done; failed), remote, downloaded (rclone was downloaded), progress (the download's percent while it downloads), waiting (rclone waits for the browser), via_tunnel, error with failed_at (the phase it stopped in): download_failed, hash_mismatch, extract_failed, rclone_unsupported, rclone_failed, remote_taken (a remote of that name is not Dropbox), denied (the user did not allow access), stale_page (Allow was clicked on a page from an earlier try: use the newest page), port_busy (another program holds port 53682), port_reserved (Windows reserved port 53682; a restart usually frees it), timed_out (10 minutes without Allow), cancelled or settings_failed; found (the other computers sharing there, by name, once done) and revision. With ssh_host, asks that computer, closes this computer's tunnel once it has finished, and when it is done and this computer shares too, sees_this_computer says whether it sees this one (false: it may be signed in to another Dropbox account).",
-            schema(json!({ "ssh_host": { "type": "string", "description": "Ask this other computer, as ssh reaches it." } }), &[]), true, false, true, false),
+        tool("get_sharing_setup", "Get sharing setup", "Where setup_sharing stands: phase (idle; rclone: finding or downloading it; dropbox: waiting for the user to allow access; sharing: turning it on; done; failed), remote, downloaded (rclone was downloaded), progress (the download's percent while it downloads), waiting (rclone waits for the browser), via_tunnel, error with failed_at (the phase it stopped in): download_failed, hash_mismatch, extract_failed, rclone_unsupported, rclone_failed, remote_taken (a remote of that name is not Dropbox), denied (the user did not allow access), stale_page (Allow was clicked on a page from an earlier try: use the newest page), port_busy (another program holds port 53682), port_reserved (Windows reserved port 53682; a restart usually frees it), timed_out (10 minutes without Allow), cancelled or settings_failed; found (the other computers sharing there, by name, once done) and revision. With wait_seconds (up to 45) and since (the revision of an earlier answer), it first waits for the setup to change, instead of polling. With ssh_host, asks that computer (which does the waiting), closes this computer's tunnel once it has finished, and when it is done and this computer shares too, sees_this_computer says whether it sees this one (false: it may be signed in to another Dropbox account).",
+            schema(json!({
+                "ssh_host": { "type": "string", "description": "Ask this other computer, as ssh reaches it." },
+                "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 45, "description": "Wait up to this long (at most 45) for the setup to change before answering, instead of polling." },
+                "since": { "type": "integer", "minimum": 0, "description": "The revision of an earlier answer: with wait_seconds, wait for a change from it." },
+            }), &[]), true, false, true, false),
         tool("list_diagnostic_exports", "List diagnostics exports", "The most recent diagnostics exports, newest first, with paths, sizes and times. Works while SlopBar Ultra is closed.", none(), true, false, true, false),
     ]
 }
@@ -299,7 +303,7 @@ fn local_args(name: &str) -> Option<(&'static [&'static str], &'static [&'static
         "pair_machine" => Some((&["ssh_host", "replace_key"], &["ssh_host"])),
         "run_on_machine" => Some((&["ssh_host", "tool", "arguments"], &["ssh_host", "tool"])),
         "setup_sharing" => Some((&["ssh_host", "remote", "cancel", "via_tunnel", "confirm", "reconnect"], &[])),
-        "get_sharing_setup" => Some((&["ssh_host"], &[])),
+        "get_sharing_setup" => Some((&["ssh_host", "wait_seconds", "since"], &[])),
         _ => None,
     }
 }
@@ -313,8 +317,13 @@ fn check_local(name: &str, args: &Value) -> Option<Result<(), String>> {
     if let Some(k) = required.iter().find(|k| !map.contains_key(**k)) {
         return Some(Err(format!("Invalid arguments: {k} is required")));
     }
-    let typed = map.iter().all(|(k, v)| match k.as_str() { "arguments" => v.is_object(), "replace_key" => v.is_boolean(), "wait_seconds" | "since" => v.is_u64(), _ => v.is_string() });
-    Some(if typed { Ok(()) } else { Err("Invalid arguments: ssh_host and tool are strings, arguments an object, replace_key a boolean, wait_seconds and since whole numbers".into()) })
+    let typed = map.iter().all(|(k, v)| match k.as_str() {
+        "arguments" => v.is_object(),
+        "replace_key" | "confirm" | "reconnect" | "cancel" | "via_tunnel" => v.is_boolean(),
+        "wait_seconds" | "since" => v.is_u64(),
+        _ => v.is_string(),
+    });
+    Some(if typed { Ok(()) } else { Err("Invalid arguments: ssh_host, tool and remote are strings, arguments an object, replace_key, confirm, reconnect, cancel and via_tunnel true or false, wait_seconds and since whole numbers".into()) })
 }
 
 /// The door request for a tool call, or a message for the agent when the arguments are wrong.
@@ -714,11 +723,24 @@ fn print_answer(outcome: Result<Value, String>) -> i32 {
     code
 }
 
-/// `slopbar-mcp --sharing-state`: the phase of this computer's sharing setup and the state value
-/// of rclone's waiting link, for the computer finishing the sign-in through a tunnel (see
-/// `pairing::setup_remote_sharing`). Not an MCP tool, so the value never lands in an agent's result.
-pub fn sharing_state() -> i32 {
-    print_answer(crate::door::call(&crate::door::pipe_name(), &Request::SharingSetupLink))
+/// `slopbar-mcp --sharing-state [seconds]`: the phase of this computer's sharing setup and the
+/// state value of rclone's waiting link, for the computer finishing the sign-in through a tunnel
+/// (see `pairing::setup_remote_sharing`), once a sign-in waits, the setup is no longer under way,
+/// or the seconds have passed. Not an MCP tool, so the value never lands in an agent's result.
+pub fn sharing_state(args: &[String]) -> i32 {
+    // Waiting here (at most 45 seconds) until a sign-in waits or the setup stops means the other
+    // computer asks over SSH every 40 seconds, not every few: each ask starts a shell there.
+    let wait = args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0).min(45);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+    let pipe = crate::door::pipe_name();
+    loop {
+        let answer = crate::door::call(&pipe, &Request::SharingSetupLink);
+        let settled = answer.as_ref().map_or(true, |a| a["state"].is_string() || !crate::pairing::setup_running(a));
+        if settled || std::time::Instant::now() >= deadline {
+            return print_answer(answer);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
 }
 
 /// `slopbar-mcp --pair-receive`: the target's half of `pair_machine`, reading the offer from
@@ -863,6 +885,20 @@ mod tests {
     }
 
     #[test]
+    fn sharing_setup_takes_its_flags_and_shows_what_it_would_do_before_confirm() {
+        for (name, args) in [
+            ("setup_sharing", json!({ "confirm": true, "reconnect": false, "cancel": false, "ssh_host": "box", "remote": "dropbox" })),
+            ("setup_sharing", json!({ "via_tunnel": true, "confirm": true })),
+            ("get_sharing_setup", json!({ "ssh_host": "box", "wait_seconds": 45, "since": 7 })),
+        ] {
+            assert_eq!(check_local(name, &args), Some(Ok(())), "{name} {args}");
+        }
+        // The path an agent's call takes (MCP, or --call over SSH), with no app: nothing starts.
+        let preview = run_tool("setup_sharing", json!({}), "unused-pipe", true).unwrap();
+        assert_eq!(preview["started"], false, "{preview}");
+    }
+
+    #[test]
     fn bad_arguments_and_app_errors_are_tool_errors() {
         for (name, args) in [
             ("switch_account", json!({ "provider": "claude" })),
@@ -890,6 +926,12 @@ mod tests {
             ("get_machine_readiness", json!({ "since": -1 })),
             ("run_on_machine", json!({ "ssh_host": "box", "tool": "get_roster", "arguments": [] })),
             ("restore_backup", json!({ "path": "C:\\x", "passphrase": "p", "confirm": true })),
+            ("setup_sharing", json!({ "confirm": "yes" })),
+            ("setup_sharing", json!({ "reconnect": 1 })),
+            ("setup_sharing", json!({ "remote": true })),
+            ("setup_sharing", json!({ "bogus": true })),
+            ("get_sharing_setup", json!({ "wait_seconds": "soon" })),
+            ("get_sharing_setup", json!({ "since": -1 })),
         ] {
             assert_eq!(tool(name, args.clone(), None)["result"]["isError"], true, "{name} {args}");
         }
