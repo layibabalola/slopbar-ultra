@@ -669,6 +669,21 @@ mod tests {
     }
 
     #[test]
+    fn restore_turns_auto_update_on_only_where_this_build_updates() {
+        let mut backup = sample();
+        backup.settings.auto_update = true;
+        let current = Settings { auto_update: false, ..Settings::default() };
+        let none: &[(Provider, String)] = &[];
+        let missing = |_: &str| -> Result<String, &'static str> { Err("folder_missing_here") };
+        let manual = here_with(none, &missing);
+        let (merged, _) = merge(&current, &History::default(), &Ledger::default(), &backup, &manual, at(22));
+        assert!(!merged.settings.auto_update, "kept off: this build has no updates");
+        let updates = Here { updates_enabled: true, ..here_with(none, &missing) };
+        let (merged, _) = merge(&current, &History::default(), &Ledger::default(), &backup, &updates, at(22));
+        assert!(merged.settings.auto_update, "the backup's value where this build updates");
+    }
+
+    #[test]
     fn pins_restore_only_where_the_folder_exists_here() {
         let dir = TempDir::new();
         let mut contents = sample();
