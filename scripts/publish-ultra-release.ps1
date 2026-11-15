@@ -77,6 +77,13 @@ function Test-InstallerScript([string]$nsi) {
   return $nsi -match '/oname=slopbar-mcp\.exe' -and ($nsi -match 'slopbar-mcp\.old-' -or $nsi -match 'ultra-hooks\.nsh')
 }
 
+# pnpm itself, or through corepack, always as an array: a lone 'pnpm' out of an `if` arrives as a
+# string, and [0] of a string is its first letter.
+function Get-PnpmCommand {
+  $command = @(if (Get-Command pnpm -ErrorAction SilentlyContinue) { 'pnpm' } else { 'corepack', 'pnpm' })
+  return , $command
+}
+
 function Read-Config {
   $conf = Get-Content (Join-Path $root 'src-tauri/tauri.conf.json') -Raw | ConvertFrom-Json
   if ($conf.version -notmatch '^\d+\.\d+\.\d+$') { throw "Package version $($conf.version) is not x.y.z." }
@@ -218,7 +225,7 @@ function Invoke-Build {
       windows                = @{ nsis = @{ installerHooks = (Join-Path $root 'src-tauri/nsis/ultra-hooks.nsh') } }
     }
   } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $override
-  $pnpm = if (Get-Command pnpm -ErrorAction SilentlyContinue) { @('pnpm') } else { @('corepack', 'pnpm') }
+  $pnpm = Get-PnpmCommand
   $pnpmArgs = @($pnpm | Select-Object -Skip 1)
   Push-Location $root
   try {

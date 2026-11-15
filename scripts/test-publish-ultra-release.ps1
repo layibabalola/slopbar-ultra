@@ -144,6 +144,11 @@ try {
   Check 'an installer with the server and the hook passes' (Test-InstallerScript "File /a `"/oname=slopbar-mcp.exe`" `"x`"`n!include `"C:\s\src-tauri\nsis\ultra-hooks.nsh`"")
   Check 'an installer without the hook fails' (-not (Test-InstallerScript 'File /a "/oname=slopbar-mcp.exe" "x"'))
   Check 'an installer without the server fails' (-not (Test-InstallerScript '!include "C:\s\src-tauri\nsis\ultra-hooks.nsh"'))
+  # With pnpm on the path (as in the workflow), the command must stay 'pnpm', not 'p'.
+  function pnpm { }
+  $pnpmCommand = Get-PnpmCommand
+  Check 'pnpm on the path runs as pnpm' ($pnpmCommand.Count -eq 1 -and $pnpmCommand[0] -eq 'pnpm')
+  Remove-Item Function:\pnpm
 
   # A machine publishes the pushed ultra tip: build 1, and the first channel.
   New-Stage; $Tag = ''; $Build = 0
