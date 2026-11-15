@@ -204,11 +204,11 @@ test("another record under this machine's name is not listed twice", () => {
 test("the compact row names two machines in full, this one second, then how many more", () => {
   const on = (machine) => ({ machine, where: ["Windows"], seen_at: iso(now), live: true });
   const here = { active: true, sources: ["Windows"] };
-  assert.equal(compactPlaces(used({ remote: [on("BACHELOR"), on("PC-MINI1")] })), "BACHELOR, PC-MINI1");
+  assert.equal(compactPlaces(used({ remote: [on("BOX-0001"), on("BOX-0002")] })), "BOX-0001, BOX-0002");
   assert.equal(compactPlaces(used(here)), "DESK-1 (this PC)");
   // Listed with others, this machine comes second: a narrow row cuts its mark, not a name.
-  assert.equal(compactPlaces(used({ ...here, remote: [on("VIRTUAL-TEN")] })), "VIRTUAL-TEN, DESK-1 (this PC)");
-  assert.equal(compactPlaces(used({ ...here, remote: [on("VIRTUAL-TEN"), on("PC-MINI2")] })), "VIRTUAL-TEN, DESK-1 (this PC) +1");
+  assert.equal(compactPlaces(used({ ...here, remote: [on("WORKSTATION")] })), "WORKSTATION, DESK-1 (this PC)");
+  assert.equal(compactPlaces(used({ ...here, remote: [on("WORKSTATION"), on("BOX-0003")] })), "WORKSTATION, DESK-1 (this PC) +1");
   assert.equal(compactPlaces(used({ remote: [on("A-1"), on("B-2"), on("C-3"), on("D-4")] })), "A-1, B-2 +2");
   assert.equal(compactPlaces(used({})), "");
   // Two records under one name are one machine, as the app's overlap badge counts them.
@@ -216,7 +216,7 @@ test("the compact row names two machines in full, this one second, then how many
   assert.equal(compactPlaces(used({ ...here, remote: [on("LAPTOP-2"), on("LAPTOP-2")] })), "LAPTOP-2, DESK-1 (this PC)");
   assert.deepEqual(placesText(used({ remote: [on("CLONE-VM"), on("CLONE-VM"), on("clone-vm")] })).machines, ["CLONE-VM"]);
   // The full line keeps this machine first.
-  assert.equal(placesText(used({ ...here, remote: [on("VIRTUAL-TEN")] })).short, "In use on DESK-1 (this PC), VIRTUAL-TEN");
+  assert.equal(placesText(used({ ...here, remote: [on("WORKSTATION")] })).short, "In use on DESK-1 (this PC), WORKSTATION");
 });
 
 test("machine names are translated around, never translated themselves", () => {
