@@ -90,16 +90,28 @@ pub fn valid_host(host: &str) -> bool {
     (1..=253).contains(&host.len()) && ok_chars && !host.starts_with('-') && host.matches('@').count() <= 1 && !host.ends_with('@')
 }
 
-/// The command `ssh` runs on the target: its `slopbar-mcp.exe` with `args`, the same from cmd,
-/// Windows PowerShell or PowerShell 7 as the remote shell (an encoded command needs no quoting).
-/// `args` never holds a secret: a command line is visible to every process on the target.
+/// The command `ssh` runs on the target: its `slopbar-mcp.exe` with `args`, under PowerShell 7
+/// (`pwsh`). It reads the same from cmd, Windows PowerShell or PowerShell 7 as the remote shell (an
+/// encoded command needs no quoting). `args` never holds a secret: a command line is visible to
+/// every process on the target. `run_there` sends it, and the same script under Windows
+/// PowerShell 5.1 (`fallback_command`) only where the target has no `pwsh`: a 5.1 process started
+/// over SSH can outlive its session and grow without bound (it reached 85 GiB on one computer).
 pub fn remote_command(args: &[&str]) -> String {
+    command_under("pwsh", args)
+}
+
+/// `remote_command`'s script under Windows PowerShell 5.1, for a target without PowerShell 7.
+fn fallback_command(args: &[&str]) -> String {
+    command_under("powershell", args)
+}
+
+fn command_under(shell: &str, args: &[&str]) -> String {
     let quoted: Vec<String> = args.iter().map(|a| format!("'{}'", a.replace('\'', "''"))).collect();
     let script = format!(concat!(
         "$ErrorActionPreference = 'Stop'\n",
         "$exe = Join-Path $env:LOCALAPPDATA 'SlopBar\\slopbar-mcp.exe'\n",
         "if (-not (Test-Path -LiteralPath $exe)) {{ '{{\"error\":\"slopbar_not_installed\"}}'; exit 3 }}\n",
-        // A pipeline stage, not just capturing it, makes Windows PowerShell wait for this windowless
+        // A pipeline stage, not just capturing it, makes either PowerShell wait for this windowless
         // program; it still inherits standard input.
         "$out = & $exe {} | ForEach-Object {{ $_ }}\n",
         "$code = $LASTEXITCODE\n",
@@ -107,7 +119,23 @@ pub fn remote_command(args: &[&str]) -> String {
         "exit $code\n"), quoted.join(" "));
     let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD,
         script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>());
-    format!("powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}")
+    format!("{shell} -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}")
+}
+
+/// Runs the target's `slopbar-mcp.exe` with `args`, `input` as its standard input, and returns
+/// what it printed: under PowerShell 7, or under Windows PowerShell 5.1 where `pwsh` never ran.
+/// Only that case is tried again, so no tool runs twice: a shell that finds no program prints
+/// nothing and exits 1 (cmd and both PowerShells, measured over SSH) or 127 (a POSIX shell), while
+/// the script, once running, prints slopbar-mcp's answer or passes on its exit code (0 or 1 with
+/// an answer, 101 for a crash). `input` goes to both tries: to the first, only to the target's
+/// shell, which exits without reading it.
+fn run_there(remote: &dyn Remote, host: &str, args: &[&str], input: &[u8]) -> Result<Vec<u8>, String> {
+    let ran = remote.run(host, &remote_command(args), input)?;
+    let never_ran = ran.out.iter().all(u8::is_ascii_whitespace) && matches!(ran.code, Some(1 | 127));
+    if !never_ran {
+        return Ok(ran.out);
+    }
+    Ok(remote.run(host, &fallback_command(args), input)?.out)
 }
 
 /// JSON with every non-ASCII character escaped, so no console code page on the way through SSH
@@ -185,9 +213,15 @@ impl Door for LocalDoor {
     }
 }
 
+/// What a command run on another computer printed on its standard output, and its exit code.
+pub struct Ran {
+    pub out: Vec<u8>,
+    pub code: Option<i32>,
+}
+
 pub trait Remote {
-    /// Runs `command` on `host` with `input` as its standard input; returns its standard output.
-    fn run(&self, host: &str, command: &str, input: &[u8]) -> Result<Vec<u8>, String>;
+    /// Runs `command` on `host` with `input` as its standard input.
+    fn run(&self, host: &str, command: &str, input: &[u8]) -> Result<Ran, String>;
 }
 
 /// The system's OpenSSH client, with the user's own keys and ~/.ssh/config (Tailscale SSH works
@@ -202,7 +236,7 @@ impl Ssh {
 }
 
 impl Remote for Ssh {
-    fn run(&self, host: &str, command: &str, input: &[u8]) -> Result<Vec<u8>, String> {
+    fn run(&self, host: &str, command: &str, input: &[u8]) -> Result<Ran, String> {
         use std::process::{Command, Stdio};
         if !valid_host(host) {
             return Err("bad_ssh_host".into());
@@ -256,7 +290,7 @@ impl Remote for Ssh {
             let first = String::from_utf8_lossy(&err).lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("**")).unwrap_or("").chars().take(200).collect::<String>();
             return Err(format!("ssh_failed: {first}"));
         }
-        Ok(out)
+        Ok(Ran { out, code: status.code() })
     }
 }
 
@@ -264,7 +298,7 @@ impl Remote for Ssh {
 pub fn remote_call(remote: &dyn Remote, host: &str, tool: &str, arguments: &Value) -> Result<Value, String> {
     let ask = json!({ "tool": tool, "arguments": arguments });
     let encoded = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, ask.to_string());
-    answer(&remote.run(host, &remote_command(&["--call-b64", &encoded]), b"")?)
+    answer(&run_there(remote, host, &["--call-b64", &encoded], b"")?)
 }
 
 /// The JSON object a remote `slopbar-mcp` printed last: `{"ok": …}` or `{"error": …}`.
@@ -328,7 +362,7 @@ pub fn pair(door: &dyn Door, remote: &dyn Remote, host: &str, saved: Option<Pass
     line.push(b'\n');
     drop(offer);
     // Whatever the target sends back is scrubbed of the key, in case it echoes it.
-    let received = match remote.run(host, &remote_command(&["--pair-receive"]), &line) {
+    let received = match run_there(remote, host, &["--pair-receive"], &line) {
         Ok(out) => answer(&out).map(|v| redact(v, &shown)).map_err(|e| format!("target: {}", e.replace(&shown, "[key]"))),
         Err(e) if e.starts_with("ssh_failed") => Err("ssh_failed".into()),
         Err(e) => Err(e),
@@ -566,7 +600,7 @@ fn setup_remote_sharing(door: &dyn Door, ssh: &dyn Remote, host: &str, args: &Va
     }
     let deadline = std::time::Instant::now() + SETUP_START;
     loop {
-        let link = answer(&ssh.run(host, &remote_command(&["--sharing-state", STATE_WAIT]), b"")?)?;
+        let link = answer(&run_there(ssh, host, &["--sharing-state", STATE_WAIT], b"")?)?;
         if let Some(state) = link.get("state").and_then(Value::as_str) {
             let shown = match door.call(&Request::SharingTunnel { host: host.into(), state: Some(state.into()), close: false }) {
                 Ok(shown) => shown,
@@ -716,16 +750,88 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_remote_command_carries_no_secret_and_quotes_its_arguments() {
-        let cmd = remote_command(&["--call-b64", "it's"]);
-        assert!(cmd.starts_with("powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "));
+    /// The script a remote command carries, decoded.
+    fn script_of(cmd: &str) -> String {
         let b64 = cmd.rsplit(' ').next().unwrap();
         let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
         let units: Vec<u16> = bytes.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        let script = String::from_utf16(&units).unwrap();
+        String::from_utf16(&units).unwrap()
+    }
+
+    #[test]
+    fn the_remote_command_carries_no_secret_and_quotes_its_arguments() {
+        let cmd = remote_command(&["--call-b64", "it's"]);
+        assert!(cmd.starts_with("pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "), "PowerShell 7 first: {cmd}");
+        let script = script_of(&cmd);
         assert!(script.contains("$out = & $exe '--call-b64' 'it''s' | ForEach-Object { $_ }"), "{script}");
         assert!(script.contains("SlopBar\\slopbar-mcp.exe"));
+        let fallback = fallback_command(&["--call-b64", "it's"]);
+        assert!(fallback.starts_with("powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "), "{fallback}");
+        assert_eq!(script_of(&fallback), script, "the same script under Windows PowerShell");
+        // Nothing any remote shell (cmd, Windows PowerShell, PowerShell 7) would read as quoting or
+        // an operator: a program name, its switches and base64.
+        for c in [&cmd, &fallback] {
+            assert!(c.chars().all(|ch| ch.is_ascii_alphanumeric() || " -+/=".contains(ch)), "{c}");
+        }
+    }
+
+    /// Another computer's shell, answering each command with the next of `replies`.
+    struct Scripted {
+        replies: RefCell<Vec<Result<Ran, String>>>,
+        commands: RefCell<Vec<String>>,
+        inputs: RefCell<Vec<Vec<u8>>>,
+    }
+
+    impl Remote for Scripted {
+        fn run(&self, _host: &str, command: &str, input: &[u8]) -> Result<Ran, String> {
+            self.commands.borrow_mut().push(command.into());
+            self.inputs.borrow_mut().push(input.to_vec());
+            self.replies.borrow_mut().remove(0)
+        }
+    }
+
+    fn scripted(replies: Vec<Result<Ran, String>>) -> Scripted {
+        Scripted { replies: RefCell::new(replies), commands: RefCell::default(), inputs: RefCell::default() }
+    }
+
+    fn ran(out: &str, code: i32) -> Result<Ran, String> {
+        Ok(Ran { out: out.into(), code: Some(code) })
+    }
+
+    #[test]
+    fn windows_powershell_runs_only_where_powershell_7_never_did() {
+        let args = ["--pair-receive"];
+        let (pwsh, fallback) = (remote_command(&args), fallback_command(&args));
+        let answer = "{\"ok\":{\"paired\":true}}\r\n";
+        // A shell that finds no pwsh prints nothing and exits 1 (cmd, both PowerShells) or 127
+        // (a POSIX shell): the same script and input go to Windows PowerShell.
+        for code in [1, 127] {
+            let there = scripted(vec![ran("", code), ran(answer, 0)]);
+            assert_eq!(run_there(&there, "box", &args, b"offer\n").unwrap(), answer.as_bytes());
+            assert_eq!(*there.commands.borrow(), [pwsh.clone(), fallback.clone()]);
+            assert_eq!(*there.inputs.borrow(), [b"offer\n".to_vec(), b"offer\n".to_vec()]);
+        }
+        // Blank lines are still nothing.
+        let there = scripted(vec![ran("\r\n", 1), ran(answer, 0)]);
+        assert_eq!(run_there(&there, "box", &args, b"").unwrap(), answer.as_bytes());
+
+        // Once the script ran under pwsh, its outcome stands, whatever it was: an answer, an error
+        // answer, SlopBar missing there, or a crash that printed nothing.
+        for (out, code) in [(answer, 0), ("{\"error\":\"target_has_other_key\"}\r\n", 1), ("{\"error\":\"slopbar_not_installed\"}\r\n", 3), ("", 101), ("", 0)] {
+            let there = scripted(vec![ran(out, code)]);
+            assert_eq!(run_there(&there, "box", &args, b"").unwrap(), out.as_bytes(), "{out:?} {code}");
+            assert_eq!(*there.commands.borrow(), [pwsh.clone()], "never twice: {out:?} {code}");
+        }
+        // SSH itself failed or timed out: nothing is tried again.
+        for e in ["ssh_failed: Connection refused", "ssh_timeout"] {
+            let there = scripted(vec![Err(e.into())]);
+            assert_eq!(run_there(&there, "box", &args, b"").unwrap_err(), e);
+            assert_eq!(there.commands.borrow().len(), 1);
+        }
+        // Neither PowerShell there: no answer, as before.
+        let there = scripted(vec![ran("", 1), ran("", 1)]);
+        assert_eq!(remote_call(&there, "box", "get_app_info", &json!({})).unwrap_err(), "remote_no_answer");
+        assert!(there.commands.borrow()[0].starts_with("pwsh ") && there.commands.borrow()[1].starts_with("powershell "));
     }
 
     #[test]
@@ -778,16 +884,25 @@ mod tests {
         running: bool,
         /// A misbehaving target that echoes what it was sent.
         echo: bool,
+        /// It has PowerShell 7; without it, its shell finds no `pwsh` and only Windows PowerShell
+        /// runs the script.
+        pwsh: bool,
         commands: RefCell<Vec<String>>,
         inputs: RefCell<Vec<Vec<u8>>>,
     }
 
     impl Remote for FakeSsh<'_> {
-        fn run(&self, _host: &str, command: &str, input: &[u8]) -> Result<Vec<u8>, String> {
+        fn run(&self, _host: &str, command: &str, input: &[u8]) -> Result<Ran, String> {
             self.commands.borrow_mut().push(command.into());
             self.inputs.borrow_mut().push(input.to_vec());
-            let asked = |tool: &str| command == remote_command(&["--call-b64", &base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, json!({ "tool": tool, "arguments": {} }).to_string())]);
-            let out = if command == remote_command(&["--pair-receive"]) {
+            if !self.pwsh && command.starts_with("pwsh ") {
+                // Its shell says "'pwsh' is not recognized…" on standard error and exits 1.
+                return Ok(Ran { out: Vec::new(), code: Some(1) });
+            }
+            assert!(!self.pwsh || command.starts_with("pwsh "), "Windows PowerShell where PowerShell 7 answers: {command}");
+            let runs = if self.pwsh { remote_command } else { fallback_command };
+            let asked = |tool: &str| command == runs(&["--call-b64", &base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, json!({ "tool": tool, "arguments": {} }).to_string())]);
+            let out = if command == runs(&["--pair-receive"]) {
                 match receive(self.target, &mut &input[..], self.target.saved.map(|s| Passphrase(s.into()))) {
                     Ok(v) => json!({ "ok": if self.echo { json!({ "leak": String::from_utf8_lossy(input) }) } else { v } }),
                     Err(e) => json!({ "error": e }),
@@ -800,8 +915,13 @@ mod tests {
                 let location = self.target.settings["presence_remote"].is_string() || self.target.settings["presence_folder"].is_string();
                 json!({ "ok": { "app": { "running": self.running }, "roster": { "location": location } } })
             };
-            Ok(ascii_json(&out).into_bytes())
+            answered(&out)
         }
+    }
+
+    /// What the script prints and exits with when slopbar-mcp answers `out` (see `mcp::print_answer`).
+    fn answered(out: &Value) -> Result<Ran, String> {
+        Ok(Ran { out: format!("{}\r\n", ascii_json(out)).into_bytes(), code: Some(if out.get("error").is_some() { 1 } else { 0 }) })
     }
 
     /// Another computer running a sharing setup: its tools and `--sharing-state` answer as scripted.
@@ -824,7 +944,7 @@ mod tests {
     }
 
     impl Remote for SharingTarget {
-        fn run(&self, _host: &str, command: &str, _input: &[u8]) -> Result<Vec<u8>, String> {
+        fn run(&self, _host: &str, command: &str, _input: &[u8]) -> Result<Ran, String> {
             self.commands.borrow_mut().push(command.into());
             let out = if command == remote_command(&["--sharing-state", STATE_WAIT]) {
                 json!({ "ok": self.link })
@@ -837,7 +957,7 @@ mod tests {
             } else {
                 json!({ "ok": { "phase": "rclone" } })
             };
-            Ok(ascii_json(&out).into_bytes())
+            answered(&out)
         }
     }
 
@@ -941,29 +1061,40 @@ mod tests {
     }
 
     fn ssh(target: &FakeApp, running: bool) -> FakeSsh<'_> {
-        FakeSsh { target, running, echo: false, commands: RefCell::default(), inputs: RefCell::default() }
+        FakeSsh { target, running, echo: false, pwsh: true, commands: RefCell::default(), inputs: RefCell::default() }
     }
 
     #[test]
     fn pairing_moves_a_new_key_only_through_ssh_input() {
-        let source = FakeApp::new(json!({ "presence_remote": "dropbox", "presence_folder": null, "account_roster": false }));
-        let target = FakeApp::new(json!({ "presence_remote": null, "presence_folder": null, "account_roster": false }));
-        let link = ssh(&target, true);
-        let result = pair(&source, &link, "box", None, "DESK-1", false).unwrap();
-        let key = source.key_set().expect("the source saved a new key");
-        assert!(key.starts_with(KEY_PREFIX));
-        assert_eq!(target.key_set().as_deref(), Some(key.as_str()), "the target saved the same key");
-        assert_eq!(source.patches(), [json!({ "account_roster": true })]);
-        assert_eq!(target.patches(), [json!({ "presence_remote": "dropbox", "account_roster": true })]);
-        // The key is in ssh's input, never in a command line or the result.
-        assert!(link.commands.borrow().iter().all(|c| !c.contains(&key)));
-        assert!(link.inputs.borrow().iter().filter(|i| String::from_utf8_lossy(i).contains(&key)).count() == 1, "sent once, as input");
-        let shown = result.to_string();
-        assert!(!shown.contains(&key) && !shown.contains(KEY_SHOWN), "{shown}");
-        assert_eq!(result["key"], "generated");
-        assert_eq!(result["target"]["roster"]["waiting"], 1, "a count, not the list of emails");
-        assert_eq!(result["target"]["from"], "DESK-1");
-        assert!(matches!(source.seen.borrow().last(), Some(Request::SyncRoster)), "the source reads the target's roster at once");
+        // A target with PowerShell 7, and one with only Windows PowerShell.
+        for pwsh in [true, false] {
+            let source = FakeApp::new(json!({ "presence_remote": "dropbox", "presence_folder": null, "account_roster": false }));
+            let target = FakeApp::new(json!({ "presence_remote": null, "presence_folder": null, "account_roster": false }));
+            let link = FakeSsh { pwsh, ..ssh(&target, true) };
+            let result = pair(&source, &link, "box", None, "DESK-1", false).unwrap();
+            let key = source.key_set().expect("the source saved a new key");
+            assert!(key.starts_with(KEY_PREFIX));
+            assert_eq!(target.key_set().as_deref(), Some(key.as_str()), "the target saved the same key");
+            assert_eq!(source.patches(), [json!({ "account_roster": true })]);
+            assert_eq!(target.patches(), [json!({ "presence_remote": "dropbox", "account_roster": true })]);
+            // The key is in ssh's input, never in a command line or the result: once, or once for
+            // each try where the target's shell finds no pwsh (that shell exits without reading it).
+            let commands = link.commands.borrow();
+            assert!(commands.iter().all(|c| !c.contains(&key)));
+            let carried = link.inputs.borrow().iter().filter(|i| String::from_utf8_lossy(i).contains(&key)).count();
+            assert_eq!(carried, if pwsh { 1 } else { 2 }, "sent as input only");
+            if pwsh {
+                assert!(commands.iter().all(|c| c.starts_with("pwsh ")), "never Windows PowerShell where PowerShell 7 runs");
+            } else {
+                assert_eq!(commands.iter().filter(|c| c.starts_with("powershell ")).count(), 3, "readiness, sharing locations, the key: {commands:?}");
+            }
+            let shown = result.to_string();
+            assert!(!shown.contains(&key) && !shown.contains(KEY_SHOWN), "{shown}");
+            assert_eq!(result["key"], "generated");
+            assert_eq!(result["target"]["roster"]["waiting"], 1, "a count, not the list of emails");
+            assert_eq!(result["target"]["from"], "DESK-1");
+            assert!(matches!(source.seen.borrow().last(), Some(Request::SyncRoster)), "the source reads the target's roster at once");
+        }
     }
 
     #[test]
