@@ -174,10 +174,9 @@ re-running the failed run. A run on a tag that already has its release only stan
   builds as the user whose profile holds the key files.
 - **Toolchain.** The runner has its own Rust, Node and Visual Studio versions, so two builds of one
   commit are not byte-identical. Both pass the same checks.
-- **Temp folder.** The runner's default `TEMP` has an 8.3 short name in it (`C:\Users\RUNNER~1\…`),
-  and two `pins` launcher tests fail under such a spelling. That is why the repository's Tests
-  workflow fails on GitHub. The workflow's Build step therefore points `TEMP` at the runner's
-  long-named temp folder, as the owner's machines have.
+- **Temp folder.** The runner's `TEMP` is spelled with an 8.3 short name (`C:\Users\RUNNER~1\…`).
+  The unit tests run there as in the repository's Tests workflow, and the `pins` tests need such a
+  spelling: in CI they fail rather than skip without one.
 
 ### Agents' MCP server (`slopbar-mcp.exe`)
 
