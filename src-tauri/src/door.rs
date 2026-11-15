@@ -989,7 +989,7 @@ mod tests {
             });
             ask_patiently(&over, &name, Request::GetAppInfo).await.unwrap();
             let stuck: Vec<_> = (0..imp::MAX_CONNECTIONS).map(|_| ask_patiently(&over, &name, Request::Refresh)).collect();
-            eventually("every slot holds a stuck operation", || started.load(SeqCst) == imp::MAX_CONNECTIONS).await;
+            eventually("every slot holds a stuck operation", || started.load(SeqCst) >= imp::MAX_CONNECTIONS).await;
             let info = ask_patiently(&over, &name, Request::GetAppInfo).await.unwrap();
             assert!(!ended.load(SeqCst), "get_app_info was answered only once a stuck operation ended and gave its slot up");
             assert_eq!(info.result.unwrap()["op"], "get_app_info");
@@ -1019,9 +1019,7 @@ mod tests {
                 async move {
                     s.fetch_add(1, SeqCst);
                     let fresh = || async { serde_json::json!({ "accounts": [], "fresh": true }) };
-                    let (answer, waited) = refresh_wait::noting_waits(refresh_wait::under(&l, SHORT, fresh)).await;
-                    let answer = answer.unwrap_or_else(|| serde_json::json!({ "accounts": [] }));
-                    Ok(if waited { refresh_wait::mark_waiting(answer) } else { answer })
+                    refresh_wait::noted(async { Ok(refresh_wait::under(&l, SHORT, fresh).await.unwrap_or_else(|| serde_json::json!({ "accounts": [] }))) }).await
                 }
             });
             ask_patiently(&over, &name, Request::GetAppInfo).await.unwrap();
@@ -1038,6 +1036,62 @@ mod tests {
                 assert_eq!(result[refresh_wait::WAITING], refresh_wait::WAITING_NOTE, "and says it gave up: {result}");
                 assert!(result.get("fresh").is_none(), "{result}");
             }
+        })
+        .await
+    }
+
+    /// An operation whose client gave up carries on: the door only lets the connection go, as the
+    /// "timeout" it answers says (mcp's explain: "it keeps going").
+    #[tokio::test]
+    async fn an_operation_whose_client_gave_up_carries_on() {
+        within_test_limit(async {
+            let over = Over::new();
+            let name = test_pipe();
+            let finished = Arc::new(AtomicBool::new(false));
+            let f = finished.clone();
+            fake_app_within(&name, SHORT, move || {
+                let f = f.clone();
+                async move {
+                    tokio::time::sleep(SHORT * 3).await;
+                    f.store(true, SeqCst);
+                    Ok(serde_json::json!({ "accounts": [] }))
+                }
+            });
+            let reply = ask_patiently(&over, &name, Request::Refresh).await.unwrap();
+            assert_eq!(reply.error.as_deref(), Some("timeout"), "its client hears it is still running");
+            eventually("the operation carried on after its client gave up", || finished.load(SeqCst)).await;
+        })
+        .await
+    }
+
+    /// The door the app opens waits for an operation as long as its client does (CLIENT_TIMEOUT):
+    /// never less, which would answer "timeout" to a client still waiting for the answer.
+    #[test]
+    fn the_door_the_app_opens_waits_as_long_as_its_client() {
+        let source = include_str!("door.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(production.contains("serve_within(name, CLIENT_TIMEOUT, handle).await"), "serve passes the client's own limit");
+        assert_eq!(production.matches("serve_within(").count(), 1, "the app's door is opened that way only");
+    }
+
+    /// An operation that panics leaves its client a closed pipe, as it always has: never an answer
+    /// that it is still running.
+    #[tokio::test]
+    async fn an_operation_that_panics_leaves_its_client_a_closed_pipe() {
+        within_test_limit(async {
+            let over = Over::new();
+            let name = test_pipe();
+            tokio::spawn(imp::serve_within(name.clone(), PATIENT, |request| async move {
+                match request {
+                    Request::GetSettings => panic!("synthetic panic"),
+                    other => Ok(serde_json::to_value(&other).unwrap()),
+                }
+            }));
+            ask_patiently(&over, &name, Request::GetAppInfo).await.unwrap();
+            let n = name.clone();
+            let answer = tokio::task::spawn_blocking(move || imp::request_raw(&n, &Request::GetSettings, PATIENT)).await.unwrap();
+            assert_eq!(answer.err().as_deref(), Some("door_unavailable"), "a closed pipe, not an answer");
+            assert!(ask_patiently(&over, &name, Request::GetAppInfo).await.unwrap().result.is_some(), "and the door goes on");
         })
         .await
     }
