@@ -20,7 +20,8 @@ pub(crate) const MENU_COMPACT: &str = "compact_flyout";
 pub struct AppState {
     monitor: monitoring::Monitor,
     diagnostics: std::sync::Arc<diagnostics::Recorder>,
-    pub(crate) refresh_lock: tokio::sync::Mutex<()>,
+    /// Held by a refresh, and by an update's handover until its thread ends (`update_check::hand_over`).
+    pub(crate) refresh_lock: Arc<tokio::sync::Mutex<()>>,
     /// Held from reading settings to storing them, so the window and agents never lose a change.
     settings_lock: tokio::sync::Mutex<()>,
     account_operations: monitoring::Operations,
@@ -3147,7 +3148,7 @@ pub fn run() {
         usage_index: Mutex::default(),
         monitor: monitoring::Monitor::new(settings::app_dir().expect("config directory").join("monitoring")).with_diagnostics(diagnostics.clone()),
         diagnostics: diagnostics.clone(),
-        refresh_lock: tokio::sync::Mutex::new(()),
+        refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         settings_lock: tokio::sync::Mutex::new(()),
         account_operations: monitoring::Operations::default(),
         last_switch: Mutex::default(),

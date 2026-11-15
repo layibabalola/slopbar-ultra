@@ -86,7 +86,9 @@ mod tests {
 
     /// Installs wait for token rotation as named, bounded steps: an open sign-in defers the update
     /// before the download and again before the handover, and a refresh in progress is waited for
-    /// within its limit; the exit cleanup runs before the installer ends SlopBar.
+    /// within its limit. The refresh lock is an owned guard, bound once and then only handed, with
+    /// the turn, to the handover, whose thread holds it until it ends; the exit cleanup runs before
+    /// the installer ends SlopBar.
     #[test]
     fn ultra_updates_wait_for_token_rotation() {
         let (_, updater) = updates_rs("fn updater(");
@@ -96,8 +98,30 @@ mod tests {
         let deferral = "if crate::signin::any_active() {\n        return Ok(Outcome::Deferred(SIGN_IN_OPEN.into()));";
         assert_eq!(install.matches(deferral).count(), 2, "{install}");
         let (first, second) = (at(deferral), install.rfind(deferral).unwrap());
-        assert!(first < at("update.download("), "a sign-in defers before anything is downloaded");
-        assert!(at("update.download(") < at("refresh_lock.lock()") && at("refresh_lock.lock()") < second && second < at("update_check::hand_over("));
-        assert!(install.contains("\"Waiting for a refresh to finish\", update_check::REFRESH_WAIT_LIMIT"), "{install}");
+        let (refresh, handover) = (at("let refresh = steps"), at("update_check::hand_over("));
+        assert!(first < at("update.download(") && at("update.download(") < refresh && refresh < second && second < handover,
+            "a sign-in defers before the download and again before the handover, after the refresh lock:\n{install}");
+        assert!(install.contains(".run(\"Waiting for a refresh to finish\", update_check::REFRESH_WAIT_LIMIT, async move { Ok::<_, String>(refresh_lock.lock_owned().await) })"),
+            "an owned guard, within its limit:\n{install}");
+        let after = &install[refresh..];
+        let after = &after[after.find(".await?;").expect("the guard's binding ends") + ".await?;".len()..];
+        let named = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let uses = after.match_indices("refresh").filter(|(i, w)| !named(after[..*i].chars().next_back()) && !named(after[i + w.len()..].chars().next())).count();
+        assert_eq!(uses, 1, "once bound, the guard is used only to hand it to the handover:\n{after}");
+        assert!(install[handover..].starts_with("update_check::hand_over(steps, update_check::HANDOFF_LIMIT, (turn, refresh), "),
+            "the handover's thread holds the turn and the refresh lock:\n{install}");
+    }
+
+    /// The deadlines in updates.rs rely on tauri-plugin-updater 2.12.0's internals (updater.rs: the
+    /// builder's `timeout` reaching only the check; `check()` carrying the `configure_client` hook
+    /// into the `Update` it returns, with no timeout of its own; `Update::download` applying both).
+    /// A different version must be read again before this test is changed.
+    #[test]
+    fn the_updater_plugin_is_the_version_reviewed() {
+        let version = include_str!("../Cargo.lock")
+            .split("[[package]]")
+            .find(|package| package.lines().any(|l| l == "name = \"tauri-plugin-updater\""))
+            .and_then(|package| package.lines().find_map(|l| l.strip_prefix("version = \"")?.strip_suffix('"')));
+        assert_eq!(version, Some("2.12.0"), "re-review the deadlines in src-tauri/src/updates.rs against this tauri-plugin-updater");
     }
 }

@@ -106,7 +106,8 @@ async fn install_now(app: &AppHandle, by: Trigger, steps: &Steps) -> Result<Outc
     // On Windows the installer ends this process without an Exit event. Monitoring tokens rotate
     // only during a refresh or a sign-in, so it waits for both: an open sign-in page puts the update
     // off (deferred, not failed) before anything is downloaded and again before the handover, and
-    // the refresh lock is held until the process ends.
+    // the refresh lock goes with the handover's thread, held until that thread ends: a handover that
+    // never returns keeps refreshes waiting until SlopBar restarts.
     if crate::signin::any_active() {
         return Ok(Outcome::Deferred(SIGN_IN_OPEN.into()));
     }
@@ -121,17 +122,18 @@ async fn install_now(app: &AppHandle, by: Trigger, steps: &Steps) -> Result<Outc
     let bytes = steps
         .run("The download", update_check::DOWNLOAD_LIMIT, async { update.download(|_, _| {}, || {}).await.map_err(|e| describe(&e)) })
         .await?;
-    let state = app.state::<AppState>();
-    let _refresh = steps
-        .run("Waiting for a refresh to finish", update_check::REFRESH_WAIT_LIMIT, async { Ok::<_, String>(state.refresh_lock.lock().await) })
+    let refresh_lock = app.state::<AppState>().refresh_lock.clone();
+    let refresh = steps
+        .run("Waiting for a refresh to finish", update_check::REFRESH_WAIT_LIMIT, async move { Ok::<_, String>(refresh_lock.lock_owned().await) })
         .await?;
     if crate::signin::any_active() {
         return Ok(Outcome::Deferred(SIGN_IN_OPEN.into()));
     }
     record(app, by, Outcome::Installing(update.version.clone()));
     let _ = app.emit("update-installing", &update.version);
-    // On a thread of its own, holding the turn until that thread ends (see `hand_over`).
-    update_check::hand_over(steps, update_check::HANDOFF_LIMIT, turn, move || update.install(bytes).map_err(|e| describe(&e))).await?;
+    // On a thread of its own, holding the turn and the refresh lock until that thread ends, so no
+    // refresh starts while the installer may still end this process (see `hand_over`).
+    update_check::hand_over(steps, update_check::HANDOFF_LIMIT, (turn, refresh), move || update.install(bytes).map_err(|e| describe(&e))).await?;
     app.restart();
 }
 
