@@ -363,8 +363,9 @@ listen("settings-changed", (e) => applySettings(e.payload));
 invoke("system_locale")
   .then(setSystemLocale, () => {})
   .finally(() => invoke("get_settings").then(applySettings));
-// This computer's name, to tell it apart from the other machines an account is in use on.
-invoke("this_machine").then((name) => { setThisMachine(name); if (lastSnap.updated_at) render(lastSnap); }, () => {});
+// This computer's name, to tell it apart from the other machines an account is in use on. Only
+// the flyout shows it: redrawn now if open, else when it next opens.
+invoke("this_machine").then((name) => { setThisMachine(name); if (panelOpen && lastSnap.updated_at) render(lastSnap); }, () => {});
 
 $refresh.addEventListener("click", async () => {
   $refresh.classList.add("spin");
