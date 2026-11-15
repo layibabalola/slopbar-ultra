@@ -1935,13 +1935,15 @@ const machineText = (r) => {
  * which some languages inflect after "in use on") and `names` are their bare names; `elsewhere`
  * is whether other machines have it, and `seen` are machines that went quiet within the last day.
  * Another record under this machine's name (a second install, a clone) is this machine again and
- * is not listed twice, as in the app's overlap.
+ * is not listed twice, and two records under another machine's name are listed once (names match
+ * without regard to case), as in the app's overlap.
  */
 export function placesText(a) {
   const remote = a.remote ?? [];
   const here = a.active || a.desktop
     ? [{ machine: me(), here: true, where: [...(a.active ? a.sources ?? [] : []), ...(a.desktop ? ["Desktop app"] : [])] }] : [];
-  const live = remote.filter((r) => r.live && !(here.length && me() && sameName(r.machine, me())));
+  const live = remote.filter((r) => r.live && !(here.length && me() && sameName(r.machine, me())))
+    .filter((r, i, all) => !r.machine || all.findIndex((o) => o.machine && sameName(o.machine, r.machine)) === i);
   const using = [...here, ...live];
   const inUse = using.length ? t("inUseOn", { list: using.map(machineText).join(", ") }) : "";
   const labels = using.map((r) => machineText({ ...r, where: [] }));
@@ -1952,6 +1954,19 @@ export function placesText(a) {
     machine: machineText(r), t: duration(Math.max(1, Math.round((Date.now() - new Date(r.seen_at)) / 60000))),
   }));
   return { inUse, short, machines, names, elsewhere: live.length > 0, seen };
+}
+
+/**
+ * The line under an account's name in the compact flyout: two machines in full, then how many more
+ * ("+1"; the row's tooltip names them all). This machine, listed with others, comes second there,
+ * so that a narrow row cuts its "(this PC)" mark rather than another machine's name. Named
+ * machines only, as `placesText(a).machines`; empty when there are none.
+ */
+export function compactPlaces(a) {
+  const { machines } = placesText(a);
+  const hereFirst = (a.active || a.desktop) && me() && machines.length > 1;
+  const order = hereFirst ? [machines[1], machines[0], ...machines.slice(2)] : machines;
+  return order.length > 2 ? `${order.slice(0, 2).join(", ")} +${order.length - 2}` : order.join(", ");
 }
 
 /**

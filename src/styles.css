@@ -173,7 +173,7 @@ body.panel #accounts { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollba
 .overlap { display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; color: var(--warn); margin: 1px 0 2px; min-width: 0; }
 .overlap > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .overlap-icon { font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets"; font-size: 12px; font-weight: 400; flex: none; }
-.acct.line .overlap-badge { flex: none; display: inline-flex; align-items: center; gap: 2px; color: var(--warn); font-size: 11px; font-weight: 700; padding: 0 2px; }
+.acct.line .overlap-badge { display: inline-flex; align-items: center; gap: 2px; color: var(--warn); font-size: 11px; font-weight: 700; padding: 0 2px; }
 .acc-meta { font-size: 11px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 1px 0 2px; }
 .win { margin-top: 8px; }
 .acct .win:first-of-type { margin-top: 6px; }
@@ -235,19 +235,37 @@ body.panel #accounts { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollba
 .acct-head .spark { margin-left: auto; }
 .acct-head .spark + .in-use, .acct-head .spark + .use { margin-left: 0; }
 
-/* Compact layout: one line per account. */
+/* Compact layout: one line per account, laid out as a grid so that the machines under the name
+   can run on under the badge, sparkline and percentage. Gaps are margins: a row without a problem
+   mark or overlap badge keeps no empty gap for it. */
 .compact-list { display: flex; flex-direction: column; gap: 2px; }
-.acct.line { display: flex; align-items: center; gap: 8px; margin: 0; padding: 5px 8px; min-height: 34px; }
-.acct.line .who { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-.acct.line .who > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.acct.line .who .name { font-weight: 600; }
-/* The machines it is in use on, under the name; the row keeps its height (15 + 13 + 2 × 2 + borders = 34). */
-.acct.line:has(.where) { padding-block: 2px; }
+.acct.line {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto auto auto auto;
+  grid-template-areas: "mark name problem badge spark pct use"; align-items: center;
+  margin: 0; padding: 5px 8px; min-height: 34px;
+}
+.acct.line .who { display: contents; }
+.acct.line .who > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-left: 8px; }
+.acct.line .provider-mark { grid-area: mark; }
+.acct.line .who .name { grid-area: name; font-weight: 600; }
+.acct.line .problem { grid-area: problem; margin-left: 8px; }
+.acct.line .overlap-badge { grid-area: badge; margin-left: 8px; }
+.acct.line .spark { grid-area: spark; margin-left: 8px; }
+.acct.line .pct { grid-area: pct; margin-left: 8px; }
+.acct.line .in-use, .acct.line .use { grid-area: use; margin-left: 8px; }
+/* The machines it is in use on, under the name and on under the badge, sparkline and percentage,
+   so that two full computer names fit; Use spans both lines. The row keeps its height
+   (15 + 13 + 2 × 2 + borders = 34). */
+.acct.line:has(.where) {
+  grid-template-areas: "mark name problem badge spark pct use" "mark where where where where where use";
+  grid-template-rows: 15px 13px; padding-block: 2px;
+}
+.acct.line .where { grid-area: where; }
 .acct.line .who .name:has(+ .where) { line-height: 15px; }
 .acct.line .where { font-size: 11px; line-height: 13px; color: var(--text-3); }
 .acct.line .where .glyph { font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets"; font-size: 10px; line-height: 0; margin-right: 4px; vertical-align: -1px; }
-.acct.line .pct { flex: none; width: 34px; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
-.acct.line .in-use, .acct.line .use { flex: none; min-width: 52px; text-align: center; }
+.acct.line .pct { width: 34px; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+.acct.line .in-use, .acct.line .use { min-width: 52px; text-align: center; }
 .acct.line .in-use { color: var(--ok); font-weight: 600; font-size: 11px; }
 .acct.line .in-use.pending { opacity: 0.55; }
 .acct.line .use {
@@ -261,7 +279,7 @@ body.panel #accounts { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollba
   content: ""; position: absolute; inset: 0; margin: auto; width: 10px; height: 10px; border-radius: 50%;
   border: 1.5px solid var(--text-3); border-top-color: var(--text); animation: spin 0.7s linear infinite;
 }
-.acct.line .problem { flex: none; color: var(--warn); font-weight: 700; padding: 0 2px; }
+.acct.line .problem { color: var(--warn); font-weight: 700; padding: 0 2px; }
 
 /* The one-time offer of the compact layout. */
 #compact-offer { margin: 0 0 10px; padding: 10px 12px; border-radius: 4px; background: var(--card); border: 1px solid var(--card-stroke); }
