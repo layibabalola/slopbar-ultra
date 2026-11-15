@@ -12,6 +12,8 @@ use crate::update_check::{self, describe, Outcome, Steps, Trigger};
 use crate::AppState;
 
 const FIRST_CHECK: Duration = Duration::from_secs(20);
+/// Why an update is put off: tokens may be rotating in the sign-in, and the installer ends SlopBar.
+const SIGN_IN_OPEN: &str = "A sign-in is open; the update waits for it to finish";
 /// Upstream builds look for an update every 6 hours; Ultra release builds every 15 minutes
 /// (`ultra_release::CHECK_EVERY`), because their releases publish themselves.
 #[cfg(not(feature = "ultra-updates"))]
@@ -101,6 +103,13 @@ async fn install_now(app: &AppHandle, by: Trigger, steps: &Steps) -> Result<Outc
         .run("The update check", update_check::CHECK_LIMIT, async { updater(app)?.check().await.map_err(|e| describe(&e)) })
         .await?;
     let Some(mut update) = found else { return Ok(Outcome::UpToDate) };
+    // On Windows the installer ends this process without an Exit event. Monitoring tokens rotate
+    // only during a refresh or a sign-in, so it waits for both: an open sign-in page puts the update
+    // off (deferred, not failed) before anything is downloaded and again before the handover, and
+    // the refresh lock is held until the process ends.
+    if crate::signin::any_active() {
+        return Ok(Outcome::Deferred(SIGN_IN_OPEN.into()));
+    }
     // One install at a time, from its download to the end of its handover (a check takes no turn).
     let turn = match app.state::<AppState>().update_check.begin_install() {
         Ok(turn) => turn,
@@ -112,13 +121,12 @@ async fn install_now(app: &AppHandle, by: Trigger, steps: &Steps) -> Result<Outc
     let bytes = steps
         .run("The download", update_check::DOWNLOAD_LIMIT, async { update.download(|_, _| {}, || {}).await.map_err(|e| describe(&e)) })
         .await?;
-    // On Windows the installer ends this process without an Exit event. Monitoring tokens rotate
-    // only during a refresh or a sign-in, so it waits for both: the refresh lock is held until
-    // the process ends, and an open sign-in page puts the update off to the next check.
     let state = app.state::<AppState>();
-    let _refresh = state.refresh_lock.lock().await;
+    let _refresh = steps
+        .run("Waiting for a refresh to finish", update_check::REFRESH_WAIT_LIMIT, async { Ok::<_, String>(state.refresh_lock.lock().await) })
+        .await?;
     if crate::signin::any_active() {
-        return Err("A sign-in is open; the update waits for it to finish".into());
+        return Ok(Outcome::Deferred(SIGN_IN_OPEN.into()));
     }
     record(app, by, Outcome::Installing(update.version.clone()));
     let _ = app.emit("update-installing", &update.version);
