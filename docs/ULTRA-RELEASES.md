@@ -333,6 +333,13 @@ pwsh scripts/fleet-slopbar.ps1 -UpdateNow
     channel's release was published (`pub_date` in `latest.json`). A build from before the record,
     whose old updater could stall, gets 15 minutes plus the new pass limit (50 2/3 minutes), so a
     machine stuck on it shows during a rollout,
+  - a machine that is behind while the release time is unknown: `latest.json` has no `pub_date`, or
+    one that is not a time. (A file without a `pub_date` still updates machines. The updater reads
+    one that is not RFC 3339 as an error and rejects the whole file, so then no machine can update.)
+    How long the machine has been behind cannot be told, and one that is stuck must not pass for
+    one mid-rollout, so it is a problem, reported as "release time unknown". The report goes on and
+    says so above the table. A machine that is current is not affected, so a bad `pub_date` alone
+    never fails a report whose machines are all current,
   - and, from each machine's record, with its own interval and pass limit (15 minutes and 35 min 40 s
     on Ultra builds):
     - a failed last update check (a deferred one is no problem),

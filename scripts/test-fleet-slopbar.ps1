@@ -98,8 +98,35 @@ $r = Row (Info $behind '0.1.0-ultra.12') -published (Ago 60)
 Check 'behind an hour after the release is a problem' ($r.Behind -and $r.Problem -and $r.Status -eq 'behind; still behind 60 min after the release')
 $r = Row (Info $behind '0.1.0-ultra.12') -published (Ago 20)
 Check 'behind 20 minutes after the release is not yet a problem' ($r.Behind -and -not $r.Problem)
-$r = Row (Info $behind '0.1.0-ultra.12') -published $null
-Check 'without a release time there is no such problem' ($r.Behind -and -not $r.Problem)
+
+# A release time that cannot be used (latest.json has no pub_date, or one that is not a time): how long
+# a machine has been behind cannot be told, so one that is behind is a problem (a stuck one would pass
+# for one mid-rollout), and the report goes on. A current machine is not affected. pub_date arrives as
+# ConvertFrom-Json reads it: a string, a [datetime], or whatever a malformed file holds.
+function Published([string]$json) { ("{`"pub_date`": $json}" | ConvertFrom-Json).pub_date }
+# The row, or an object without a status when making it stopped with an error (so the check fails
+# instead of the whole test).
+function TryRow($info, $published) {
+  try { Row $info -published $published } catch { [pscustomobject]@{ Status = $null; Problem = $false; Behind = $false; Error = $_.Exception.Message } }
+}
+$noDate = 'behind; release time unknown (latest.json has no pub_date)'
+$notATime = 'behind; release time unknown (latest.json has a pub_date that is not a time)'
+$r = TryRow (Info $behind '0.1.0-ultra.12') (Published 'null')
+Check 'behind, with no pub_date, is a problem that says so' ($r.Behind -and $r.Problem -and $r.Status -eq $noDate)
+$r = TryRow (Info $behind '0.1.0-ultra.12') (Published '""')
+Check 'behind, with an empty pub_date, is the same' ($r.Behind -and $r.Problem -and $r.Status -eq $noDate)
+$r = TryRow (Info $null '0.1.0-ultra.10') (Published 'null')
+Check 'a build without the record, behind, with no pub_date, is a problem too' ($r.Behind -and $r.Problem -and $r.Status -eq $noDate)
+foreach ($bad in '"soon"', '"11:00"', '"2026-11-15"', '"2026-11-15 11:00"', '"2026-13-45T25:61:61Z"', '1763200000', 'true', '[1, 2]', '{"at": 1}') {
+  $r = TryRow (Info $behind '0.1.0-ultra.12') (Published $bad)
+  Check "behind, with a pub_date of $bad, is a problem that says so, and no error" ($r.Behind -and $r.Problem -and $r.Status -eq $notATime)
+}
+$r = TryRow (Info (Record @{ at = (Ago 4); result = 'up_to_date'; next_at = (Ago -11) })) (Published 'null')
+Check 'a current machine is not affected by an unusable release time' (-not $r.Behind -and -not $r.Problem -and $r.Status -eq 'current')
+$r = TryRow (Info $behind '0.1.0-ultra.12') (Published ('"' + (Ago 60) + '"'))
+Check 'a pub_date as ConvertFrom-Json reads it (a [datetime]) is used' ($r.Problem -and $r.Status -eq 'behind; still behind 60 min after the release')
+$r = TryRow (Info $behind '0.1.0-ultra.12') (Published ('"' + (Ago 20) + '"'))
+Check '...and within the grace it is no problem' ($r.Behind -and -not $r.Problem -and $r.Status -eq 'behind')
 
 # Times as the door and latest.json give them: text, or a [datetime] once ConvertFrom-Json read it.
 $hourAgo = $now.AddHours(-1)
@@ -107,6 +134,17 @@ Check 'a time as text' ((ConvertTo-UtcTime '2026-11-15T11:00:00Z') -eq $hourAgo)
 Check 'a time with an offset' ((ConvertTo-UtcTime '2026-11-15T13:00:00+02:00') -eq $hourAgo)
 Check 'a time ConvertFrom-Json read' ((ConvertTo-UtcTime ('{"t":"2026-11-15T11:00:00Z"}' | ConvertFrom-Json).t) -eq $hourAgo)
 Check 'a time without a kind is UTC' ((ConvertTo-UtcTime ([datetime]::new(2026, 11, 15, 11, 0, 0))) -eq $hourAgo)
+$released = Get-ReleaseTime (Published '"2026-11-15T11:00:00Z"')
+Check 'a release time, as ConvertFrom-Json reads it, is a UTC time' ($released.Time -eq $hourAgo -and $null -eq $released.Why)
+$released = Get-ReleaseTime '2026-11-15T13:00:00+02:00'
+Check 'a release time as text, with an offset' ($released.Time -eq $hourAgo -and $null -eq $released.Why)
+$released = Get-ReleaseTime $null
+Check 'no pub_date: no release time, and why' ($null -eq $released.Time -and $released.Why -eq 'latest.json has no pub_date')
+$released = Get-ReleaseTime '2026-13-45T25:61:61Z'
+Check 'a pub_date of the right shape that is no time: no release time, and why' ($null -eq $released.Time -and $released.Why -eq 'latest.json has a pub_date that is not a time')
+Check 'the report says so above the table' ((Get-ReleaseTimeNote $null) -match '^Release time unknown \(latest\.json has no pub_date\): a machine that is behind is reported as a problem' -and
+  (Get-ReleaseTimeNote 'soon') -match 'not a time\)')
+Check 'and says nothing when the release time is known' ($null -eq (Get-ReleaseTimeNote (Published '"2026-11-15T11:00:00Z"')))
 Check 'short text is left alone' ((Get-Short 'up to date') -eq 'up to date')
 
 if ($failures) { Write-Output "$failures failed"; exit 1 }

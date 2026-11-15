@@ -25,7 +25,10 @@ Problems (exit code 1): a local build (a version without -ultra., which takes no
 without updates, "Update automatically" off, a machine that does not answer, an update that does not
 arrive, a machine still behind the channel longer than the interval plus a pass's limit after the
 channel's release was published (latest.json's pub_date; a build from before the record, whose old
-updater could stall, gets Ultra's 15-minute interval plus the new pass limit), and, from the record:
+updater could stall, gets Ultra's 15-minute interval plus the new pass limit), a machine that is
+behind when the release time is unknown (no pub_date, or one that is not a time: how long it has
+been behind cannot be told, and a stuck machine must not pass for one mid-rollout; the report says
+so and goes on, and a machine that is current is not affected), and, from the record:
   - a failed last update check (a deferred one is no problem);
   - no update check for longer than the interval plus a pass's limit while "Update automatically" is
     on;
@@ -88,6 +91,27 @@ function ConvertTo-UtcTime($value) {
     return $value.ToUniversalTime()
   }
   return [datetimeoffset]::Parse("$value", [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+}
+
+# When the channel's release was published: latest.json's pub_date, as a UTC time (Time), or why it
+# cannot be used (Why, with Time $null): it is missing, or not a time. $published is what
+# ConvertFrom-Json made of it: text, a [datetime], or whatever a malformed file holds. The updater
+# reads it as RFC 3339 (a date, a time and an offset) and rejects the whole file otherwise, so text
+# that is not that is no time here either, whatever .NET would make of it ("11:00" is today).
+function Get-ReleaseTime($published) {
+  $unusable = { param([string]$why) [pscustomobject]@{ Time = $null; Why = $why } }
+  if ($null -eq $published -or "$published".Trim() -eq '') { return & $unusable 'latest.json has no pub_date' }
+  $notATime = 'latest.json has a pub_date that is not a time'
+  if ($published -isnot [datetime] -and "$published" -notmatch '^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$') { return & $unusable $notATime }
+  try { $time = ConvertTo-UtcTime $published } catch { return & $unusable $notATime }
+  return [pscustomobject]@{ Time = $time; Why = $null }
+}
+
+# The line above the table when the release time cannot be used, else $null.
+function Get-ReleaseTimeNote($published) {
+  $release = Get-ReleaseTime $published
+  if (-not $release.Why) { return $null }
+  return "Release time unknown ($($release.Why)): a machine that is behind is reported as a problem, because how long it has been behind cannot be told."
 }
 
 # $text cut to $max characters.
@@ -177,7 +201,7 @@ function Invoke-Everywhere([string[]]$machines, [string]$tool, [int]$seconds = $
 }
 
 # One machine's row. $published is when the channel's release was published (latest.json's
-# pub_date).
+# pub_date, as ConvertFrom-Json read it: see Get-ReleaseTime).
 function Get-Row([string]$machine, $info, $settings, [string]$channel, $published, [datetime]$now = [datetime]::UtcNow) {
   $row = [pscustomobject]@{ Machine = $(if ($machine -eq $here) { "$($machine.ToLowerInvariant()) (here)" } else { $machine })
     Version = ''; AutoUpdate = ''; LastCheck = ''; Status = ''; Behind = $false; Problem = $false; Key = $machine; CheckText = '' }
@@ -202,12 +226,17 @@ function Get-Row([string]$machine, $info, $settings, [string]$channel, $publishe
       foreach ($problem in $last.Problems) { $notes.Add($problem); $row.Problem = $true }
       # Still behind long after the release: its update loop should have installed it by now. A build
       # from before the record, whose old updater could stall, gets Ultra's interval and the new pass
-      # limit, so a machine stuck on it shows during a rollout.
-      $released = ConvertTo-UtcTime $published
-      if ($row.Behind -and $null -ne $released) {
-        $since = $now - $released
-        if ($since.TotalSeconds -gt ($last.Interval ?? $OldBuildInterval) + ($last.PassLimit ?? $OldBuildPassLimit)) {
-          $notes.Add("still behind $([int][Math]::Floor($since.TotalMinutes)) min after the release"); $row.Problem = $true
+      # limit, so a machine stuck on it shows during a rollout. Without a usable release time that
+      # cannot be told, and a machine that is stuck would pass for one mid-rollout: a problem too.
+      if ($row.Behind) {
+        $release = Get-ReleaseTime $published
+        if ($null -eq $release.Time) {
+          $notes.Add("release time unknown ($($release.Why))"); $row.Problem = $true
+        } else {
+          $since = $now - $release.Time
+          if ($since.TotalSeconds -gt ($last.Interval ?? $OldBuildInterval) + ($last.PassLimit ?? $OldBuildPassLimit)) {
+            $notes.Add("still behind $([int][Math]::Floor($since.TotalMinutes)) min after the release"); $row.Problem = $true
+          }
         }
       }
       $row.Status = $notes -join '; '
@@ -246,6 +275,8 @@ try {
   if ($channel -notmatch '^\d+\.\d+\.\d+-ultra\.\d+$') { throw "The channel holds '$channel', not an Ultra version." }
   $machines = @($here) + @(Get-FleetHosts $SshConfig)
   Write-Output "Channel: $channel. Machines: $($machines.Count) (this one and the ssh managed block)."
+  $releaseNote = Get-ReleaseTimeNote $published
+  if ($releaseNote) { Write-Output $releaseNote }
   $rows = Get-Report $machines $channel $published
   Write-Report $rows
 
