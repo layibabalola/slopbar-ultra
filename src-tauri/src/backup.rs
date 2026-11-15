@@ -417,7 +417,7 @@ pub fn merge(settings: &Settings, history: &History, ledger: &Ledger, backup: &C
         };
         let pin = ProjectPin { folder, ..pin.clone() };
         let full = next.project_pins.len() >= crate::pins::MAX_PINS;
-        match next.project_pins.iter_mut().find(|p| p.folder.eq_ignore_ascii_case(&pin.folder) && p.provider == pin.provider) {
+        match next.project_pins.iter_mut().find(|p| crate::pins::same_folder(&p.folder, &pin.folder) && p.provider == pin.provider) {
             Some(p) if *p == pin => {}
             Some(p) => { pins.changed.push(pin.folder.clone()); *p = pin; }
             None if full => skipped.push(Skipped { what: format!("pin {}", pin.folder), reason: "too_many_pins" }),
