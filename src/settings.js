@@ -1117,6 +1117,8 @@ $("guide").addEventListener("click", async (e) => {
   if (e.target.closest("#guide-close, #guide-done")) { closeGuide(); return; }
   if (e.target.closest("#guide-sharing-setup")) {
     showPage("data");
+    // Its steps show under Other computers, below the fold.
+    $("sharing-setup").scrollIntoView({ block: "start", behavior: "smooth" });
     startSharingSetup();
     return;
   }
@@ -1298,8 +1300,8 @@ function renderSharingSetup() {
   const running = SETUP_RUNNING.includes(s.phase);
   const shown = s.phase !== "idle";
   $("sharing-setup").hidden = !(running || shown || (!settings.presence_folder && !settings.presence_remote));
-  $("sharing-setup-start").disabled = running;
-  $("sharing-setup-start").hidden = s.phase === "done";
+  // While it runs, Cancel (under the steps) is the one action; once done, nothing to start.
+  $("sharing-setup-start").hidden = running || s.phase === "done";
   $("sharing-setup-start").textContent = t(s.phase === "failed" ? "sharingSetupRetry" : "sharingSetupStart");
   $("sharing-setup-steps").hidden = !shown;
   $("sharing-setup-cancel").hidden = !running;
@@ -1329,11 +1331,14 @@ function renderSharingSetup() {
     + step(2, t("sharingStepOn"), "") + result;
 }
 async function startSharingSetup(reconnect = false) {
+  // One click starts one setup: a second before the answer would only hear "already running".
+  $("sharing-setup-start").disabled = $("sharing-setup-reconnect").disabled = true;
   try {
-    sharingSetup = await invoke("setup_sharing", { reconnect });
+    sharingSetup = (await invoke("setup_sharing", { reconnect })) ?? sharingSetup;
   } catch (err) {
     sharingSetup = { phase: "failed", error: String(err) };
   }
+  $("sharing-setup-start").disabled = $("sharing-setup-reconnect").disabled = false;
   renderSharingSetup();
 }
 $("sharing-setup-start").addEventListener("click", () => startSharingSetup());
