@@ -73,6 +73,35 @@ pub enum Request {
     },
     /// An RFC 7386 merge patch over the current settings (see `settings::patched`).
     UpdateSettings { patch: Value },
+    /// Connect this computer's in-use sharing to Dropbox through rclone (see `sharing_setup`):
+    /// get rclone if it is missing, rclone's own Dropbox sign-in, sharing on. Answers at once with
+    /// the setup's state; `cancel` stops a running one. With `via_tunnel` the sign-in is finished in
+    /// a browser on another computer, so this computer's desktop need not be shown. `reconnect`
+    /// signs in again even when the remote works (to use another Dropbox account).
+    SetupSharing {
+        #[serde(default)]
+        remote: Option<String>,
+        #[serde(default)]
+        via_tunnel: bool,
+        #[serde(default)]
+        cancel: bool,
+        #[serde(default)]
+        reconnect: bool,
+    },
+    /// The sharing setup's state, never its sign-in link.
+    GetSharingSetup,
+    /// `slopbar-mcp --sharing-state` only: the state value in rclone's waiting link, for the
+    /// computer that finishes the sign-in through a tunnel. Never an MCP tool's result.
+    SharingSetupLink,
+    /// Opens an SSH tunnel to `host` for rclone's sign-in port and this computer's browser on the
+    /// link built from `state`; with `close`, closes it.
+    SharingTunnel {
+        host: String,
+        #[serde(default)]
+        state: Option<String>,
+        #[serde(default)]
+        close: bool,
+    },
     /// Used share, reset, pace and forecast per window for one account (or each provider's account
     /// in use), from the last snapshot (see `headroom`).
     GetHeadroom {
