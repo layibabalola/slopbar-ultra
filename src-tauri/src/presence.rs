@@ -99,8 +99,14 @@ pub fn withdraw(store: &dyn PresenceStore, interval_s: u64) {
 
 /// The computer's name, as other machines will show it.
 pub fn machine_name() -> String {
+    this_machine().unwrap_or_else(|| "?".into())
+}
+
+/// This computer's name, as other machines show it (the one its presence record carries), so
+/// the UI can tell it apart from them; None when the system has none.
+pub fn this_machine() -> Option<String> {
     let name = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_default();
-    clean_name(&name).unwrap_or_else(|| "?".into())
+    clean_name(&name)
 }
 
 fn clean_name(name: &str) -> Option<String> {

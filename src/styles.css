@@ -238,7 +238,14 @@ body.panel #accounts { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollba
 /* Compact layout: one line per account. */
 .compact-list { display: flex; flex-direction: column; gap: 2px; }
 .acct.line { display: flex; align-items: center; gap: 8px; margin: 0; padding: 5px 8px; min-height: 34px; }
-.acct.line .who { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acct.line .who { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.acct.line .who > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acct.line .who .name { font-weight: 600; }
+/* The machines it is in use on, under the name; the row keeps its height (15 + 13 + 2 × 2 + borders = 34). */
+.acct.line:has(.where) { padding-block: 2px; }
+.acct.line .who .name:has(+ .where) { line-height: 15px; }
+.acct.line .where { font-size: 11px; line-height: 13px; color: var(--text-3); }
+.acct.line .where .glyph { font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets"; font-size: 10px; line-height: 0; margin-right: 4px; vertical-align: -1px; }
 .acct.line .pct { flex: none; width: 34px; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
 .acct.line .in-use, .acct.line .use { flex: none; min-width: 52px; text-align: center; }
 .acct.line .in-use { color: var(--ok); font-weight: 600; font-size: 11px; }

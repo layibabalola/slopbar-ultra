@@ -2134,6 +2134,13 @@ fn system_locale() -> Option<String> {
     sys_locale::get_locale()
 }
 
+/// This computer's name, so the windows can say which machine an account is in use on and mark
+/// this one among the others (`presence::this_machine`).
+#[tauri::command]
+fn this_machine() -> Option<String> {
+    presence::this_machine()
+}
+
 /// Sync folders (OneDrive, Dropbox, iCloud Drive) Settings can offer for sharing in-use status.
 #[tauri::command]
 async fn sync_folders() -> Vec<presence::SyncFolder> {
@@ -3213,6 +3220,7 @@ pub fn run() {
             check_presence_folder,
             rclone_remotes,
             system_locale,
+            this_machine,
             check_for_updates,
             install_update,
             app_version,

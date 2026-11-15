@@ -325,6 +325,58 @@ pub fn money(lang: &str, v: f64) -> String {
     format!("{}${grouped}{frac}", if v < 0.0 && cents > 0 { "-" } else { "" })
 }
 
+/// Where on a machine an account is in use, translated ("WSL: Ubuntu, Desktop app"); empty when
+/// it is only the CLI on Windows, the usual place.
+fn places(lang: &str, where_: &[String]) -> String {
+    let list: Vec<String> = where_.iter()
+        .map(|w| if w == crate::desktop_apps::PLACE { t(lang, "desktopApp", &[]) } else { w.clone() })
+        .collect();
+    if list.len() == 1 && list[0] == "Windows" { String::new() } else { list.join(", ") }
+}
+
+/// Another machine and where on it (i18n.js `machineText`): "LAPTOP-2", "LAPTOP-2 (WSL: Ubuntu)".
+pub fn remote_text(lang: &str, r: &crate::model::RemoteSeat) -> String {
+    match places(lang, &r.where_) {
+        p if p.is_empty() => r.machine.clone(),
+        p => format!("{} ({p})", r.machine),
+    }
+}
+
+/// This machine and where on it: "ULTRA-MAGNUS (this PC)", "ULTRA-MAGNUS (this PC, Desktop app)",
+/// or "this PC" while its name is unknown.
+fn here_text(lang: &str, me: Option<&str>, where_: &[String]) -> String {
+    let p = places(lang, where_);
+    match me {
+        Some(me) if p.is_empty() => t(lang, "thisPc", &[("machine", me)]),
+        Some(me) => t(lang, "thisPcWhere", &[("machine", me), ("where", &p)]),
+        None if p.is_empty() => t(lang, "thisPcUnnamed", &[]),
+        None => format!("{} ({p})", t(lang, "thisPcUnnamed", &[])),
+    }
+}
+
+/// A machine by name, marked when it is this one (i18n.js `machineName`). Names compare without
+/// case, as `presence::overlap` does.
+pub fn machine_name(lang: &str, name: &str, me: Option<&str>) -> String {
+    if me.is_some_and(|me| me.eq_ignore_ascii_case(name)) { t(lang, "thisPc", &[("machine", name)]) } else { name.to_string() }
+}
+
+/// Where an account is in use (i18n.js `placesText`): "In use on ULTRA-MAGNUS (this PC, Desktop
+/// app), LAPTOP-2 (WSL: Ubuntu)": this machine first while its CLI or desktop app is signed in to
+/// the account, then the other machines that are still writing. Empty when it is in use nowhere.
+/// `me` is this machine's name.
+pub fn in_use_text(lang: &str, a: &crate::model::AccountUsage, me: Option<&str>) -> String {
+    let mut list = vec![];
+    if a.active || a.desktop {
+        let mut here = if a.active { a.sources.clone() } else { vec![] };
+        if a.desktop {
+            here.push(crate::desktop_apps::PLACE.into());
+        }
+        list.push(here_text(lang, me, &here));
+    }
+    list.extend(a.remote.iter().filter(|r| r.live).map(|r| remote_text(lang, r)));
+    if list.is_empty() { String::new() } else { t(lang, "inUseOn", &[("list", &list.join(", "))]) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,5 +478,38 @@ mod tests {
         assert_eq!(js_number(2.0), "2");
         assert_eq!(js_number(2.5), "2.5");
         assert_eq!(js_round(2.5), 3.0);
+    }
+
+    fn used(active: bool, desktop: bool, sources: &[&str], remote: serde_json::Value) -> crate::model::AccountUsage {
+        serde_json::from_value(serde_json::json!({
+            "id": "a1", "provider": "claude", "email": "synthetic@example.invalid", "alias": null, "plan": null,
+            "org": null, "active": active, "desktop": desktop, "sources": sources, "windows": [], "credits": null,
+            "resets": [], "error": null, "stale": false, "fetched_at": null, "monitor_connected": true, "remote": remote,
+        })).unwrap()
+    }
+
+    #[test]
+    fn names_every_machine_an_account_is_in_use_on_this_one_first() {
+        let now = at("2026-11-15T07:00:00Z");
+        let laptop = serde_json::json!({ "machine": "LAPTOP-2", "where": ["WSL: Ubuntu"], "seen_at": now, "live": true });
+        let quiet = serde_json::json!({ "machine": "DESK-3", "where": ["Windows"], "seen_at": now, "live": false });
+        let me = Some("DESK-1");
+        // Here only: the CLI on Windows goes unsaid, other places are named.
+        assert_eq!(in_use_text("en", &used(true, false, &["Windows"], serde_json::json!([])), me), "In use on DESK-1 (this PC)");
+        assert_eq!(in_use_text("en", &used(true, true, &["Windows"], serde_json::json!([])), me), "In use on DESK-1 (this PC, Windows, Desktop app)");
+        assert_eq!(in_use_text("en", &used(false, true, &[], serde_json::json!([])), me), "In use on DESK-1 (this PC, Desktop app)");
+        // Here and elsewhere; a machine that went quiet is not in use.
+        assert_eq!(in_use_text("en", &used(true, false, &["Windows"], serde_json::json!([laptop, quiet])), me),
+            "In use on DESK-1 (this PC), LAPTOP-2 (WSL: Ubuntu)");
+        // Elsewhere only, as before.
+        assert_eq!(in_use_text("en", &used(false, false, &[], serde_json::json!([laptop])), me), "In use on LAPTOP-2 (WSL: Ubuntu)");
+        assert_eq!(in_use_text("en", &used(false, false, &[], serde_json::json!([quiet])), me), "");
+        // No name for this machine: still said, and translated.
+        assert_eq!(in_use_text("en", &used(true, false, &["WSL: Ubuntu"], serde_json::json!([])), None), "In use on this PC (WSL: Ubuntu)");
+        assert_eq!(in_use_text("de", &used(true, false, &["Windows"], serde_json::json!([])), me), "Aktiv auf DESK-1 (dieser PC)");
+        // In an overlap's list of names, this one is marked (without case, as `presence::overlap` matches).
+        assert_eq!(machine_name("en", "desk-1", me), "desk-1 (this PC)");
+        assert_eq!(machine_name("en", "LAPTOP-2", me), "LAPTOP-2");
+        assert_eq!(machine_name("en", "LAPTOP-2", None), "LAPTOP-2");
     }
 }
