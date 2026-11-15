@@ -70,10 +70,11 @@ Tailscale only gives the two computers a private route to each other wherever th
 
 - Install SlopBar and start it from the Start menu. Agents never start it over SSH: started from
   an SSH session it would run where nobody can see it.
-- Sharing through Dropbox needs nothing at this screen: from the computer with the accounts, the
-  agent runs `setup_sharing` with this computer's `ssh_host` and `confirm: true` (below). With a
-  synced folder instead (OneDrive, Dropbox…), sign in to it here and choose it in Settings → Data
-  → Other computers. Pairing points SlopBar at the same rclone remote by name.
+- Sharing through Dropbox: click **Set up** in Settings → Data → Other computers here, or let the
+  agent start it from the computer with the accounts (below); either way Dropbox's page opens here,
+  for you to sign in and click Allow. With a synced folder instead (OneDrive, Dropbox…), sign in to
+  it here and choose it in Settings → Data → Other computers. Pairing points SlopBar at the same
+  rclone remote by name.
 - Leave Windows signed in. Locking is fine until the sign-ins start.
 
 ## 3. Point the agent at it
@@ -89,13 +90,14 @@ The agent should:
    `no_desktop_session` (nobody is signed in at its desktop), `app_not_running`, `desktop_locked`,
    `desktop_not_shown` (a closed Remote Desktop or another user switched in), `no_browser`.
 2. If the new computer has no sharing location yet (readiness lists `no_sharing_location` or
-   `rclone_remote_missing`), call `setup_sharing` with `ssh_host: "newpc"` and `confirm: true`.
-   SlopBar there gets rclone (a fixed, checksum-verified download) and starts Dropbox's sign-in, and
-   the page opens in this computer's browser through an SSH tunnel: sign in with the Dropbox
-   account this computer uses and click Allow; the token goes straight to the new computer's
-   rclone. Follow it with `get_sharing_setup` and the same `ssh_host` until `phase` is `done`;
-   `sees_this_computer: false` means it is signed in to another Dropbox account (run it again with
-   `reconnect: true`).
+   `rclone_remote_missing`), ask you to sit at its screen, then call `setup_sharing` with
+   `ssh_host: "newpc"` and `confirm: true`. SlopBar there gets rclone (a fixed, checksum-verified
+   download) and opens Dropbox's page in its own browser: sign in there with the Dropbox account
+   this computer uses and click Allow. Follow it with `get_sharing_setup` and the same `ssh_host`
+   (`wait_seconds: 45` with `since`) until `phase` is `done`; `sees_this_computer: false` means it
+   is signed in to another Dropbox account (run it again with `reconnect: true`). If that screen is
+   out of reach, `open_here: true` opens the page in this computer's browser instead, through an
+   SSH tunnel; the token still goes straight to the new computer's rclone.
 3. Call `pair_machine` with `ssh_host: "newpc"`. It uses this computer's roster passphrase (or
    generates a 256-bit key when there is none), sends it over the SSH connection's input to the
    new computer's SlopBar, which saves it with Windows DPAPI as it saves any roster passphrase,
@@ -132,7 +134,8 @@ for example `| Out-String`.
 | SSH could not run the command (Permission denied) | The public key is not in the right `authorized_keys` file, or that file's permissions are too open (administrators: the `icacls` line above). |
 | SSH could not run the command (Host key verification failed) | Connect once by hand with `ssh newpc` and accept the host key. |
 | SlopBar is not running on the other computer's desktop | Start it there from the Start menu. |
-| The other computer has no working rclone remote named … (or readiness lists `rclone_remote_missing`) | Run `setup_sharing` with its `ssh_host` and `confirm: true` from here: the Dropbox sign-in opens in this computer's browser. At its screen, **Set up** in Settings → Data → Other computers does the same. |
-| `setup_sharing` with `ssh_host` fails with `tunnel_failed` | Port 53682 is in use on this computer (another rclone sign-in is waiting), or SSH could not connect. Close the other sign-in and try again. |
+| The other computer has no working rclone remote named … (or readiness lists `rclone_remote_missing`) | At its screen, click **Set up** in Settings → Data → Other computers, or have the agent run `setup_sharing` with its `ssh_host` and `confirm: true`: either way the Dropbox sign-in opens there. |
+| `setup_sharing` with `ssh_host` fails with `desktop_locked` or `desktop_not_shown` | Nobody can see the new computer's desktop: unlock it (or go back to it), then try again. |
+| `setup_sharing` with `ssh_host` and `open_here` fails with `tunnel_failed` | Port 53682 is in use on this computer (another rclone sign-in is waiting), or SSH could not connect. Close the other sign-in and try again. |
 | `setup_sharing` with `ssh_host` fails with `update_slopbar_there` | The other computer's SlopBar predates the guided setup: update it there. |
 | The other computer answered without a SlopBar result | Update SlopBar there; pairing needs the same version on both. |

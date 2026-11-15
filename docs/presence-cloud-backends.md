@@ -97,8 +97,12 @@ rclone and the tunnel below run in the app's job object, so they end with SlopBa
 automatic update waits while a setup runs here or the tunnel for another computer is open.
 
 **Another computer, over SSH.** `setup_sharing` with `ssh_host` sets up that computer from this
-one, with nobody at its screen. Its SlopBar gets rclone and starts the sign-in without a browser;
-this computer's SlopBar reads only the link's `state` value (`slopbar-mcp --sharing-state`, never
+one, and Dropbox's page opens on that computer's own screen, in its browser, as if the setup had
+started there (the owner's ruling: the page opens on the computer being set up). It is refused
+while nobody can see that desktop, like every sign-in SlopBar starts. Only with `open_here: true`,
+for a computer whose screen is out of reach, does the page open on this computer instead: that
+computer's SlopBar gets rclone and starts the sign-in without a browser, and this computer's
+SlopBar reads only the link's `state` value (`slopbar-mcp --sharing-state`, never
 a tool result), checks that it is letters, digits, `-` and `_`, opens an SSH tunnel
 (`ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:53682:127.0.0.1:53682 -L
 [::1]:53682:127.0.0.1:53682`; Dropbox sends the browser to `localhost`, which browsers try over
