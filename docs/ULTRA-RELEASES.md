@@ -50,6 +50,9 @@ as the next `0.1.0-ultra.<n>`, and installed copies take it at their next check.
 only docs, the roadmap or the README publishes nothing. After merging into `ultra` and pushing,
 nothing is left to do. To watch: `gh run list -R layibabalola/slopbar-ultra --workflow ultra-release.yml`.
 
+A push that changes only the release tooling or the fleet report is rehearsed instead: built and
+tested, not published (step 0 below).
+
 Installed copies pick the release up at their next check: about 20 seconds after SlopBar starts,
 then every 15 minutes (`ultra_release::CHECK_EVERY`; upstream builds keep 6 hours). So a fix reaches
 every machine about 10 minutes for the build plus at most 15 for the check after the push. To have
@@ -125,9 +128,19 @@ On a machine without the key, the first form stops before building and suggests 
 The steps:
 
 0. **Decide** (the workflow, on a push to `ultra`). It publishes when anything that ships changed
-   since the release the channel holds. It rehearses (Check and Build, nothing kept) when only the
-   release tooling changed in this push: the workflow, the script or its test. Otherwise it does
-   nothing.
+   since the release the channel holds. It rehearses when only the release tooling (the workflow,
+   the publisher or its test) or the fleet report (its script or test) changed in this push.
+   Otherwise it does nothing.
+
+   A rehearsal is the workflow's whole `build` job without `publish`: Check, the unit tests twice,
+   `tauri build` and both offline tests, with nothing kept. It exists so a break in the publisher
+   or the fleet report shows on the push that made it. Without it, a push that changes only the
+   fleet report would run no test, and a break would stop the next release instead. It costs a
+   whole build (about 5 to 8 minutes with a warm cache, 16 when the cache is cold, of which the
+   fleet test is one second) and the workflow's one lane for that long, so a release pushed
+   meanwhile waits behind it. Everything the workflow runs is in one of the two lists in
+   `scripts/publish-ultra-release.ps1`, and its test fails if a script the workflow runs, or the
+   script under a test it runs, is in neither.
 1. **Check.** The checkout is clean. By hand it must be exactly `origin/ultra`. On a push, it is the
    pushed commit, which must be on `ultra`. In both cases the version takes the next free build
    number, above every `ultra-v` tag and the channel's. On a tag, it is the tagged commit, on
@@ -163,6 +176,9 @@ The steps:
   commit and that no release run is unfinished. Then it pushes the tag `ultra-v<version>` under the
   next free number. With nothing else running, the tag's run starts at once, where no newer run can
   replace it.
+- **Only the fleet report changed** (its script or test). The workflow rehearses that push so the
+  test runs, but no installer holds the fleet report, so a release of it would be the installer the
+  channel has, again. It publishes nothing and pushes no tag, as for documentation.
 - **Only documentation changed.** It publishes nothing: the installer would be the same.
 
 A run usually takes 10 to 20 minutes. At the end it confirms that the channel holds a release with

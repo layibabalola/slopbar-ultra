@@ -15,7 +15,10 @@ The workflow, one step per call, sharing the -Stage folder:
   -Step Build|Sign|Publish [-Tag <tag>]
 
 Decide   Publish when anything under $shippingPaths changed since the channel's release; rehearse
-         (Check and Build only) when only the release tooling changed in this push; else nothing.
+         (the build job without publishing: Check, Build and the offline tests) when only the release
+         tooling ($toolingPaths) or the fleet report ($fleetPaths) changed in this push; else nothing.
+         -ViaActions releases a rehearsal's commit by tag only for the tooling: no installer holds the
+         fleet report.
 Check    The checkout is clean. By hand: it is exactly origin/ultra. On a push: the pushed commit, on
          ultra. Both take the next free build number, above every ultra-v tag and the channel. On a
          tag: the tagged commit, on ultra, under the tag's version. Always: the version is newer than
@@ -54,8 +57,14 @@ $workflow = 'ultra-release.yml'
 $pollSeconds = 5
 # What ships: everything the installer is built from. A change here is published.
 $shippingPaths = @('src', 'src-tauri', 'package.json', 'pnpm-lock.yaml')
-# The release tooling: a change here alone rehearses the build.
+# The release tooling: a change here alone rehearses the build, and -ViaActions releases it by tag,
+# since the build it makes may differ.
 $toolingPaths = @('.github/workflows/ultra-release.yml', 'scripts/publish-ultra-release.ps1', 'scripts/test-publish-ultra-release.ps1')
+# The fleet report and its test: the build job runs the test, but no installer holds either. A change
+# here alone rehearses too, so its test runs on that push and not at the next release, which a break
+# would stop; -ViaActions publishes nothing for it, as for documentation. Everything the workflow runs
+# is in one of the two lists: the publisher's test fails otherwise.
+$fleetPaths = @('scripts/fleet-slopbar.ps1', 'scripts/test-fleet-slopbar.ps1')
 # The workflow hands these secrets to the Sign step alone, under the same names.
 $secretNames = @('ULTRA_UPDATER_KEY', 'ULTRA_UPDATER_KEY_PASSWORD')
 # Never to be set: the release workflow of older commits reads these names, and it publishes without
@@ -209,6 +218,8 @@ function Get-HighestBuild([string]$package, [string]$current, [string[]]$refs = 
 
 # 0. On a push to ultra (the workflow): publish, rehearse or nothing. Compared with the channel's
 # release, not the previous push, so the next run catches up whatever an earlier one did not publish.
+# Writes the mode, and what changed ('shipping', 'tooling', 'fleet' or 'nothing': the first that
+# applies), which tells -ViaActions whether a rehearsal's commit is one to release (see $fleetPaths).
 function Invoke-Decide {
   # The channel first: fetched after, its release's tag is here even if one lands in between.
   $current = Get-ChannelVersion
@@ -217,14 +228,23 @@ function Invoke-Decide {
   $built = if ($current) { Get-TagCommit "ultra-v$current" }
   if (-not $built -or (Test-Changed $built $head $shippingPaths)) {
     $mode = 'push'
+    $changed = 'shipping'
     $why = if ($built) { "what ships changed since $current" } else { 'no release yet' }
   } else {
-    # The tooling alone changed in this push (or, without a usable previous commit, since the release).
+    # The tooling or the fleet report alone changed in this push (or, without a usable previous
+    # commit, since the release).
     $since = if ($Before -match '^[0-9a-f]{40}$' -and $Before -notmatch '^0+$' -and (Test-Ancestor $Before $head)) { $Before } else { $built }
-    $mode = if (Test-Changed $since $head $toolingPaths) { 'rehearsal' } else { 'none' }
-    $why = if ($mode -eq 'rehearsal') { 'only the release tooling changed' } else { "nothing that ships changed since $current" }
+    $tooling = Test-Changed $since $head $toolingPaths
+    $fleet = Test-Changed $since $head $fleetPaths
+    $mode = if ($tooling -or $fleet) { 'rehearsal' } else { 'none' }
+    $changed = if ($tooling) { 'tooling' } elseif ($fleet) { 'fleet' } else { 'nothing' }
+    $why = if ($tooling -and $fleet) { 'only the release tooling and the fleet report changed' }
+      elseif ($tooling) { 'only the release tooling changed' }
+      elseif ($fleet) { 'only the fleet report changed' }
+      else { "nothing that ships changed since $current" }
   }
   Set-Content -LiteralPath (Join-Path $stageDir 'mode') -Value $mode -NoNewline
+  Set-Content -LiteralPath (Join-Path $stageDir 'changed') -Value $changed -NoNewline
   Write-Output "Decision for $($head): $mode ($why)."
 }
 
@@ -491,6 +511,9 @@ function Test-Published([string]$commit) {
 
 function Get-Mode { Get-Content -LiteralPath (Join-Path $stageDir 'mode') -Raw }
 
+# What Decide found changed: 'shipping', 'tooling', 'fleet' or 'nothing'.
+function Get-Changed { Get-Content -LiteralPath (Join-Path $stageDir 'changed') -Raw }
+
 function Get-RemoteUltra {
   $line = @(git -C $root ls-remote origin refs/heads/ultra)[0]
   if ($LASTEXITCODE -ne 0 -or -not $line) { throw 'Could not read ultra on origin.' }
@@ -598,6 +621,12 @@ function Invoke-ViaActions {
   if (-not $run) {
     if ((Get-Mode) -eq 'none') {
       Write-Output "Nothing to publish: nothing that ships, or builds it, changed since the channel's $(Get-ChannelVersion)."
+      return
+    }
+    # The workflow rehearses a change of the fleet report so its test runs, but no installer holds it:
+    # a release of this commit would be the installer the channel has, again.
+    if ((Get-Changed) -eq 'fleet') {
+      Write-Output "Nothing to publish: since the channel's $(Get-ChannelVersion) only the fleet report changed, which no installer holds."
       return
     }
     $run = Publish-ByTag $release

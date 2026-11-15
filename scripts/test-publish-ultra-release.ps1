@@ -314,6 +314,33 @@ try {
   $tooling = Add-Commit 'scripts/publish-ultra-release.ps1' 'tooling only'
   Check 'a push that changes only the release tooling rehearses' ((Get-Decision $docs) -eq 'rehearsal')
   Check '...also when the previous commit is unknown' ((Get-Decision $zero) -eq 'rehearsal')
+  # Every file of the release tooling and of the fleet report rehearses alone, and nothing else does.
+  # The loop reads the publisher's own lists, so a file added to one is covered at once. A fleet-only
+  # push must rehearse, or its test runs only at the next release, where a break stops that release.
+  foreach ($path in @($toolingPaths) + @($fleetPaths)) {
+    $previous = Invoke-Work rev-parse HEAD
+    $null = Add-Commit $path "only $path"
+    $kind = if ($toolingPaths -contains $path) { 'tooling' } else { 'fleet' }
+    Check "a push that changes only $path rehearses, and what changed is the $kind" ((Get-Decision $previous) -eq 'rehearsal' -and (Get-Content (Join-Path $stageDir 'changed') -Raw) -eq $kind)
+  }
+  $previous = Invoke-Work rev-parse HEAD
+  $null = Add-Commit 'scripts/measure-footprint.ps1' 'a script no release step runs'
+  Check 'a push that changes only another script publishes nothing' ((Get-Decision $previous) -eq 'none' -and (Get-Content (Join-Path $stageDir 'changed') -Raw) -eq 'nothing')
+  $previous = Invoke-Work rev-parse HEAD
+  $null = Add-Commit 'scripts/fleet-slopbar.ps1' 'the fleet report'
+  $null = Add-Commit 'scripts/publish-ultra-release.ps1' 'and the tooling with it'
+  Check 'the release tooling counts when the fleet report changed with it' ((Get-Decision $previous) -eq 'rehearsal' -and (Get-Content (Join-Path $stageDir 'changed') -Raw) -eq 'tooling')
+  # The lists cover what the build job runs: every script the workflow runs, and the script under each
+  # test it runs, and each listed file exists (a renamed one would drop out of its list unseen).
+  $repoRoot = Split-Path -Parent $PSScriptRoot
+  $listed = @($toolingPaths) + @($fleetPaths)
+  $absent = @($listed | Where-Object { -not (Test-Path -LiteralPath (Join-Path $repoRoot $_)) })
+  Check "every file in the rehearsal lists exists ($($listed.Count) listed$(if ($absent) { ", missing: $($absent -join ', ')" }))" (-not $absent)
+  $workflowText = Get-Content -LiteralPath (Join-Path $repoRoot '.github/workflows/ultra-release.yml') -Raw
+  $ran = @([regex]::Matches($workflowText, '(?m)^\s*(?:run:\s*)?\./(scripts/[\w.-]+\.ps1)') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+  $needed = @(@($ran) + @($ran | ForEach-Object { if ($_ -match '^scripts/test-(.+\.ps1)$') { "scripts/$($Matches[1])" } }) | Select-Object -Unique)
+  $unlisted = @($needed | Where-Object { $listed -notcontains $_ })
+  Check "every script the workflow runs, and the script under each of its tests, rehearses ($($needed.Count) found$(if ($unlisted) { ", not listed: $($unlisted -join ', ')" }))" ($needed.Count -ge 4 -and -not $unlisted)
   $shipping = Add-Commit 'src/app.js' 'what ships'
   Check 'a push that changes what ships publishes' ((Get-Decision $tooling) -eq 'push')
   $later = Add-Commit 'docs/notes.md' 'docs after a fix'
@@ -404,6 +431,14 @@ try {
   $null = Invoke-Check
   $out = Invoke-ViaActions | Out-String
   Check '-ViaActions publishes no documentation-only commit' ($out -match 'Nothing to publish: nothing that ships')
+  # Nor the fleet report alone: the workflow rehearses it so its test runs, but no installer holds it,
+  # so a tag's release would be the installer the channel has, again.
+  $null = Add-Commit 'scripts/fleet-slopbar.ps1' 'the fleet report changed'
+  New-Stage
+  $null = Invoke-Check
+  $r = Read-StageFile 'release.json'
+  $out = try { Invoke-ViaActions | Out-String } catch { "refused: $($_.Exception.Message)" }
+  Check '-ViaActions publishes nothing, and pushes no tag, for a change of the fleet report alone' ($out -match "Nothing to publish: since the channel's \S+ only the fleet report changed" -and -not (Get-OriginTag $r.tag))
   # A commit whose push publishes nothing although the release tooling changed gets a tag, but only
   # while no run is unfinished, and a failed watch is not taken for a run that did not publish.
   $tooling2 = Add-Commit 'scripts/publish-ultra-release.ps1' 'tooling changed'
