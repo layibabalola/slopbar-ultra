@@ -1075,26 +1075,44 @@ mod tests {
         .await
     }
 
+    /// Notes an operation dropped before it finished: one the door stopped.
+    struct Unfinished {
+        finished: Arc<AtomicBool>,
+        stopped: Arc<AtomicBool>,
+    }
+
+    impl Drop for Unfinished {
+        fn drop(&mut self) {
+            if !self.finished.load(SeqCst) {
+                self.stopped.store(true, SeqCst);
+            }
+        }
+    }
+
     /// An operation whose client gave up carries on: the door only lets the connection go, as the
-    /// "timeout" it answers says (mcp's explain: "it keeps going").
+    /// "timeout" it answers says (mcp's explain: "it keeps going"). The operation finishes only
+    /// once its client has heard that, so the test waits on neither a clock nor a guess.
     #[tokio::test]
     async fn an_operation_whose_client_gave_up_carries_on() {
         within_test_limit(async {
             let over = Over::new();
             let name = test_pipe();
-            let finished = Arc::new(AtomicBool::new(false));
-            let f = finished.clone();
+            let (finished, stopped, go) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(tokio::sync::Notify::new()));
+            let (f, s, g) = (finished.clone(), stopped.clone(), go.clone());
             fake_app_within(&name, SHORT, move || {
-                let f = f.clone();
+                let (f, s, g) = (f.clone(), s.clone(), g.clone());
                 async move {
-                    tokio::time::sleep(SHORT * 3).await;
+                    let _watch = Unfinished { finished: f.clone(), stopped: s };
+                    g.notified().await;
                     f.store(true, SeqCst);
                     Ok(serde_json::json!({ "accounts": [] }))
                 }
             });
             let reply = ask_patiently(&over, &name, Request::Refresh).await.unwrap();
             assert_eq!(reply.error.as_deref(), Some("timeout"), "its client hears it is still running");
-            eventually("the operation carried on after its client gave up", || finished.load(SeqCst)).await;
+            go.notify_one();
+            eventually("the operation finished, or was stopped", || finished.load(SeqCst) || stopped.load(SeqCst)).await;
+            assert!(finished.load(SeqCst) && !stopped.load(SeqCst), "the operation carried on after its client gave up");
         })
         .await
     }
