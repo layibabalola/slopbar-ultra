@@ -83,7 +83,7 @@ fn settings_patch_schema() -> Value {
         "auto_update": { "type": "boolean", "description": "Only builds with automatic updates." },
         "aliases": { "type": "object", "description": "Display names keyed \"provider:id\" (ids from get_usage); null removes one.", "additionalProperties": { "type": ["string", "null"] } },
         "balancer": both(rule),
-        "notifications": { "type": "object", "properties": { "usage": { "type": "boolean", "description": "Limits at 75% and 90% and reached, and the account in use running out of its week within a few hours." }, "resets": { "type": "boolean" }, "switches": { "type": "boolean" }, "renewals": { "type": "boolean", "description": "A plan that looks unused or underused renewing within three days, and any paid plan renewing within a day." }, "unexpected_use": { "type": "boolean", "description": "Notify (at most every 6 h per account) when a monitored account is used while none of the user's computers sharing in-use status has it signed in." }, "digest": { "type": "boolean", "description": "One notification each Monday morning summing up the plans: monthly spend, possible savings, plans renewing this week, accounts that ran out last week and how many plans the usage needs. On by default." }, "extra_usage": { "type": "boolean", "description": "A Claude account whose extra usage reaches 75% and then 90% of its monthly limit, once each per month. On by default." }, "burn": { "type": "boolean", "description": "Runaway-agent alert: an account burning through its week abnormally fast (see get_burn_alerts), at most every 3 h per account. On by default." }, "reset_credits": { "type": "boolean", "description": "Codex reset credits: whether to spend one or switch accounts when an account hits its limit while holding one, and a reminder 2 days before one expires unused. On by default." }, "multi_machine": { "type": "boolean", "description": "One notification when an account becomes in use on more than one of the user's computers at once (seen through in-use sharing), after it lasts a few minutes and never twice for the same overlap. On by default." } } },
+        "notifications": { "type": "object", "properties": { "usage": { "type": "boolean", "description": "Limits at 75% and 90% and reached, and the account in use running out of its week within a few hours." }, "resets": { "type": "boolean" }, "switches": { "type": "boolean" }, "renewals": { "type": "boolean", "description": "A plan that looks unused or underused renewing within three days, and any paid plan renewing within a day." }, "unexpected_use": { "type": "boolean", "description": "Notify (at most every 6 h per account) when a monitored account is used while none of the user's computers sharing in-use status has it signed in." }, "digest": { "type": "boolean", "description": "One notification each Monday morning summing up the plans: monthly spend, possible savings, plans renewing this week, accounts that ran out last week and how many plans the usage needs. On by default." }, "extra_usage": { "type": "boolean", "description": "A Claude account whose extra usage reaches 75% and then 90% of its monthly limit, once each per month. On by default." }, "burn": { "type": "boolean", "description": "Runaway-agent alert: an account burning through its week abnormally fast (see get_burn_alerts), at most every 3 h per account. On by default." }, "reset_credits": { "type": "boolean", "description": "Codex reset credits: whether to spend one or switch accounts when an account hits its limit while holding one, and a reminder 2 days before one expires unused. On by default." }, "multi_machine": { "type": "boolean", "description": "One notification when an account becomes in use on more than one of the user's computers at once (seen through in-use sharing), after it lasts a few minutes and never twice for the same overlap. On by default." }, "sharing_sign_in": { "type": "boolean", "description": "A notification when a sharing setup (setup_sharing, here or for another computer) waits for the user to allow access in Dropbox; clicking it opens Dropbox's page. On by default." } } },
         "burn": { "type": "object", "additionalProperties": false, "description": "What counts as abnormal burn (see get_burn_alerts).", "properties": {
             "points": { "type": "integer", "minimum": *crate::settings::BURN_POINTS.start(), "maximum": *crate::settings::BURN_POINTS.end(), "description": "Weekly percentage points that, used within minutes, are abnormal (default 15)." },
             "minutes": { "type": "integer", "minimum": *crate::settings::BURN_MINUTES.start(), "maximum": *crate::settings::BURN_MINUTES.end(), "description": "The window for points, and for the local token rate (default 60)." },
@@ -110,6 +110,7 @@ fn settings_patch_schema() -> Value {
         "unexpected_min_rise": { "type": "integer", "minimum": *crate::settings::UNEXPECTED_MIN_RISE.start(), "maximum": *crate::settings::UNEXPECTED_MIN_RISE.end(), "description": "Points the weekly window must rise between two close readings to count as unexpected use (default 2)." },
         "presence_folder": { "type": ["string", "null"], "description": "An existing folder the user syncs between machines (OneDrive, Dropbox, Google Drive, iCloud Drive, Box) where SlopBar Ultra shares which accounts are in use, as hashes only; null turns sharing off. Change it only when the user asks." },
         "presence_remote": { "type": ["string", "null"], "description": "An rclone remote name (from `rclone listremotes`, no colon) to share in-use status through instead of a folder; it takes precedence over presence_folder. null turns it off. Change it only when the user asks." },
+        "sharing_open_browser": { "type": "boolean", "description": "A sharing setup (setup_sharing, here or for another computer) opens Dropbox's page in this computer's default browser by itself (default on). Off: the page waits for the notification or Settings' button." },
         "switch_desktop": { "type": "boolean", "description": "Use and switch_account also move this machine's desktop app onto the account (default off): Claude Desktop is opened for the user to sign in with the named account (no supported way exists to sign it in from outside; SlopBar Ultra never types credentials or touches its sessions), and the user is told to restart the Codex app, which shares the CLI's sign-in. Change it only when the user asks." },
         "account_roster": { "type": "boolean", "description": "Share the list of accounts (provider, account id, email and plan; never sign-ins or tokens) with the user's other computers through the in-use sharing folder or rclone remote, encrypted with a roster passphrase set on each computer (set_roster_passphrase or Settings), so a new computer's sign_in_all queues every account they have. Off by default; turning it off removes this computer's roster. Change it only when the user asks." },
         "phone": { "type": "object", "additionalProperties": false, "description": "Phone alerts through ntfy (off by default): a few notifications also sent to a push topic the user chose. Change it only when the user asks. The access token is set in Settings only, never here.", "properties": {
@@ -266,6 +267,21 @@ fn catalog() -> Vec<Tool> {
                 "tool": { "type": "string", "enum": crate::pairing::REMOTE_TOOLS },
                 "arguments": { "type": "object", "description": "The tool's own arguments." },
             }), &["ssh_host", "tool"]), false, true, false, true),
+        tool("setup_sharing", "Set up sharing with Dropbox", "Connects in-use sharing to the user's Dropbox, so each of their computers sees which accounts the others use: gets rclone if no recent one (v1.60 or later) is installed (a fixed, checksum-verified download from rclone's own site into SlopBar Ultra's folder, never another installer), runs rclone's own Dropbox sign-in (rclone keeps the token in its own config; SlopBar Ultra and agents never see it), turns sharing on with that rclone remote and lists the other computers sharing there. A remote of that name that already works is used as it is; one whose access ended is signed in again, and so is one with reconnect: true (to use another Dropbox account). Only when the user asked to set up sharing: without confirm: true nothing starts and the answer says what would happen. The user signs in and clicks Allow on dropbox.com themselves (never click Allow, sign in or approve for them). rclone's access covers their whole Dropbox; SlopBar Ultra only uses its SlopBar folder there. Refused on a computer that shares through a folder (uses_folder). Answers at once: follow it with get_sharing_setup. Without ssh_host, Dropbox's page opens in this computer's browser (refused while its desktop is locked or not shown). With ssh_host, sets up that computer from this one: its SlopBar Ultra gets rclone and starts the sign-in, and the page opens in this computer's browser through an SSH tunnel to that computer's rclone, so nobody needs to be at its screen; the token goes straight to that computer's rclone. That computer takes this one's remote name when this one shares through a Dropbox remote. If that computer is still getting rclone after about 150 seconds, the call answers with its state; calling again joins the same setup. cancel stops a running setup (with ssh_host, that computer's).",
+            schema(json!({
+                "confirm": { "type": "boolean", "description": "true to start; without it nothing starts and the answer says what would happen." },
+                "ssh_host": { "type": "string", "description": "Set up this other computer instead, as ssh reaches it; the sign-in page opens here." },
+                "remote": { "type": "string", "description": "The rclone remote to create or use. Default: the one this computer shares through already (with ssh_host: this computer's Dropbox remote), else \"dropbox\". Keep the same name on every computer." },
+                "reconnect": { "type": "boolean", "description": "Sign in to Dropbox again even when the remote works, to use another Dropbox account (the one the user's other computers use)." },
+                "cancel": { "type": "boolean", "description": "Stop a running setup." },
+                "via_tunnel": { "type": "boolean", "description": "Set by the computer that runs setup_sharing with ssh_host: the sign-in is finished in its browser, so this computer's desktop need not be shown." },
+            }), &[]), false, true, false, true),
+        tool("get_sharing_setup", "Get sharing setup", "Where setup_sharing stands: phase (idle; rclone: finding or downloading it; dropbox: waiting for the user to allow access; sharing: turning it on; done; failed), remote, downloaded (rclone was downloaded), progress (the download's percent while it downloads), waiting (rclone waits for the browser), via_tunnel, error with failed_at (the phase it stopped in): download_failed, hash_mismatch, extract_failed, rclone_unsupported, rclone_failed, remote_taken (a remote of that name is not Dropbox), denied (the user did not allow access), stale_page (Allow was clicked on a page from an earlier try: use the newest page), port_busy (another program holds port 53682), port_reserved (Windows reserved port 53682; a restart usually frees it), timed_out (10 minutes without Allow), cancelled or settings_failed; found (the other computers sharing there, by name, once done) and revision. With wait_seconds (up to 45) and since (the revision of an earlier answer), it first waits for the setup to change, instead of polling. With ssh_host, asks that computer (which does the waiting), closes this computer's tunnel once it has finished, and when it is done and this computer shares too, sees_this_computer says whether it sees this one (false: it may be signed in to another Dropbox account).",
+            schema(json!({
+                "ssh_host": { "type": "string", "description": "Ask this other computer, as ssh reaches it." },
+                "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 45, "description": "Wait up to this long (at most 45) for the setup to change before answering, instead of polling." },
+                "since": { "type": "integer", "minimum": 0, "description": "The revision of an earlier answer: with wait_seconds, wait for a change from it." },
+            }), &[]), true, false, true, false),
         tool("list_diagnostic_exports", "List diagnostics exports", "The most recent diagnostics exports, newest first, with paths, sizes and times. Works while SlopBar Ultra is closed.", none(), true, false, true, false),
     ]
 }
@@ -287,6 +303,8 @@ fn local_args(name: &str) -> Option<(&'static [&'static str], &'static [&'static
         "get_machine_readiness" => Some((&["ssh_host", "wait_seconds", "since"], &[])),
         "pair_machine" => Some((&["ssh_host", "replace_key"], &["ssh_host"])),
         "run_on_machine" => Some((&["ssh_host", "tool", "arguments"], &["ssh_host", "tool"])),
+        "setup_sharing" => Some((&["ssh_host", "remote", "cancel", "via_tunnel", "confirm", "reconnect"], &[])),
+        "get_sharing_setup" => Some((&["ssh_host", "wait_seconds", "since"], &[])),
         _ => None,
     }
 }
@@ -300,8 +318,13 @@ fn check_local(name: &str, args: &Value) -> Option<Result<(), String>> {
     if let Some(k) = required.iter().find(|k| !map.contains_key(**k)) {
         return Some(Err(format!("Invalid arguments: {k} is required")));
     }
-    let typed = map.iter().all(|(k, v)| match k.as_str() { "arguments" => v.is_object(), "replace_key" => v.is_boolean(), "wait_seconds" | "since" => v.is_u64(), _ => v.is_string() });
-    Some(if typed { Ok(()) } else { Err("Invalid arguments: ssh_host and tool are strings, arguments an object, replace_key a boolean, wait_seconds and since whole numbers".into()) })
+    let typed = map.iter().all(|(k, v)| match k.as_str() {
+        "arguments" => v.is_object(),
+        "replace_key" | "confirm" | "reconnect" | "cancel" | "via_tunnel" => v.is_boolean(),
+        "wait_seconds" | "since" => v.is_u64(),
+        _ => v.is_string(),
+    });
+    Some(if typed { Ok(()) } else { Err("Invalid arguments: ssh_host, tool and remote are strings, arguments an object, replace_key, confirm, reconnect, cancel and via_tunnel true or false, wait_seconds and since whole numbers".into()) })
 }
 
 /// The door request for a tool call, or a message for the agent when the arguments are wrong.
@@ -444,10 +467,16 @@ fn explain(error: &str) -> String {
         "pairing_unreadable" | "pairing_unsupported" => "The pairing offer could not be read: update SlopBar Ultra on both computers to the same version.".into(),
         "app_outdated" => "The SlopBar Ultra running there is older than its helper and does not check that someone can see its desktop; nothing was started. Update it (and restart it through restart_app), then try again.".into(),
         "target_has_other_key" => "The other computer already has a different roster passphrase, which its own other computers may share; nothing was changed. Ask the user whether to replace it (pair_machine with replace_key: true).".into(),
+        "uses_folder" => "This computer shares through a folder, so the Dropbox setup did not start: it would move sharing off that folder. To use Dropbox instead, the user turns folder sharing off first (update_settings presence_folder: null).".into(),
+        "bad_remote" => "remote must be an rclone remote name of up to 64 characters: letters, digits, spaces and . _ - + @, not starting with - or a space.".into(),
+        "sharing_setup_busy" => "A sharing setup is already running on this computer: follow it with get_sharing_setup, or stop it with setup_sharing cancel: true.".into(),
+        "update_slopbar_there" => "The other computer's SlopBar Ultra predates the guided sharing setup: update it there (with automatic updates on, it updates itself), then try again.".into(),
+        "tunnel_failed" => "The SSH tunnel for the Dropbox sign-in did not open: port 53682 is in use on this computer (another rclone sign-in is waiting), or SSH could not connect. The setup on the other computer was stopped; try again once the port is free.".into(),
+        "bad_state" | "no_sign_in_waiting" => "No Dropbox sign-in is waiting (it finished, failed or was cancelled): see get_sharing_setup.".into(),
         "not_from_a_remote_call" => "A computer reached over SSH cannot reach on to another one.".into(),
         e if e.starts_with("ssh_failed") => format!("SSH could not run the command ({}). Check key auth with: ssh -o BatchMode=yes <host> hostname; see the README's field guide.",
             e.trim_start_matches("ssh_failed").trim_start_matches(':').trim().chars().filter(|c| !c.is_control()).take(200).collect::<String>()),
-        e if e.starts_with("remote_missing_here: ") => format!("The other computer has no working rclone remote named {} (rclone missing, or the remote not configured): install rclone there and create the same remote (rclone config) at its screen, then pair again.",
+        e if e.starts_with("remote_missing_here: ") => format!("The other computer has no working rclone remote named {} (rclone missing, or the remote not configured): connect it with setup_sharing (ssh_host and confirm: true), which opens the Dropbox sign-in in this computer's browser, then pair again.",
             e.trim_start_matches("remote_missing_here: ").chars().filter(|c| !c.is_control()).take(64).collect::<String>()),
         e if e.starts_with("target: ") => format!("On the other computer: {}", explain(e.trim_start_matches("target: "))),
         other => other.chars().filter(|c| !c.is_control()).take(MAX_TEXT).collect(),
@@ -695,6 +724,26 @@ fn print_answer(outcome: Result<Value, String>) -> i32 {
     code
 }
 
+/// `slopbar-mcp --sharing-state [seconds]`: the phase of this computer's sharing setup and the
+/// state value of rclone's waiting link, for the computer finishing the sign-in through a tunnel
+/// (see `pairing::setup_remote_sharing`), once a sign-in waits, the setup is no longer under way,
+/// or the seconds have passed. Not an MCP tool, so the value never lands in an agent's result.
+pub fn sharing_state(args: &[String]) -> i32 {
+    // Waiting here (at most 45 seconds) until a sign-in waits or the setup stops means the other
+    // computer asks over SSH every 40 seconds, not every few: each ask starts a shell there.
+    let wait = args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0).min(45);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+    let pipe = crate::door::pipe_name();
+    loop {
+        let answer = crate::door::call(&pipe, &Request::SharingSetupLink);
+        let settled = answer.as_ref().map_or(true, |a| a["state"].is_string() || !crate::pairing::setup_running(a));
+        if settled || std::time::Instant::now() >= deadline {
+            return print_answer(answer);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
 /// `slopbar-mcp --pair-receive`: the target's half of `pair_machine`, reading the offer from
 /// standard input (see `pairing::receive`). Prints the outcome, never the key.
 pub fn pair_receive() -> i32 {
@@ -791,7 +840,7 @@ mod tests {
     fn every_listed_tool_maps_to_a_door_operation() {
         let listed = rpc(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).unwrap();
         let tools = listed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 47);
+        assert_eq!(tools.len(), 49);
         let account = json!({ "provider": "claude", "id": "a1" });
         for t in tools {
             let name = t["name"].as_str().unwrap();
@@ -826,14 +875,28 @@ mod tests {
         assert_eq!(tool("lease_account", json!({ "provider": "claude" }), None)["result"]["isError"], true, "a purpose is required");
         assert_eq!(tool("release_lease", json!({}), None)["result"]["isError"], true);
         let marked = |hint: &str| -> Vec<&str> { tools.iter().filter(|t| t["annotations"][hint] == true).map(|t| t["name"].as_str().unwrap()).collect() };
-        assert_eq!(marked("destructiveHint"), ["recommend_account", "refresh_usage", "update_settings", "switch_account", "disconnect_monitoring", "remove_account", "revoke_account_sessions", "remove_lapsed_accounts", "set_project_pin", "install_update", "quit_app", "restore_backup", "set_roster_passphrase", "pair_machine", "run_on_machine"]);
+        assert_eq!(marked("destructiveHint"), ["recommend_account", "refresh_usage", "update_settings", "switch_account", "disconnect_monitoring", "remove_account", "revoke_account_sessions", "remove_lapsed_accounts", "set_project_pin", "install_update", "quit_app", "restore_backup", "set_roster_passphrase", "pair_machine", "run_on_machine", "setup_sharing"]);
         assert_eq!(tool("restore_backup", json!({ "path": "C:/b.slopbar-backup", "passphrase": "correct horse battery" }), None)["result"]["structuredContent"]["dry_run"], true, "restoring only previews by default");
         assert_eq!(tool("remove_lapsed_accounts", json!({}), None)["result"]["structuredContent"], json!({ "op": "remove_lapsed_accounts", "confirm": false }), "bulk tools only report by default");
         assert_eq!(tool("connect_monitoring_all", json!({}), None)["result"]["structuredContent"], json!({ "op": "connect_monitoring_all", "confirm": false }));
         assert_eq!(tool("revoke_account_sessions", json!({ "provider": "codex", "id": "a1" }), None)["result"]["structuredContent"],
             json!({ "op": "revoke_account_sessions", "provider": "codex", "id": "a1", "confirm": false, "remove_slot": false }), "revoking only reports by default");
         assert_eq!(tool("set_project_pin", json!({ "folder": "C:/a", "provider": "codex", "id": null }), None)["result"]["structuredContent"]["id"], Value::Null);
-        assert_eq!(marked("readOnlyHint"), ["get_usage", "get_headroom", "list_leases", "get_settings", "get_subscription_report", "get_plan_advice", "get_burn_alerts", "get_usage_breakdown", "get_health", "list_project_pins", "check_for_updates", "get_app_info", "inspect_window", "list_sharing_locations", "get_roster", "get_machine_readiness", "list_diagnostic_exports"]);
+        assert_eq!(marked("readOnlyHint"), ["get_usage", "get_headroom", "list_leases", "get_settings", "get_subscription_report", "get_plan_advice", "get_burn_alerts", "get_usage_breakdown", "get_health", "list_project_pins", "check_for_updates", "get_app_info", "inspect_window", "list_sharing_locations", "get_roster", "get_machine_readiness", "get_sharing_setup", "list_diagnostic_exports"]);
+    }
+
+    #[test]
+    fn sharing_setup_takes_its_flags_and_shows_what_it_would_do_before_confirm() {
+        for (name, args) in [
+            ("setup_sharing", json!({ "confirm": true, "reconnect": false, "cancel": false, "ssh_host": "box", "remote": "dropbox" })),
+            ("setup_sharing", json!({ "via_tunnel": true, "confirm": true })),
+            ("get_sharing_setup", json!({ "ssh_host": "box", "wait_seconds": 45, "since": 7 })),
+        ] {
+            assert_eq!(check_local(name, &args), Some(Ok(())), "{name} {args}");
+        }
+        // The path an agent's call takes (MCP, or --call over SSH), with no app: nothing starts.
+        let preview = run_tool("setup_sharing", json!({}), "unused-pipe", true).unwrap();
+        assert_eq!(preview["started"], false, "{preview}");
     }
 
     #[test]
@@ -864,6 +927,12 @@ mod tests {
             ("get_machine_readiness", json!({ "since": -1 })),
             ("run_on_machine", json!({ "ssh_host": "box", "tool": "get_roster", "arguments": [] })),
             ("restore_backup", json!({ "path": "C:\\x", "passphrase": "p", "confirm": true })),
+            ("setup_sharing", json!({ "confirm": "yes" })),
+            ("setup_sharing", json!({ "reconnect": 1 })),
+            ("setup_sharing", json!({ "remote": true })),
+            ("setup_sharing", json!({ "bogus": true })),
+            ("get_sharing_setup", json!({ "wait_seconds": "soon" })),
+            ("get_sharing_setup", json!({ "since": -1 })),
         ] {
             assert_eq!(tool(name, args.clone(), None)["result"]["isError"], true, "{name} {args}");
         }
