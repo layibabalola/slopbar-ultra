@@ -628,7 +628,9 @@ mod patch_tests {
 
     #[test]
     fn refuses_what_the_settings_window_cannot_produce() {
-        let current = Settings::default();
+        // auto_update off, whatever this build's default: builds with updates turn it on, and the
+        // manual-update case below must still be a change.
+        let current = Settings { auto_update: false, ..Settings::default() };
         for (patch, why) in [
             (json!({ "refresh_minute": 5 }), "typo"),
             (json!({ "last_version": "9.9.9" }), "internal"),

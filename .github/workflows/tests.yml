@@ -23,5 +23,9 @@ jobs:
         run: node scripts/check-ui-syntax.cjs
       - name: Unit tests (desktop build)
         run: cargo test --locked --lib --manifest-path src-tauri/Cargo.toml
+      # Releases turn on upstream-updates, which changes defaults such as auto_update: a test can
+      # pass without it and fail with it. Same dependencies as above, so only the app recompiles.
+      - name: Unit tests (desktop build with updates, as released)
+        run: cargo test --locked --features upstream-updates --lib --manifest-path src-tauri/Cargo.toml
       - name: Agent tool (slopbar-mcp) builds without the desktop app
         run: cargo build --locked --bin slopbar-mcp --no-default-features --manifest-path src-tauri/Cargo.toml
