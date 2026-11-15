@@ -311,6 +311,7 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
 .setup-steps li.result { padding-left: 0; }
 .setup-steps li.result::before { content: none; }
 .setup-actions { display: flex; gap: 8px; }
+#sharing-setup > .btn { flex-shrink: 0; white-space: nowrap; }
 .guide-step { padding: 12px 14px; border-radius: 4px; background: var(--control); border: 1px solid var(--control-stroke); }
 .guide-step-head { display: flex; align-items: center; gap: 10px; }
 .guide-step-head h3 { font-size: 14px; font-weight: 600; }
@@ -371,6 +372,8 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
 
 /* Sharing in-use status with the user's other computers (Data page). */
 .row[hidden] { display: none; }
+/* .btn sets display, which outranks the browser's own rule for the hidden attribute. */
+.btn[hidden] { display: none; }
 .presence-path { flex: 1; display: flex; gap: 8px; }
 .presence-path input {
   flex: 1; min-width: 0; height: 32px; padding: 0 10px; font: inherit; color: var(--text);
