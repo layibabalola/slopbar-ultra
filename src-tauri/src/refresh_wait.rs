@@ -37,7 +37,7 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(30);
 /// The field a door answer gets when a refresh it needed gave up waiting (`noted`)...
 pub const WAITING: &str = "waiting_for_refresh";
 /// ...and what it says.
-pub const WAITING_NOTE: &str = "SlopBar is still busy with an earlier refresh or an update, so these are the last numbers it has. \
+pub const WAITING_NOTE: &str = "SlopBar is still busy with an earlier refresh, so these are the last numbers it has. \
 A new refresh runs as soon as that one ends: check get_usage shortly.";
 
 tokio::task_local! {
