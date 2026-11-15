@@ -94,7 +94,7 @@ pub fn valid_host(host: &str) -> bool {
 /// (`pwsh`). It reads the same from cmd, Windows PowerShell or PowerShell 7 as the remote shell (an
 /// encoded command needs no quoting). `args` never holds a secret: a command line is visible to
 /// every process on the target. `run_there` sends it, and the same script under Windows
-/// PowerShell 5.1 (`fallback_command`) only where the target has no `pwsh`: a 5.1 process started
+/// PowerShell 5.1 (`fallback_command`) only where pwsh never started it: a 5.1 process started
 /// over SSH can outlive its session and grow without bound (it reached 85 GiB on one computer).
 pub fn remote_command(args: &[&str]) -> String {
     command_under("pwsh", args)
@@ -105,9 +105,14 @@ fn fallback_command(args: &[&str]) -> String {
     command_under("powershell", args)
 }
 
+/// The remote script's first line, printed before anything that can fail: the PowerShell it was
+/// sent to started it. `answer` skips it, as it skips anything but the last JSON line.
+const STARTED: &str = "slopbar-remote: started";
+
 fn command_under(shell: &str, args: &[&str]) -> String {
     let quoted: Vec<String> = args.iter().map(|a| format!("'{}'", a.replace('\'', "''"))).collect();
     let script = format!(concat!(
+        "'{}'\n",
         "$ErrorActionPreference = 'Stop'\n",
         "$exe = Join-Path $env:LOCALAPPDATA 'SlopBar\\slopbar-mcp.exe'\n",
         "if (-not (Test-Path -LiteralPath $exe)) {{ '{{\"error\":\"slopbar_not_installed\"}}'; exit 3 }}\n",
@@ -116,26 +121,25 @@ fn command_under(shell: &str, args: &[&str]) -> String {
         "$out = & $exe {} | ForEach-Object {{ $_ }}\n",
         "$code = $LASTEXITCODE\n",
         "$out\n",
-        "exit $code\n"), quoted.join(" "));
+        "exit $code\n"), STARTED, quoted.join(" "));
     let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD,
         script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>());
     format!("{shell} -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}")
 }
 
 /// Runs the target's `slopbar-mcp.exe` with `args`, `input` as its standard input, and returns
-/// what it printed: under PowerShell 7, or under Windows PowerShell 5.1 where `pwsh` never ran.
-/// Only that case is tried again, so no tool runs twice: a shell that finds no program prints
-/// nothing and exits 1 (cmd and both PowerShells, measured over SSH) or 127 (a POSIX shell), while
-/// the script, once running, prints slopbar-mcp's answer or passes on its exit code (0 or 1 with
-/// an answer, 101 for a crash). `input` goes to both tries: to the first, only to the target's
-/// shell, which exits without reading it.
+/// what it printed: under PowerShell 7, or under Windows PowerShell 5.1 where pwsh never started
+/// the script (not installed there, or it could not start). Once the script printed `STARTED`
+/// under pwsh, its outcome stands, whatever came after, so no tool runs twice and 5.1 never starts
+/// where pwsh runs. The exit code cannot tell these apart: a PowerShell remote shell turns every
+/// failure into 1, and a shell may print its own lines first (cmd's AutoRun, a profile's
+/// greeting). `input` goes to both tries; a shell that cannot start pwsh exits without reading it.
 fn run_there(remote: &dyn Remote, host: &str, args: &[&str], input: &[u8]) -> Result<Vec<u8>, String> {
-    let ran = remote.run(host, &remote_command(args), input)?;
-    let never_ran = ran.out.iter().all(u8::is_ascii_whitespace) && matches!(ran.code, Some(1 | 127));
-    if !never_ran {
-        return Ok(ran.out);
+    let out = remote.run(host, &remote_command(args), input)?;
+    if String::from_utf8_lossy(&out).lines().any(|line| line.trim() == STARTED) {
+        return Ok(out);
     }
-    Ok(remote.run(host, &fallback_command(args), input)?.out)
+    remote.run(host, &fallback_command(args), input)
 }
 
 /// JSON with every non-ASCII character escaped, so no console code page on the way through SSH
@@ -213,16 +217,9 @@ impl Door for LocalDoor {
     }
 }
 
-/// What a command run on another computer printed on its standard output, and its exit code.
-#[derive(Debug)]
-pub struct Ran {
-    pub out: Vec<u8>,
-    pub code: Option<i32>,
-}
-
 pub trait Remote {
-    /// Runs `command` on `host` with `input` as its standard input.
-    fn run(&self, host: &str, command: &str, input: &[u8]) -> Result<Ran, String>;
+    /// Runs `command` on `host` with `input` as its standard input; returns its standard output.
+    fn run(&self, host: &str, command: &str, input: &[u8]) -> Result<Vec<u8>, String>;
 }
 
 /// The system's OpenSSH client, with the user's own keys and ~/.ssh/config (Tailscale SSH works
@@ -237,7 +234,7 @@ impl Ssh {
 }
 
 impl Remote for Ssh {
-    fn run(&self, host: &str, command: &str, input: &[u8]) -> Result<Ran, String> {
+    fn run(&self, host: &str, command: &str, input: &[u8]) -> Result<Vec<u8>, String> {
         use std::process::{Command, Stdio};
         if !valid_host(host) {
             return Err("bad_ssh_host".into());
@@ -252,8 +249,12 @@ impl Remote for Ssh {
         }
         let mut child = cmd.spawn().map_err(|_| "ssh_missing".to_string())?;
         let mut stdin = child.stdin.take().ok_or("ssh_failed")?;
-        let input = input.to_vec();
-        let writer = std::thread::spawn(move || { let _ = stdin.write_all(&input); });
+        let mut input = input.to_vec();
+        // The input may be a pairing key: this copy is wiped once sent, as `pair` wipes its own.
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+            input.iter_mut().for_each(|b| *b = 0);
+        });
         let mut stdout = child.stdout.take().ok_or("ssh_failed")?;
         let mut stderr = child.stderr.take().ok_or("ssh_failed")?;
         let (send, receive) = std::sync::mpsc::channel();
@@ -288,15 +289,15 @@ impl Remote for Ssh {
     }
 }
 
-/// What a finished `ssh` gives: the command's output and exit code, or ssh's own failure.
-fn finished(out: Vec<u8>, code: Option<i32>, err: &[u8]) -> Result<Ran, String> {
+/// What a finished `ssh` gives: the command's output, or ssh's own failure.
+fn finished(out: Vec<u8>, code: Option<i32>, err: &[u8]) -> Result<Vec<u8>, String> {
     // 255 is ssh's own failure (no connection, key refused, unknown host key); "**" lines are
     // its banners (a key exchange warning), not the reason.
     if code == Some(255) {
         let first = String::from_utf8_lossy(err).lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("**")).unwrap_or("").chars().take(200).collect::<String>();
         return Err(format!("ssh_failed: {first}"));
     }
-    Ok(Ran { out, code })
+    Ok(out)
 }
 
 /// Runs one of the target's tools through its `slopbar-mcp --call`; its answer or its error.
@@ -808,6 +809,7 @@ mod tests {
         let cmd = remote_command(&["--call-b64", "it's"]);
         assert!(cmd.starts_with("pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "), "PowerShell 7 first: {cmd}");
         let script = script_of(&cmd);
+        assert!(script.starts_with("'slopbar-remote: started'\n$ErrorActionPreference = 'Stop'\n"), "it says it started before anything can fail: {script}");
         assert!(script.contains("$out = & $exe '--call-b64' 'it''s' | ForEach-Object { $_ }"), "{script}");
         assert!(script.contains("SlopBar\\slopbar-mcp.exe"));
         assert_eq!(parts(&cmd), ("pwsh".to_string(), vec!["--call-b64".to_string(), "it's".to_string()]));
@@ -823,24 +825,23 @@ mod tests {
     }
 
     #[test]
-    fn ssh_hands_back_the_exit_code_or_its_own_failure() {
-        let ran = finished(Vec::new(), Some(1), b"'pwsh' is not recognized as an internal or external command,\r\n").unwrap();
-        assert!(ran.out.is_empty() && ran.code == Some(1), "a program the remote shell cannot find: {ran:?}");
-        let ran = finished(b"{\"ok\":{}}\r\n".to_vec(), Some(0), b"").unwrap();
-        assert_eq!((&ran.out[..], ran.code), (&b"{\"ok\":{}}\r\n"[..], Some(0)));
+    fn ssh_hands_back_the_output_or_its_own_failure() {
+        let shell_said = b"'pwsh' is not recognized as an internal or external command,\r\n";
+        assert_eq!(finished(Vec::new(), Some(1), shell_said).unwrap(), b"", "the remote shell's own failure is the command's");
+        assert_eq!(finished(b"{\"ok\":{}}\r\n".to_vec(), Some(0), b"").unwrap(), b"{\"ok\":{}}\r\n");
         let refused = b"** WARNING: connection is not using a post-quantum key exchange algorithm.\r\n** This session may be vulnerable.\r\nssh: connect to host box port 22: Connection refused\r\n";
         assert_eq!(finished(Vec::new(), Some(255), refused).unwrap_err(), "ssh_failed: ssh: connect to host box port 22: Connection refused");
     }
 
     /// Another computer's shell, answering each command with the next of `replies`.
     struct Scripted {
-        replies: RefCell<Vec<Result<Ran, String>>>,
+        replies: RefCell<Vec<Result<Vec<u8>, String>>>,
         commands: RefCell<Vec<String>>,
         inputs: RefCell<Vec<Vec<u8>>>,
     }
 
     impl Remote for Scripted {
-        fn run(&self, _host: &str, command: &str, input: &[u8]) -> Result<Ran, String> {
+        fn run(&self, _host: &str, command: &str, input: &[u8]) -> Result<Vec<u8>, String> {
             self.commands.borrow_mut().push(command.into());
             self.inputs.borrow_mut().push(input.to_vec());
             let mut replies = self.replies.borrow_mut();
@@ -849,42 +850,44 @@ mod tests {
         }
     }
 
-    fn scripted(replies: Vec<Result<Ran, String>>) -> Scripted {
+    fn scripted(replies: Vec<Result<Vec<u8>, String>>) -> Scripted {
         Scripted { replies: RefCell::new(replies), commands: RefCell::default(), inputs: RefCell::default() }
     }
 
-    fn ran(out: &str, code: i32) -> Result<Ran, String> {
-        Ok(Ran { out: out.into(), code: Some(code) })
+    fn printed(out: &str) -> Result<Vec<u8>, String> {
+        Ok(out.as_bytes().to_vec())
     }
 
     #[test]
-    fn windows_powershell_runs_only_where_powershell_7_never_did() {
+    fn windows_powershell_runs_only_where_powershell_7_never_started_the_script() {
         let args = ["--call-b64", "it's"];
         let asked = vec!["--call-b64".to_string(), "it's".to_string()];
         let tried = |there: &Scripted| there.commands.borrow().iter().map(|c| parts(c)).collect::<Vec<_>>();
-        let answer = "{\"ok\":{\"paired\":true}}\r\n";
-        // A shell that finds no pwsh prints nothing and exits 1 (cmd, both PowerShells) or 127
-        // (a POSIX shell): the same script and input go to Windows PowerShell.
-        for code in [1, 127] {
-            let there = scripted(vec![ran("", code), ran(answer, 0)]);
-            assert_eq!(run_there(&there, "box", &args, b"offer\n").unwrap(), answer.as_bytes());
+        let started = |rest: &str| format!("{STARTED}\r\n{rest}");
+        let answer = started("{\"ok\":{\"paired\":true}}\r\n");
+        // pwsh never started the script (none there, or it cannot start): the same script and
+        // input go to Windows PowerShell, whatever the shell printed of its own (cmd's AutoRun, a
+        // profile's greeting) and whatever exit code it gave.
+        for first in ["", "\r\n", "Active code page: 65001\r\n", "Welcome back\r\n"] {
+            let there = scripted(vec![printed(first), printed(&answer)]);
+            assert_eq!(run_there(&there, "box", &args, b"offer\n").unwrap(), answer.as_bytes(), "{first:?}");
             assert_eq!(tried(&there), [("pwsh".to_string(), asked.clone()), ("powershell".to_string(), asked.clone())]);
             assert_eq!(*there.inputs.borrow(), [b"offer\n".to_vec(), b"offer\n".to_vec()]);
         }
-        // Blank lines are still nothing.
-        let there = scripted(vec![ran("\r\n", 1), ran(answer, 0)]);
-        assert_eq!(run_there(&there, "box", &args, b"").unwrap(), answer.as_bytes());
         // The second try's own failure is the outcome.
-        let there = scripted(vec![ran("", 1), Err("ssh_timeout".into())]);
+        let there = scripted(vec![printed(""), Err("ssh_timeout".into())]);
         assert_eq!(run_there(&there, "box", &args, b"").unwrap_err(), "ssh_timeout");
 
-        // Once the script ran under pwsh, its outcome stands, whatever it was: an answer, an error
-        // answer, SlopBar missing there, or a crash that printed nothing.
-        for (out, code) in [(answer, 0), ("{\"error\":\"target_has_other_key\"}\r\n", 1), ("{\"error\":\"slopbar_not_installed\"}\r\n", 3), ("", 101), ("", 0)] {
-            let there = scripted(vec![ran(out, code)]);
-            assert_eq!(run_there(&there, "box", &args, b"").unwrap(), out.as_bytes(), "{out:?} {code}");
-            assert_eq!(tried(&there), [("pwsh".to_string(), asked.clone())], "never twice: {out:?} {code}");
+        // Once the script started under pwsh, its outcome stands, whatever came after: an answer, an
+        // error answer, SlopBar missing there, or nothing more (slopbar-mcp crashed or was killed,
+        // which a PowerShell remote shell reports as exit 1, like a missing pwsh).
+        for rest in ["{\"ok\":{\"paired\":true}}\r\n", "{\"error\":\"target_has_other_key\"}\r\n", "{\"error\":\"slopbar_not_installed\"}\r\n", ""] {
+            let there = scripted(vec![printed(&format!("Welcome back\r\n{}", started(rest)))]);
+            run_there(&there, "box", &args, b"").unwrap();
+            assert_eq!(tried(&there), [("pwsh".to_string(), asked.clone())], "never twice: {rest:?}");
         }
+        let there = scripted(vec![printed(&started(""))]);
+        assert_eq!(remote_call(&there, "box", "sign_in_all", &json!({ "confirm": true })).unwrap_err(), "remote_no_answer");
         // SSH itself failed or timed out: nothing is tried again.
         for e in ["ssh_failed: Connection refused", "ssh_timeout"] {
             let there = scripted(vec![Err(e.into())]);
@@ -892,7 +895,7 @@ mod tests {
             assert_eq!(there.commands.borrow().len(), 1);
         }
         // Neither PowerShell there: no answer, as before.
-        let there = scripted(vec![ran("", 1), ran("", 1)]);
+        let there = scripted(vec![printed(""), printed("")]);
         assert_eq!(remote_call(&there, "box", "get_app_info", &json!({})).unwrap_err(), "remote_no_answer");
         assert_eq!(tried(&there).iter().map(|(shell, _)| shell.as_str()).collect::<Vec<_>>(), ["pwsh", "powershell"]);
     }
@@ -907,10 +910,10 @@ mod tests {
         }
     }
 
-    /// What the target's shell gives for a program it cannot find: nothing on standard output, exit 1
+    /// What the target's shell prints on standard output for a program it cannot find: nothing
     /// (cmd's "'pwsh' is not recognized…" goes to standard error).
-    fn not_found() -> Result<Ran, String> {
-        Ok(Ran { out: Vec::new(), code: Some(1) })
+    fn not_found() -> Result<Vec<u8>, String> {
+        Ok(Vec::new())
     }
 
     #[test]
@@ -971,7 +974,7 @@ mod tests {
     }
 
     impl Remote for FakeSsh<'_> {
-        fn run(&self, _host: &str, command: &str, input: &[u8]) -> Result<Ran, String> {
+        fn run(&self, _host: &str, command: &str, input: &[u8]) -> Result<Vec<u8>, String> {
             self.commands.borrow_mut().push(command.into());
             self.inputs.borrow_mut().push(input.to_vec());
             if !shell_runs(self.pwsh, command) {
@@ -998,9 +1001,9 @@ mod tests {
         }
     }
 
-    /// What the script prints and exits with when slopbar-mcp answers `out` (see `mcp::print_answer`).
-    fn answered(out: &Value) -> Result<Ran, String> {
-        Ok(Ran { out: format!("{}\r\n", ascii_json(out)).into_bytes(), code: Some(if out.get("error").is_some() { 1 } else { 0 }) })
+    /// What the script prints when slopbar-mcp answers `out` (see `mcp::print_answer`).
+    fn answered(out: &Value) -> Result<Vec<u8>, String> {
+        Ok(format!("{STARTED}\r\n{}\r\n", ascii_json(out)).into_bytes())
     }
 
     /// Another computer running a sharing setup: its tools and `--sharing-state` answer as scripted.
@@ -1025,7 +1028,7 @@ mod tests {
     }
 
     impl Remote for SharingTarget {
-        fn run(&self, _host: &str, command: &str, _input: &[u8]) -> Result<Ran, String> {
+        fn run(&self, _host: &str, command: &str, _input: &[u8]) -> Result<Vec<u8>, String> {
             self.commands.borrow_mut().push(command.into());
             if !shell_runs(self.pwsh, command) {
                 return not_found();
