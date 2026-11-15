@@ -11,7 +11,7 @@ rules and the UI only see that trait.
 | Backend | Status | Needs |
 | --- | --- | --- |
 | `SyncedFolder`: any folder a sync client mirrors | Shipped | Nothing. Settings > Data detects OneDrive, Dropbox, Google Drive for desktop, iCloud Drive and Box, or takes a custom folder. |
-| `Rclone`: any remote the user set up with `rclone config` | Shipped | rclone installed. **No app registration.** |
+| `Rclone`: any remote the user set up with `rclone config`, or Dropbox through the guided setup | Shipped | rclone, which the guided setup downloads when it is missing. **No app registration.** |
 | `CloudApi(Dropbox)` | Optional stub, reports `not_configured` | A Dropbox app registered by the owner |
 | `CloudApi(GoogleDrive)` | Optional stub, reports `not_configured` | A Google Cloud OAuth client registered by the owner |
 | `CloudApi(OneDrive)` | Optional stub, reports `not_configured` | A Microsoft Entra app registered by the owner |
@@ -21,21 +21,29 @@ Machines without a sync client should use rclone. The direct API backends below 
 for. Every API backend would store records in an **app-private folder only**, so SlopBar never
 asks for access to the user's own files.
 
+The guided Dropbox setup does not meet that bar, and says so on its button: it signs in through
+rclone's own registered Dropbox client, whose access covers the user's whole Dropbox. rclone, not
+SlopBar, holds that token, and SlopBar only ever touches `SlopBar/presence`. A Dropbox app
+registered for SlopBar with **App folder** access (`CloudApi(Dropbox)` below) would narrow it to
+SlopBar's own folder; that needs the owner to register the app.
+
 Google Docs is not a target. Presence records are JSON files, and Google Drive covers Docs users.
 
 ## rclone: any cloud, no app registration (`src-tauri/src/rclone.rs`)
 
-The user connects their cloud once, outside SlopBar, with `rclone config`. That covers Dropbox,
-Google Drive, OneDrive, Box, pCloud, MEGA, S3, WebDAV, SFTP and the other rclone backends.
-rclone keeps its own config and tokens.
+The user connects their cloud once: Dropbox with SlopBar's guided setup (below), or any cloud
+outside SlopBar with `rclone config`. That covers Dropbox, Google Drive, OneDrive, Box, pCloud,
+MEGA, S3, WebDAV, SFTP and the other rclone backends. rclone keeps its own config and tokens.
 
 - **Choosing a remote.** Settings > Data lists the remotes from `rclone listremotes --long` as
   "Dropbox (via rclone)" and so on, next to the detected sync folders. That command prints only
   names and backend types. SlopBar never runs `rclone config dump` or `config show`, and never
   reads `rclone.conf`, so it never sees a token.
-- **When rclone is missing.** Settings shows a one-line hint: "Install rclone and run
-  `rclone config` to connect any cloud without a sync app."
-- **Where rclone is found.** On `PATH`, or in `%LOCALAPPDATA%\Microsoft\WinGet\Links`.
+- **When rclone is missing.** Settings offers the guided Dropbox setup, and a one-line hint for
+  other clouds: "Install rclone and run `rclone config` to connect any cloud without a sync app."
+- **Where rclone is found.** SlopBar's own copy (`%LOCALAPPDATA%\SlopBar\rclone\rclone.exe`, from
+  the guided setup), then `%LOCALAPPDATA%\Microsoft\WinGet\Links`, then `PATH` (last: folders on
+  `PATH` can be writable by anyone). All of them read the same rclone config.
 - **Calls.** SlopBar runs only these, and only on `<remote>:SlopBar/presence`:
   - `lsjson --files-only --no-mimetype` to list records;
   - `cat <file>` to read each one;
@@ -52,6 +60,52 @@ rclone keeps its own config and tokens.
 - **Tests.** Unit tests use a fake rclone, an injected `Runner`. Run the live check, which uses
   only `SlopBar/presence` and removes its synthetic record afterwards, with:
   `SLOPBAR_RCLONE_LIVE=<remote> cargo test --lib rclone_live -- --ignored`
+
+### Guided Dropbox setup (`src-tauri/src/sharing_setup.rs`)
+
+**Set up** in Settings → Data → Other computers (shown while no sharing location is chosen, and in
+the getting-started guide), or the `setup_sharing` agent tool, connects a computer in one go:
+
+1. **rclone.** An installed rclone of v1.60 or later is used as it is. Otherwise SlopBar downloads
+   one fixed release (v1.76.0) from downloads.rclone.org, or its GitHub release if that fails, and
+   takes it only when the zip's SHA-256 matches the one pinned in the code (as rclone's
+   `SHA256SUMS` and winget's reviewed manifest publish it). It unpacks only `rclone.exe` with
+   Windows' `tar.exe` (PowerShell's `Expand-Archive` where tar is missing), checks that it runs and
+   reports that version, then moves it into SlopBar's folder. The download shows its progress, has
+   no overall limit but fails after 30 seconds without data, and Cancel stops it.
+2. **Dropbox.** A remote of that name (the one sharing already uses, else `dropbox`) that reaches
+   its storage is used as it is. Otherwise rclone signs in with its own flow:
+   `rclone config create <remote> dropbox` for a new remote, `rclone config update <remote>
+   config_refresh_token=true` for an existing one whose access ended (or with **Sign in to
+   Dropbox again**, for another account). Both run with `config_auth_no_browser=true`, so rclone
+   opens no browser, and `--no-output`, and rclone's standard output stays closed: it would end
+   with the remote, token included. From rclone's notices SlopBar takes only its loopback link
+   (`http://127.0.0.1:53682/auth?state=…`, exactly that form), which it opens in the browser (with a
+   notification that opens it again: Windows can keep a page opened from the background behind
+   other windows; Settings turns either off, `sharing_open_browser` and
+   `notifications.sharing_sign_in`, both on by default), and
+   the reason a failed sign-in gives: `denied` (not allowed on Dropbox's page), `stale_page`
+   (Allow clicked on a page from an earlier try), `port_busy` or `port_reserved` (port 53682 held
+   by another program, or reserved by Windows). The user has 10 minutes. Stopped before Allow,
+   rclone writes nothing. A failed listing of the remotes stops the setup instead of creating one:
+   `config create` would replace a remote of that name.
+3. **Sharing on.** `presence_remote` is set to the remote, and the setup lists the other computers
+   seen there within the last day. A computer that shares through a folder is refused
+   (`uses_folder`) rather than moved off it.
+
+rclone and the tunnel below run in the app's job object, so they end with SlopBar, and an
+automatic update waits while a setup runs here or the tunnel for another computer is open.
+
+**Another computer, over SSH.** `setup_sharing` with `ssh_host` sets up that computer from this
+one, with nobody at its screen. Its SlopBar gets rclone and starts the sign-in without a browser;
+this computer's SlopBar reads only the link's `state` value (`slopbar-mcp --sharing-state`, never
+a tool result), checks that it is letters, digits, `-` and `_`, opens an SSH tunnel
+(`ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:53682:127.0.0.1:53682 -L
+[::1]:53682:127.0.0.1:53682`; Dropbox sends the browser to `localhost`, which browsers try over
+IPv6 first) and opens the link it builds from that value in this computer's browser. Dropbox's
+answer reaches that computer's rclone through the tunnel, so the token never passes through this
+computer. The tunnel closes once `get_sharing_setup` with that `ssh_host` sees the setup end, and
+12 minutes after it opened at the latest. A computer reached over SSH can never set up a third one.
 
 ## Rejected: reusing browser sign-ins
 

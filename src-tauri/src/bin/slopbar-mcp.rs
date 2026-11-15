@@ -10,7 +10,9 @@
 //! `session_hook`); with `--turn-hook` its UserPromptSubmit and Stop hook for graceful rotation (see
 //! `turn_hook`); `--pick` and `--release` serve the `slopbar-run` launcher (see `launcher`);
 //! `--call` runs one tool and prints its result, which is how another computer reaches this one
-//! over SSH, and `--pair-receive` takes a pairing key on standard input (see `pairing`).
+//! over SSH, `--pair-receive` takes a pairing key on standard input (see `pairing`), and
+//! `--sharing-state` hands another computer the state of a waiting Dropbox sign-in (see
+//! `sharing_setup`).
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -20,6 +22,7 @@ fn main() {
         Some("--pick" | "--release") => std::process::exit(slopbar_lib::launcher_helper(&args)),
         Some("--call" | "--call-b64") => std::process::exit(slopbar_lib::call_cli(&args)),
         Some("--pair-receive") => std::process::exit(slopbar_lib::pair_receive()),
+        Some("--sharing-state") => std::process::exit(slopbar_lib::sharing_state(&args)),
         _ => std::process::exit(if slopbar_lib::serve_mcp().is_ok() { 0 } else { 1 }),
     }
 }

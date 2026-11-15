@@ -13,6 +13,8 @@ use crate::AppState;
 
 const FIRST_CHECK: Duration = Duration::from_secs(20);
 const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+/// Why an automatic install waited (see `install_now`).
+const SHARING_SETUP_RUNS: &str = "waiting for the sharing setup to finish";
 
 #[derive(Clone, Serialize)]
 pub struct UpdateInfo {
@@ -84,6 +86,10 @@ async fn install_now(app: &AppHandle, by: Trigger, steps: &Steps) -> Result<Outc
         .run("The update check", update_check::CHECK_LIMIT, async { updater(app)?.check().await.map_err(|e| describe(&e)) })
         .await?;
     let Some(mut update) = found else { return Ok(Outcome::UpToDate) };
+    // An automatic install waits while a sharing setup runs: restarting would end its sign-in.
+    if matches!(by, Trigger::Auto) && crate::app::sharing_setup_running(app) {
+        return Ok(Outcome::Deferred(SHARING_SETUP_RUNS.into()));
+    }
     // One install at a time, from its download to the end of its handover (a check takes no turn).
     let turn = match app.state::<AppState>().update_check.begin_install() {
         Ok(turn) => turn,

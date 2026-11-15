@@ -32,6 +32,10 @@ Add accounts in **Settings → Accounts**: SlopBar opens the CLI's own sign-in (
 > [!NOTE]
 > A running Codex session keeps its account until you restart it.
 
+### Turning sharing on
+
+In-use sharing needs a place all your computers reach: a folder a sync app mirrors (OneDrive, Dropbox, Google Drive, iCloud Drive, Box), or a cloud remote through rclone. On a computer with neither, **Set up** in Settings → Data → Other computers (also in the getting-started guide) does it in one go: it downloads rclone if no recent copy is installed (one fixed release, checked against its published SHA-256, into SlopBar's own folder), opens Dropbox's page in your browser for you to sign in and click **Allow** (a notification offers it too; Settings turns either off), then turns sharing on and lists the other computers it finds there. Use the same Dropbox account on every computer. rclone keeps the Dropbox token in its own config, so SlopBar never sees it; rclone's access covers your whole Dropbox, while SlopBar only uses its `SlopBar` folder there. Agents do the same with the `setup_sharing` tool, also for another of your computers over SSH: the page opens in your browser on this computer, and the token goes straight to that computer's rclone.
+
 ### Which computer uses which account
 
 With in-use sharing on (Settings → Data → Other computers), wherever SlopBar shows an account it names the computers the account is in use on, this PC first and marked: "In use on DESK-1 (this PC, Desktop app), LAPTOP-2 (WSL: Ubuntu)". That is the account's tooltip in the flyout and in the taskbar widget, a short line under its name in the compact flyout, the cards in the full flyout and in Settings → Accounts and Subscriptions, the notification about an account in use on two computers, and the quick switcher, where typing a computer's name finds the account it uses. The names are the ones sharing already carries, so nothing more is shared; with sharing off, no computer's name is shown.
@@ -105,9 +109,9 @@ command = 'C:\Users\<you>\AppData\Local\SlopBar\slopbar-mcp.exe'
 
 | Tool | Does |
 | --- | --- |
-| `get_usage`, `refresh_usage` | Every account's usage windows, resets, monitoring state and errors (as last refreshed, or polled now). |
+| `get_usage`, `refresh_usage` | Every account's usage windows, resets, monitoring state and errors (as last refreshed, or polled now). While an earlier refresh or an update holds SlopBar's refresh for more than 30 seconds, `refresh_usage` (and any tool that refreshes after acting) returns the last numbers with a `waiting_for_refresh` note; a refresh follows as soon as that one ends. |
 | `get_settings`, `update_settings` | Read settings, or change them with a JSON merge patch. Only values the Settings window offers are accepted; unknown fields are refused. |
-| `switch_account`, `remove_account` | Use or remove a saved account, as in Settings. |
+| `switch_account`, `remove_account` | Use or remove a saved account, as in Settings. A switch's `switched_to_requested` is `null` when SlopBar was too busy to refresh and tell. |
 | `add_account`, `connect_monitoring`, `disconnect_monitoring` | Start the CLI's own sign-in for the user to complete, or revoke a monitoring sign-in. |
 | `revoke_account_sessions` | Revoke every sign-in SlopBar holds for an account (its monitoring session, at the provider and here), optionally removing the saved CLI login with `remove_slot`. Only reports unless `confirm: true`; the CLI's own sign-in is left to the CLI. |
 | `check_for_updates`, `install_update`, `get_app_info`, `open_settings` | Updates (builds with automatic updates only), version and build, the last update check (time, result, and error or the reason it was deferred), and showing the Settings window. |

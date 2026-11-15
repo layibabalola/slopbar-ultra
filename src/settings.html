@@ -173,6 +173,10 @@
           <input type="checkbox" class="switch" id="notify-multi_machine" />
         </div>
         <div class="row">
+          <div class="title"><label for="notify-sharing_sign_in" data-i18n="notifySharing"></label><small data-i18n="notifySharingHint"></small></div>
+          <input type="checkbox" class="switch" id="notify-sharing_sign_in" />
+        </div>
+        <div class="row">
           <div class="title"><label for="notify-renewals" data-i18n="notifyRenewals"></label><small data-i18n="notifyRenewalsHint"></small></div>
           <input type="checkbox" class="switch" id="notify-renewals" />
         </div>
@@ -284,6 +288,22 @@
       </div>
       <h2 data-i18n="sPresence"></h2>
       <div class="group">
+        <div class="row" id="sharing-setup" hidden>
+          <div class="title"><span data-i18n="sharingSetupTitle"></span><small data-i18n="sharingSetupHint"></small></div>
+          <button class="btn accent" id="sharing-setup-start" data-i18n="sharingSetupStart"></button>
+        </div>
+        <div class="row sharing-steps" id="sharing-setup-steps" hidden>
+          <ol class="setup-steps" id="sharing-setup-list" aria-live="polite"></ol>
+          <div class="setup-actions">
+            <button class="btn" id="sharing-setup-again" data-i18n="sharingStepDropboxAgain" hidden></button>
+            <button class="btn" id="sharing-setup-reconnect" data-i18n="sharingSetupReconnect" hidden></button>
+            <button class="btn" id="sharing-setup-cancel" data-i18n="sharingSetupCancel" hidden></button>
+          </div>
+        </div>
+        <div class="row">
+          <div class="title"><label for="sharing-open-browser" data-i18n="sharingOpenBrowser"></label><small data-i18n="sharingOpenBrowserHint"></small></div>
+          <input type="checkbox" class="switch" id="sharing-open-browser" />
+        </div>
         <div class="row">
           <div class="title"><label for="presence" data-i18n="sharePresence"></label><small data-i18n="sharePresenceHint"></small></div>
           <div class="select"><select id="presence"></select></div>

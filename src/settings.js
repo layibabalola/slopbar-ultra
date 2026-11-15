@@ -346,7 +346,7 @@ listen("account-added", () => { $("add-hint").hidden = true; });
 // The verdicts come from the backend (subscriptions.rs); this page only words them.
 
 let report = null;
-const NOTIFY_KINDS = ["usage", "resets", "switches", "renewals", "extra_usage", "burn", "reset_credits", "unexpected_use", "multi_machine", "digest"];
+const NOTIFY_KINDS = ["usage", "resets", "switches", "renewals", "extra_usage", "burn", "reset_credits", "unexpected_use", "multi_machine", "sharing_sign_in", "digest"];
 const VERDICT_TONE = { exhausted_weekly: "bad", unused: "warn", underused: "warn", healthy: "ok", insufficient_data: "" };
 
 function verdictLines(e) {
@@ -973,6 +973,7 @@ async function render() {
   $("crash-records").checked = settings.crash_records;
   $("auto-monitoring").checked = settings.auto_connect_monitoring;
   $("switch-desktop").checked = settings.switch_desktop;
+  $("sharing-open-browser").checked = settings.sharing_open_browser;
   $("compact-flyout").checked = settings.compact_flyout;
   $("compact-flyout-hint").textContent = snapshot.accounts.length > COMPACT_SUGGEST_ABOVE && !settings.compact_flyout
     ? t("compactFlyoutSuggested", { n: snapshot.accounts.length }) : t("compactFlyoutHint");
@@ -981,6 +982,7 @@ async function render() {
   renderCalendar();
   renderPhone();
   renderPresence();
+  renderSharingSetup();
   renderRoster();
   const version = await invoke("app_version");
   $("version").textContent = /^\d/.test(version) ? `v${version}` : version;
@@ -1021,6 +1023,7 @@ $("export-diagnostics").addEventListener("click", async () => {
 $("crash-records").addEventListener("change", (e) => update({ crash_records: e.target.checked }));
 $("auto-monitoring").addEventListener("change", (e) => update({ auto_connect_monitoring: e.target.checked }));
 $("switch-desktop").addEventListener("change", (e) => update({ switch_desktop: e.target.checked }));
+$("sharing-open-browser").addEventListener("change", (e) => update({ sharing_open_browser: e.target.checked }));
 $("wsl-accounts").addEventListener("change", (e) => update({ wsl_accounts: e.target.value }));
 $("signin-window").addEventListener("change", (e) => update({ signin_window: e.target.value }));
 // Reads every WSL distro once, starting stopped ones, then refreshes.
@@ -1091,7 +1094,8 @@ function renderGuide() {
           <label for="guide-presence">${t("guideShareLabel")}</label>
           <div class="select"><select id="guide-presence">${presence.html}</select></div>
           <button class="btn" id="guide-presence-other">${t("guideShareOther")}</button>
-        </div>`)}
+        </div>
+        ${settings.presence_folder || settings.presence_remote ? "" : `<p><button class="btn accent" id="guide-sharing-setup">${t("sharingSetupTitle")}</button></p>`}`)}
       ${guideStep(4, t("guideNotifyTitle"), GUIDE_NOTIFY.every((k) => settings.notifications[k]) ? "done" : "todo", `
         <p>${t("guideNotifyBody")}</p>
         <div class="guide-notify">${GUIDE_NOTIFY.map((k) => `
@@ -1113,6 +1117,13 @@ async function closeGuide() {
 }
 $("guide").addEventListener("click", async (e) => {
   if (e.target.closest("#guide-close, #guide-done")) { closeGuide(); return; }
+  if (e.target.closest("#guide-sharing-setup")) {
+    showPage("data");
+    // Its steps show under Other computers, below the fold.
+    $("sharing-setup").scrollIntoView({ block: "start", behavior: "smooth" });
+    startSharingSetup();
+    return;
+  }
   if (e.target.closest("#guide-presence-other")) {
     showPage("data");
     $("presence").value = "__other__";
@@ -1281,6 +1292,70 @@ async function savePresencePath() {
 }
 $("presence-save").addEventListener("click", savePresencePath);
 $("presence-path").addEventListener("keydown", (e) => { if (e.key === "Enter") savePresencePath(); });
+// Set up sharing with Dropbox (sharing_setup.rs): SlopBar gets rclone if it is missing, rclone runs
+// its own Dropbox sign-in, then sharing goes on. The app publishes each step ("sharing-setup").
+let sharingSetup = { phase: "idle" };
+const SETUP_RUNNING = ["rclone", "dropbox", "sharing"];
+function renderSharingSetup() {
+  if (!settings) return;
+  const s = sharingSetup;
+  const running = SETUP_RUNNING.includes(s.phase);
+  const shown = s.phase !== "idle";
+  $("sharing-setup").hidden = !(running || shown || (!settings.presence_folder && !settings.presence_remote));
+  // While it runs, Cancel (under the steps) is the one action; once done, nothing to start.
+  $("sharing-setup-start").hidden = running || s.phase === "done";
+  $("sharing-setup-start").textContent = t(s.phase === "failed" ? "sharingSetupRetry" : "sharingSetupStart");
+  $("sharing-setup-steps").hidden = !shown;
+  $("sharing-setup-cancel").hidden = !running;
+  $("sharing-setup-again").hidden = !(s.phase === "dropbox" && s.waiting && !s.via_tunnel);
+  // No other computer seen: perhaps another Dropbox account than theirs.
+  $("sharing-setup-reconnect").hidden = !(s.phase === "done" && !s.found?.length);
+  if (!shown) return;
+  // Each step is done, under way, failed (where the run stopped) or still to come.
+  const order = ["rclone", "dropbox", "sharing"];
+  const at = order.indexOf(s.phase);
+  const stopped = s.phase === "failed";
+  const reached = Math.max(0, order.indexOf(s.failed_at));
+  const step = (i, title, busy, more = "") => {
+    const state = s.phase === "done" || (!stopped && at > i) || (stopped && reached > i) ? "done"
+      : stopped && reached === i ? "failed" : at === i ? "busy" : "todo";
+    return `<li class="${state}"><span>${esc(title)}</span>${state === "busy" && busy ? `<small>${esc(busy)}</small>${more}` : ""}</li>`;
+  };
+  const key = `sharingErr_${s.error}`;
+  const why = t(key, { remote: s.remote ?? "" }) === key ? errorText("", s.error ?? "") : t(key, { remote: s.remote ?? "" });
+  const result = s.phase === "done"
+    ? `<li class="result">${esc(s.found?.length ? t("sharingFound", { list: s.found.join(", ") }) : t("sharingFoundNone"))}</li>`
+    : stopped ? `<li class="result">${esc(t("sharingFailed", { error: why }))}</li>` : "";
+  // The download's progress, once rclone says how big it is.
+  const bar = Number.isInteger(s.progress) ? `<progress max="100" value="${s.progress}"></progress>` : "";
+  $("sharing-setup-list").innerHTML = step(0, t("sharingStepRclone"), s.downloaded ? t("sharingStepRcloneBusy") : "", bar)
+    + step(1, t("sharingStepDropbox"), s.waiting ? t("sharingStepDropboxBusy") : "")
+    + step(2, t("sharingStepOn"), "") + result;
+}
+async function startSharingSetup(reconnect = false) {
+  // One click starts one setup: a second before the answer would only hear "already running".
+  $("sharing-setup-start").disabled = $("sharing-setup-reconnect").disabled = true;
+  try {
+    sharingSetup = (await invoke("setup_sharing", { reconnect })) ?? sharingSetup;
+  } catch (err) {
+    sharingSetup = { phase: "failed", error: String(err) };
+  }
+  $("sharing-setup-start").disabled = $("sharing-setup-reconnect").disabled = false;
+  renderSharingSetup();
+}
+$("sharing-setup-start").addEventListener("click", () => startSharingSetup());
+$("sharing-setup-reconnect").addEventListener("click", () => startSharingSetup(true));
+$("sharing-setup-cancel").addEventListener("click", () => invoke("cancel_sharing_setup").catch(() => {}));
+$("sharing-setup-again").addEventListener("click", () => invoke("open_sharing_page").catch(() => {}));
+listen("sharing-setup", ({ payload }) => {
+  const finished = payload.phase === "done" && sharingSetup.phase !== "done";
+  sharingSetup = payload;
+  renderSharingSetup();
+  // The new remote joins the sharing choices.
+  if (finished) invoke("rclone_remotes").then((found) => { rclone = found ?? rclone; renderPresence(); renderGuide(); }, () => {});
+});
+invoke("sharing_setup_state").then((s) => { sharingSetup = s ?? sharingSetup; renderSharingSetup(); }, () => {});
+
 invoke("sync_folders").then((folders) => { syncFolders = folders ?? []; if (settings) { renderPresence(); renderGuide(); } }, () => {});
 invoke("rclone_remotes").then((found) => { rclone = found ?? rclone; if (settings) { renderPresence(); renderGuide(); } }, () => {});
 
