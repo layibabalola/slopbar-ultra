@@ -2843,15 +2843,19 @@ pub(crate) fn sharing_setup_running(app: &AppHandle) -> bool {
     here || state.sharing_tunnel.lock().unwrap().is_some()
 }
 
-/// Opens one of rclone's loopback sign-in links in the default browser. Windows lets a window come
-/// to the front only for the app the user is using, so whatever right this one has is passed on.
+/// Opens one of rclone's loopback sign-in links in the default browser through url.dll's protocol
+/// handler, as rclone itself does: explorer.exe takes a link with a query string for a folder and
+/// opens Documents instead. Windows lets a window come to the front only for the app the user is
+/// using, so whatever right this one has is passed on.
 fn open_in_browser(link: &str) -> Result<(), String> {
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, ASFW_ANY};
         AllowSetForegroundWindow(ASFW_ANY);
     }
-    std::process::Command::new("explorer.exe").arg(link).spawn().map(|_| ()).map_err(|e| e.to_string())
+    let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\Windows".into());
+    std::process::Command::new(system.join(r"System32\rundll32.exe")).arg("url.dll,FileProtocolHandler").arg(link)
+        .spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Opens Dropbox's page and says so in a notification whose click opens it again: a page opened
