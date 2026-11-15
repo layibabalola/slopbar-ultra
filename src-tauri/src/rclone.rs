@@ -1,5 +1,6 @@
 //! Presence records on any cloud storage rclone can reach, with no app registration: the user
-//! connects their cloud once with `rclone config`, and rclone keeps its own config and tokens.
+//! connects their cloud once, with `rclone config` or with SlopBar's guided Dropbox setup
+//! (`sharing_setup`, which runs rclone's own sign-in), and rclone keeps its own config and tokens.
 //! SlopBar only runs rclone (no window, a hard timeout per call) on `<remote>:SlopBar/presence`,
 //! never passes or reads credentials, and never prints rclone's output.
 
@@ -75,14 +76,24 @@ impl Runner for Cli {
     }
 }
 
-/// rclone on PATH, or where WinGet links it.
+/// The rclone to run: the copy SlopBar downloaded and verified (see `sharing_setup`), else where
+/// WinGet links it, else the first on PATH (last: folders on PATH can be writable by anyone). All
+/// read the same rclone config, so the remotes are the same whichever runs.
 pub fn find() -> Option<PathBuf> {
     let exe = if cfg!(windows) { "rclone.exe" } else { "rclone" };
+    let own = crate::sharing_setup::own_rclone();
+    let winget = dirs::data_local_dir().map(|d| d.join("Microsoft").join("WinGet").join("Links").join(exe));
     let on_path = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).map(|d| d.join(exe)).collect::<Vec<_>>())
         .unwrap_or_default();
-    let winget = dirs::data_local_dir().map(|d| d.join("Microsoft").join("WinGet").join("Links").join(exe));
-    on_path.into_iter().chain(winget).find(|p| p.is_file())
+    own.into_iter().chain(winget).chain(on_path).find(|p| p.is_file())
+}
+
+/// Whether the rclone at `path` runs and is recent enough for the guided setup (see
+/// `sharing_setup::recent_enough`).
+pub fn usable(path: &std::path::Path) -> bool {
+    Cli(path.to_path_buf()).run(&["version"], None)
+        .is_ok_and(|ran| ran.code == Some(0) && crate::sharing_setup::recent_enough(&String::from_utf8_lossy(&ran.stdout)))
 }
 
 /// A remote the user configured in rclone.
@@ -99,18 +110,25 @@ pub struct Remote {
 /// The user's rclone remotes. `listremotes --long` prints only names and types, so no
 /// credential is ever read (unlike `config dump`).
 pub fn remotes(runner: &dyn Runner) -> Vec<Remote> {
-    let Ok(ran) = runner.run(&["listremotes", "--long"], None) else { return vec![] };
+    listed(runner).unwrap_or_default()
+}
+
+/// The remotes, or None when rclone could not list them: before creating a remote, an empty list
+/// and a failed one must differ, or an existing remote of that name would be overwritten.
+pub fn listed(runner: &dyn Runner) -> Option<Vec<Remote>> {
+    let ran = runner.run(&["listremotes", "--long"], None).ok()?;
     if ran.code != Some(0) {
-        return vec![];
+        return None;
     }
-    String::from_utf8_lossy(&ran.stdout)
+    let found = String::from_utf8_lossy(&ran.stdout)
         .lines()
         .filter_map(|line| {
             let (name, kind) = line.trim().split_once(':')?;
             let kind = kind.trim().to_string();
             valid_remote(name).then(|| Remote { name: name.into(), provider: provider_name(&kind), kind })
         })
-        .collect()
+        .collect();
+    Some(found)
 }
 
 fn provider_name(kind: &str) -> String {
