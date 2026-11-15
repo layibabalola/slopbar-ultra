@@ -10,7 +10,7 @@ by the workflow. By hand:
   pwsh scripts/publish-ultra-release.ps1 -Build 7     # a given build number (higher than any before)
   pwsh scripts/publish-ultra-release.ps1 -ViaActions  # any machine: the workflow publishes origin/ultra
 The workflow, one step per call, sharing the -Stage folder:
-  -Step Decide -Before <sha>             on a push to ultra: publish, rehearse, or nothing (mode file)
+  -Step Decide -Before <sha>             on a push to ultra: publish, rehearse, or nothing (mode and changed files)
   -Step Check -Auto | -Tag <tag>         a push to ultra, or a pushed tag
   -Step Build|Sign|Publish [-Tag <tag>]
 

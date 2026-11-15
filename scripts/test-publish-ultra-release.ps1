@@ -22,6 +22,19 @@ function Check([string]$what, [bool]$ok) {
 function Get-Refusal([scriptblock]$block) {
   try { $null = & $block 2>$null; return '' } catch { return $_.Exception.Message }
 }
+# Whether $relative (slash-separated) is a file or folder under $base, spelled exactly so, case
+# included. Git on the Linux runner matches a listed path that way; Test-Path, on a case-insensitive
+# disk, takes any case for the file.
+function Test-ExactPath([string]$base, [string]$relative) {
+  $folder = $base
+  foreach ($part in $relative -split '/') {
+    if (-not (Test-Path -LiteralPath $folder -PathType Container)) { return $false }
+    $names = @([IO.Directory]::EnumerateFileSystemEntries($folder) | ForEach-Object { [IO.Path]::GetFileName($_) })
+    if ($names -cnotcontains $part) { return $false }
+    $folder = Join-Path $folder $part
+  }
+  return $true
+}
 
 # A synthetic fork: origin (bare) and a checkout of ultra.
 $origin = Join-Path $tmp 'origin.git'
@@ -320,7 +333,7 @@ try {
   foreach ($path in @($toolingPaths) + @($fleetPaths)) {
     $previous = Invoke-Work rev-parse HEAD
     $null = Add-Commit $path "only $path"
-    $kind = if ($toolingPaths -contains $path) { 'tooling' } else { 'fleet' }
+    $kind = if ($toolingPaths -ccontains $path) { 'tooling' } else { 'fleet' }
     Check "a push that changes only $path rehearses, and what changed is the $kind" ((Get-Decision $previous) -eq 'rehearsal' -and (Get-Content (Join-Path $stageDir 'changed') -Raw) -eq $kind)
   }
   $previous = Invoke-Work rev-parse HEAD
@@ -331,16 +344,31 @@ try {
   $null = Add-Commit 'scripts/publish-ultra-release.ps1' 'and the tooling with it'
   Check 'the release tooling counts when the fleet report changed with it' ((Get-Decision $previous) -eq 'rehearsal' -and (Get-Content (Join-Path $stageDir 'changed') -Raw) -eq 'tooling')
   # The lists cover what the build job runs: every script the workflow runs, and the script under each
-  # test it runs, and each listed file exists (a renamed one would drop out of its list unseen).
+  # test it runs, and each listed file exists (a renamed one would drop out of its list unseen). Case
+  # counts: git on the Linux runner reads a listed path exactly, where Test-Path and -contains take
+  # 'scripts/Fleet-Slopbar.ps1' for the file, so a path spelled in another case would never match a push.
   $repoRoot = Split-Path -Parent $PSScriptRoot
   $listed = @($toolingPaths) + @($fleetPaths)
-  $absent = @($listed | Where-Object { -not (Test-Path -LiteralPath (Join-Path $repoRoot $_)) })
-  Check "every file in the rehearsal lists exists ($($listed.Count) listed$(if ($absent) { ", missing: $($absent -join ', ')" }))" (-not $absent)
+  $absent = @($listed | Where-Object { -not (Test-ExactPath $repoRoot $_) })
+  Check "every file in the rehearsal lists exists, spelled as on disk ($($listed.Count) listed$(if ($absent) { ", missing: $($absent -join ', ')" }))" (-not $absent)
+  Check 'a path in another case than the file is not the file' ((Test-ExactPath $repoRoot 'scripts/publish-ultra-release.ps1') -and
+    -not (Test-ExactPath $repoRoot 'scripts/Publish-Ultra-Release.ps1') -and -not (Test-ExactPath $repoRoot 'Scripts/publish-ultra-release.ps1'))
   $workflowText = Get-Content -LiteralPath (Join-Path $repoRoot '.github/workflows/ultra-release.yml') -Raw
   $ran = @([regex]::Matches($workflowText, '(?m)^\s*(?:run:\s*)?\./(scripts/[\w.-]+\.ps1)') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
   $needed = @(@($ran) + @($ran | ForEach-Object { if ($_ -match '^scripts/test-(.+\.ps1)$') { "scripts/$($Matches[1])" } }) | Select-Object -Unique)
-  $unlisted = @($needed | Where-Object { $listed -notcontains $_ })
+  $unlisted = @($needed | Where-Object { $listed -cnotcontains $_ })
   Check "every script the workflow runs, and the script under each of its tests, rehearses ($($needed.Count) found$(if ($unlisted) { ", not listed: $($unlisted -join ', ')" }))" ($needed.Count -ge 4 -and -not $unlisted)
+  # Which list a file is in decides what -ViaActions does with a change to it. The release tooling is
+  # released by tag, since the build may differ. The fleet report is not: no installer holds it. A file
+  # in both lists counts as tooling, so a change to the fleet report would push a tag, publish the
+  # installer the channel already has, and restart every machine for nothing. So the lists share no
+  # file, and each of the five files is in its own list: moving one, or dropping it, fails here.
+  $shared = @($toolingPaths | Where-Object { $fleetPaths -contains $_ })
+  Check "the release tooling and the fleet report share no file$(if ($shared) { " (in both: $($shared -join ', '))" })" (-not $shared)
+  $notTooling = @(@('.github/workflows/ultra-release.yml', 'scripts/publish-ultra-release.ps1', 'scripts/test-publish-ultra-release.ps1') | Where-Object { $toolingPaths -cnotcontains $_ })
+  Check "the workflow, the publisher and its test are the release tooling$(if ($notTooling) { " (not in that list: $($notTooling -join ', '))" })" (-not $notTooling)
+  $notFleet = @(@('scripts/fleet-slopbar.ps1', 'scripts/test-fleet-slopbar.ps1') | Where-Object { $fleetPaths -cnotcontains $_ })
+  Check "the fleet report and its test are the fleet report$(if ($notFleet) { " (not in that list: $($notFleet -join ', '))" })" (-not $notFleet)
   $shipping = Add-Commit 'src/app.js' 'what ships'
   Check 'a push that changes what ships publishes' ((Get-Decision $tooling) -eq 'push')
   $later = Add-Commit 'docs/notes.md' 'docs after a fix'
@@ -432,13 +460,20 @@ try {
   $out = Invoke-ViaActions | Out-String
   Check '-ViaActions publishes no documentation-only commit' ($out -match 'Nothing to publish: nothing that ships')
   # Nor the fleet report alone: the workflow rehearses it so its test runs, but no installer holds it,
-  # so a tag's release would be the installer the channel has, again.
-  $null = Add-Commit 'scripts/fleet-slopbar.ps1' 'the fleet report changed'
-  New-Stage
-  $null = Invoke-Check
-  $r = Read-StageFile 'release.json'
-  $out = try { Invoke-ViaActions | Out-String } catch { "refused: $($_.Exception.Message)" }
-  Check '-ViaActions publishes nothing, and pushes no tag, for a change of the fleet report alone' ($out -match "Nothing to publish: since the channel's \S+ only the fleet report changed" -and -not (Get-OriginTag $r.tag))
+  # so a tag's release would be the installer the channel has, again. That holds for every file of the
+  # fleet report, the publisher's own list read, and for each alone: the channel's release is moved to
+  # where the checkout is first, so the file is the only change since it.
+  foreach ($path in $fleetPaths) {
+    $next = (Get-HighestBuild '0.1.0' (Get-ChannelVersion)) + 1
+    Invoke-Work push -q origin "HEAD:refs/tags/ultra-v0.1.0-ultra.$next"
+    Set-ChannelVersion "0.1.0-ultra.$next"
+    $null = Add-Commit $path "only $path changed"
+    New-Stage
+    $null = Invoke-Check
+    $r = Read-StageFile 'release.json'
+    $out = try { Invoke-ViaActions | Out-String } catch { "refused: $($_.Exception.Message)" }
+    Check "-ViaActions publishes nothing, and pushes no tag, for a change of $path alone" ($out -match "Nothing to publish: since the channel's \S+ only the fleet report changed" -and -not (Get-OriginTag $r.tag))
+  }
   # A commit whose push publishes nothing although the release tooling changed gets a tag, but only
   # while no run is unfinished, and a failed watch is not taken for a run that did not publish.
   $tooling2 = Add-Commit 'scripts/publish-ultra-release.ps1' 'tooling changed'

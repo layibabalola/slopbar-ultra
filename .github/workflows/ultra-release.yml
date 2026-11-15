@@ -10,7 +10,8 @@ name: Ultra release
 # One run at a time, never cancelled, so each run takes its build number after the previous one has
 # finished. A newer waiting run replaces an older waiting one, and it carries that one's commits: a
 # push is compared with the channel's release, not with the push before it. A push that changes only
-# the release tooling rehearses Check and Build without publishing.
+# the release tooling or the fleet report (scripts/fleet-slopbar.ps1 and its test) rehearses: the
+# build job runs (Check, Build and both offline tests) and nothing is published.
 #
 # One publisher per tag: a tag made together with its release (by the script on the key's machine,
 # or by this workflow, whose token starts no runs) arrives with that release, and this workflow
@@ -136,7 +137,9 @@ jobs:
         shell: pwsh
         run: ./scripts/test-publish-ultra-release.ps1
 
-      # Offline, on synthetic machine answers: the fleet report's last-check and problem rules.
+      # Offline, on synthetic machine answers: the fleet report's problem rules, how it reads a machine's
+      # last update check and the channel's release time, its main body (run against stand-ins for
+      # latest.json and each machine) and the two constants it copies from the Rust source.
       - name: Test the fleet report
         shell: pwsh
         run: ./scripts/test-fleet-slopbar.ps1
