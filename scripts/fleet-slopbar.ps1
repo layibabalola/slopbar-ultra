@@ -17,20 +17,20 @@ machines an ssh.exe whose output is piped never exits.
 
 LastCheck is each machine's last update check (get_app_info's update_check): how long ago it ran,
 and what it found, why it was deferred, or its error, cut to 40 characters; the table is followed
-by each one that was cut, in full. A build from before that record shows n/a, which is no problem,
-because machines update one by one. The limits below come from each machine's own record: its
-update interval and the limit of one pass of its update loop.
+by each one that was cut, in full. A build from before that record shows n/a there, which is no
+problem in itself, because machines update one by one. The limits below come from each machine's own
+record: its update interval and the limit of one pass of its update loop.
 
 Problems (exit code 1): a local build (a version without -ultra., which takes no releases), a build
 without updates, "Update automatically" off, a machine that does not answer, an update that does not
-arrive, and, from the record:
+arrive, a machine still behind the channel longer than the interval plus a pass's limit after the
+channel's release was published (latest.json's pub_date; a build from before the record, whose old
+updater could stall, gets Ultra's 15-minute interval plus the new pass limit), and, from the record:
   - a failed last update check (a deferred one is no problem);
   - no update check for longer than the interval plus a pass's limit while "Update automatically" is
     on;
   - an update loop whose next run is overdue by more than a pass's limit: it has stopped, even if a
-    check asked for since then shows a recent time;
-  - a machine still behind the channel longer than the interval plus a pass's limit after the
-    channel's release was published (latest.json's pub_date).
+    check asked for since then shows a recent time.
 A machine without SlopBar is reported as not installed, which is no problem.
 
 The functions are tested offline by scripts/test-fleet-slopbar.ps1, which dot-sources this file.
@@ -45,6 +45,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $here = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [Environment]::MachineName }
 $door = '%LOCALAPPDATA%\SlopBar\slopbar-mcp.exe'
+# A build from before the update-check record has neither: Ultra's update interval and the pass
+# limit of the updater that records it, in seconds.
+$OldBuildInterval = 900
+$OldBuildPassLimit = 2140
 
 # The fleet's ssh aliases: the first name of each managed stanza that has a HostName, except this machine.
 function Get-FleetHosts([string]$path) {
@@ -196,11 +200,13 @@ function Get-Row([string]$machine, $info, $settings, [string]$channel, $publishe
       $row.CheckText = $last.Text
       $row.LastCheck = Get-Short $last.Text
       foreach ($problem in $last.Problems) { $notes.Add($problem); $row.Problem = $true }
-      # Still behind long after the release: its update loop should have installed it by now.
+      # Still behind long after the release: its update loop should have installed it by now. A build
+      # from before the record, whose old updater could stall, gets Ultra's interval and the new pass
+      # limit, so a machine stuck on it shows during a rollout.
       $released = ConvertTo-UtcTime $published
-      if ($row.Behind -and $null -ne $last.Interval -and $null -ne $released) {
+      if ($row.Behind -and $null -ne $released) {
         $since = $now - $released
-        if ($since.TotalSeconds -gt $last.Interval + $last.PassLimit) {
+        if ($since.TotalSeconds -gt ($last.Interval ?? $OldBuildInterval) + ($last.PassLimit ?? $OldBuildPassLimit)) {
           $notes.Add("still behind $([int][Math]::Floor($since.TotalMinutes)) min after the release"); $row.Problem = $true
         }
       }

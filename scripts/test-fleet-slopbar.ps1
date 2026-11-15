@@ -37,11 +37,16 @@ $off = [pscustomobject]@{ State = 'ok'; Value = ('{"auto_update":false}' | Conve
 $channel = '0.1.0-ultra.13'
 function Row($info, $settings = $on, $published = (Ago 120)) { Get-Row 'synthetic-host' $info $settings $channel $published $now }
 
-# Builds from before the record: n/a, and no problem, even long behind.
+# Builds from before the record: n/a, no problem in itself; but still behind 15 minutes plus the new
+# pass limit (50 2/3 minutes) after the release, their old updater has stalled.
 $r = Row (Info $null)
 Check 'a build without the record shows n/a and no problem' ($r.LastCheck -eq 'n/a' -and -not $r.Problem -and $r.Status -eq 'current')
 $r = Row (Info $null '0.1.0-ultra.10') -published (Ago 600)
-Check 'a build without the record, long behind, is behind but no problem' ($r.Behind -and -not $r.Problem -and $r.Status -eq 'behind')
+Check 'a build without the record, long behind, is a problem' ($r.LastCheck -eq 'n/a' -and $r.Behind -and $r.Problem -and $r.Status -eq 'behind; still behind 600 min after the release')
+$r = Row (Info $null '0.1.0-ultra.10') -published (Ago 52)
+Check 'a build without the record, 52 minutes behind, is past the grace' ($r.Problem -and $r.Status -eq 'behind; still behind 52 min after the release')
+$r = Row (Info $null '0.1.0-ultra.10') -published (Ago 45)
+Check 'a build without the record, 45 minutes behind, is within the grace' ($r.Behind -and -not $r.Problem -and $r.Status -eq 'behind')
 
 $r = Row (Info (Record @{ at = (Ago 5); result = 'up_to_date'; by = 'auto'; next_at = (Ago -10) }))
 Check 'up to date 5 minutes ago' ($r.LastCheck -eq '5 min ago: up to date' -and -not $r.Problem)
