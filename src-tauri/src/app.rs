@@ -94,6 +94,8 @@ pub struct AppState {
     settings_page: Mutex<Option<String>>,
     /// Accounts reserved for jobs (see `leases`); in memory only.
     pub(crate) leases: Mutex<leases::Leases>,
+    /// The last update check and the update loop's next run (see `update_check`); in memory only.
+    pub(crate) update_check: crate::update_check::Status,
 }
 
 pub(crate) const SWITCHER_LABEL: &str = "switcher";
@@ -692,6 +694,8 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::GetAppInfo => Ok(serde_json::json!({
             "version": app_version(app.clone()),
             "updates_enabled": updates_enabled(),
+            // The last update check's time, result and error, and when the update loop runs next.
+            "update_check": updates::report(&app),
             "build": diagnostics::build_info(),
             // Which process answers the door (the installer quits exactly this one).
             "pid": std::process::id(),
@@ -3167,6 +3171,7 @@ pub fn run() {
         compact_item: Mutex::default(),
         settings_page: Mutex::default(),
         leases: Mutex::default(),
+        update_check: Default::default(),
     };
     tauri::Builder::default()
         // Must come first: a second launch hands over to the running instance and exits.
