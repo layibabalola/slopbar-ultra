@@ -502,8 +502,12 @@ const SETUP_START: Duration = Duration::from_secs(150);
 /// What `setup_sharing` answers without `confirm: true`.
 const SETUP_SHARING_PREVIEW: &str = "Nothing was started. With confirm: true, SlopBar gets rclone if no recent one is installed (a fixed, checksum-verified download from rclone's own site into SlopBar's folder), opens Dropbox's consent page in this computer's browser for the user to sign in and click Allow themselves, and turns in-use sharing on with that rclone remote. rclone's access covers the user's whole Dropbox; SlopBar only uses its SlopBar folder there. Confirm only when the user asked for this setup.";
 
+/// How long `--sharing-state` waits on the other computer for its sign-in before answering, in
+/// seconds: each ask over SSH starts a shell there, so it asks seldom and the waiting is done there.
+const STATE_WAIT: &str = "40";
+
 /// Whether a setup's phase (in `get_sharing_setup`'s or `--sharing-state`'s answer) is under way.
-fn setup_running(setup: &Value) -> bool {
+pub(crate) fn setup_running(setup: &Value) -> bool {
     setup.get("phase").and_then(Value::as_str).is_some_and(|p| matches!(p, "rclone" | "dropbox" | "sharing"))
 }
 
@@ -546,7 +550,7 @@ fn setup_remote_sharing(door: &dyn Door, ssh: &dyn Remote, host: &str, args: &Va
     }
     let deadline = std::time::Instant::now() + SETUP_START;
     loop {
-        let link = answer(&ssh.run(host, &remote_command(&["--sharing-state"]), b"")?)?;
+        let link = answer(&ssh.run(host, &remote_command(&["--sharing-state", STATE_WAIT]), b"")?)?;
         if let Some(state) = link.get("state").and_then(Value::as_str) {
             if let Err(e) = door.call(&Request::SharingTunnel { host: host.into(), state: Some(state.into()), close: false }) {
                 let _ = cancel_there();
@@ -555,7 +559,7 @@ fn setup_remote_sharing(door: &dyn Door, ssh: &dyn Remote, host: &str, args: &Va
             return Ok(json!({
                 "phase": "dropbox",
                 "browser": "this computer",
-                "next": "Dropbox's page opened in this computer's browser. The user signs in with the Dropbox account their other computers use and clicks Allow on dropbox.com; then call get_sharing_setup with this ssh_host until phase is done or failed.",
+                "next": "Dropbox's page opened in this computer's browser. The user signs in with the Dropbox account their other computers use and clicks Allow on dropbox.com; then call get_sharing_setup with this ssh_host, wait_seconds: 45 and since: the last revision, until phase is done or failed.",
             }));
         }
         if !setup_running(&link) {
@@ -627,7 +631,10 @@ pub fn local_tool(name: &str, args: &Value, pipe: &str, remote_ok: bool) -> Resu
             reconnect: flag("reconnect"),
         }),
         ("get_sharing_setup", Some(host)) => {
-            let mut answer = remote_call(&Ssh, host, "get_sharing_setup", &json!({}))?;
+            // Waiting for a change is passed on: the other computer's app does the waiting.
+            let wait: serde_json::Map<String, Value> = args.as_object().into_iter().flatten()
+                .filter(|(k, _)| matches!(k.as_str(), "wait_seconds" | "since")).map(|(k, v)| (k.clone(), v.clone())).collect();
+            let mut answer = remote_call(&Ssh, host, "get_sharing_setup", &Value::Object(wait))?;
             if !setup_running(&answer) {
                 let _ = crate::door::call(pipe, &Request::SharingTunnel { host: host.into(), state: None, close: true });
             }
@@ -640,7 +647,10 @@ pub fn local_tool(name: &str, args: &Value, pipe: &str, remote_ok: bool) -> Resu
             }
             Ok(answer)
         }
-        ("get_sharing_setup", None) => crate::door::call(pipe, &Request::GetSharingSetup),
+        ("get_sharing_setup", None) => crate::door::call(pipe, &Request::GetSharingSetup {
+            wait_seconds: args.get("wait_seconds").and_then(Value::as_u64).map(|s| s.min(45) as u32),
+            since: args.get("since").and_then(Value::as_u64),
+        }),
         ("run_on_machine", Some(host)) => {
             let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
             let arguments = args.get("arguments").cloned().unwrap_or(json!({}));
@@ -793,7 +803,7 @@ mod tests {
     impl Remote for SharingTarget {
         fn run(&self, _host: &str, command: &str, _input: &[u8]) -> Result<Vec<u8>, String> {
             self.commands.borrow_mut().push(command.into());
-            let out = if command == remote_command(&["--sharing-state"]) {
+            let out = if command == remote_command(&["--sharing-state", STATE_WAIT]) {
                 json!({ "ok": self.link })
             } else if command == call_b64("get_sharing_setup", json!({})) {
                 json!({ "ok": { "phase": "done", "found": ["DESK-2"] } })

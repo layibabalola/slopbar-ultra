@@ -22,7 +22,7 @@ fn main() {
         Some("--pick" | "--release") => std::process::exit(slopbar_lib::launcher_helper(&args)),
         Some("--call" | "--call-b64") => std::process::exit(slopbar_lib::call_cli(&args)),
         Some("--pair-receive") => std::process::exit(slopbar_lib::pair_receive()),
-        Some("--sharing-state") => std::process::exit(slopbar_lib::sharing_state()),
+        Some("--sharing-state") => std::process::exit(slopbar_lib::sharing_state(&args)),
         _ => std::process::exit(if slopbar_lib::serve_mcp().is_ok() { 0 } else { 1 }),
     }
 }

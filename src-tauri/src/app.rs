@@ -547,7 +547,23 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         }
         R::SetupSharing { cancel: true, .. } => value(cancel_sharing_setup_now(&app)),
         R::SetupSharing { remote, via_tunnel, reconnect, .. } => value(start_sharing_setup(&app, remote, via_tunnel, reconnect)?),
-        R::GetSharingSetup => value(app.state::<AppState>().sharing_setup.lock().unwrap().clone()),
+        R::GetSharingSetup { wait_seconds, since } => {
+            let state = app.state::<AppState>();
+            if let Some(wait) = wait_seconds {
+                // Waits here, so an agent following another computer's setup asks over SSH seldom.
+                let since = since.unwrap_or_else(|| state.sharing_setup.lock().unwrap().revision);
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(u64::from(wait.min(45)));
+                loop {
+                    let changed = state.sharing_setup.lock().unwrap().revision != since;
+                    if changed || tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+            let setup = state.sharing_setup.lock().unwrap().clone();
+            value(setup)
+        }
         R::SharingSetupLink => {
             let setup = app.state::<AppState>().sharing_setup.lock().unwrap().clone();
             Ok(serde_json::json!({ "phase": setup.phase, "error": setup.error, "state": setup.link.as_deref().and_then(sharing_setup::state_of) }))
