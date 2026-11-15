@@ -521,6 +521,7 @@ fn span(d: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::guard::{calls, count, find, function, has, lost, tokens, update, words};
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
@@ -700,11 +701,14 @@ mod tests {
         }
         within_test_limit(async {
             let dropped = Arc::new(AtomicBool::new(false));
+            let finished = Arc::new(AtomicBool::new(false));
             let flag = Flag(dropped.clone());
+            let done = finished.clone();
             let outcome = isolated(Duration::from_millis(200), move |steps| async move {
                 let _flag = flag;
                 let stalled = async {
                     tokio::time::sleep(SELF_ENDING).await;
+                    done.store(true, SeqCst);
                     Ok::<_, String>(())
                 };
                 steps.run("The download", PATIENT, stalled).await.map(|()| Outcome::UpToDate)
@@ -712,6 +716,9 @@ mod tests {
             .await;
             assert_eq!(outcome, Outcome::Failed("The update timed out after 200 ms in: The download".into()));
             eventually("the pass's task is stopped", || dropped.load(SeqCst)).await;
+            // A task left running would also end, once its stalled step ended by itself; one that
+            // was stopped never gets past that step.
+            assert!(!finished.load(SeqCst), "the pass's task ran on past its limit until its step ended by itself");
         })
         .await
     }
@@ -781,62 +788,13 @@ mod tests {
         assert_eq!(span(Duration::from_millis(400)), "400 ms");
     }
 
-    /// `source` without whole-line comments, so a line commented out does not count.
-    fn code(source: &str) -> String {
-        source.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
-    }
+    /// Where each guard's needles are, for its failure (see `guard::update`).
+    const WIRING: &str = "update_check::tests::updates_rs_wires_each_deadline_to_its_own_step (src-tauri/src/update_check.rs)";
+    const TURN: &str = "update_check::tests::only_an_install_takes_the_turn (src-tauri/src/update_check.rs)";
+    const EXIT: &str = "update_check::tests::the_exit_cleanup_and_the_door_keep_their_limits (src-tauri/src/update_check.rs)";
 
-    /// The function in `code` whose signature starts `signature`, to the first line that is `}`.
-    fn body<'a>(code: &'a str, signature: &str) -> &'a str {
-        let start = code.find(signature).unwrap_or_else(|| panic!("no `{signature}`"));
-        let rest = &code[start..];
-        rest.find("\n}").map_or(rest, |end| &rest[..end + 2])
-    }
-
-    /// The call whose opening parenthesis is at byte `open` of `code`, to its closing one.
-    fn call_at(code: &str, open: usize) -> &str {
-        assert_eq!(code.as_bytes()[open], b'(', "a call opens at byte {open}");
-        let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
-        for (i, b) in code.bytes().enumerate().skip(open) {
-            if quoted {
-                match b {
-                    _ if escaped => escaped = false,
-                    b'\\' => escaped = true,
-                    b'"' => quoted = false,
-                    _ => {}
-                }
-                continue;
-            }
-            match b {
-                b'"' => quoted = true,
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return &code[open..=i];
-                    }
-                }
-                _ => {}
-            }
-        }
-        panic!("the call at byte {open} never closes");
-    }
-
-    /// Every call of `name` in `code`, each from its opening parenthesis to its closing one.
-    fn calls<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
-        code.match_indices(name)
-            .filter(|(at, _)| code[at + name.len()..].starts_with('('))
-            .map(|(at, _)| call_at(code, at + name.len()))
-            .collect()
-    }
-
-    /// How often `word` stands alone in `code`, not inside a longer name.
-    fn words(code: &str, word: &str) -> usize {
-        let named = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
-        code.match_indices(word).filter(|(at, _)| !named(code[..*at].chars().next_back()) && !named(code[at + word.len()..].chars().next())).count()
-    }
-
-    /// Each step (`.run("<name>", <limit>, ..)`) in `code`: its name, its limit and the whole call.
+    /// Each step (`.run("<name>", <limit>, ..)`) in `code` (tokens): its name, its limit and the
+    /// whole call.
     fn steps_in(code: &str) -> Vec<(&str, &str, &str)> {
         calls(code, ".run")
             .into_iter()
@@ -854,10 +812,12 @@ mod tests {
     /// that what the handover holds is bound once and handed to it, never let go before.
     #[test]
     fn updates_rs_wires_each_deadline_to_its_own_step() {
-        let code = code(include_str!("updates.rs"));
-        let updater = body(&code, "fn updater(");
-        assert!(updater.contains(".timeout(update_check::CHECK_TIMEOUT)"), "the check's request deadline, on the builder:\n{updater}");
-        assert!(updater.contains(".configure_client(|client| client.read_timeout(update_check::STALL_TIMEOUT))"), "the stall limit:\n{updater}");
+        let code = tokens(include_str!("updates.rs"));
+        let updater = function(&code, "updates.rs", "fn updater(", WIRING);
+        // The check's request deadline, on the builder, and the stall limit.
+        for needle in [".timeout(update_check::CHECK_TIMEOUT)", ".configure_client(|client| client.read_timeout(update_check::STALL_TIMEOUT))"] {
+            assert!(has(updater, needle), "{}\n{updater}", lost("updater() in updates.rs", needle, WIRING));
+        }
 
         let expected = [
             ("The update check", "update_check::CHECK_LIMIT", "updater(app)?.check()"),
@@ -866,54 +826,121 @@ mod tests {
         ];
         let steps = steps_in(&code);
         for (name, limit, call) in &steps {
-            let (_, want, work) = expected.iter().find(|(n, ..)| n == name).unwrap_or_else(|| panic!("a step updates.rs should not have: {name}"));
-            assert_eq!(limit, want, "{name} runs within {want}");
-            assert!(call.contains(work), "{name} wraps `{work}`:\n{call}");
+            let (_, want, work) = expected.iter().find(|(n, ..)| n == name)
+                .unwrap_or_else(|| panic!("updates.rs has a step this guard does not know: \"{name}\". {}", update(WIRING)));
+            assert_eq!(limit, want, "\"{name}\" runs within {want}. {}", update(WIRING));
+            assert!(has(call, work), "{}\n{call}", lost(&format!("The step \"{name}\" in updates.rs"), work, WIRING));
         }
-        assert_eq!(steps.iter().filter(|(n, ..)| *n == "The update check").count(), 2, "check() and install_now each check as a step");
-        assert_eq!(steps.iter().filter(|(n, ..)| *n == "The download").count(), 1, "install_now downloads as a step");
+        assert_eq!(steps.iter().filter(|(n, ..)| *n == "The update check").count(), 2, "check() and install_now each check as a step. {}", update(WIRING));
+        assert_eq!(steps.iter().filter(|(n, ..)| *n == "The download").count(), 1, "install_now downloads as a step. {}", update(WIRING));
 
-        let install = body(&code, "async fn install_now(");
-        let at = |what: &str| install.find(what).unwrap_or_else(|| panic!("install_now lost `{what}`:\n{install}"));
+        let install = function(&code, "updates.rs", "async fn install_now(", WIRING);
+        let at = |needle: &str| find(install, needle).unwrap_or_else(|| panic!("{}\n{install}", lost("install_now in updates.rs", needle, WIRING)));
         let turn = at("let turn = match app.state::<AppState>().update_check.begin_install()");
-        assert!(at("\"The update check\"") < turn && turn < at("\"The download\""), "a check holds no turn; the download does");
-        assert!(at("update.timeout = Some(update_check::DOWNLOAD_TIMEOUT)") < at("\"The download\""), "the download's deadline is on the update before it downloads");
+        assert!(at("\"The update check\"") < turn && turn < at("\"The download\""), "a check holds no turn; the download does. {}\n{install}", update(WIRING));
+        assert!(at("update.timeout = Some(update_check::DOWNLOAD_TIMEOUT)") < at("\"The download\""),
+            "the download's deadline is on the update before it downloads. {}\n{install}", update(WIRING));
         let handovers = calls(install, "update_check::hand_over");
-        assert_eq!(handovers.len(), 1, "one handover:\n{install}");
+        assert_eq!(handovers.len(), 1, "one handover. {}\n{install}", update(WIRING));
         let handover = handovers[0];
-        assert!(handover.starts_with("(steps, update_check::HANDOFF_LIMIT, "), "the handover runs within HANDOFF_LIMIT: {handover}");
-        assert!(handover.contains("update.install(bytes)"), "{handover}");
+        let within = "(steps, update_check::HANDOFF_LIMIT, ";
+        assert_eq!(find(handover, within), Some(0), "the handover runs within HANDOFF_LIMIT. {}\n{handover}", lost("The handover in updates.rs", within, WIRING));
+        assert!(has(handover, "update.install(bytes)"), "{}\n{handover}", lost("The handover in updates.rs", "update.install(bytes)", WIRING));
         let after = &install[turn..];
-        let after = &after[after.find("};").expect("the turn's binding ends") + 2..];
-        assert_eq!((words(after, "turn"), words(handover, "turn")), (1, 1), "once bound, the turn is used only to hand it to the handover");
+        let after = &after[find(after, "};").unwrap_or_else(|| panic!("{}", lost("The turn's binding in updates.rs", "};", WIRING))) + 2..];
+        assert_eq!((words(after, "turn"), words(handover, "turn")), (1, 1), "once bound, the turn is used only to hand it to the handover. {}\n{install}", update(WIRING));
 
-        let manual = calls(body(&code, "pub async fn install("), "update_check::isolated");
-        assert!(manual.len() == 1 && manual[0].starts_with("(update_check::PASS_LIMIT, ") && manual[0].contains("install_now("), "an install asked for runs isolated within PASS_LIMIT: {manual:?}");
-        let looped = calls(body(&code, "pub async fn run_loop("), "update_check::run_loop");
-        assert!(looped.len() == 1 && looped[0].starts_with("(&state.update_check, FIRST_CHECK, EVERY, update_check::PASS_LIMIT, "), "{looped:?}");
-        assert!(code.contains("const EVERY: Duration = Duration::from_secs(6 * 60 * 60);"), "the interval is unchanged");
+        let manual = calls(function(&code, "updates.rs", "pub async fn install(", WIRING), "update_check::isolated");
+        assert!(manual.len() == 1 && find(manual[0], "(update_check::PASS_LIMIT, ") == Some(0) && has(manual[0], "install_now("),
+            "an install asked for runs isolated within PASS_LIMIT. {}\n{manual:?}", update(WIRING));
+        let looped = calls(function(&code, "updates.rs", "pub async fn run_loop(", WIRING), "update_check::run_loop");
+        assert!(looped.len() == 1 && find(looped[0], "(&state.update_check, FIRST_CHECK, EVERY, update_check::PASS_LIMIT, ") == Some(0),
+            "the update loop runs each pass within PASS_LIMIT, every EVERY. {}\n{looped:?}", update(WIRING));
+        let interval = "const EVERY: Duration = Duration::from_secs(6 * 60 * 60);";
+        assert!(has(&code, interval), "the interval is unchanged. {}", lost("updates.rs", interval, WIRING));
+    }
+
+    /// Only an install takes the turn. A check that took it as well (one that Settings or an agent
+    /// asks for) would put off every install that starts while it runs, for up to CHECK_LIMIT.
+    #[test]
+    fn only_an_install_takes_the_turn() {
+        let code = tokens(include_str!("updates.rs"));
+        let install = function(&code, "updates.rs", "async fn install_now(", TURN);
+        assert_eq!((words(&code, "begin_install"), words(install, "begin_install")), (1, 1),
+            "updates.rs takes the install's turn (begin_install) once, in install_now. {}", update(TURN));
     }
 
     /// The exit cleanup bounds each part that can wait, and the door answers at once while an
     /// install runs (app.rs).
     #[test]
     fn the_exit_cleanup_and_the_door_keep_their_limits() {
-        let app = code(include_str!("app.rs"));
-        let exit = body(&app, "pub(crate) fn on_exit(");
-        assert!(!exit.contains(".lock().unwrap()"), "a poisoned lock cannot panic the exit:\n{exit}");
+        let app = tokens(include_str!("app.rs"));
+        let exit = function(&app, "app.rs", "pub(crate) fn on_exit(", EXIT);
+        assert!(!has(exit, ".lock().unwrap()"), "a poisoned lock cannot panic the exit. {}\n{exit}", update(EXIT));
         let bounded = calls(exit, "wait_at_most");
-        assert!(bounded.len() == 2 && bounded.iter().all(|c| c.starts_with("(EXIT_PART_LIMIT, ")), "{bounded:?}");
+        assert!(bounded.len() == 2 && bounded.iter().all(|c| find(c, "(EXIT_PART_LIMIT, ") == Some(0)),
+            "each part of the exit cleanup that can wait runs within wait_at_most(EXIT_PART_LIMIT, ..). {}\n{bounded:?}", update(EXIT));
         for part in ["presence::withdraw(", "settings.lock()", "signin::close_all"] {
-            let inside: usize = bounded.iter().map(|c| c.matches(part).count()).sum();
-            assert!(inside == 1 && exit.matches(part).count() == 1, "`{part}` runs within wait_at_most(EXIT_PART_LIMIT, ..):\n{exit}");
+            let inside: usize = bounded.iter().map(|c| count(c, part)).sum();
+            assert!(inside == 1 && count(exit, part) == 1, "`{part}` runs within wait_at_most(EXIT_PART_LIMIT, ..). {}\n{exit}", update(EXIT));
         }
-        assert!(exit.contains(".settings.lock().unwrap_or_else(|e| e.into_inner())"), "{exit}");
-        assert!(exit.contains("diagnostics.record(None, None, diagnostics::Event::Shutdown)"), "the journal, which waits FLUSH_WAIT at most");
+        // The journal waits FLUSH_WAIT at most.
+        for needle in [".settings.lock().unwrap_or_else(|e| e.into_inner())", "diagnostics.record(None, None, diagnostics::Event::Shutdown)"] {
+            assert!(has(exit, needle), "{}\n{exit}", lost("on_exit in app.rs", needle, EXIT));
+        }
 
-        let arm = &app[app.find("R::InstallUpdate => {").expect("the door's install_update")..];
-        let arm = &arm[..arm.find("\n        }").expect("its end")];
-        let blocked = arm.find("if let Some(reason) = updates::install_blocked(&app) {").unwrap_or_else(|| panic!("install_update answers at once while an install runs:\n{arm}"));
-        assert!(blocked < arm.find("check_for_updates(").expect("its check"), "before it checks:\n{arm}");
+        let arm = function(&app, "app.rs", "R::InstallUpdate => {", EXIT);
+        let at = |needle: &str| find(arm, needle).unwrap_or_else(|| panic!("{}\n{arm}", lost("The door's install_update in app.rs", needle, EXIT)));
+        assert!(at("if let Some(reason) = updates::install_blocked(&app) {") < at("check_for_updates("),
+            "install_update answers at once while an install runs, before it checks. {}\n{arm}", update(EXIT));
+    }
+
+    /// The guards read tokens: what rustfmt or a hand changes in layout reads the same; what the
+    /// code is does not.
+    #[test]
+    fn guards_read_tokens_not_layout() {
+        let one_line = "update_check::hand_over(steps, update_check::HANDOFF_LIMIT, (turn, refresh), move || update.install(bytes).map_err(|e| describe(&e))).await?;";
+        let rustfmt = "update_check::hand_over(\n    steps,\n    update_check::HANDOFF_LIMIT,\n    (turn, refresh),\n    move || update.install(bytes).map_err(|e| describe(&e)),\n)\n.await?;";
+        assert_eq!(tokens(rustfmt), tokens(one_line), "a call broken over lines, with rustfmt's trailing comma");
+        assert_eq!(tokens("updater(app)?\n            .check()\n            .await"), tokens("updater(app)?.check().await"), "a method chain broken over lines");
+        let deferral = "if crate::signin::any_active() {\n        return Ok(Outcome::Deferred(SIGN_IN_OPEN.into()));\n    }";
+        assert_eq!(tokens(&deferral.replace('\n', "\n    ")), tokens(deferral), "indented anew");
+        assert_eq!(tokens("if  crate::signin::any_active()\n{ return Ok(Outcome::Deferred(SIGN_IN_OPEN.into())); }"), tokens(deferral), "braces and spaces moved");
+        assert_eq!(tokens("let  turn =\n match x /* a /* nested */ note */ { // the turn\n Ok(t) => t, }"), "let turn=match x{Ok(t)=>t}", "comments go; words stay apart");
+        assert_ne!(tokens("letturn = x"), tokens("let turn = x"), "words are not run together");
+        assert_ne!(tokens("(a, b)"), tokens("(a, c)"), "a rename is a change");
+        // Literals are kept as written, with what looks like a comment or a bracket inside them.
+        let literals = r##"f("a  //  b ) {", '}', '\'', '"', r#"x ) "y" // z"#, b"(", &'a str, 'label: loop {})"##;
+        assert_eq!(tokens(literals), r##"f("a  //  b ) {",'}','\'','"',r#"x ) "y" // z"#,b"(",&'a str,'label:loop{})"##);
+        assert_eq!(calls(&tokens(literals), "f"), [tokens(literals)[1..].to_string()], "the call ends at its own bracket, past every literal");
+        assert_eq!(tokens("a / *b"), "a/ *b", "no comment is made where there was none");
+        // A label stays apart from a character literal after it: run together, `'a '}'` would read
+        // as the literal `'a'` and a `}` that ends the body early (or, with `'"'`, a string that
+        // never ends), and a guard would pass on half a function.
+        for literal in ["'}'", "'\"'"] {
+            let body = format!("fn f() {{ let _k = 'a: {{ break 'a {literal}; }}; signin::close_all(); }}");
+            let code = tokens(&format!("{body}\nfn g() {{ wait(); }}"));
+            assert_eq!(function(&code, "the test's code", "fn f(", "guards_read_tokens_not_layout"), tokens(&body), "the body ends at its own brace");
+            assert_eq!(count(&code, "signin::close_all"), 1);
+        }
+        // So does a word from a string or `#` after it: in a macro, `r "a\"b"` run together would
+        // read as the raw string `r"a\"`, and its last quote would open a string that hid the code
+        // after it.
+        let body = r#"fn f() { let _m = stringify!(r "a\"b"); let _s = state.lock().unwrap(); let _q = identity('"'); }"#;
+        let code = tokens(&format!("{body}\nfn g() {{ wait(); }}"));
+        assert_eq!(function(&code, "the test's code", "fn f(", "guards_read_tokens_not_layout"), tokens(body), "the body ends at its own brace");
+        assert!(has(&code, ".lock().unwrap()"), "the code after the string is read as code");
+        // Text in a literal is not code: a needle spelled there is not found, though a needle that
+        // is the whole literal is.
+        let spelled = tokens("fn f() { let s = \"update.download( turn \"; let c = '('; }");
+        assert!(!has(&spelled, "update.download("), "a needle spelled in a string");
+        assert_eq!((words(&spelled, "turn"), calls(&spelled, "update.download").len()), (0, 0), "a word, and a call, spelled in a string");
+        assert_eq!(find(&spelled, "\"update.download( turn \""), spelled.find('"'), "a whole literal");
+        assert_eq!(function(&spelled, "the test's code", "fn f(", "guards_read_tokens_not_layout"), spelled, "a bracket in a literal does not count");
+        for source in [include_str!("updates.rs"), include_str!("app.rs"), include_str!("update_check.rs")] {
+            let once = tokens(source);
+            assert_eq!(tokens(&once), once, "reading tokens again changes nothing");
+        }
     }
 
     #[test]
@@ -1089,5 +1116,258 @@ mod tests {
         let error = Layer("error sending request for url (https://example.invalid/latest.json?sig=SECRET)",
             Some(Box::new(Layer("operation timed out", Some(Box::new(Layer("timed out", None)))))));
         assert_eq!(describe(&error), "error sending request for url (https://example.invalid/latest.json): operation timed out");
+    }
+
+    /// The deadlines in updates.rs rely on tauri-plugin-updater 2.12.0's internals (its updater.rs:
+    /// the builder's `timeout` reaching only the check; `check()` carrying the `configure_client`
+    /// hook into the `Update` it returns, with no timeout of its own; `Update::download` applying
+    /// both). Every build with updates uses them, so this lives here, where every tree has it. A
+    /// different version must be read again before this test is changed.
+    #[test]
+    fn the_updater_plugin_is_the_version_reviewed() {
+        let version = include_str!("../Cargo.lock")
+            .split("[[package]]")
+            .find(|package| package.lines().any(|l| l == "name = \"tauri-plugin-updater\""))
+            .and_then(|package| package.lines().find_map(|l| l.strip_prefix("version = \"")?.strip_suffix('"')));
+        assert_eq!(version, Some("2.12.0"), "re-review the deadlines in src-tauri/src/updates.rs against this tauri-plugin-updater");
+    }
+}
+
+/// Source guards: tests that read code for what no other test can see (the limit each step of an
+/// update runs within, where an install takes its turn, what the exit cleanup bounds). They read
+/// tokens, not layout (`tokens`), so rustfmt, a call broken over lines or a block indented anew
+/// reads the same; and only code: a needle spelled inside a string or character literal is not
+/// found there. A rename does not read the same, and then the failure names the text that went and
+/// the test to update (`lost`, `update`).
+#[cfg(test)]
+pub(crate) mod guard {
+    fn word(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    /// `source` as a guard reads it, code and needles alike: no comments; whitespace only where it
+    /// keeps two words apart, a word from a quote or `#` after it (`break 'a '}'`, or `r "a\"b"`
+    /// in a macro, which run together would read as the literal `'a'` or the raw string `r"a\"`),
+    /// or `/` from a `/` or `*` after it, as one space; and no comma right before a closing
+    /// bracket, which rustfmt adds when it breaks a call over lines. String and character literals
+    /// are kept as written.
+    pub fn tokens(source: &str) -> String {
+        let mut out = String::with_capacity(source.len());
+        let mut gap = false;
+        let mut i = 0;
+        while let Some(c) = source[i..].chars().next() {
+            let rest = &source[i..];
+            if rest.starts_with("//") {
+                i += rest.find('\n').unwrap_or(rest.len());
+                gap = true;
+            } else if rest.starts_with("/*") {
+                i += block_comment(rest);
+                gap = true;
+            } else if c.is_whitespace() {
+                i += c.len_utf8();
+                gap = true;
+            } else {
+                let end = literal_end(source, i).unwrap_or(i + c.len_utf8());
+                if matches!(c, ')' | ']' | '}') && out.ends_with(',') {
+                    out.pop();
+                }
+                let last = out.chars().next_back();
+                if gap && (((word(c) || matches!(c, '\'' | '"' | '#')) && last.is_some_and(word)) || (last == Some('/') && matches!(c, '/' | '*'))) {
+                    out.push(' ');
+                }
+                out.push_str(&source[i..end]);
+                gap = false;
+                i = end;
+            }
+        }
+        out
+    }
+
+    /// How long the block comment that `rest` starts with is, the comments nested in it included.
+    fn block_comment(rest: &str) -> usize {
+        let mut depth = 0usize;
+        let mut i = 0;
+        while let Some(c) = rest[i..].chars().next() {
+            if rest[i..].starts_with("/*") {
+                depth += 1;
+                i += 2;
+            } else if rest[i..].starts_with("*/") {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return i;
+                }
+            } else {
+                i += c.len_utf8();
+            }
+        }
+        rest.len()
+    }
+
+    /// Where the string or character literal that starts at byte `at` of `s` ends, if one starts
+    /// there: `"…"`, `r#"…"#` (and `b`, `c` before either), `'…'`. A lifetime or a label is none.
+    fn literal_end(s: &str, at: usize) -> Option<usize> {
+        let rest = &s[at..];
+        if rest.starts_with('"') {
+            let mut escaped = false;
+            for (i, c) in rest.char_indices().skip(1) {
+                match c {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '"' => return Some(at + i + 1),
+                    _ => {}
+                }
+            }
+            return Some(s.len());
+        }
+        if rest.starts_with('r') && raw_prefix(s, at) {
+            let hashes = rest[1..].len() - rest[1..].trim_start_matches('#').len();
+            let open = 1 + hashes;
+            if !rest[open..].starts_with('"') {
+                return None;
+            }
+            let close = format!("\"{}", "#".repeat(hashes));
+            return Some(rest[open + 1..].find(&close).map_or(s.len(), |e| at + open + 1 + e + close.len()));
+        }
+        if rest.starts_with('\'') {
+            let mut chars = rest.char_indices().skip(1);
+            let (_, first) = chars.next()?;
+            if first == '\\' {
+                chars.next()?;
+                return chars.find(|&(_, c)| c == '\'').map(|(i, _)| at + i + 1);
+            }
+            let (i, second) = chars.next()?;
+            return (first != '\'' && second == '\'').then_some(at + i + 1);
+        }
+        None
+    }
+
+    /// Whether an `r` at byte `at` of `s` can start a raw string: it starts a token, alone or after
+    /// a `b` or `c` that does.
+    fn raw_prefix(s: &str, at: usize) -> bool {
+        let mut before = s[..at].chars().rev();
+        match before.next() {
+            None => true,
+            Some('b' | 'c') => !before.next().is_some_and(word),
+            Some(c) => !word(c),
+        }
+    }
+
+    /// The characters of `code` from byte `from` on that are not inside a literal, with their bytes.
+    fn outside_literals(code: &str, from: usize) -> impl Iterator<Item = (usize, char)> + '_ {
+        let mut i = from;
+        std::iter::from_fn(move || loop {
+            let c = code[i..].chars().next()?;
+            if let Some(end) = literal_end(code, i) {
+                i = end;
+                continue;
+            }
+            i += c.len_utf8();
+            return Some((i - c.len_utf8(), c));
+        })
+    }
+
+    /// The bracket that closes the one at byte `open` of `code`.
+    fn closing(code: &str, open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (at, c) in outside_literals(code, open) {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(at);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The literals in `code`, in order: where each starts and where it ends.
+    fn literals(code: &str) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        let mut i = 0;
+        while let Some(c) = code[i..].chars().next() {
+            match literal_end(code, i) {
+                Some(end) => {
+                    spans.push((i, end));
+                    i = end;
+                }
+                None => i += c.len_utf8(),
+            }
+        }
+        spans
+    }
+
+    /// Where `pattern` occurs in `code` (tokens), but never inside a literal: text spelled in a
+    /// string or character literal is not code. A match that starts at a literal's opening quote
+    /// is the literal itself, and counts.
+    fn occurrences(code: &str, pattern: &str) -> Vec<usize> {
+        let spans = literals(code);
+        let inside = |at: usize| {
+            let k = spans.partition_point(|&(start, _)| start < at);
+            k > 0 && spans[k - 1].1 > at
+        };
+        code.match_indices(pattern).map(|(at, _)| at).filter(|&at| !inside(at)).collect()
+    }
+
+    /// Where `needle`, read as tokens itself, starts in `code` (tokens): every place, in order.
+    pub fn places(code: &str, needle: &str) -> Vec<usize> {
+        occurrences(code, &tokens(needle))
+    }
+
+    /// Where `needle` first starts in `code` (tokens), read as tokens itself.
+    pub fn find(code: &str, needle: &str) -> Option<usize> {
+        places(code, needle).first().copied()
+    }
+
+    /// Whether `code` (tokens) has `needle`, read as tokens itself.
+    pub fn has(code: &str, needle: &str) -> bool {
+        find(code, needle).is_some()
+    }
+
+    /// How often `code` (tokens) has `needle`, read as tokens itself.
+    pub fn count(code: &str, needle: &str) -> usize {
+        places(code, needle).len()
+    }
+
+    /// The function (or arm, or block) whose code starts `signature`, through the brace that closes
+    /// it; a failure that says what to update in `test` when `file` (tokens: `code`) has none.
+    pub fn function<'a>(code: &'a str, file: &str, signature: &str, test: &str) -> &'a str {
+        let start = find(code, signature).unwrap_or_else(|| panic!("{}", lost(file, signature, test)));
+        let open = outside_literals(code, start).find(|&(_, c)| c == '{').map(|(at, _)| at);
+        let close = open.and_then(|open| closing(code, open)).unwrap_or_else(|| panic!("`{signature}` in {file} has no body that closes, as {test} reads it"));
+        &code[start..=close]
+    }
+
+    /// Every call of `name` in `code` (tokens), each from its opening parenthesis to its closing one;
+    /// a call spelled in a literal is none.
+    pub fn calls<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
+        let name = tokens(name);
+        let named = |at: usize| name.starts_with(word) && code[..at].chars().next_back().is_some_and(word);
+        occurrences(code, &name)
+            .into_iter()
+            .map(|at| at + name.len())
+            .filter(|&open| code[open..].starts_with('(') && !named(open - name.len()))
+            .map(|open| &code[open..=closing(code, open).unwrap_or_else(|| panic!("the call of `{name}` at byte {open} never closes"))])
+            .collect()
+    }
+
+    /// How often `name` stands alone in `code`, not inside a longer name or a literal.
+    pub fn words(code: &str, name: &str) -> usize {
+        let named = |c: Option<char>| c.is_some_and(word);
+        occurrences(code, name).into_iter().filter(|&at| !named(code[..at].chars().next_back()) && !named(code[at + name.len()..].chars().next())).count()
+    }
+
+    /// A guard's failure when `place` no longer has `needle`.
+    pub fn lost(place: &str, needle: &str, test: &str) -> String {
+        format!("{place} no longer has `{needle}`. {}", update(test))
+    }
+
+    /// What every guard's failure ends with: what to update after a rename that keeps the behaviour.
+    pub fn update(test: &str) -> String {
+        format!("If a rename or a move left what the code does as it was, update the text this guard looks for in {test}. Otherwise the guard caught a change in what the code does.")
     }
 }
