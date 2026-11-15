@@ -14,6 +14,9 @@ const MAX_BYTES: u64 = 16 * 1024 * 1024;
 const DAYS: i64 = 7;
 const HEARTBEAT_SECONDS: i64 = 3_600;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(300);
+/// The longest `flush` waits for the background writer: a stuck disk never holds up an exit or an
+/// export for longer.
+pub(crate) const FLUSH_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -706,17 +709,23 @@ impl Recorder {
             }
         }
     }
-    // Only export/shutdown wait for the background writer. Auth callers merely notify it.
+    // Only export/shutdown wait for the background writer, and FLUSH_WAIT at most. Auth callers
+    // merely notify it.
     pub(crate) fn flush(&self) {
         if self.worker.is_none() {
             return;
         }
+        let deadline = Instant::now() + FLUSH_WAIT;
         let mut s = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let target = s.generation;
         s.urgent_through = target;
         self.shared.wake.notify_all();
         while s.started && s.completed < target {
-            s = self.shared.wake.wait(s).unwrap_or_else(|e| e.into_inner());
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            s = self.shared.wake.wait_timeout(s, left).unwrap_or_else(|e| e.into_inner()).0;
         }
     }
     pub fn record(&self, provider: Option<Provider>, id: Option<&str>, event: Event) {
@@ -1338,6 +1347,23 @@ mod tests {
         assert!(!serde_json::to_string(&report)
             .unwrap()
             .contains("private-id"));
+    }
+    #[test]
+    fn a_stuck_writer_holds_up_shutdown_for_seconds_at_most() {
+        let dir = TempDir::new();
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        // The writer's first save never returns until the test lets it.
+        let r = Recorder::with_writer(dir.0.join("history"), move |_, _| {
+            let _ = stuck.recv();
+            true
+        });
+        r.start();
+        let started = Instant::now();
+        r.record(None, None, Event::Shutdown);
+        let waited = started.elapsed();
+        assert!(waited >= FLUSH_WAIT && waited < FLUSH_WAIT + Duration::from_secs(5), "{waited:?}");
+        assert!(r.shared.state.lock().unwrap().history.clean_shutdown, "the shutdown is still recorded");
+        drop(release);
     }
     #[test]
     fn rotation_corruption_and_disk_failure_are_visible_and_nonfatal() {
