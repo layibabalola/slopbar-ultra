@@ -563,7 +563,7 @@ mod tests {
 
     #[test]
     fn hosts_are_never_read_as_ssh_options() {
-        for good in ["virtualten", "ultra-magnus", "obabalola@virtual-ten", "box.tail1234.ts.net", "100.64.0.7", "fe80::1"] {
+        for good in ["box", "laptop-2", "user@laptop-2", "box.tail1234.ts.net", "100.64.0.7", "fe80::1"] {
             assert!(valid_host(good), "{good}");
         }
         for bad in ["", "-oProxyCommand=calc", "a b", "a;b", "a@b@c", "user@", "a\nb", "$(x)", "a`b", &"x".repeat(254)] {
@@ -665,7 +665,7 @@ mod tests {
         let source = FakeApp::new(json!({ "presence_remote": "dropbox", "presence_folder": null, "account_roster": false }));
         let target = FakeApp::new(json!({ "presence_remote": null, "presence_folder": null, "account_roster": false }));
         let link = ssh(&target, true);
-        let result = pair(&source, &link, "virtualten", None, "DESK-1", false).unwrap();
+        let result = pair(&source, &link, "box", None, "DESK-1", false).unwrap();
         let key = source.key_set().expect("the source saved a new key");
         assert!(key.starts_with(KEY_PREFIX));
         assert_eq!(target.key_set().as_deref(), Some(key.as_str()), "the target saved the same key");
@@ -688,7 +688,7 @@ mod tests {
         let target = FakeApp::new(json!({ "presence_remote": "dropbox", "account_roster": true }));
         let mut target = target;
         target.saved = Some("synthetic saved passphrase");
-        let result = pair(&source, &ssh(&target, true), "virtualten", Some(Passphrase("synthetic saved passphrase".into())), "A", false).unwrap();
+        let result = pair(&source, &ssh(&target, true), "box", Some(Passphrase("synthetic saved passphrase".into())), "A", false).unwrap();
         assert_eq!(result["key"], "reused");
         assert!(source.key_set().is_none(), "the source keeps its passphrase");
         assert!(source.patches().is_empty() && target.patches().is_empty(), "nothing else to change");
@@ -702,9 +702,9 @@ mod tests {
         let mut target = FakeApp::new(json!({ "presence_remote": "dropbox", "account_roster": true }));
         target.saved = Some("synthetic other passphrase");
         let mine = || Some(Passphrase("synthetic saved passphrase".into()));
-        assert_eq!(pair(&source, &ssh(&target, true), "virtualten", mine(), "A", false).unwrap_err(), "target: target_has_other_key");
+        assert_eq!(pair(&source, &ssh(&target, true), "box", mine(), "A", false).unwrap_err(), "target: target_has_other_key");
         assert!(target.key_set().is_none() && target.patches().is_empty(), "nothing changed there");
-        let result = pair(&source, &ssh(&target, true), "virtualten", mine(), "A", true).unwrap();
+        let result = pair(&source, &ssh(&target, true), "box", mine(), "A", true).unwrap();
         assert_eq!(result["target"]["replaced_key"], true);
         assert_eq!(target.key_set().as_deref(), Some("synthetic saved passphrase"));
     }
@@ -713,25 +713,25 @@ mod tests {
     fn pairing_changes_nothing_when_either_side_cannot_take_it() {
         let nowhere = FakeApp::new(json!({ "presence_remote": null, "presence_folder": null }));
         let target = FakeApp::new(json!({}));
-        assert_eq!(pair(&nowhere, &ssh(&target, true), "virtualten", None, "A", false).unwrap_err(), "no_sharing_location");
+        assert_eq!(pair(&nowhere, &ssh(&target, true), "box", None, "A", false).unwrap_err(), "no_sharing_location");
         assert_eq!(pair(&nowhere, &ssh(&target, true), "-oProxyCommand=x", None, "A", false).unwrap_err(), "bad_ssh_host");
         let source = FakeApp::new(json!({ "presence_remote": "dropbox", "account_roster": false }));
-        assert_eq!(pair(&source, &ssh(&target, false), "virtualten", None, "A", false).unwrap_err(), "target_not_running");
+        assert_eq!(pair(&source, &ssh(&target, false), "box", None, "A", false).unwrap_err(), "target_not_running");
         assert!(source.key_set().is_none() && source.patches().is_empty(), "the target is checked before anything changes here");
         // A target without the source's rclone remote: nothing changes on either computer.
         let mut bare = FakeApp::new(json!({ "presence_remote": null, "presence_folder": null }));
         bare.remotes = vec![];
-        let err = pair(&source, &ssh(&bare, true), "virtualten", None, "A", false).unwrap_err();
+        let err = pair(&source, &ssh(&bare, true), "box", None, "A", false).unwrap_err();
         assert_eq!(err, "target: remote_missing_here: dropbox");
         assert!(bare.key_set().is_none() && bare.patches().is_empty());
         assert!(source.key_set().is_none() && source.patches().is_empty(), "checked before anything changed here");
         // The setting names the remote but rclone there does not have it (or is not installed).
         let mut unset = FakeApp::new(json!({ "presence_remote": "dropbox", "presence_folder": null }));
         unset.remotes = vec![];
-        assert_eq!(pair(&source, &ssh(&unset, true), "virtualten", None, "A", false).unwrap_err(), "target: remote_missing_here: dropbox");
+        assert_eq!(pair(&source, &ssh(&unset, true), "box", None, "A", false).unwrap_err(), "target: remote_missing_here: dropbox");
         // A folder-sharing source and a target with no location at all.
         let folder = FakeApp::new(json!({ "presence_remote": null, "presence_folder": "C:/Dropbox", "account_roster": true }));
-        assert_eq!(pair(&folder, &ssh(&bare, true), "virtualten", None, "A", false).unwrap_err(), "no_sharing_location_here");
+        assert_eq!(pair(&folder, &ssh(&bare, true), "box", None, "A", false).unwrap_err(), "no_sharing_location_here");
     }
 
     #[test]
@@ -740,7 +740,7 @@ mod tests {
         let target = FakeApp::new(json!({ "presence_remote": "dropbox", "account_roster": true }));
         let mut link = ssh(&target, true);
         link.echo = true;
-        let result = pair(&source, &link, "virtualten", Some(Passphrase("synthetic saved passphrase".into())), "A", false).unwrap();
+        let result = pair(&source, &link, "box", Some(Passphrase("synthetic saved passphrase".into())), "A", false).unwrap();
         assert!(!result.to_string().contains("synthetic saved passphrase"), "{result}");
         assert!(result.to_string().contains("[key]"));
     }
@@ -783,8 +783,8 @@ mod tests {
 
     #[test]
     fn remote_tools_are_limited_and_never_chain() {
-        assert_eq!(local_tool("run_on_machine", &json!({ "ssh_host": "virtualten", "tool": "set_roster_passphrase" }), "x", true).unwrap_err().split(' ').next(), Some("run_on_machine"));
-        assert_eq!(local_tool("pair_machine", &json!({ "ssh_host": "virtualten" }), "x", false).unwrap_err(), "not_from_a_remote_call");
+        assert_eq!(local_tool("run_on_machine", &json!({ "ssh_host": "box", "tool": "set_roster_passphrase" }), "x", true).unwrap_err().split(' ').next(), Some("run_on_machine"));
+        assert_eq!(local_tool("pair_machine", &json!({ "ssh_host": "box" }), "x", false).unwrap_err(), "not_from_a_remote_call");
         assert!(local_tool("pair_machine", &json!({}), "x", true).unwrap_err().contains("ssh_host is required"));
         assert!(check_remote("update_settings", &json!({ "patch": { "presence_remote": "dropbox", "account_roster": true } })).is_ok());
         assert!(check_remote("update_settings", &json!({ "patch": { "phone": { "url": "https://ntfy.sh/x" } } })).unwrap_err().contains("not phone"));
@@ -800,13 +800,13 @@ mod tests {
         let dir = crate::test_support::TempDir::new();
         const ID: &str = "22222222-2222-4222-8222-222222222222";
         assert_eq!(host_for(&dir.0, ID), None);
-        remember_host(&dir.0, ID, "virtual-ten");
-        assert_eq!(host_for(&dir.0, ID).as_deref(), Some("virtual-ten"));
-        remember_host(&dir.0, ID, "user@virtual-ten.tailnet");
-        assert_eq!(host_for(&dir.0, ID).as_deref(), Some("user@virtual-ten.tailnet"), "the last host it answered on");
+        remember_host(&dir.0, ID, "box");
+        assert_eq!(host_for(&dir.0, ID).as_deref(), Some("box"));
+        remember_host(&dir.0, ID, "user@box.tail1234.ts.net");
+        assert_eq!(host_for(&dir.0, ID).as_deref(), Some("user@box.tail1234.ts.net"), "the last host it answered on");
         remember_host(&dir.0, ID, "-oProxyCommand=x");
-        remember_host(&dir.0, "../../evil", "virtual-ten");
-        assert_eq!(host_for(&dir.0, ID).as_deref(), Some("user@virtual-ten.tailnet"));
+        remember_host(&dir.0, "../../evil", "box");
+        assert_eq!(host_for(&dir.0, ID).as_deref(), Some("user@box.tail1234.ts.net"));
         assert_eq!(host_for(&dir.0, "../../evil"), None);
         std::fs::write(dir.0.join(HOSTS_FILE), format!("{{\"{ID}\": \"-oProxyCommand=x\"}}")).unwrap();
         assert_eq!(host_for(&dir.0, ID), None, "a changed file never hands ssh an option");

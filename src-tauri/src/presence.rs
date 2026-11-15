@@ -557,7 +557,7 @@ mod tests {
                 (file("peer", "LAPTOP-2", at(-30), vec![seat("old")]), None),
                 (file("peer", "LAPTOP-2", at(-2), vec![seat("new")]), None),
                 (file("peer", "LAPTOP-2", at(-10), vec![seat("mid")]), None),
-                (file("me", "BACHELOR", at(-1), vec![seat("new")]), None),
+                (file("me", "DESK-1", at(-1), vec![seat("new")]), None),
             ],
             "me",
             now,
@@ -619,7 +619,7 @@ mod tests {
         let now = at(0);
         let mut accounts = vec![account("synthetic-user:synthetic-org", true), account("token:abcdef", true), account("idle", false)];
         accounts[0].email = Some("someone@example.invalid".into());
-        let mine = own("11111111-1111-4111-8111-111111111111", "BACHELOR", 300, &accounts, now);
+        let mine = own("11111111-1111-4111-8111-111111111111", "DESK-1", 300, &accounts, now);
         assert_eq!(mine.seats.len(), 1, "token: logins and idle accounts are left out");
         store.write(&mine).unwrap();
         let other = own("22222222-2222-4222-8222-222222222222", "LAPTOP-2", 300, &accounts, now);
@@ -658,7 +658,7 @@ mod tests {
         desk_only.desktop = true;
         let mut both = account("b", true);
         both.desktop = true;
-        let mine = own("me", "BACHELOR", 300, &[desk_only.clone(), both, account("n", false)], now);
+        let mine = own("me", "DESK-1", 300, &[desk_only.clone(), both, account("n", false)], now);
         let wheres: Vec<_> = mine.seats.iter().map(|s| (s.h.clone(), s.where_.clone())).collect();
         assert_eq!(wheres.len(), 2, "the desktop-only account is shared, the unused one is not");
         assert!(wheres.contains(&(hash(Provider::Claude, "d"), vec![crate::desktop_apps::PLACE.to_string()])));
@@ -667,8 +667,8 @@ mod tests {
         let peers = peers(vec![(file("p1", "LAPTOP-2", now - Duration::minutes(1), vec![seat("d")]), None)], "me", now);
         let mut list = vec![desk_only];
         attach(&mut list, &peers, now);
-        overlap(&mut list, "BACHELOR");
-        assert_eq!(list[0].overlap, ["BACHELOR", "LAPTOP-2"], "the desktop app here and the CLI there drain one account");
+        overlap(&mut list, "DESK-1");
+        assert_eq!(list[0].overlap, ["DESK-1", "LAPTOP-2"], "the desktop app here and the CLI there drain one account");
     }
 
     #[test]
@@ -683,9 +683,9 @@ mod tests {
         let peers = peers(files, "me", now);
         let mut list = vec![account("x", true), account("y", false), account("z", true), account("w", true)];
         attach(&mut list, &peers, now);
-        overlap(&mut list, "BACHELOR");
+        overlap(&mut list, "DESK-1");
         // Here and on a live peer.
-        assert_eq!(list[0].overlap, ["BACHELOR", "LAPTOP-2"]);
+        assert_eq!(list[0].overlap, ["DESK-1", "LAPTOP-2"]);
         // Not here, but on two live peers: still on two machines at once.
         assert_eq!(list[1].overlap, ["DESK-3", "LAPTOP-2"]);
         // The only other machine went quiet: shown dimmed, never an overlap.
@@ -695,16 +695,16 @@ mod tests {
         assert!(list[3].overlap.is_empty());
 
         // A second install with this machine's own name is the same machine.
-        let same = peers_of(vec![(file("p4", "bachelor", now, vec![seat("w")]), None)], now);
+        let same = peers_of(vec![(file("p4", "desk-1", now, vec![seat("w")]), None)], now);
         attach(&mut list, &same, now);
-        overlap(&mut list, "BACHELOR");
+        overlap(&mut list, "DESK-1");
         assert!(list[3].overlap.is_empty());
 
         // Once LAPTOP-2 stops writing, x is only in use here again.
         let later = now + Duration::minutes(16);
         let quiet = peers_of(vec![(file("p1", "LAPTOP-2", now - Duration::minutes(2), vec![seat("x")]), None)], later);
         attach(&mut list, &quiet, later);
-        overlap(&mut list, "BACHELOR");
+        overlap(&mut list, "DESK-1");
         assert!(list[0].overlap.is_empty());
     }
 
@@ -729,7 +729,7 @@ mod tests {
         let store = Memory(Default::default());
         let now = at(0);
         store.write(&file("peer", "LAPTOP-2", now, vec![seat("x")])).unwrap();
-        store.write(&file("me", "BACHELOR", now, vec![seat("x")])).unwrap();
+        store.write(&file("me", "DESK-1", now, vec![seat("x")])).unwrap();
         let mut list = vec![account("x", false)];
         attach(&mut list, &read(&store, "me", now), now);
         assert_eq!(list[0].remote.iter().map(|r| r.machine.as_str()).collect::<Vec<_>>(), ["LAPTOP-2"]);
@@ -743,7 +743,7 @@ mod tests {
         for provider in [CloudProvider::Dropbox, CloudProvider::GoogleDrive, CloudProvider::OneDrive] {
             let store = CloudApi(provider);
             assert_eq!(store.list().unwrap_err().to_string(), "not_configured");
-            assert_eq!(store.write(&file("me", "BACHELOR", at(0), vec![])).unwrap_err().to_string(), "not_configured");
+            assert_eq!(store.write(&file("me", "DESK-1", at(0), vec![])).unwrap_err().to_string(), "not_configured");
             assert!(read(&store, "me", at(0)).is_empty(), "an unconfigured backend shows nothing");
         }
     }

@@ -326,7 +326,7 @@ mod tests {
         let store = Rclone::with("cloud", Fake::default());
         let now = Utc::now();
         assert!(store.list().unwrap().is_empty(), "a missing folder is an empty one");
-        let mine = own("11111111-1111-4111-8111-111111111111", "BACHELOR", 300, &[account("synthetic-a:org")], now);
+        let mine = own("11111111-1111-4111-8111-111111111111", "DESK-1", 300, &[account("synthetic-a:org")], now);
         let other = own("22222222-2222-4222-8222-222222222222", "LAPTOP-2", 300, &[account("synthetic-a:org")], now);
         store.write(&mine).unwrap();
         store.write(&other).unwrap();
@@ -351,12 +351,12 @@ mod tests {
         let store = Rclone::with("cloud", Fake::default());
         let passphrase = crate::backup::Passphrase("synthetic roster passphrase".into());
         let mut sync = Syncer::default();
-        sync.sync(&store, &passphrase, ("11111111-1111-4111-8111-111111111111", "BACHELOR"), &[account("synthetic-a:org")], Utc::now(), false, false);
+        sync.sync(&store, &passphrase, ("11111111-1111-4111-8111-111111111111", "DESK-1"), &[account("synthetic-a:org")], Utc::now(), false, false);
         assert_eq!((sync.seen.wrote, sync.seen.own_accounts), (Some(true), Some(1)), "written and read back");
         let files = store.runner.files.lock().unwrap().clone();
         assert_eq!(files.keys().collect::<Vec<_>>(), ["cloud:SlopBar/roster/11111111-1111-4111-8111-111111111111.roster"]);
         let text = String::from_utf8_lossy(files.values().next().unwrap());
-        assert!(!text.contains('@') && !text.contains("synthetic-a") && !text.contains("BACHELOR"), "{text}");
+        assert!(!text.contains('@') && !text.contains("synthetic-a") && !text.contains("DESK-1"), "{text}");
         store.remove("11111111-1111-4111-8111-111111111111.roster").unwrap();
         assert!(RosterStore::list(&store).unwrap().is_empty());
     }
