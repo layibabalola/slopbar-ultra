@@ -559,7 +559,7 @@ mod tests {
             }
             assert!(app[store..].starts_with("store_settings(&app,held,") || app[store..].starts_with("store_settings(app,held,"), "the lock goes with the change:\n{}", around(&app, store, 80));
         }
-        assert_eq!(taken, 6, "save_settings, update_settings, apply_backup, remove_one, set_project_pin, the compact toggle");
+        assert_eq!(taken, 7, "save_settings, update_settings, apply_backup, remove_one, set_project_pin, the compact toggle, the sharing setup");
         assert!(has(&app, "let held = state.settings_lock.lock().await; if store_settings(&app, held, settings)? { do_refresh(&app).await; } Ok(())"), "save_settings refreshes when the save asks");
         assert!(has(&app, "if store_settings(&app, held, next.clone())? { do_refresh(&app).await; } value(next)"), "update_settings refreshes when the save asks");
         let restore = function(&app, "async fn apply_backup(");

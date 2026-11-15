@@ -1,4 +1,4 @@
-use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, desktop, desktop_apps, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, pairing, panel, phone, pins, plan_alerts, presence, providers, refresh_wait, reset_credits, roster, settings, sharing, signin, sources, subscriptions, unexpected, updates, usage_index, wind_down};
+use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, desktop, desktop_apps, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, pairing, panel, phone, pins, plan_alerts, presence, providers, rclone, refresh_wait, reset_credits, roster, settings, sharing, sharing_setup, signin, sources, subscriptions, unexpected, updates, usage_index, wind_down};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -99,6 +99,11 @@ pub struct AppState {
     pub(crate) leases: Mutex<leases::Leases>,
     /// The last update check and the update loop's next run (see `update_check`); in memory only.
     pub(crate) update_check: crate::update_check::Status,
+    /// "Set up with Dropbox" (Settings > Data, or the door's setup_sharing): see `sharing_setup`.
+    sharing_setup: Mutex<sharing_setup::Setup>,
+    sharing_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// The SSH tunnel while another computer's Dropbox sign-in waits for this computer's browser.
+    sharing_tunnel: Mutex<Option<sharing_setup::Tunnel>>,
 }
 
 pub(crate) const SWITCHER_LABEL: &str = "switcher";
@@ -553,6 +558,30 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             }
             value(next)
         }
+        R::SetupSharing { cancel: true, .. } => value(cancel_sharing_setup_now(&app)),
+        R::SetupSharing { remote, via_tunnel, reconnect, .. } => value(start_sharing_setup(&app, remote, via_tunnel, reconnect)?),
+        R::GetSharingSetup { wait_seconds, since } => {
+            let state = app.state::<AppState>();
+            if let Some(wait) = wait_seconds {
+                // Waits here, so an agent following another computer's setup asks over SSH seldom.
+                let since = since.unwrap_or_else(|| state.sharing_setup.lock().unwrap().revision);
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(u64::from(wait.min(45)));
+                loop {
+                    let changed = state.sharing_setup.lock().unwrap().revision != since;
+                    if changed || tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+            let setup = state.sharing_setup.lock().unwrap().clone();
+            value(setup)
+        }
+        R::SharingSetupLink => {
+            let setup = app.state::<AppState>().sharing_setup.lock().unwrap().clone();
+            Ok(serde_json::json!({ "phase": setup.phase, "error": setup.error, "state": setup.link.as_deref().and_then(sharing_setup::state_of) }))
+        }
+        R::SharingTunnel { host, state, close } => sharing_tunnel(&app, host, state, close).await,
         R::SwitchAccount { provider, id } => agent_switch(&app, provider, id).await,
         R::GetHeadroom { provider, id } => {
             let state = app.state::<AppState>();
@@ -2849,6 +2878,241 @@ async fn set_phone_token(token: Option<String>) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Sharing setup (see `sharing_setup`)
+
+/// Changes the setup's state and tells the windows.
+fn publish_sharing(app: &AppHandle, change: impl FnOnce(&mut sharing_setup::Setup)) -> sharing_setup::Setup {
+    let state = app.state::<AppState>();
+    let out = {
+        let mut setup = state.sharing_setup.lock().unwrap();
+        change(&mut setup);
+        setup.revision += 1;
+        setup.clone()
+    };
+    let _ = app.emit("sharing-setup", &out);
+    out
+}
+
+/// Whether a sharing setup is under way: an automatic update waits for it (see `updates`), since
+/// restarting would end its Dropbox sign-in.
+pub(crate) fn sharing_setup_running(app: &AppHandle) -> bool {
+    app.state::<AppState>().sharing_setup.lock().unwrap().phase.running()
+}
+
+/// Opens one of rclone's loopback sign-in links in the default browser.
+fn open_in_browser(link: &str) -> Result<(), String> {
+    std::process::Command::new("explorer.exe").arg(link).spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Starts a setup and answers at once with its state. Dropbox's page opens on this screen, so it
+/// must be shown, unless the sign-in is finished on another computer (`via_tunnel`). The remote is
+/// the one named, else the one sharing uses already, else "dropbox". `reconnect` signs in again
+/// even when the remote works (another Dropbox account).
+fn start_sharing_setup(app: &AppHandle, remote: Option<String>, via_tunnel: bool, reconnect: bool) -> Result<sharing_setup::Setup, String> {
+    use sharing_setup::{Phase, Setup};
+    let state = app.state::<AppState>();
+    let settings = state.settings.lock().unwrap().clone();
+    // A computer sharing through a folder keeps it: the setup would move it off that folder.
+    if settings.presence_folder.is_some() {
+        return Err("uses_folder".into());
+    }
+    let remote = remote.or(settings.presence_remote).unwrap_or_else(|| sharing_setup::DEFAULT_REMOTE.into());
+    if !rclone::valid_remote(&remote) {
+        return Err("bad_remote".into());
+    }
+    if !via_tunnel {
+        desktop_shown()?;
+    }
+    let started = {
+        let mut setup = state.sharing_setup.lock().unwrap();
+        if setup.phase.running() {
+            return Err("sharing_setup_busy".into());
+        }
+        *setup = Setup { phase: Phase::Rclone, remote: remote.clone(), via_tunnel, revision: setup.revision + 1, ..Default::default() };
+        setup.clone()
+    };
+    state.sharing_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+    let _ = app.emit("sharing-setup", &started);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(code) = run_sharing_setup(&app, remote, via_tunnel, reconnect).await {
+            publish_sharing(&app, |s| {
+                s.failed_at = Some(s.phase);
+                s.phase = Phase::Failed;
+                s.error = Some(code.into());
+                s.waiting = false;
+                s.link = None;
+                s.progress = None;
+            });
+        }
+    });
+    Ok(started)
+}
+
+/// The setup's steps: rclone (SlopBar's own verified copy when none recent enough is installed),
+/// the remote (created, signed in again when its access ended or another account is wanted, or
+/// used as it is), sharing on, and who else shares there.
+async fn run_sharing_setup(app: &AppHandle, remote: String, via_tunnel: bool, reconnect: bool) -> Result<(), &'static str> {
+    use sharing_setup::{Connect, Phase};
+    use std::sync::atomic::Ordering::SeqCst;
+    let state = app.state::<AppState>();
+    let installed = tauri::async_runtime::spawn_blocking(|| rclone::find().filter(|path| rclone::usable(path))).await.unwrap_or(None);
+    let path = match installed {
+        Some(path) => path,
+        None => {
+            let own = sharing_setup::own_rclone().ok_or("extract_failed")?;
+            publish_sharing(app, |s| {
+                s.downloaded = true;
+                s.progress = Some(0);
+            });
+            let signal = app.clone();
+            let progress = move |percent: u8| {
+                publish_sharing(&signal, |s| s.progress = Some(percent));
+            };
+            let result = sharing_setup::install_rclone(&http_client(), &own, &state.sharing_cancel, &progress).await;
+            publish_sharing(app, |s| s.progress = None);
+            result?;
+            own
+        }
+    };
+    if state.sharing_cancel.load(SeqCst) {
+        return Err("cancelled");
+    }
+    let (rclone_path, name) = (path.clone(), remote.clone());
+    let how = tauri::async_runtime::spawn_blocking(move || -> Result<Option<Connect>, &'static str> {
+        // A listing that failed is not an empty one: creating would overwrite a remote of that name.
+        let listed = rclone::listed(&rclone::Cli(rclone_path)).ok_or("rclone_failed")?;
+        match listed.iter().find(|r| r.name == name) {
+            None => Ok(Some(Connect::Create)),
+            Some(r) if r.kind != "dropbox" => Err("remote_taken"),
+            Some(_) if reconnect || !reaches(&name) => Ok(Some(Connect::Reconnect)),
+            Some(_) => Ok(None),
+        }
+    }).await.map_err(|_| "rclone_failed")??;
+    if let Some(how) = how {
+        publish_sharing(app, |s| s.phase = Phase::Dropbox);
+        let (signal, rclone_path, name, cancel) = (app.clone(), path.clone(), remote.clone(), state.sharing_cancel.clone());
+        tauri::async_runtime::spawn_blocking(move || {
+            let on_link = |link: String| {
+                // rclone opens no browser: SlopBar opens its page here, unless a browser on another
+                // computer finishes the sign-in through a tunnel.
+                if !via_tunnel {
+                    let _ = open_in_browser(&link);
+                }
+                publish_sharing(&signal, |s| {
+                    s.waiting = true;
+                    s.link = Some(link);
+                });
+            };
+            sharing_setup::connect_dropbox(&rclone_path, &name, how, &on_link, &cancel, sharing_setup::SIGN_IN_TIMEOUT)
+        }).await.map_err(|_| "rclone_failed")??;
+        publish_sharing(app, |s| {
+            s.waiting = false;
+            s.link = None;
+        });
+        // rclone ends well only with the remote written; it must also reach Dropbox.
+        let name = remote.clone();
+        if !tauri::async_runtime::spawn_blocking(move || reaches(&name)).await.unwrap_or(false) {
+            return Err("rclone_failed");
+        }
+    }
+    publish_sharing(app, |s| s.phase = Phase::Sharing);
+    {
+        let held = state.settings_lock.lock().await;
+        let mut next = state.settings.lock().unwrap().clone();
+        next.presence_remote = Some(remote.clone());
+        next.presence_folder = None;
+        // Lets go of settings_lock; the refresh below withdraws what the move left behind.
+        store_settings(app, held, next).map_err(|_| "settings_failed")?;
+    }
+    do_refresh(app).await;
+    let settings = state.settings.lock().unwrap().clone();
+    let found = tauri::async_runtime::spawn_blocking(move || {
+        let Some(store) = presence::store(&settings) else { return vec![] };
+        let own = presence::identity().map(|(id, _)| id.clone()).unwrap_or_default();
+        let now = chrono::Utc::now();
+        presence::peers(store.list().unwrap_or_default(), &own, now).into_iter()
+            .filter(|p| p.live || now - p.seen_at <= chrono::Duration::days(1))
+            .map(|p| p.machine)
+            .collect::<Vec<_>>()
+    }).await.unwrap_or_default();
+    publish_sharing(app, |s| {
+        s.phase = Phase::Done;
+        s.found = found;
+    });
+    Ok(())
+}
+
+/// Whether the rclone remote `name` reaches its storage (lists SlopBar's folder there).
+fn reaches(name: &str) -> bool {
+    rclone::Rclone::open(name).is_some_and(|store| presence::PresenceStore::list(&store).is_ok())
+}
+
+/// Stops a running setup: rclone's sign-in ends and writes nothing.
+fn cancel_sharing_setup_now(app: &AppHandle) -> sharing_setup::Setup {
+    let state = app.state::<AppState>();
+    state.sharing_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    let setup = state.sharing_setup.lock().unwrap().clone();
+    setup
+}
+
+/// Opens (or closes) the SSH tunnel for another computer's waiting sign-in, and this computer's
+/// browser on the link built here from `state` alone.
+async fn sharing_tunnel(app: &AppHandle, host: String, state: Option<String>, close: bool) -> Result<serde_json::Value, String> {
+    let shared = app.state::<AppState>();
+    if close {
+        let mut tunnel = shared.sharing_tunnel.lock().unwrap();
+        if tunnel.as_ref().is_some_and(|t| t.host == host) {
+            *tunnel = None;
+        }
+        return Ok(serde_json::json!({ "closed": true }));
+    }
+    let link = state.as_deref().and_then(sharing_setup::link_for).ok_or("bad_state")?;
+    desktop_shown()?;
+    *shared.sharing_tunnel.lock().unwrap() = None;
+    let target = host.clone();
+    let tunnel = tauri::async_runtime::spawn_blocking(move || sharing_setup::Tunnel::open(&pairing::Ssh::exe(), &target))
+        .await.map_err(|e| e.to_string())?.map_err(String::from)?;
+    let opened = tunnel.opened;
+    *shared.sharing_tunnel.lock().unwrap() = Some(tunnel);
+    // Closed after the sign-in's own time limit at the latest.
+    let watcher = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(sharing_setup::SIGN_IN_TIMEOUT + Duration::from_secs(120)).await;
+        let state = watcher.state::<AppState>();
+        let mut tunnel = state.sharing_tunnel.lock().unwrap();
+        if tunnel.as_ref().is_some_and(|t| t.opened == opened) {
+            *tunnel = None;
+        }
+    });
+    open_in_browser(&link)?;
+    Ok(serde_json::json!({ "opened": true }))
+}
+
+#[tauri::command]
+fn setup_sharing(app: AppHandle, reconnect: Option<bool>) -> Result<sharing_setup::Setup, String> {
+    start_sharing_setup(&app, None, false, reconnect.unwrap_or(false))
+}
+
+#[tauri::command]
+fn cancel_sharing_setup(app: AppHandle) -> sharing_setup::Setup {
+    cancel_sharing_setup_now(&app)
+}
+
+/// Opens Dropbox's page again (through rclone's own local link) when the user closed it.
+#[tauri::command]
+fn open_sharing_page(app: AppHandle) -> Result<(), String> {
+    let link = app.state::<AppState>().sharing_setup.lock().unwrap().link.clone();
+    let link = link.as_deref().and_then(sharing_setup::state_of).and_then(sharing_setup::link_for).ok_or("no_sign_in_waiting")?;
+    open_in_browser(&link)
+}
+
+#[tauri::command]
+fn sharing_setup_state(app: AppHandle) -> sharing_setup::Setup {
+    app.state::<AppState>().sharing_setup.lock().unwrap().clone()
+}
+
+// ---------------------------------------------------------------------------------------------
 // Account roster (see `roster`)
 
 /// Writes this machine's roster (with its "Sign in all accounts" run) when due and reads the
@@ -3238,6 +3502,9 @@ pub fn run() {
         settings_page: Mutex::default(),
         leases: Mutex::default(),
         update_check: Default::default(),
+        sharing_setup: Mutex::default(),
+        sharing_cancel: Arc::default(),
+        sharing_tunnel: Mutex::default(),
     };
     tauri::Builder::default()
         // Must come first: a second launch hands over to the running instance and exits.
@@ -3292,6 +3559,10 @@ pub fn run() {
             sync_folders,
             check_presence_folder,
             rclone_remotes,
+            setup_sharing,
+            cancel_sharing_setup,
+            sharing_setup_state,
+            open_sharing_page,
             system_locale,
             this_machine,
             check_for_updates,
