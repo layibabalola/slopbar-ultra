@@ -149,6 +149,7 @@ test("every machine an account is in use on is named, this one first and marked"
     const p = placesText(a);
     assert.equal(p.inUse, inUse);
     assert.deepEqual(p.machines, machines);
+    assert.equal(p.short, machines.length ? `In use on ${machines.join(", ")}` : "", "chips leave the places to their tooltip");
     assert.deepEqual(p.names, machines.map((m) => m.replace(" (this PC)", "")));
   }
   assert.ok(placesText(used({ remote: [{ ...laptop, live: false }] })).seen[0].startsWith("LAPTOP-2 (WSL: Ubuntu): seen "));

@@ -50,9 +50,7 @@ function render() {
     const room = w ? `<b>${Math.max(0, Math.round(100 - w.used_percent))}%</b><small>${esc(t("switcherLeft", { window: windowLabel(w) }))}</small>`
       : `<b>—</b><small>${esc(t("usageUnknown"))}</small>`;
     // The machines it is in use on, so switching here does not land on another's account unawares.
-    const machines = placesText(a).machines;
-    const meta = [PROVIDER_NAME[a.provider], a.alias ? a.email : "", a.plan, machines.length ? t("inUseOn", { list: machines.join(", ") }) : ""]
-      .filter(Boolean).join(" · ");
+    const meta = [PROVIDER_NAME[a.provider], a.alias ? a.email : "", a.plan, placesText(a).short].filter(Boolean).join(" · ");
     return `<li role="option" id="option-${i}" data-i="${i}" aria-selected="${i === selected}">
       <span class="mark-box" title="${PROVIDER_NAME[a.provider]}">${MARK[a.provider]}</span>
       <span class="who"><b>${esc(name(a))}</b><small>${esc(meta)}</small></span>
