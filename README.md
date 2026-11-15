@@ -110,7 +110,7 @@ command = 'C:\Users\<you>\AppData\Local\SlopBar\slopbar-mcp.exe'
 | `switch_account`, `remove_account` | Use or remove a saved account, as in Settings. |
 | `add_account`, `connect_monitoring`, `disconnect_monitoring` | Start the CLI's own sign-in for the user to complete, or revoke a monitoring sign-in. |
 | `revoke_account_sessions` | Revoke every sign-in SlopBar holds for an account (its monitoring session, at the provider and here), optionally removing the saved CLI login with `remove_slot`. Only reports unless `confirm: true`; the CLI's own sign-in is left to the CLI. |
-| `check_for_updates`, `install_update`, `get_app_info`, `open_settings` | Updates (builds with automatic updates only), version and build, and showing the Settings window. |
+| `check_for_updates`, `install_update`, `get_app_info`, `open_settings` | Updates (builds with automatic updates only), version and build, the last update check (time, result and error), and showing the Settings window. |
 | `quit_app`, `restart_app` | Quit as the tray's Quit does, or quit and start the installed executable again. |
 | `get_usage_breakdown` | Tokens on this PC by account and repository, model or day, with each provider's model mix and an hour-of-week heatmap, and how each account's tokens were attributed. |
 | `export_csv` | Write the weekly history, the usage breakdown and the subscription report as CSV files (default `Documents\SlopBar Exports`) and return their paths. |
