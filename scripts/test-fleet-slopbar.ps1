@@ -69,17 +69,35 @@ $reason = 'A sign-in is open; the update waits for it to finish'
 $r = Row (Info (Record @{ at = (Ago 3); result = 'deferred'; reason = $reason; next_at = (Ago -12) }))
 Check 'a deferred check is no problem' (-not $r.Problem -and $r.CheckText -eq "3 min ago: deferred: $reason")
 
-# No check for longer than the interval plus a pass's limit: 15 + 35 2/3 = 50 2/3 minutes.
-$r = Row (Info (Record @{ at = (Ago 52); result = 'up_to_date'; next_at = (Ago -1) }))
-Check 'no check for 52 minutes is a problem' ($r.Problem -and $r.Status -eq 'current; no update check for 52 min')
-$r = Row (Info (Record @{ at = (Ago 49); result = 'up_to_date'; next_at = (Ago -1) }))
+# No check for longer than the interval plus a pass's limit (15 + 35 2/3 = 50 2/3 minutes) is a
+# problem when the loop's next run does not explain it: none is shown, or it is overdue past a pass's
+# limit (a stopped loop). A loop that waits for a next run checks there.
+$r = Row (Info (Record @{ at = (Ago 52); result = 'up_to_date' }))
+Check 'no check for 52 minutes, with no next run shown, is a problem' ($r.Problem -and $r.Status -eq 'current; no update check for 52 min')
+$r = Row (Info (Record @{ at = (Ago 49); result = 'up_to_date' }))
 Check '49 minutes is within a pass of the interval' (-not $r.Problem)
 $r = Row (Info (Record @{ at = (Ago 52); result = 'up_to_date'; next_at = (Ago -1) })) $off
 Check 'with automatic updates off, that alone is reported' ($r.Status -eq 'current; auto-update off')
-$r = Row (Info (Record @{ at = (Ago 380); result = 'up_to_date'; next_at = (Ago -1); interval_seconds = 21600 }))
+$r = Row (Info (Record @{ at = (Ago 380); result = 'up_to_date'; interval_seconds = 21600 }))
 Check 'a 6-hour interval allows longer' (-not $r.Problem)
-$r = Row (Info (Record @{ at = (Ago 400); result = 'up_to_date'; next_at = (Ago -1); interval_seconds = 21600 }))
+$r = Row (Info (Record @{ at = (Ago 400); result = 'up_to_date'; interval_seconds = 21600 }))
 Check 'but not past it and a pass' ($r.Status -eq 'current; no update check for 400 min')
+
+# "Update automatically" just switched on: the loop skipped its runs while updates were off (it wakes
+# at its interval and moves its next run on, but checks nothing), so the last check is old and the
+# next run is ahead. That is no problem until the run is overdue; then the loop has stopped.
+$r = Row (Info (Record @{ at = (Ago 1500); result = 'up_to_date'; next_at = (Ago -7) }))
+Check 'an old check with the next run ahead is no problem (updates just switched on)' (-not $r.Problem -and $r.Status -eq 'current' -and $r.LastCheck -eq '1500 min ago: up to date')
+$r = Row (Info (Record @{ at = (Ago 1500); result = 'up_to_date'; next_at = (Ago 5) }))
+Check '...nor with the next run just due, or its pass running' (-not $r.Problem)
+$r = Row (Info (Record @{ at = (Ago 1500); result = 'up_to_date'; next_at = (Ago 36) }))
+Check '...nor 36 minutes overdue, still within a pass and a minute' (-not $r.Problem)
+$r = Row (Info (Record @{ at = (Ago 1500); result = 'up_to_date'; next_at = (Ago 40) }))
+Check '...but a loop 40 minutes overdue has stopped, and the old check is reported with it' ($r.Problem -and $r.Status -eq 'current; update loop stopped: next check 40 min overdue; no update check for 1500 min')
+$r = Row (Info (Record @{ at = (Ago 1500); result = 'up_to_date'; next_at = (Ago -7) })) $off
+Check '...and with updates off, only the setting is reported' ($r.Status -eq 'current; auto-update off')
+$r = Row (Info (Record @{ at = (Ago 1500); result = 'error'; error = 'The download failed'; next_at = (Ago -7) }))
+Check 'a failed check is a problem whatever the next run' ($r.Problem -and $r.Status -eq 'current; last update check failed')
 
 # A stopped loop: its next run overdue by more than a pass's limit, even after a check asked for.
 $r = Row (Info (Record @{ at = (Ago 2); result = 'up_to_date'; by = 'manual'; next_at = (Ago 40) }))

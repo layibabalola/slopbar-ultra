@@ -360,9 +360,27 @@ pwsh scripts/fleet-slopbar.ps1 -UpdateNow
     on Ultra builds):
     - a failed last update check (a deferred one is no problem),
     - no update check for longer than the interval plus the pass limit (about 51 minutes) while
-      "Update automatically" is on,
+      "Update automatically" is on and the loop shows no next run to explain it: none at all, or one
+      overdue by more than the pass limit. A loop waiting for a next run that is ahead (or only just
+      due) is no problem: see the transient states below,
     - an update loop whose next run is overdue by more than the pass limit: it has stopped, even if
       a check asked for since then shows a recent time.
+- **Transient states** that look like problems for a while. The report reads only what
+  `get_app_info` returns: the last check, the loop's next run (`next_at`, a clock time), the interval
+  and the pass limit. It carries no uptime, no wake time and no reading of the machine's own clock.
+  - *"Update automatically" just switched on.* While it is off, the loop still wakes at its interval
+    and moves `next_at` on, but checks nothing, so the last check grows as old as the time it was
+    off. For up to one interval after the switch, the last check is old and the next run is ahead.
+    The report tells that from a stopped loop by the next run, and calls the old check no problem
+    while that run is ahead or less than a pass limit overdue. A stopped loop's next run is overdue
+    by more than that, and is reported as before.
+  - *A machine that has just woken from sleep* shows "update loop stopped" and "no update check"
+    until its next pass, and nothing `get_app_info` returns tells it from a dead loop: `next_at` is a
+    clock time that passed while the machine slept, exactly as for a loop that died, and no field
+    says when the machine woke. The loop runs again within about one interval of the wake (15
+    minutes on Ultra builds), which clears both. So a machine reported as stopped that may have been
+    asleep (a laptop, say) is asked again after an interval before it is called dead; one still
+    reported as stopped then is.
 - **Tested** offline by `pwsh scripts/test-fleet-slopbar.ps1`, on synthetic answers.
 - **The two limits a machine may not report.** A build from before the update-check record (or a
   record from before the limit) reports no update interval and no pass limit, so the script judges it

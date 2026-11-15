@@ -33,9 +33,12 @@ been behind cannot be told, and a stuck machine must not pass for one mid-rollou
 so and goes on, and a machine that is current is not affected), and, from the record:
   - a failed last update check (a deferred one is no problem);
   - no update check for longer than the interval plus a pass's limit while "Update automatically" is
-    on;
+    on, unless the loop's next run explains it (it is ahead, or less than a pass's limit overdue: a
+    machine on which updates were just switched on checks there);
   - an update loop whose next run is overdue by more than a pass's limit: it has stopped, even if a
     check asked for since then shows a recent time.
+A machine that has just woken from sleep shows both of the last two until its next pass, and cannot be
+told from a dead loop: ask again after an interval.
 A machine without SlopBar is reported as not installed, which is no problem.
 
 The functions are tested offline by scripts/test-fleet-slopbar.ps1, which dot-sources this file.
@@ -127,17 +130,23 @@ function Get-Short([string]$text, [int]$max = 40) {
 
 # The app's last update check (get_app_info's update_check): its text, the problems it shows, and
 # the machine's update interval and pass limit, in seconds. A build from before the record has no
-# update_check: n/a, no problem. Problems: a failed check (a deferred one is none); no check for
-# longer than the interval plus a pass's limit while "Update automatically" is on; and an update
-# loop whose next run is overdue by more than a pass's limit, which means it has stopped, whatever
-# a check asked for since then shows.
+# update_check: n/a, no problem. Problems: a failed check (a deferred one is none); an update loop
+# whose next run is overdue by more than a pass's limit, which means it has stopped, whatever a
+# check asked for since then shows; and no check for longer than the interval plus a pass's limit
+# while "Update automatically" is on, unless the loop's next run explains it. The loop wakes at its
+# interval even while updates are off (and moves its next run on), but checks only when they are on,
+# so a machine on which they were just switched on has an old last check and a next run ahead, where
+# it checks. That is no problem; only a loop that has stopped, or shows no next run, has nothing to
+# explain an old check. (A machine just woken from sleep looks like a stopped loop, and nothing in
+# the record tells them apart: see docs/ULTRA-RELEASES.md.)
 function Get-LastCheck($check, $auto, [datetime]$now = [datetime]::UtcNow) {
   if ($null -eq $check) { return [pscustomobject]@{ Text = 'n/a'; Problems = @(); Interval = $null; PassLimit = $null } }
   $interval = [double]($check.interval_seconds ?? $OldBuildInterval)
   $passLimit = [double]($check.pass_limit_seconds ?? $OldBuildPassLimit)
   $problems = [Collections.Generic.List[string]]::new()
   $due = ConvertTo-UtcTime $check.next_at
-  if ($null -ne $due -and ($now - $due).TotalSeconds -gt $passLimit + 60) {
+  $stopped = $null -ne $due -and ($now - $due).TotalSeconds -gt $passLimit + 60
+  if ($stopped) {
     $problems.Add("update loop stopped: next check $([int][Math]::Floor(($now - $due).TotalMinutes)) min overdue")
   }
   $at = ConvertTo-UtcTime $check.at
@@ -155,7 +164,7 @@ function Get-LastCheck($check, $auto, [datetime]$now = [datetime]::UtcNow) {
     default { "$($check.result)" }
   }
   if ("$($check.result)" -eq 'error') { $problems.Add('last update check failed') }
-  elseif ($auto -ne $false -and $age.TotalSeconds -gt $interval + $passLimit) { $problems.Add("no update check for $minutes min") }
+  elseif ($auto -ne $false -and $age.TotalSeconds -gt $interval + $passLimit -and ($stopped -or $null -eq $due)) { $problems.Add("no update check for $minutes min") }
   return [pscustomobject]@{ Text = "$minutes min ago: $result"; Problems = $problems.ToArray(); Interval = $interval; PassLimit = $passLimit }
 }
 
