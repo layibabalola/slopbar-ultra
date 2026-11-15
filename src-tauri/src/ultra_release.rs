@@ -28,6 +28,7 @@ pub fn is_ultra_version(version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::update_check::guard::{find, function, has, lost, tokens, update, words};
 
     const UPSTREAM_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE0MDdFRDM5QzIxRTZGMTEKUldRUmJ4N0NPZTBIcEcvT2F1YThXMTB0UVRRREpMUmtPSjJUS1V4M2poTzdFUXBtejB0V1FNUFAK";
 
@@ -58,30 +59,26 @@ mod tests {
         assert!(!is_ultra_version("0.1-ultra.1"));
     }
 
-    /// updates.rs without whole-line comments (a line commented out does not count), and the part
-    /// from `signature` to the first line that is `}`.
-    fn updates_rs(signature: &str) -> (String, String) {
-        let code = include_str!("updates.rs").lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
-        let start = code.find(signature).unwrap_or_else(|| panic!("updates.rs has no `{signature}`"));
-        let end = code[start..].find("\n}").map_or(code.len(), |e| start + e + 2);
-        let body = code[start..end].to_string();
-        (code, body)
-    }
+    /// Where each guard's needles are, for its failure (see `update_check::guard`).
+    const PINS: &str = "ultra_release::tests::ultra_builds_pin_the_fork_updater_in_code (src-tauri/src/ultra_release.rs)";
+    const ROTATION: &str = "ultra_release::tests::ultra_updates_wait_for_token_rotation (src-tauri/src/ultra_release.rs)";
 
     /// The pins `updater_config_is_the_ultra_channel` checks in tauri.conf.json are also in code, so
     /// a merged config change cannot point Ultra builds back at upstream.
     #[test]
     fn ultra_builds_pin_the_fork_updater_in_code() {
-        let (code, updater) = updates_rs("fn updater(");
+        let code = tokens(include_str!("updates.rs"));
+        let updater = function(&code, "updates.rs", "fn updater(", PINS);
         for pin in [
             "#[cfg(feature = \"ultra-updates\")]",
             ".endpoints(vec![crate::ultra_release::UPDATE_ENDPOINT",
             ".pubkey(crate::ultra_release::PUBKEY)",
             "crate::ultra_release::is_ultra_version(&remote.version.to_string()) && remote.version > current",
         ] {
-            assert!(updater.contains(pin), "updater() lost `{pin}`:\n{updater}");
+            assert!(has(updater, pin), "{}\n{updater}", lost("updater() in updates.rs", pin, PINS));
         }
-        assert!(code.contains("#[cfg(feature = \"ultra-updates\")]\nconst EVERY: Duration = crate::ultra_release::CHECK_EVERY;"), "Ultra builds check every CHECK_EVERY");
+        let every = "#[cfg(feature = \"ultra-updates\")]\nconst EVERY: Duration = crate::ultra_release::CHECK_EVERY;";
+        assert!(has(&code, every), "Ultra builds check every CHECK_EVERY. {}", lost("updates.rs", every, PINS));
     }
 
     /// Installs wait for token rotation as named, bounded steps: an open sign-in defers the update
@@ -91,37 +88,27 @@ mod tests {
     /// the installer ends SlopBar.
     #[test]
     fn ultra_updates_wait_for_token_rotation() {
-        let (_, updater) = updates_rs("fn updater(");
-        assert!(updater.contains(".on_before_exit(move || crate::app::on_exit(&h))"), "{updater}");
-        let (_, install) = updates_rs("async fn install_now(");
-        let at = |needle: &str| install.find(needle).unwrap_or_else(|| panic!("install_now lost `{needle}`:\n{install}"));
+        let code = tokens(include_str!("updates.rs"));
+        let updater = function(&code, "updates.rs", "fn updater(", ROTATION);
+        let exit = ".on_before_exit(move || crate::app::on_exit(&h))";
+        assert!(has(updater, exit), "{}\n{updater}", lost("updater() in updates.rs", exit, ROTATION));
+        let install = function(&code, "updates.rs", "async fn install_now(", ROTATION);
+        let at = |needle: &str| find(install, needle).unwrap_or_else(|| panic!("{}\n{install}", lost("install_now in updates.rs", needle, ROTATION)));
         let deferral = "if crate::signin::any_active() {\n        return Ok(Outcome::Deferred(SIGN_IN_OPEN.into()));";
-        assert_eq!(install.matches(deferral).count(), 2, "{install}");
-        let (first, second) = (at(deferral), install.rfind(deferral).unwrap());
-        let (refresh, handover) = (at("let refresh = steps"), at("update_check::hand_over("));
-        assert!(first < at("update.download(") && at("update.download(") < refresh && refresh < second && second < handover,
-            "a sign-in defers before the download and again before the handover, after the refresh lock:\n{install}");
-        assert!(install.contains(".run(\"Waiting for a refresh to finish\", update_check::REFRESH_WAIT_LIMIT, async move { Ok::<_, String>(refresh_lock.lock_owned().await) })"),
-            "an owned guard, within its limit:\n{install}");
+        assert_eq!(install.matches(&tokens(deferral)).count(), 2, "an open sign-in defers the update twice, at `{deferral}`. {}\n{install}", update(ROTATION));
+        let (first, second) = (at(deferral), install.rfind(&tokens(deferral)).unwrap());
+        let (download, refresh, handover) = (at("update.download("), at("let refresh = steps"), at("update_check::hand_over("));
+        assert!(first < download && download < refresh && refresh < second && second < handover,
+            "a sign-in defers before the download and again before the handover, after the refresh lock. {}\n{install}", update(ROTATION));
+        let wait = ".run(\"Waiting for a refresh to finish\", update_check::REFRESH_WAIT_LIMIT, async move { Ok::<_, String>(refresh_lock.lock_owned().await) })";
+        assert!(has(install, wait), "an owned guard, within its limit. {}\n{install}", lost("install_now in updates.rs", wait, ROTATION));
         let after = &install[refresh..];
-        let after = &after[after.find(".await?;").expect("the guard's binding ends") + ".await?;".len()..];
-        let named = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
-        let uses = after.match_indices("refresh").filter(|(i, w)| !named(after[..*i].chars().next_back()) && !named(after[i + w.len()..].chars().next())).count();
-        assert_eq!(uses, 1, "once bound, the guard is used only to hand it to the handover:\n{after}");
-        assert!(install[handover..].starts_with("update_check::hand_over(steps, update_check::HANDOFF_LIMIT, (turn, refresh), "),
-            "the handover's thread holds the turn and the refresh lock:\n{install}");
+        let after = &after[find(after, ".await?;").unwrap_or_else(|| panic!("{}", lost("The refresh lock's binding in updates.rs", ".await?;", ROTATION))) + ".await?;".len()..];
+        assert_eq!(words(after, "refresh"), 1, "once bound, the guard is used only to hand it to the handover. {}\n{after}", update(ROTATION));
+        let held = "update_check::hand_over(steps, update_check::HANDOFF_LIMIT, (turn, refresh), ";
+        assert_eq!(find(&install[handover..], held), Some(0), "the handover's thread holds the turn and the refresh lock. {}\n{install}", lost("The handover in updates.rs", held, ROTATION));
     }
 
-    /// The deadlines in updates.rs rely on tauri-plugin-updater 2.12.0's internals (updater.rs: the
-    /// builder's `timeout` reaching only the check; `check()` carrying the `configure_client` hook
-    /// into the `Update` it returns, with no timeout of its own; `Update::download` applying both).
-    /// A different version must be read again before this test is changed.
-    #[test]
-    fn the_updater_plugin_is_the_version_reviewed() {
-        let version = include_str!("../Cargo.lock")
-            .split("[[package]]")
-            .find(|package| package.lines().any(|l| l == "name = \"tauri-plugin-updater\""))
-            .and_then(|package| package.lines().find_map(|l| l.strip_prefix("version = \"")?.strip_suffix('"')));
-        assert_eq!(version, Some("2.12.0"), "re-review the deadlines in src-tauri/src/updates.rs against this tauri-plugin-updater");
-    }
+    // The deadlines' tripwire on tauri-plugin-updater's version is update_check's
+    // `the_updater_plugin_is_the_version_reviewed`, which every tree has.
 }
