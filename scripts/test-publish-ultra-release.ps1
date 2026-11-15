@@ -248,8 +248,10 @@ try {
   New-Stage
   $null = Invoke-Check
   $r = Read-StageFile 'release.json'
-  $secrets = @('ULTRA_TAURI_SIGNING_PRIVATE_KEY')
-  Check '-ViaActions refuses while a secret is missing, and pushes no tag' ((Get-Refusal { Invoke-ViaActions }) -match 'ULTRA_TAURI_SIGNING_PRIVATE_KEY_PASSWORD not set' -and -not (Get-OriginTag $r.tag))
+  $secrets = @('ULTRA_UPDATER_KEY')
+  Check '-ViaActions refuses while a secret is missing, and pushes no tag' ((Get-Refusal { Invoke-ViaActions }) -match 'ULTRA_UPDATER_KEY_PASSWORD not set' -and -not (Get-OriginTag $r.tag))
+  $secrets = @('ULTRA_UPDATER_KEY', 'ULTRA_UPDATER_KEY_PASSWORD', 'ULTRA_TAURI_SIGNING_PRIVATE_KEY')
+  Check '-ViaActions refuses while a secret under a retired name exists' ((Get-Refusal { Invoke-ViaActions }) -match 'Delete ULTRA_TAURI_SIGNING_PRIVATE_KEY' -and -not (Get-OriginTag $r.tag))
 
   # Sign, with a throwaway key: the real signer, its password handoff and the key check.
   if (Test-Path $tauriCli) {
@@ -269,12 +271,12 @@ try {
     Set-Conf (Get-Content "$keyFile.pub" -Raw).Trim()
     Check 'the key files sign' ((Get-Refusal { Invoke-Sign }) -eq '' -and (Get-KeyId (Get-Content $sig -Raw)) -eq (Get-KeyId (Get-Content "$keyFile.pub" -Raw)))
     $KeyDir = Join-Path $tmp 'no-key'
-    $env:ULTRA_TAURI_SIGNING_PRIVATE_KEY = Get-Content $keyFile -Raw
-    $env:ULTRA_TAURI_SIGNING_PRIVATE_KEY_PASSWORD = "test-password`n"
+    $env:ULTRA_UPDATER_KEY = Get-Content $keyFile -Raw
+    $env:ULTRA_UPDATER_KEY_PASSWORD = "test-password`n"
     Check 'the secrets sign, and leave the environment' ((Get-Refusal { Invoke-Sign }) -eq '' -and (Test-Path $sig) -and
-      -not $env:ULTRA_TAURI_SIGNING_PRIVATE_KEY -and -not $env:ULTRA_TAURI_SIGNING_PRIVATE_KEY_PASSWORD)
-    $env:ULTRA_TAURI_SIGNING_PRIVATE_KEY = Get-Content $keyFile -Raw
-    $env:ULTRA_TAURI_SIGNING_PRIVATE_KEY_PASSWORD = 'wrong'
+      -not $env:ULTRA_UPDATER_KEY -and -not $env:ULTRA_UPDATER_KEY_PASSWORD)
+    $env:ULTRA_UPDATER_KEY = Get-Content $keyFile -Raw
+    $env:ULTRA_UPDATER_KEY_PASSWORD = 'wrong'
     Check 'a wrong password fails the signing' ((Get-Refusal { Invoke-Sign }) -match 'Signing failed' -and -not (Test-Path $sig))
     Set-Conf $realConf.plugins.updater.pubkey
   } else {
@@ -282,7 +284,7 @@ try {
   }
 } finally {
   $env:GITHUB_STEP_SUMMARY = $summary
-  Remove-Item Env:ULTRA_TAURI_SIGNING_PRIVATE_KEY, Env:ULTRA_TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
+  Remove-Item Env:ULTRA_UPDATER_KEY, Env:ULTRA_UPDATER_KEY_PASSWORD -ErrorAction SilentlyContinue
   # Another process (a scanner) may hold a new file for a moment; Windows then finishes the delete
   # once it lets go.
   for ($i = 0; $i -lt 10 -and (Test-Path $tmp); $i++) {

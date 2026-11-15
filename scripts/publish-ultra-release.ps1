@@ -44,7 +44,10 @@ $tauriCli = Join-Path $root 'node_modules/@tauri-apps/cli/tauri.js'
 $channelTag = 'ultra-latest'
 $workflow = 'ultra-release.yml'
 # The workflow hands these secrets to the Sign step alone, under the same names.
-$secretNames = @('ULTRA_TAURI_SIGNING_PRIVATE_KEY', 'ULTRA_TAURI_SIGNING_PRIVATE_KEY_PASSWORD')
+$secretNames = @('ULTRA_UPDATER_KEY', 'ULTRA_UPDATER_KEY_PASSWORD')
+# Never to be set: the release workflow of older commits reads these names, and it publishes without
+# the installer hook or any of these checks.
+$retiredSecretNames = @('ULTRA_TAURI_SIGNING_PRIVATE_KEY', 'ULTRA_TAURI_SIGNING_PRIVATE_KEY_PASSWORD')
 
 function Invoke-Checked([string]$what, [scriptblock]$block) {
   & $block
@@ -366,6 +369,10 @@ function Invoke-ViaActions {
   $release = Read-StageFile 'release.json'
   $names = @(gh secret list -R $Repo --json name --jq '.[].name')
   if ($LASTEXITCODE -ne 0) { throw "Could not list the secrets of $Repo (the owner's gh sign-in can)." }
+  $retired = @($retiredSecretNames | Where-Object { $names -contains $_ })
+  if ($retired) {
+    throw "Delete $($retired -join ' and ') from ${Repo}: the release workflow of older commits reads those names and would publish without the installer checks."
+  }
   $missing = @($secretNames | Where-Object { $names -notcontains $_ })
   if ($missing) {
     throw "$($missing -join ' and ') not set on $Repo, so the workflow would publish nothing. Add the secrets (docs/ULTRA-RELEASES.md) or publish on the machine with the key."

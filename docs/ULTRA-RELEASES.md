@@ -171,17 +171,26 @@ that carries a new key.
 From PowerShell, without showing either value:
 
 ```powershell
-Get-Content -Raw "$env:USERPROFILE\.slopbar-ultra\updater.key" | gh secret set ULTRA_TAURI_SIGNING_PRIVATE_KEY -R layibabalola/slopbar-ultra
-Get-Content -Raw "$env:USERPROFILE\.slopbar-ultra\updater.key.password" | gh secret set ULTRA_TAURI_SIGNING_PRIVATE_KEY_PASSWORD -R layibabalola/slopbar-ultra
+Get-Content -Raw "$env:USERPROFILE\.slopbar-ultra\updater.key" | gh secret set ULTRA_UPDATER_KEY -R layibabalola/slopbar-ultra
+Get-Content -Raw "$env:USERPROFILE\.slopbar-ultra\updater.key.password" | gh secret set ULTRA_UPDATER_KEY_PASSWORD -R layibabalola/slopbar-ultra
 gh secret list -R layibabalola/slopbar-ultra
 ```
 
 Both must be set: with one alone, tag runs fail at `gate`. The script trims the trailing line end
 that `Get-Content -Raw` leaves, as it does for the files.
 
-The names are `ULTRA_`-prefixed on purpose. Upstream's `release.yml` is also on this fork and
-reads `TAURI_SIGNING_PRIVATE_KEY`. With that name unset, it can never sign a release with the
-fork's key, so it can't produce anything an Ultra install would accept.
+The names matter:
+
+- They are `ULTRA_`-prefixed. Upstream's `release.yml` is also on this fork and reads
+  `TAURI_SIGNING_PRIVATE_KEY`. With that name unset, it can never sign a release with the fork's
+  key, so it can't produce anything an Ultra install would accept.
+- Never create `ULTRA_TAURI_SIGNING_PRIVATE_KEY` or `ULTRA_TAURI_SIGNING_PRIVATE_KEY_PASSWORD`,
+  the names these docs used to give. A tag runs the workflow file of the tagged commit, and in
+  every commit before "Publish Ultra releases from any machine" (2026-11-14) that file reads those
+  names. Given a key, it would publish through `tauri-action`, without the installer hook or any of
+  the checks above, whenever a commit that old is tagged or one of its runs is re-run. Under the
+  new names, those old workflow files never see a key. While either old name exists, the workflow
+  fails at `gate` and `-ViaActions` refuses.
 
 ## Installing on another machine
 
