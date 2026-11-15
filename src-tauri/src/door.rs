@@ -88,8 +88,14 @@ pub enum Request {
         #[serde(default)]
         reconnect: bool,
     },
-    /// The sharing setup's state, never its sign-in link.
-    GetSharingSetup,
+    /// The sharing setup's state, never its sign-in link. With `wait_seconds`, first waits (up to
+    /// 45 s) for it to change from `since` (the `revision` of an earlier answer).
+    GetSharingSetup {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_seconds: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
+    },
     /// `slopbar-mcp --sharing-state` only: the state value in rclone's waiting link, for the
     /// computer that finishes the sign-in through a tunnel. Never an MCP tool's result.
     SharingSetupLink,
