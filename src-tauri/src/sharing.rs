@@ -237,6 +237,10 @@ mod tests {
         roster: BTreeSet<String>,
         /// (the place a write was made for, where the live settings shared when it was made)
         writes: Vec<(String, String)>,
+        /// Every withdrawal, in order ("presence A", "roster A").
+        withdrawals: Vec<String>,
+        /// How often the app cleared the roster news it shows (`roster_seen`).
+        news_cleared: u32,
     }
 
     fn name(place: &Place) -> String {
@@ -247,10 +251,14 @@ mod tests {
 
     impl Withdraw for Io<'_> {
         fn presence(&mut self, place: &Place) {
-            self.0.lock().unwrap().presence.insert(name(place), "withdrawn");
+            let mut world = self.0.lock().unwrap();
+            world.presence.insert(name(place), "withdrawn");
+            world.withdrawals.push(format!("presence {}", name(place)));
         }
         fn roster(&mut self, place: &Place) {
-            self.0.lock().unwrap().roster.remove(&name(place));
+            let mut world = self.0.lock().unwrap();
+            world.roster.remove(&name(place));
+            world.withdrawals.push(format!("roster {}", name(place)));
         }
     }
 
@@ -278,9 +286,13 @@ mod tests {
             self.sharing.saved(&before, &after)
         }
 
-        /// `app::refresh_locked`'s start: `catch_up`, then the settings read.
+        /// `app::refresh_locked`'s start: `catch_up` when `is_due` says a save left something,
+        /// clearing the roster news the app shows when it reset the roster sync; then the settings
+        /// read.
         fn start(&self) -> Place {
-            self.sharing.catch_up(&mut Io(&self.world));
+            if self.sharing.is_due() && self.sharing.catch_up(&mut Io(&self.world)) {
+                self.world.lock().unwrap().news_cleared += 1;
+            }
             self.live()
         }
 
@@ -423,5 +435,58 @@ mod tests {
         let world = app.world.lock().unwrap();
         assert_eq!(world.presence, BTreeMap::from([("A".into(), "withdrawn"), ("B".into(), "in use")]));
         assert_eq!(world.roster, BTreeSet::from(["B".to_string()]));
+    }
+
+    /// What the refresh does with a save, through the app's own gate (`is_due`): the roster turned
+    /// off where it was, then a move, each leaves something due; the next refresh withdraws each
+    /// file once and clears the roster news shown, and leaves nothing due, so the refresh after it
+    /// withdraws nothing again.
+    #[test]
+    fn a_refresh_takes_what_a_save_left_once() {
+        let app = App::new(at("A", true));
+        app.refresh();
+        assert!(!app.sharing.is_due(), "nothing saved, nothing due");
+        let after = |app: &App| {
+            let world = app.world.lock().unwrap();
+            (world.withdrawals.clone(), world.news_cleared)
+        };
+
+        assert!(app.save(at("A", false)), "the roster turned off where it was");
+        assert!(app.sharing.is_due(), "is due, though presence stays");
+        app.refresh();
+        assert!(!app.sharing.is_due(), "nothing left due");
+        app.refresh();
+        assert_eq!(after(&app), (vec!["roster A".to_string()], 1), "withdrawn once; the roster news cleared");
+
+        assert!(app.save(at("B", true)), "a move");
+        assert!(app.sharing.is_due());
+        app.refresh();
+        assert!(!app.sharing.is_due());
+        app.refresh();
+        assert_eq!(after(&app), (vec!["roster A".to_string(), "presence A".to_string()], 2), "A's presence once (its roster was gone)");
+        let world = app.world.lock().unwrap();
+        assert_eq!((world.presence["B"], world.roster.clone()), ("in use", BTreeSet::from(["B".to_string()])), "sharing at B");
+    }
+
+    /// The settings a withdrawal opens a place's stores with (`Place::settings`, in `Files`) share
+    /// where that place does: its rclone remote or its folder, with its roster setting.
+    #[test]
+    fn a_place_opens_its_stores_where_it_shares() {
+        let remote = Place { folder: None, remote: Some("dropbox".into()), roster: true };
+        let folder = Place { folder: Some(r"C:\Sync\SlopBar".into()), remote: None, roster: false };
+        for place in [remote, folder] {
+            assert_eq!(Place::of(&place.settings()), place);
+        }
+    }
+
+    /// The real roster sync, forgotten after a move or with the roster turned off, starts from
+    /// nothing: what it found last goes with its keys and what it wrote (`roster::Syncer::reset`).
+    #[test]
+    fn the_real_roster_sync_forgets_what_it_found() {
+        let mut syncer = crate::roster::Syncer::default();
+        syncer.seen.wrote = Some(true);
+        syncer.seen.unreadable = 2;
+        Forget::forget(&mut syncer);
+        assert_eq!((syncer.seen.wrote, syncer.seen.unreadable), (None, 0));
     }
 }
