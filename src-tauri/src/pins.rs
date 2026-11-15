@@ -24,8 +24,22 @@ pub fn env_var(provider: Provider) -> &'static str {
     }
 }
 
-/// A folder as pins store it: trimmed, absolute, existing, without a trailing separator.
+/// A folder as pins store it when it is pinned: trimmed, absolute, existing, in its long spelling
+/// (see [`long_spelling`]), without a trailing separator.
 pub fn normalize_folder(folder: &str) -> Result<String, String> {
+    checked_folder(folder).map(|f| long_spelling(&f))
+}
+
+/// A pin's folder from a backup: checked like [`normalize_folder`], but never expanded, because a
+/// short name in the backup may belong to another folder here. A pin spelled with short names is
+/// skipped (`short_spelling`), for the user to pin that folder again.
+pub fn restored_folder(folder: &str) -> Result<String, &'static str> {
+    let checked = checked_folder(folder).map_err(|_| "folder_missing_here")?;
+    if long_spelling(&checked).eq_ignore_ascii_case(&checked) { Ok(checked) } else { Err("short_spelling") }
+}
+
+/// `folder` trimmed, absolute, existing and without a trailing separator, spelled as given.
+fn checked_folder(folder: &str) -> Result<String, String> {
     let trimmed = folder.trim();
     let refuse = || format!("folder must be an existing absolute folder (got {folder:?})");
     if trimmed.is_empty() || trimmed.len() > 1024 || trimmed.chars().any(char::is_control) {
@@ -42,8 +56,54 @@ pub fn normalize_folder(folder: &str) -> Result<String, String> {
     Ok(if stripped.ends_with(':') || stripped.is_empty() { spelled.clone() } else { stripped.to_string() })
 }
 
-fn same_folder(a: &str, b: &str) -> bool {
+/// `folder` with its 8.3 short names expanded: "C:\Users\RUNNER~1\repo" is
+/// "C:\Users\runneradmin\repo", the spelling Windows PowerShell reports for the current folder.
+/// A pin is expanded once, when it is pinned: a short name belongs to whichever folder holds it at
+/// the time, so expanding a saved or restored pin could point it at a folder nobody pinned. Like
+/// .NET, only a spelling with a `~` is expanded. Anything else comes back as given: a folder that
+/// is not there, a spelling with a NUL (Windows would read only the part before it), other systems.
+#[cfg(windows)]
+pub fn long_spelling(folder: &str) -> String {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetLongPathNameW;
+    if !folder.contains('~') || folder.contains('\0') {
+        return folder.to_string();
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(folder).encode_wide().chain([0]).collect();
+    // The first call asks for the length, terminating null included.
+    let need = unsafe { GetLongPathNameW(wide.as_ptr(), std::ptr::null_mut(), 0) } as usize;
+    if need == 0 {
+        return folder.to_string();
+    }
+    let mut buf = vec![0u16; need];
+    let n = unsafe { GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), need as u32) } as usize;
+    if n == 0 || n >= need {
+        return folder.to_string();
+    }
+    std::ffi::OsString::from_wide(&buf[..n]).into_string().unwrap_or_else(|_| folder.to_string())
+}
+
+#[cfg(not(windows))]
+pub fn long_spelling(folder: &str) -> String {
+    folder.to_string()
+}
+
+/// Whether two pins are spelled the same: on Windows case aside.
+fn same_spelling(a: &str, b: &str) -> bool {
     if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b }
+}
+
+/// Whether two pins name the same folder: spelled the same, or the same once short names are
+/// expanded where the folder is there, so a pin saved in its 8.3 spelling is found by its long one.
+pub(crate) fn same_folder(a: &str, b: &str) -> bool {
+    same_spelling(a, b) || (cfg!(windows) && long_spelling(a).eq_ignore_ascii_case(&long_spelling(b)))
+}
+
+/// Where `provider`'s pin on `folder` is in `pins`: one spelled the same first, and only when there
+/// is none, one whose short names name that folder (a short name may have moved to it since).
+pub(crate) fn find_pin(pins: &[ProjectPin], provider: Provider, folder: &str) -> Option<usize> {
+    pins.iter().position(|p| p.provider == provider && same_spelling(&p.folder, folder))
+        .or_else(|| pins.iter().position(|p| p.provider == provider && same_folder(&p.folder, folder)))
 }
 
 /// `pins` with `provider`'s pin on `folder` set to account `id`, or removed when `id` is None.
@@ -54,7 +114,14 @@ pub fn set(pins: &[ProjectPin], folder: &str, provider: Provider, id: Option<&st
         None => {
             let before = next.len();
             let folder = folder.trim().trim_end_matches(['\\', '/']);
-            next.retain(|p| !(p.provider == provider && same_folder(p.folder.trim_end_matches(['\\', '/']), folder)));
+            let trimmed = |p: &ProjectPin| p.folder.trim_end_matches(['\\', '/']).to_string();
+            // The pins spelled the same, if any: a short spelling may since have moved to a folder
+            // pinned under its long spelling, and removing this one must leave that pin alone.
+            if next.iter().any(|p| p.provider == provider && same_spelling(&trimmed(p), folder)) {
+                next.retain(|p| !(p.provider == provider && same_spelling(&trimmed(p), folder)));
+            } else {
+                next.retain(|p| !(p.provider == provider && same_folder(&trimmed(p), folder)));
+            }
             if next.len() == before {
                 return Err(format!("no {} pin on {folder:?}", provider.name()));
             }
@@ -65,7 +132,7 @@ pub fn set(pins: &[ProjectPin], folder: &str, provider: Provider, id: Option<&st
             }
             let folder = normalize_folder(folder)?;
             let pin = ProjectPin { folder: folder.clone(), provider, id: id.to_string() };
-            match next.iter().position(|p| p.provider == provider && same_folder(&p.folder, &folder)) {
+            match find_pin(&next, provider, &folder) {
                 Some(i) => next[i] = pin,
                 None if next.len() >= MAX_PINS => return Err(format!("at most {MAX_PINS} pins")),
                 None => next.push(pin),
@@ -96,8 +163,19 @@ pub fn launcher_path() -> Option<PathBuf> {
     bin_dir().map(|d| d.join(if cfg!(windows) { "slopbar-run.cmd" } else { "slopbar-run.ps1" }))
 }
 
+/// `text` as a PowerShell single-quoted string. PowerShell takes the typographic single quotes
+/// (‘ ’ ‚ ‛) as quotes too, so each of them is doubled as ' is.
 fn ps_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('\'');
+    for c in text.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            quoted.push(c);
+        }
+        quoted.push(c);
+    }
+    quoted.push('\'');
+    quoted
 }
 
 fn sh_quote(text: &str) -> String {
@@ -168,7 +246,8 @@ $bestLength = -1
 foreach ($pin in $pins) {{
   if ($pin.Provider -ne $provider) {{ continue }}
   $folder = $pin.Folder.Replace('/', '\').TrimEnd('\')
-  $inside = $here -eq $folder -or $here.StartsWith($folder + '\', [StringComparison]::OrdinalIgnoreCase)
+  # Ordinal: -eq follows culture rules, under which two different folders can compare equal.
+  $inside = [string]::Equals($here, $folder, [StringComparison]::OrdinalIgnoreCase) -or $here.StartsWith($folder + '\', [StringComparison]::OrdinalIgnoreCase)
   if ($inside -and $folder.Length -gt $bestLength) {{ $best = $pin; $bestLength = $folder.Length }}
 }}
 $lease = $null
@@ -219,8 +298,12 @@ const LAUNCHER_CMD: &str = "@echo off\r\nrem Generated by SlopBar: see slopbar-r
 /// no pin applies.
 pub fn write_launcher_in(dir: &Path, root: &Path, pins: &[ProjectPin], helper: Option<&Path>) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
+    // Folders as saved, never expanded here (see `long_spelling`).
     let entries: Vec<_> = pins.iter().map(|p| (p.clone(), root.join(accounts::profile_name(p.provider, &p.id)))).collect();
-    for (name, text) in [("slopbar-run.ps1", launcher_script(&entries, helper)), ("slopbar-run.cmd", LAUNCHER_CMD.to_string())] {
+    // The script starts with a byte order mark. Without one, Windows PowerShell reads it in the
+    // ANSI code page, and a folder with a letter outside ASCII in its name never matches.
+    let script = format!("\u{feff}{}", launcher_script(&entries, helper));
+    for (name, text) in [("slopbar-run.ps1", script), ("slopbar-run.cmd", LAUNCHER_CMD.to_string())] {
         let path = dir.join(name);
         if std::fs::read_to_string(&path).is_ok_and(|old| old == text) {
             continue;
@@ -322,18 +405,55 @@ mod tests {
     #[test]
     fn pins_one_account_per_provider_per_folder() {
         let repo = TempDir::new();
-        let folder = repo.0.to_string_lossy().into_owned();
+        // Pins keep the long spelling, also where the temp folder is spelled short.
+        let folder = long_spelling(&repo.0.to_string_lossy());
         let pins = set(&[], &format!("  {folder}\\ "), Provider::Claude, Some("user-1:org-1"), &known()).unwrap();
         assert_eq!(pins, [ProjectPin { folder: folder.clone(), provider: Provider::Claude, id: "user-1:org-1".into() }], "trimmed, no trailing separator");
         let pins = set(&pins, &folder, Provider::Codex, Some("user-2:acct-2"), &known()).unwrap();
         assert_eq!(pins.len(), 2, "each provider has its own pin");
-        let pins = set(&pins, &folder.to_uppercase(), Provider::Claude, Some("user-3:org-1"), &known()).unwrap();
+        // ASCII case only, as folders are compared: a temp folder may have other letters.
+        let pins = set(&pins, &folder.to_ascii_uppercase(), Provider::Claude, Some("user-3:org-1"), &known()).unwrap();
         assert_eq!(pins.len(), 2, "the same folder is re-pinned, not pinned twice");
         assert_eq!(pins.iter().find(|p| p.provider == Provider::Claude).unwrap().id, "user-3:org-1");
         let pins = set(&pins, &folder, Provider::Claude, None, &known()).unwrap();
         assert_eq!(pins.iter().map(|p| p.provider).collect::<Vec<_>>(), [Provider::Codex]);
         assert!(set(&pins, &folder, Provider::Claude, None, &known()).is_err(), "nothing to remove");
         assert_eq!(wanted(&[pins[0].clone(), ProjectPin { folder: "D:\\other".into(), ..pins[0].clone() }]), [(Provider::Codex, "user-2:acct-2".to_string())]);
+    }
+
+    /// Windows PowerShell reports the current folder in its long spelling, so pins keep that one:
+    /// a folder given in 8.3 short names is pinned, found and removed by its long spelling.
+    #[cfg(windows)]
+    #[test]
+    fn short_spellings_pin_the_long_spelling() {
+        let out = TempDir::new();
+        let dir = out.0.join("a folder with a long name");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The temp folder may be spelled short itself (GitHub's runners: C:\Users\RUNNER~1).
+        let long = long_spelling(&dir.to_string_lossy());
+        assert!(!long.contains('~'), "{long}");
+        let Some(short) = crate::test_support::short_spelling(&long) else {
+            return crate::test_support::require_short_names(&long);
+        };
+        // Windows also corrects the case of short-shaped parts (WINDOWS\TEMP is Windows\Temp).
+        assert!(long_spelling(&short).eq_ignore_ascii_case(&long), "{short}");
+        assert!(normalize_folder(&format!("{short}\\")).unwrap().eq_ignore_ascii_case(&long), "pinned by its long spelling");
+        assert!(same_folder(&short, &long.to_ascii_uppercase()));
+        // A pin saved in its short spelling is re-pinned and removed by its long one.
+        let old = [ProjectPin { folder: short.clone(), provider: Provider::Claude, id: "user-1:org-1".into() }];
+        let repinned = set(&old, &long, Provider::Claude, Some("user-3:org-1"), &known()).unwrap();
+        assert!(repinned.len() == 1 && repinned[0].folder.eq_ignore_ascii_case(&long) && repinned[0].id == "user-3:org-1", "{repinned:?}");
+        assert!(set(&old, &long, Provider::Claude, None, &known()).unwrap().is_empty());
+        // Spelling first: removing the short pin leaves a pin saved under the long spelling alone.
+        let both = [old[0].clone(), ProjectPin { folder: long.clone(), provider: Provider::Claude, id: "user-3:org-1".into() }];
+        let left = set(&both, &short, Provider::Claude, None, &known()).unwrap();
+        assert!(left.len() == 1 && left[0].folder == long, "{left:?}");
+        let gone = format!("{short}\\not there");
+        assert_eq!(long_spelling(&gone), gone, "a folder that is not there comes back as given");
+        // Windows would read only the part before a NUL, which would widen the folder to its parent.
+        let cut = format!("{short}\0\\junk");
+        assert_eq!(long_spelling(&cut), cut);
+        assert!(!same_folder(&cut, &long));
     }
 
     #[test]
@@ -379,7 +499,7 @@ mod tests {
         let profile = profiles.join(accounts::profile_name(Provider::Claude, "user-1:org-1"));
         std::fs::create_dir_all(&profile).unwrap();
         std::fs::write(profile.join(".credentials.json"), "{}").unwrap();
-        write_launcher_in(&out.0.join("bin"), &profiles, &[pin], None).unwrap();
+        write_launcher_in(&out.0.join("bin"), &profiles, &[pin.clone()], None).unwrap();
         let run = |cwd: &Path, provider: &str| {
             let output = std::process::Command::new("cmd.exe")
                 .arg("/c").arg(out.0.join("bin").join("slopbar-run.cmd")).args([provider, "--", "cmd", "/c", "set", "CLAUDE_CONFIG_DIR"])
@@ -391,6 +511,13 @@ mod tests {
         assert_eq!(run(&repo, "claude").0, expected);
         assert_eq!(run(&out.0, "claude"), (String::new(), Some(1)), "outside: untouched, and the command's exit code comes back");
         assert_eq!(run(&repo, "codex").0, "", "a pin is per provider");
+        // A pin saved in its short spelling is written as saved, never expanded: by now its short
+        // name may belong to another folder (see `long_spelling`).
+        if let Some(short) = crate::test_support::short_spelling(&pin.folder) {
+            write_launcher_in(&out.0.join("bin"), &profiles, &[ProjectPin { folder: short.clone(), ..pin.clone() }], None).unwrap();
+            assert!(std::fs::read_to_string(out.0.join("bin").join("slopbar-run.ps1")).unwrap().contains(&ps_quote(&short)), "{short}");
+            write_launcher_in(&out.0.join("bin"), &profiles, &[pin.clone()], None).unwrap();
+        }
         std::fs::remove_file(profile.join(".credentials.json")).unwrap();
         assert_eq!(run(&repo, "claude").0, "", "while the account is the CLI's sign-in the folder runs on that");
     }
@@ -457,5 +584,37 @@ mod tests {
         assert_eq!(listing(&pins, &Default::default(), |_, _| None, &root, None).pins[0].state, ProfileState::NoLogin);
         assert_eq!(wsl_path("D:\\x y\\z"), "/mnt/d/x y/z");
         assert_eq!(sh_quote("a'b"), r"'a'\''b'");
+        assert_eq!(ps_quote("a’b‘c‚d‛e'f"), "'a’’b‘‘c‚‚d‛‛e''f'", "every quote PowerShell knows is doubled");
+    }
+
+    /// Folder names Windows PowerShell could misread: typographic quotes (it takes them as quotes
+    /// too), letters outside ASCII (the script must say it is UTF-8), and names that only a
+    /// culture-aware comparison calls the same (straße and strasse).
+    #[cfg(windows)]
+    #[test]
+    fn the_launcher_reads_folder_names_as_written() {
+        let out = TempDir::new();
+        let profiles = out.0.join("profiles");
+        let (quoted, plain, sharp) = (out.0.join("café ‘bob’s’ repo"), out.0.join("strasse"), out.0.join("straße"));
+        let mut pins = Vec::new();
+        for (dir, id) in [(&quoted, "user-1:org-1"), (&plain, "user-3:org-1")] {
+            std::fs::create_dir_all(dir).unwrap();
+            let profile = profiles.join(accounts::profile_name(Provider::Claude, id));
+            std::fs::create_dir_all(&profile).unwrap();
+            std::fs::write(profile.join(".credentials.json"), "{}").unwrap();
+            pins.push(ProjectPin { folder: normalize_folder(&dir.to_string_lossy()).unwrap(), provider: Provider::Claude, id: id.into() });
+        }
+        std::fs::create_dir_all(&sharp).unwrap();
+        write_launcher_in(&out.0.join("bin"), &profiles, &pins, None).unwrap();
+        let run = |cwd: &Path| {
+            let output = std::process::Command::new("cmd.exe")
+                .arg("/c").arg(out.0.join("bin").join("slopbar-run.cmd")).args(["claude", "--", "cmd", "/c", "set", "CLAUDE_CONFIG_DIR"])
+                .current_dir(cwd).env_remove("CLAUDE_CONFIG_DIR").output().unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let set_to = |id: &str| format!("CLAUDE_CONFIG_DIR={}", profiles.join(accounts::profile_name(Provider::Claude, id)).to_string_lossy());
+        assert_eq!(run(&quoted), set_to("user-1:org-1"), "quotes and accents");
+        assert_eq!(run(&plain), set_to("user-3:org-1"));
+        assert_eq!(run(&sharp), "", "straße is another folder than strasse");
     }
 }

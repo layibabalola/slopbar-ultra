@@ -2730,7 +2730,7 @@ async fn apply_backup(app: &AppHandle, bytes: Vec<u8>, passphrase: backup::Passp
     let current = state.settings.lock().unwrap().clone();
     let now = chrono::Utc::now();
     let (merged_settings, preview, history, ledger) = {
-        let folder = |f: &str| pins::normalize_folder(f).ok();
+        let folder = |f: &str| pins::restored_folder(f);
         let presence_ok = |f: &str| settings::valid_presence_folder(f);
         let calendar_ok = |p: &str| calendar::valid_path(p);
         let here = backup::Here { known: &known, updates_enabled: updates_enabled(), folder: &folder, presence_folder_ok: &presence_ok, calendar_path_ok: &calendar_ok };
