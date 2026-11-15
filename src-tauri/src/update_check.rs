@@ -10,9 +10,10 @@
 //!   (`isolated`), so a panic or the limit ends that pass and nothing else.
 //!
 //! Not bounded: the installer once it has started, which is a program of its own; and a handover
-//! that outlives its limit, whose thread cannot be stopped. That thread keeps the install's turn
-//! (one install at a time), so the next install is deferred, or fails once it has waited past
-//! `PASS_LIMIT`.
+//! that outlives its limit, whose thread cannot be stopped. That thread keeps what the handover
+//! holds (`hand_over`): the install's turn, so the next install is deferred, or fails once it has
+//! waited past `PASS_LIMIT`; and in builds that hold one, the refresh lock, so a handover that
+//! never returns keeps refreshes waiting until SlopBar restarts.
 
 use std::future::Future;
 use std::path::Path;
@@ -118,7 +119,8 @@ struct Seen {
     next_at: Option<DateTime<Utc>>,
 }
 
-/// An install's turn: the next install can start once it is dropped.
+/// An install's turn, from its download to the end of its handover: the next install can start
+/// once it is dropped. A check does not take one.
 pub struct Turn(Arc<Mutex<Option<DateTime<Utc>>>>);
 
 impl Drop for Turn {
@@ -243,6 +245,29 @@ impl Steps {
             Err(_) => Err(format!("{name} timed out after {}", span(limit))),
         }
     }
+}
+
+/// Hands over to the installer: `install` (synchronous, and on Windows it ends this process) on a
+/// thread of its own, as a step within `limit`. `held` (the install's turn, and in builds that wait
+/// for one, the refresh lock) goes with that thread and is released only when the thread ends, so
+/// reaching the limit, which ends the wait, never frees what the installer still needs: a handover
+/// that never returns keeps it until SlopBar restarts.
+pub async fn hand_over<H: Send + 'static>(
+    steps: &Steps,
+    limit: Duration,
+    held: H,
+    install: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Result<(), String> {
+    steps
+        .run("Handing over to the installer", limit, async move {
+            tokio::task::spawn_blocking(move || {
+                let _held = held;
+                install()
+            })
+            .await
+            .map_err(|e| describe(&e))?
+        })
+        .await
 }
 
 /// `attempt` (an install, or a pass of the update loop) in a task of its own within `limit`: a
@@ -503,6 +528,25 @@ mod tests {
 
     const FIRST: Duration = Duration::from_secs(20);
     const QUARTER_HOUR: Duration = Duration::from_secs(15 * 60);
+    /// A bound on what should be quick, generous enough that a run starved of CPU never reaches it.
+    const QUICK: Duration = Duration::from_secs(30);
+    /// How long any test here may take: a test that needs a limit in the code to end fails at this
+    /// when that limit is removed, instead of hanging the run.
+    const TEST_LIMIT: Duration = Duration::from_secs(60);
+
+    /// `test` within TEST_LIMIT.
+    async fn within_test_limit<T>(test: impl Future<Output = T>) -> T {
+        tokio::time::timeout(TEST_LIMIT, test).await.expect("the test ran past its limit: a limit in the code is missing")
+    }
+
+    /// `f` on a thread of its own, waited for at most `limit`: None if it has not finished by then.
+    fn finishes_within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(f());
+        });
+        finished.recv_timeout(limit).ok()
+    }
 
     /// A server on this machine that accepts connections and never answers. Returns a URL with a
     /// synthetic signature in its query, and how many connections it took.
@@ -528,9 +572,9 @@ mod tests {
         Ok(if body.is_empty() { Outcome::UpToDate } else { Outcome::Found(body) })
     }
 
-    /// Waits up to 5 seconds for `check` to hold, without racing the task that makes it so.
+    /// Waits up to QUICK for `check` to hold, without racing the task that makes it so.
     async fn eventually(what: &str, check: impl Fn() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + QUICK;
         while !check() {
             assert!(Instant::now() < deadline, "{what}");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -575,48 +619,53 @@ mod tests {
         waited.into_inner().unwrap()
     }
 
+    /// Whether `at` is `by` after the moment `of` was taken, within 15 s either way: the waits differ
+    /// by 100 s or more, and a starved run has room.
     fn ahead(at: Option<DateTime<Utc>>, of: Instant, by: Duration) -> bool {
         let Some(at) = at else { return false };
         let expected = Utc::now() - chrono::Duration::from_std(of.elapsed()).unwrap() + chrono::Duration::from_std(by).unwrap();
-        (at - expected).num_seconds().abs() <= 2
+        (at - expected).num_seconds().abs() <= 15
     }
 
     #[tokio::test]
     async fn a_check_that_never_answers_fails_in_time_is_recorded_and_retried_soon() {
-        let (url, accepted) = silent_server().await;
-        let status = Status::default();
-        let passes = AtomicUsize::new(0);
-        // Pass 1: the request's own deadline (the updater's `timeout`) ends it. Pass 2: a request
-        // with none, which the step's limit ends.
-        let attempt = |steps: Steps| {
-            let first = passes.fetch_add(1, SeqCst) == 0;
-            let url = url.clone();
-            async move {
-                let client = if first { reqwest::Client::builder().timeout(Duration::from_millis(300)) } else { reqwest::Client::builder() };
-                let client = client.no_proxy().build().unwrap();
-                let limit = if first { Duration::from_secs(10) } else { Duration::from_millis(400) };
-                steps.run("The update check", limit, fetch(client, url)).await
-            }
-        };
-        let waited = run_until(&status, 3, || true, attempt).await;
-        eventually("the server took both connections and kept quiet", || accepted.load(SeqCst) == 2).await;
+        within_test_limit(async {
+            let (url, accepted) = silent_server().await;
+            let status = Status::default();
+            let passes = AtomicUsize::new(0);
+            // Pass 1: the request's own deadline (the updater's `timeout`) ends it. Pass 2: a request
+            // with none, which the step's limit ends.
+            let attempt = |steps: Steps| {
+                let first = passes.fetch_add(1, SeqCst) == 0;
+                let url = url.clone();
+                async move {
+                    let client = if first { reqwest::Client::builder().timeout(Duration::from_millis(300)) } else { reqwest::Client::builder() };
+                    let client = client.no_proxy().build().unwrap();
+                    let limit = if first { Duration::from_secs(10) } else { Duration::from_millis(400) };
+                    steps.run("The update check", limit, fetch(client, url)).await
+                }
+            };
+            let waited = run_until(&status, 3, || true, attempt).await;
+            eventually("the server took both connections and kept quiet", || accepted.load(SeqCst) == 2).await;
 
-        assert_eq!(waited.iter().map(|w| w.wait).collect::<Vec<_>>(), [FIRST, RETRY_AFTER, QUARTER_HOUR]);
-        assert!(waited[0].last.is_none() && ahead(waited[0].next_at, waited[0].at, FIRST));
+            assert_eq!(waited.iter().map(|w| w.wait).collect::<Vec<_>>(), [FIRST, RETRY_AFTER, QUARTER_HOUR]);
+            assert!(waited[0].last.is_none() && ahead(waited[0].next_at, waited[0].at, FIRST));
 
-        let took = waited[1].at - waited[0].at;
-        assert!(took >= Duration::from_millis(300) && took < Duration::from_secs(10), "pass 1 took {took:?}");
-        let Some(Outcome::Failed(error)) = &waited[1].last else { panic!("{:?}", waited[1]) };
-        assert!(error.starts_with("The update check failed: ") && error.contains("timed out"), "{error}");
-        assert!(error.contains("http://127.0.0.1:") && error.contains("/latest.json"), "{error}");
-        assert!(!error.contains("Signature") && !error.contains("synthetic-signature") && !error.contains('?'), "{error}");
-        assert!(ahead(waited[1].next_at, waited[1].at, RETRY_AFTER), "the retry is scheduled two minutes on");
+            let took = waited[1].at - waited[0].at;
+            assert!(took >= Duration::from_millis(300) && took < QUICK, "pass 1 took {took:?}");
+            let Some(Outcome::Failed(error)) = &waited[1].last else { panic!("{:?}", waited[1]) };
+            assert!(error.starts_with("The update check failed: ") && error.contains("timed out"), "{error}");
+            assert!(error.contains("http://127.0.0.1:") && error.contains("/latest.json"), "{error}");
+            assert!(!error.contains("Signature") && !error.contains("synthetic-signature") && !error.contains('?'), "{error}");
+            assert!(ahead(waited[1].next_at, waited[1].at, RETRY_AFTER), "the retry is scheduled two minutes on");
 
-        let took = waited[2].at - waited[1].at;
-        assert!(took >= Duration::from_millis(400) && took < Duration::from_secs(10), "pass 2 took {took:?}");
-        assert_eq!(waited[2].last, Some(Outcome::Failed("The update check timed out after 400 ms".into())));
-        assert!(ahead(waited[2].next_at, waited[2].at, QUARTER_HOUR), "failing again, the loop keeps its interval");
-        assert_eq!(status.last().unwrap().by, Trigger::Auto);
+            let took = waited[2].at - waited[1].at;
+            assert!(took >= Duration::from_millis(400) && took < QUICK, "pass 2 took {took:?}");
+            assert_eq!(waited[2].last, Some(Outcome::Failed("The update check timed out after 400 ms".into())));
+            assert!(ahead(waited[2].next_at, waited[2].at, QUARTER_HOUR), "failing again, the loop keeps its interval");
+            assert_eq!(status.last().unwrap().by, Trigger::Auto);
+        })
+        .await
     }
 
     #[tokio::test]
@@ -624,74 +673,83 @@ mod tests {
         fn boom() -> Result<Outcome, String> {
             panic!("synthetic panic")
         }
-        let status = Status::default();
-        let passes = AtomicUsize::new(0);
-        let attempt = |steps: Steps| {
-            let first = passes.fetch_add(1, SeqCst) == 0;
-            async move {
-                if first {
-                    steps.run("The download", Duration::from_secs(10), async { boom() }).await
-                } else {
-                    Ok::<_, String>(Outcome::UpToDate)
+        within_test_limit(async {
+            let status = Status::default();
+            let passes = AtomicUsize::new(0);
+            let attempt = |steps: Steps| {
+                let first = passes.fetch_add(1, SeqCst) == 0;
+                async move {
+                    if first {
+                        steps.run("The download", Duration::from_secs(10), async { boom() }).await
+                    } else {
+                        Ok::<_, String>(Outcome::UpToDate)
+                    }
                 }
-            }
-        };
-        let waited = run_until(&status, 3, || true, attempt).await;
-        assert_eq!(waited.iter().map(|w| w.wait).collect::<Vec<_>>(), [FIRST, RETRY_AFTER, QUARTER_HOUR]);
-        assert_eq!(waited[1].last, Some(Outcome::Failed("The download panicked: synthetic panic".into())));
-        assert_eq!(waited[2].last, Some(Outcome::UpToDate));
+            };
+            let waited = run_until(&status, 3, || true, attempt).await;
+            assert_eq!(waited.iter().map(|w| w.wait).collect::<Vec<_>>(), [FIRST, RETRY_AFTER, QUARTER_HOUR]);
+            assert_eq!(waited[1].last, Some(Outcome::Failed("The download panicked: synthetic panic".into())));
+            assert_eq!(waited[2].last, Some(Outcome::UpToDate));
+        })
+        .await
     }
 
     #[tokio::test]
     async fn a_pass_past_its_limit_is_stopped_and_says_where() {
-        let dropped = Arc::new(AtomicBool::new(false));
         struct Flag(Arc<AtomicBool>);
         impl Drop for Flag {
             fn drop(&mut self) {
                 self.0.store(true, SeqCst);
             }
         }
-        let flag = Flag(dropped.clone());
-        let started = Instant::now();
-        let outcome = isolated(Duration::from_millis(200), move |steps| async move {
-            let _flag = flag;
-            steps.run("The download", Duration::from_secs(60), std::future::pending::<Result<(), String>>()).await.map(|()| Outcome::UpToDate)
+        within_test_limit(async {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let flag = Flag(dropped.clone());
+            let started = Instant::now();
+            let outcome = isolated(Duration::from_millis(200), move |steps| async move {
+                let _flag = flag;
+                steps.run("The download", TEST_LIMIT * 2, std::future::pending::<Result<(), String>>()).await.map(|()| Outcome::UpToDate)
+            })
+            .await;
+            assert!(started.elapsed() < QUICK);
+            assert_eq!(outcome, Outcome::Failed("The update timed out after 200 ms in: The download".into()));
+            eventually("the pass's task is stopped", || dropped.load(SeqCst)).await;
         })
-        .await;
-        assert!(started.elapsed() < Duration::from_secs(5));
-        assert_eq!(outcome, Outcome::Failed("The update timed out after 200 ms in: The download".into()));
-        eventually("the pass's task is stopped", || dropped.load(SeqCst)).await;
+        .await
     }
 
     #[tokio::test]
     async fn the_loop_keeps_one_schedule_across_passes() {
-        let status = Status::default();
-        let failed = || Err::<Outcome, String>("synthetic failure".into());
-        let script = Mutex::new(VecDeque::from([
-            failed(),
-            failed(),
-            Ok(Outcome::UpToDate),
-            Ok(Outcome::Deferred(ALREADY_INSTALLING.into())),
-            failed(),
-            failed(),
-            failed(),
-            failed(),
-        ]));
-        let attempt = |_: Steps| {
-            let next = script.lock().unwrap().pop_front().expect("a scripted pass");
-            async move { next }
-        };
-        // Automatic updates go off for one pass (the 7th), which resets the count.
-        let asked = AtomicUsize::new(0);
-        let auto = || asked.fetch_add(1, SeqCst) != 6;
-        let waited = run_until(&status, 10, auto, attempt).await;
-        let r = RETRY_AFTER;
-        let e = QUARTER_HOUR;
-        assert_eq!(waited.iter().map(|w| w.wait).collect::<Vec<_>>(), [FIRST, r, e, e, e, r, e, e, r, e]);
-        assert_eq!(waited[4].last, Some(Outcome::Deferred(ALREADY_INSTALLING.into())));
-        for w in &waited {
-            assert!(ahead(w.next_at, w.at, w.wait), "each wait is scheduled: {w:?}");
-        }
+        within_test_limit(async {
+            let status = Status::default();
+            let failed = || Err::<Outcome, String>("synthetic failure".into());
+            let script = Mutex::new(VecDeque::from([
+                failed(),
+                failed(),
+                Ok(Outcome::UpToDate),
+                Ok(Outcome::Deferred(ALREADY_INSTALLING.into())),
+                failed(),
+                failed(),
+                failed(),
+                failed(),
+            ]));
+            let attempt = |_: Steps| {
+                let next = script.lock().unwrap().pop_front().expect("a scripted pass");
+                async move { next }
+            };
+            // Automatic updates go off for one pass (the 7th), which resets the count.
+            let asked = AtomicUsize::new(0);
+            let auto = || asked.fetch_add(1, SeqCst) != 6;
+            let waited = run_until(&status, 10, auto, attempt).await;
+            let r = RETRY_AFTER;
+            let e = QUARTER_HOUR;
+            assert_eq!(waited.iter().map(|w| w.wait).collect::<Vec<_>>(), [FIRST, r, e, e, e, r, e, e, r, e]);
+            assert_eq!(waited[4].last, Some(Outcome::Deferred(ALREADY_INSTALLING.into())));
+            for w in &waited {
+                assert!(ahead(w.next_at, w.at, w.wait), "each wait is scheduled: {w:?}");
+            }
+        })
+        .await
     }
 
     #[test]
@@ -732,30 +790,132 @@ mod tests {
 
     /// The function in `code` whose signature starts `signature`, to the first line that is `}`.
     fn body<'a>(code: &'a str, signature: &str) -> &'a str {
-        let start = code.find(signature).unwrap_or_else(|| panic!("updates.rs has no `{signature}`"));
+        let start = code.find(signature).unwrap_or_else(|| panic!("no `{signature}`"));
         let rest = &code[start..];
         rest.find("\n}").map_or(rest, |end| &rest[..end + 2])
     }
 
-    /// updates.rs keeps every deadline and limit wired: no test of the plugin itself can see them.
+    /// The call whose opening parenthesis is at byte `open` of `code`, to its closing one.
+    fn call_at(code: &str, open: usize) -> &str {
+        assert_eq!(code.as_bytes()[open], b'(', "a call opens at byte {open}");
+        let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
+        for (i, b) in code.bytes().enumerate().skip(open) {
+            if quoted {
+                match b {
+                    _ if escaped => escaped = false,
+                    b'\\' => escaped = true,
+                    b'"' => quoted = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match b {
+                b'"' => quoted = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &code[open..=i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the call at byte {open} never closes");
+    }
+
+    /// Every call of `name` in `code`, each from its opening parenthesis to its closing one.
+    fn calls<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
+        code.match_indices(name)
+            .filter(|(at, _)| code[at + name.len()..].starts_with('('))
+            .map(|(at, _)| call_at(code, at + name.len()))
+            .collect()
+    }
+
+    /// How often `word` stands alone in `code`, not inside a longer name.
+    fn words(code: &str, word: &str) -> usize {
+        let named = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        code.match_indices(word).filter(|(at, _)| !named(code[..*at].chars().next_back()) && !named(code[at + word.len()..].chars().next())).count()
+    }
+
+    /// Each step (`.run("<name>", <limit>, ..)`) in `code`: its name, its limit and the whole call.
+    fn steps_in(code: &str) -> Vec<(&str, &str, &str)> {
+        calls(code, ".run")
+            .into_iter()
+            .filter(|call| call.starts_with("(\""))
+            .map(|call| {
+                let name = call[2..].split('"').next().unwrap();
+                let rest = call[2 + name.len() + 1..].trim_start_matches(|c: char| c == ',' || c.is_whitespace());
+                (name, rest.split(',').next().unwrap().trim(), call)
+            })
+            .collect()
+    }
+
+    /// updates.rs applies every deadline where it belongs, which no test of the plugin itself can
+    /// see: the limit each step runs within and the work it wraps, where the turn is taken, and
+    /// that what the handover holds is bound once and handed to it, never let go before.
     #[test]
-    fn updates_rs_applies_every_deadline() {
+    fn updates_rs_wires_each_deadline_to_its_own_step() {
         let code = code(include_str!("updates.rs"));
         let updater = body(&code, "fn updater(");
         assert!(updater.contains(".timeout(update_check::CHECK_TIMEOUT)"), "the check's request deadline, on the builder:\n{updater}");
-        assert!(updater.contains(".configure_client(") && updater.contains(".read_timeout(update_check::STALL_TIMEOUT)"), "the stall limit:\n{updater}");
-        let install = body(&code, "async fn install_now(");
-        assert!(install.contains("update.timeout = Some(update_check::DOWNLOAD_TIMEOUT)"), "the download's deadline, on the update:\n{install}");
-        assert!(install.contains(".begin_install()"), "one install at a time");
-        for limit in ["update_check::CHECK_LIMIT", "update_check::DOWNLOAD_LIMIT", "update_check::HANDOFF_LIMIT"] {
-            assert!(install.contains(limit), "an install's steps run within {limit}");
+        assert!(updater.contains(".configure_client(|client| client.read_timeout(update_check::STALL_TIMEOUT))"), "the stall limit:\n{updater}");
+
+        let expected = [
+            ("The update check", "update_check::CHECK_LIMIT", "updater(app)?.check()"),
+            ("The download", "update_check::DOWNLOAD_LIMIT", "update.download("),
+            ("Waiting for a refresh to finish", "update_check::REFRESH_WAIT_LIMIT", "refresh_lock"),
+        ];
+        let steps = steps_in(&code);
+        for (name, limit, call) in &steps {
+            let (_, want, work) = expected.iter().find(|(n, ..)| n == name).unwrap_or_else(|| panic!("a step updates.rs should not have: {name}"));
+            assert_eq!(limit, want, "{name} runs within {want}");
+            assert!(call.contains(work), "{name} wraps `{work}`:\n{call}");
         }
-        assert!(install.contains("spawn_blocking("), "the handover runs on a thread of its own, so its limit can end the wait");
-        assert!(body(&code, "pub async fn check(").contains("update_check::CHECK_LIMIT"), "a check asked for has its limit");
-        assert!(body(&code, "pub async fn install(").contains("update_check::isolated(update_check::PASS_LIMIT"), "an install asked for runs isolated");
-        let looped = body(&code, "pub async fn run_loop(");
-        assert!(looped.contains("update_check::run_loop(") && looped.contains("update_check::PASS_LIMIT") && looped.contains("EVERY"), "{looped}");
+        assert_eq!(steps.iter().filter(|(n, ..)| *n == "The update check").count(), 2, "check() and install_now each check as a step");
+        assert_eq!(steps.iter().filter(|(n, ..)| *n == "The download").count(), 1, "install_now downloads as a step");
+
+        let install = body(&code, "async fn install_now(");
+        let at = |what: &str| install.find(what).unwrap_or_else(|| panic!("install_now lost `{what}`:\n{install}"));
+        let turn = at("let turn = match app.state::<AppState>().update_check.begin_install()");
+        assert!(at("\"The update check\"") < turn && turn < at("\"The download\""), "a check holds no turn; the download does");
+        assert!(at("update.timeout = Some(update_check::DOWNLOAD_TIMEOUT)") < at("\"The download\""), "the download's deadline is on the update before it downloads");
+        let handovers = calls(install, "update_check::hand_over");
+        assert_eq!(handovers.len(), 1, "one handover:\n{install}");
+        let handover = handovers[0];
+        assert!(handover.starts_with("(steps, update_check::HANDOFF_LIMIT, "), "the handover runs within HANDOFF_LIMIT: {handover}");
+        assert!(handover.contains("update.install(bytes)"), "{handover}");
+        let after = &install[turn..];
+        let after = &after[after.find("};").expect("the turn's binding ends") + 2..];
+        assert_eq!((words(after, "turn"), words(handover, "turn")), (1, 1), "once bound, the turn is used only to hand it to the handover");
+
+        let manual = calls(body(&code, "pub async fn install("), "update_check::isolated");
+        assert!(manual.len() == 1 && manual[0].starts_with("(update_check::PASS_LIMIT, ") && manual[0].contains("install_now("), "an install asked for runs isolated within PASS_LIMIT: {manual:?}");
+        let looped = calls(body(&code, "pub async fn run_loop("), "update_check::run_loop");
+        assert!(looped.len() == 1 && looped[0].starts_with("(&state.update_check, FIRST_CHECK, EVERY, update_check::PASS_LIMIT, "), "{looped:?}");
         assert!(code.contains("const EVERY: Duration = Duration::from_secs(6 * 60 * 60);"), "the interval is unchanged");
+    }
+
+    /// The exit cleanup bounds each part that can wait, and the door answers at once while an
+    /// install runs (app.rs).
+    #[test]
+    fn the_exit_cleanup_and_the_door_keep_their_limits() {
+        let app = code(include_str!("app.rs"));
+        let exit = body(&app, "pub(crate) fn on_exit(");
+        assert!(!exit.contains(".lock().unwrap()"), "a poisoned lock cannot panic the exit:\n{exit}");
+        let bounded = calls(exit, "wait_at_most");
+        assert!(bounded.len() == 2 && bounded.iter().all(|c| c.starts_with("(EXIT_PART_LIMIT, ")), "{bounded:?}");
+        for part in ["presence::withdraw(", "settings.lock()", "signin::close_all"] {
+            let inside: usize = bounded.iter().map(|c| c.matches(part).count()).sum();
+            assert!(inside == 1 && exit.matches(part).count() == 1, "`{part}` runs within wait_at_most(EXIT_PART_LIMIT, ..):\n{exit}");
+        }
+        assert!(exit.contains(".settings.lock().unwrap_or_else(|e| e.into_inner())"), "{exit}");
+        assert!(exit.contains("diagnostics.record(None, None, diagnostics::Event::Shutdown)"), "the journal, which waits FLUSH_WAIT at most");
+
+        let arm = &app[app.find("R::InstallUpdate => {").expect("the door's install_update")..];
+        let arm = &arm[..arm.find("\n        }").expect("its end")];
+        let blocked = arm.find("if let Some(reason) = updates::install_blocked(&app) {").unwrap_or_else(|| panic!("install_update answers at once while an install runs:\n{arm}"));
+        assert!(blocked < arm.find("check_for_updates(").expect("its check"), "before it checks:\n{arm}");
     }
 
     #[test]
@@ -770,35 +930,73 @@ mod tests {
         // A handover stuck past its limit keeps its turn: past the pass limit, that is a failure.
         let stuck = status.begin_install().ok().unwrap();
         *lock(&status.install) = Some(Utc::now() - chrono::Duration::minutes(40));
-        assert_eq!(status.begin_install().err(), Some(Outcome::Failed("An install started 40 min ago has not finished".into())));
+        let failed = status.begin_install().err();
+        assert!(matches!(&failed, Some(Outcome::Failed(text)) if text.starts_with("An install started 40 min") && text.ends_with(" ago has not finished")), "{failed:?}");
         drop(stuck);
         assert!(status.begin_install().is_ok());
     }
 
+    #[tokio::test]
+    async fn a_handover_past_its_limit_keeps_what_it_holds_until_its_thread_ends() {
+        within_test_limit(async {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            let held = lock.clone().lock_owned().await;
+            let (finish, installing) = std::sync::mpsc::channel::<()>();
+            let steps = Steps::default();
+            let started = Instant::now();
+            let result = hand_over(&steps, Duration::from_millis(100), held, move || {
+                let _ = installing.recv();
+                Ok(())
+            })
+            .await;
+            assert_eq!(result, Err("Handing over to the installer timed out after 100 ms".into()));
+            assert!(started.elapsed() < QUICK);
+            assert!(lock.try_lock().is_err(), "still held while the handover's thread runs");
+            drop(finish);
+            eventually("let go once that thread ends", || lock.try_lock().is_ok()).await;
+            // In time, it returns the installer's result, and lets go.
+            let held = lock.clone().lock_owned().await;
+            assert_eq!(hand_over(&steps, QUICK, held, || Err("synthetic failure".into())).await, Err("Handing over to the installer failed: synthetic failure".into()));
+            eventually("let go", || lock.try_lock().is_ok()).await;
+        })
+        .await
+    }
+
     #[test]
     fn an_exit_part_that_hangs_is_left_behind_in_time() {
-        let started = Instant::now();
-        assert!(!wait_at_most(Duration::from_millis(100), || std::thread::sleep(Duration::from_secs(10))));
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        // A part that never ends by itself: wait_at_most gives up at its limit. Were the limit gone,
+        // this would fail at QUICK instead of hanging.
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let gave_up = finishes_within(QUICK, move || {
+            wait_at_most(Duration::from_millis(100), move || {
+                let _ = blocked.recv();
+            })
+        });
+        assert_eq!(gave_up, Some(false), "a part that hangs is left behind at its limit");
+        drop(release);
+        // A quick part finishes, however starved the run: its limit is generous.
         let ran = Arc::new(AtomicBool::new(false));
         let flag = ran.clone();
-        assert!(wait_at_most(Duration::from_secs(5), move || flag.store(true, SeqCst)));
+        assert!(wait_at_most(QUICK, move || flag.store(true, SeqCst)));
         assert!(ran.load(SeqCst));
         // A part that panics only ends its own thread.
-        assert!(!wait_at_most(Duration::from_secs(5), || panic!("synthetic panic")));
+        assert_eq!(finishes_within(QUICK, || wait_at_most(QUICK, || panic!("synthetic panic"))), Some(false));
     }
 
     #[tokio::test]
     async fn a_step_says_which_step_failed_or_ran_out_of_time() {
-        let steps = Steps::default();
-        assert_eq!(steps.current(), "Starting the update");
-        assert_eq!(steps.run("The download", Duration::from_secs(5), async { Ok::<_, String>(7) }).await, Ok(7));
-        assert_eq!(steps.current(), "The download");
-        assert_eq!(steps.run("The download", Duration::from_secs(5), async { Err::<(), _>("no".to_string()) }).await, Err("The download failed: no".into()));
-        let started = Instant::now();
-        let stalled = steps.run("Handing over to the installer", Duration::from_millis(50), std::future::pending::<Result<(), String>>()).await;
-        assert_eq!(stalled, Err("Handing over to the installer timed out after 50 ms".into()));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        within_test_limit(async {
+            let steps = Steps::default();
+            assert_eq!(steps.current(), "Starting the update");
+            assert_eq!(steps.run("The download", QUICK, async { Ok::<_, String>(7) }).await, Ok(7));
+            assert_eq!(steps.current(), "The download");
+            assert_eq!(steps.run("The download", QUICK, async { Err::<(), _>("no".to_string()) }).await, Err("The download failed: no".into()));
+            let started = Instant::now();
+            let stalled = steps.run("Handing over to the installer", Duration::from_millis(50), std::future::pending::<Result<(), String>>()).await;
+            assert_eq!(stalled, Err("Handing over to the installer timed out after 50 ms".into()));
+            assert!(started.elapsed() < QUICK);
+        })
+        .await
     }
 
     #[test]

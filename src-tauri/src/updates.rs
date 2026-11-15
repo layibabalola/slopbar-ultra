@@ -80,15 +80,16 @@ pub async fn install(app: &AppHandle) -> Result<(), String> {
 /// Installs the newest release, if there is one, and restarts into it, each step within its limit.
 /// Returns only when there is none, when it is deferred, or on failure.
 async fn install_now(app: &AppHandle, by: Trigger, steps: &Steps) -> Result<Outcome, String> {
+    let found = steps
+        .run("The update check", update_check::CHECK_LIMIT, async { updater(app)?.check().await.map_err(|e| describe(&e)) })
+        .await?;
+    let Some(mut update) = found else { return Ok(Outcome::UpToDate) };
+    // One install at a time, from its download to the end of its handover (a check takes no turn).
     let turn = match app.state::<AppState>().update_check.begin_install() {
         Ok(turn) => turn,
         Err(Outcome::Failed(error)) => return Err(error),
         Err(outcome) => return Ok(outcome),
     };
-    let found = steps
-        .run("The update check", update_check::CHECK_LIMIT, async { updater(app)?.check().await.map_err(|e| describe(&e)) })
-        .await?;
-    let Some(mut update) = found else { return Ok(Outcome::UpToDate) };
     // The check's deadline does not carry over: the updater leaves the download without one.
     update.timeout = Some(update_check::DOWNLOAD_TIMEOUT);
     let bytes = steps
@@ -96,18 +97,8 @@ async fn install_now(app: &AppHandle, by: Trigger, steps: &Steps) -> Result<Outc
         .await?;
     record(app, by, Outcome::Installing(update.version.clone()));
     let _ = app.emit("update-installing", &update.version);
-    // Synchronous, and on Windows it ends this process: on a thread of its own, so its limit can end
-    // the wait. The turn goes with it, so no other install starts while that thread runs.
-    steps
-        .run("Handing over to the installer", update_check::HANDOFF_LIMIT, async move {
-            tokio::task::spawn_blocking(move || {
-                let _turn = turn;
-                update.install(bytes).map_err(|e| describe(&e))
-            })
-            .await
-            .map_err(|e| describe(&e))?
-        })
-        .await?;
+    // On a thread of its own, holding the turn until that thread ends (see `hand_over`).
+    update_check::hand_over(steps, update_check::HANDOFF_LIMIT, turn, move || update.install(bytes).map_err(|e| describe(&e))).await?;
     app.restart();
 }
 
