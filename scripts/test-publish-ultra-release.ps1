@@ -44,6 +44,19 @@ function Set-Conf([string]$pubkey) {
 $secrets = @()
 $channelBroken = $false
 $onCreate = $null
+# Workflow runs, oldest first: databaseId, url, status, conclusion, branch (ultra or a tag) and
+# commit. `gh run list` lists them newest first, as gh does, and starts a run for a tag on origin
+# the first time it is asked about one (as a pushed tag would). `gh run watch` calls $onWatch with
+# the run (to publish, or to be cancelled, as a real run might) and then completes it.
+$runs = @()
+$onWatch = $null
+$watchFails = $false
+function Add-Run([string]$branch, [string]$commit, [string]$status = 'queued', [string]$conclusion = '') {
+  $id = 100 + @($script:runs).Count
+  $run = [pscustomobject]@{ databaseId = $id; url = "https://example.invalid/runs/$id"; status = $status; conclusion = $conclusion; branch = $branch; commit = $commit }
+  $script:runs = @($script:runs) + $run
+  return $run
+}
 function gh {
   $ErrorActionPreference = 'Continue'
   $global:LASTEXITCODE = 0
@@ -51,7 +64,7 @@ function gh {
   for ($i = 0; $i -lt $args.Count; $i++) {
     $a = [string]$args[$i]
     if ($a -match '^(--[a-z-]+)=(.*)$') { $opt[$Matches[1]] = $Matches[2] }
-    elseif ($a -cin '-R', '-p', '-D', '--target', '--title', '--notes', '--json', '--jq') { $opt[$a] = [string]$args[++$i] }
+    elseif ($a -cin '-R', '-p', '-D', '--target', '--title', '--notes', '--json', '--jq', '--workflow', '--event', '--branch', '--commit', '--limit', '--interval', '--status') { $opt[$a] = [string]$args[++$i] }
     elseif ($a.StartsWith('-')) { $opt[$a] = $true }
     else { $pos += $a }
   }
@@ -85,6 +98,25 @@ function gh {
       foreach ($f in @($pos | Select-Object -Skip 3)) { Copy-Item -LiteralPath $f (Join-Path $dir 'assets') -Force }
     }
     'secret list' { $script:secrets }
+    'run list' {
+      $branch = $opt['--branch']
+      if ($branch -like 'ultra-v*' -and -not @($script:runs | Where-Object { $_.branch -eq $branch })) {
+        $sha = git -C $origin rev-parse -q --verify "refs/tags/$branch^{commit}"
+        if ($sha) { $null = Add-Run $branch $sha }
+      }
+      $found = @($script:runs | Where-Object {
+          (-not $branch -or $_.branch -eq $branch) -and (-not $opt['--commit'] -or $_.commit -eq $opt['--commit']) -and (-not $opt['--status'] -or $_.status -eq $opt['--status']) })
+      [array]::Reverse($found)
+      $limit = if ($opt['--limit']) { [int]$opt['--limit'] } else { 20 }
+      ConvertTo-Json -InputObject @($found | Select-Object -First $limit databaseId, url, status, conclusion) -Compress
+    }
+    'run watch' {
+      # Without --exit-status, gh exits 0 once the run completes, whatever its conclusion.
+      $run = @($script:runs | Where-Object { "$($_.databaseId)" -eq $pos[2] })[0]
+      if (-not $run -or $script:watchFails) { & $refuse "could not watch run $($pos[2])"; return }
+      if ($script:onWatch) { & $script:onWatch $run }
+      $run.status = 'completed'
+    }
     default { & $refuse "the test's gh does not know: gh $args" }
   }
 }
@@ -310,6 +342,96 @@ try {
   Invoke-Work checkout -q ultra
   $Auto = $false
   Check 'the build number counts the channel too' ((Get-HighestBuild '0.1.0' '0.1.0-ultra.70') -eq 70 -and (Get-HighestBuild '0.1.0' '0.2.0-ultra.90') -lt 70)
+
+  # -ViaActions has the workflow publish origin/ultra, and never races a run. A push that changes
+  # what ships publishes itself: it follows that run and pushes no tag.
+  $secrets = @('ULTRA_UPDATER_KEY', 'ULTRA_UPDATER_KEY_PASSWORD')
+  $pollSeconds = 0
+  $Before = ''
+  $runs = @()
+  New-Stage
+  $null = Invoke-Check
+  $r = Read-StageFile 'release.json'
+  $null = Add-Run 'ultra' $r.commit 'in_progress'
+  # The push's run publishes under the number it picks, which need not be the one Check picked here.
+  $onWatch = { param($run) git -C $origin tag ultra-v0.1.0-ultra.62 $run.commit; Set-ChannelVersion '0.1.0-ultra.62'; $run.conclusion = 'success' }
+  $out = Invoke-ViaActions | Out-String
+  Check '-ViaActions follows the run of a push that publishes itself, and pushes no tag' ($out -match 'Published 0\.1\.0-ultra\.62' -and -not (Get-OriginTag $r.tag))
+  New-Stage
+  $null = Invoke-Check
+  $r = Read-StageFile 'release.json'
+  $out = Invoke-ViaActions | Out-String
+  Check '-ViaActions publishes nothing once the channel has the commit' ($out -match 'Nothing to publish' -and -not (Get-OriginTag $r.tag))
+  $fix = Add-Commit 'src/app.js' 'another fix'
+  New-Stage
+  $null = Invoke-Check
+  $r = Read-StageFile 'release.json'
+  Check '-ViaActions pushes no tag while the push it follows has no run' ((Get-Refusal { Invoke-ViaActions }) -match 'started no release run' -and -not (Get-OriginTag $r.tag))
+  # A failed run of the push is left to a re-run: a tag's run would race that.
+  $null = Add-Run 'ultra' $fix 'completed' 'failure'
+  Check '-ViaActions leaves a failed push run to a re-run, and pushes no tag' ((Get-Refusal { Invoke-ViaActions }) -match 'gh run rerun' -and -not (Get-OriginTag $r.tag))
+  # A newer push replaced the waiting run (cancelling it): the newer run publishes the commit too.
+  $null = Add-Run 'ultra' $fix 'pending'
+  $newer = Add-Commit 'src/app.js' 'a newer fix'
+  Invoke-Work checkout -q --detach $fix
+  $null = Add-Run 'ultra' $newer 'in_progress'
+  $onWatch = {
+    param($run)
+    if ($run.commit -eq $fix) { $run.conclusion = 'cancelled'; return }
+    git -C $origin tag ultra-v0.1.0-ultra.70 $run.commit; Set-ChannelVersion '0.1.0-ultra.70'; $run.conclusion = 'success'
+  }
+  $out = Invoke-ViaActions | Out-String
+  Check '-ViaActions follows the newer push that replaced its run' ($out -match 'Published 0\.1\.0-ultra\.70' -and -not (Get-OriginTag $r.tag))
+  Invoke-Work checkout -q ultra
+  # A push that ships (W) runs while a docs-only push (X) waits. W's run publishes W, and X's run
+  # then finds nothing to publish: X has nothing that ships which the channel lacks.
+  $shipW = Add-Commit 'src/app.js' 'ships'
+  $docsX = Add-Commit 'docs/notes.md' 'docs after it'
+  New-Stage
+  $null = Invoke-Check
+  $r = Read-StageFile 'release.json'
+  $runW = Add-Run 'ultra' $shipW 'in_progress'
+  $null = Add-Run 'ultra' $docsX 'pending'
+  $onWatch = {
+    param($run)
+    git -C $origin tag ultra-v0.1.0-ultra.75 $shipW; Set-ChannelVersion '0.1.0-ultra.75'
+    $runW.status = 'completed'; $runW.conclusion = 'success'; $run.conclusion = 'success'
+  }
+  $out = Invoke-ViaActions | Out-String
+  Check '-ViaActions publishes nothing more once a newer release has all that ships' ($out -match 'Nothing to publish: nothing that ships' -and -not (Get-OriginTag $r.tag))
+  # Documentation alone is never published.
+  New-Stage
+  $null = Invoke-Check
+  $out = Invoke-ViaActions | Out-String
+  Check '-ViaActions publishes no documentation-only commit' ($out -match 'Nothing to publish: nothing that ships')
+  # A commit whose push publishes nothing although the release tooling changed gets a tag, but only
+  # while no run is unfinished, and a failed watch is not taken for a run that did not publish.
+  $tooling2 = Add-Commit 'scripts/publish-ultra-release.ps1' 'tooling changed'
+  New-Stage
+  $null = Invoke-Check
+  $r = Read-StageFile 'release.json'
+  $pushRun = Add-Run 'ultra' $tooling2 'in_progress'
+  Check '-ViaActions pushes no tag while a release run is unfinished' ((Get-Refusal { Invoke-ViaActions }) -match 'has not finished' -and -not (Get-OriginTag $r.tag))
+  $pushRun.status = 'completed'; $pushRun.conclusion = 'success'
+  $watchFails = $true
+  Check '-ViaActions reports a watch that failed as such' ((Get-Refusal { Invoke-ViaActions }) -match 'Could not watch')
+  $watchFails = $false
+  $onWatch = { param($run) Set-ChannelVersion ($run.branch -replace '^ultra-v'); $run.conclusion = 'success' }
+  $out = Invoke-ViaActions | Out-String
+  Check '-ViaActions follows its tag, once pushed, to the release' ($out -match "Published $([regex]::Escape($r.version))" -and (Get-OriginTag $r.tag) -eq $tooling2)
+  # A tag already on the commit (another run of this) is followed, not doubled; when its run
+  # failed, the way out is a re-run.
+  $tooling3 = Add-Commit 'scripts/publish-ultra-release.ps1' 'more tooling'
+  New-Stage
+  $null = Invoke-Check
+  $r = Read-StageFile 'release.json'
+  Invoke-Work push -q origin "$($tooling3):refs/tags/ultra-v0.1.0-ultra.90"
+  $null = Add-Run 'ultra-v0.1.0-ultra.90' $tooling3 'completed' 'failure'
+  Check "-ViaActions names the re-run when the tag's run failed" ((Get-Refusal { Invoke-ViaActions }) -match 'gh run rerun' -and -not (Get-OriginTag $r.tag))
+  $null = Add-Run 'ultra-v0.1.0-ultra.90' $tooling3 'queued'
+  $out = Invoke-ViaActions | Out-String
+  Check '-ViaActions follows a tag already on the commit instead of adding one' ($out -match 'Published 0\.1\.0-ultra\.90' -and -not (Get-OriginTag $r.tag))
+  $onWatch = $null; $runs = @(); $pollSeconds = 5
   $publisher = Join-Path $PSScriptRoot 'publish-ultra-release.ps1'
   $both = pwsh -NoProfile -File $publisher -Step Check -Tag ultra-v0.1.0-ultra.1 -Auto -Stage (Join-Path $tmp 'args') 2>&1 | Out-String
   $all = pwsh -NoProfile -File $publisher -Auto -Stage (Join-Path $tmp 'args') 2>&1 | Out-String

@@ -60,7 +60,8 @@ hand, for example while Actions is down:
 
 - **On the machine with the key** (`%USERPROFILE%\.slopbar-ultra\updater.key`, BACHELOR), the
   script builds, signs and publishes on that machine.
-- **From any machine**, `-ViaActions` pushes a tag, and the workflow publishes it.
+- **From any machine**, `-ViaActions` has the workflow publish `origin/ultra`. When the push of
+  `ultra` publishes the commit anyway, it follows that run instead of racing it with a tag.
 
 By hand, run it in a clean checkout whose `HEAD` is the pushed `origin/ultra`. A detached worktree
 keeps the working `ultra` checkout free. Make it once per machine with
@@ -102,22 +103,47 @@ The steps:
    then moves `ultra-latest` and reads it back. The channel is checked again before publishing and
    again before moving, so it never goes back if another release moved it in the meantime.
 
-`-ViaActions` runs Check on your machine and makes sure both secrets exist. It then pushes the tag
-`ultra-v<version>` at `origin/ultra`, waits for the workflow run (usually 10 to 20 minutes), and
-confirms that the channel then holds the version. You can push a tag by hand
-(`git push origin origin/ultra:refs/tags/ultra-v0.1.0-ultra.<n>`), but then nothing picks the
-number or waits for the result.
+`-ViaActions` runs Check on your machine and makes sure both secrets exist. Then:
+
+- **Already published.** If the channel's release already has the commit, it stops: there is nothing
+  to publish.
+- **The push publishes it.** If what ships changed, the push's own run publishes the commit. It
+  follows that run and pushes no tag. A newer push may replace that run while it waits, or come
+  after it. The newer push's run publishes this commit too, so it follows that run instead.
+  - If a newer release already has everything that ships, it stops: nothing is left to publish.
+  - If GitHub started no run, it stops with nothing pushed. Look at the workflow's runs.
+  - If the run ended without publishing, it stops with nothing pushed and names the run to re-run
+    (`gh run rerun <id>`). A tag there would race the re-run or a newer push's run.
+- **Nothing that ships changed, but the release tooling did** (since the channel's release), so a
+  build may differ. If a tag is already on the commit (another run of `-ViaActions`), it follows
+  that tag's run. Otherwise, right before tagging, it checks that `ultra` on origin is still the
+  commit and that no release run is unfinished. Then it pushes the tag `ultra-v<version>` under the
+  next free number. With nothing else running, the tag's run starts at once, where no newer run can
+  replace it.
+- **Only documentation changed.** It publishes nothing: the installer would be the same.
+
+A run usually takes 10 to 20 minutes. At the end it confirms that the channel holds a release with
+the commit; a push's run picks its own build number. `-Build` only applies to a new tag.
+
+Don't push a tag by hand (`git push origin origin/ultra:refs/tags/ultra-v0.1.0-ultra.<n>`) for a
+commit whose push publishes it. Pushed while the push's run is running, the tag loses: the run takes
+the next number above the tag, and the tag's run then fails as older than the channel. Nothing is
+published twice, but a red run and a tag without a release are left behind. Pushed while the push's
+run is still waiting, the tag's run replaces it.
 
 ### Order, and one publisher per release
 
 - **One run at a time.** The workflow's runs take turns and are never cancelled, so each takes its
   build number after the previous one has finished. Two quick pushes publish one after the other
-  and never collide. While one run works, a newer push replaces an older waiting one, and it
-  publishes both, because every run compares with the channel's release, not with the push before.
+  and never collide. While one run works, a newer run replaces an older waiting one. A newer push's
+  run publishes both pushes, because every run compares with the channel's release, not with the
+  push before. A tag's run publishes only its tag, so `-ViaActions` pushes one only when no run is
+  unfinished.
 - **Tags.** A push's release and its tag appear together. The workflow makes them, and its token
   starts no further runs. The script on the key's machine also makes its tag together with the
   release, so the workflow finds the release on that tag and stands down. Only a tag pushed on its
-  own (`-ViaActions`) arrives without a release, and the workflow publishes it.
+  own (`-ViaActions`, for a change of the release tooling alone) arrives without a release, and the
+  workflow publishes it.
 - **Backstops.** `gh release create` refuses a tag that already has a release. On a pushed tag the
   workflow also passes `--verify-tag`, so it never makes one. Every publisher refuses a tag that
   appeared on `origin` while it was building, and checks the channel right before moving it.

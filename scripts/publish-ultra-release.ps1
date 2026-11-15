@@ -8,7 +8,7 @@ Normally nobody runs it: every push to ultra that changes what ships ($shippingP
 by the workflow. By hand:
   pwsh scripts/publish-ultra-release.ps1              # on the machine with the updater key
   pwsh scripts/publish-ultra-release.ps1 -Build 7     # a given build number (higher than any before)
-  pwsh scripts/publish-ultra-release.ps1 -ViaActions  # any machine: pushes a tag; the workflow publishes it
+  pwsh scripts/publish-ultra-release.ps1 -ViaActions  # any machine: the workflow publishes origin/ultra
 The workflow, one step per call, sharing the -Stage folder:
   -Step Decide -Before <sha>             on a push to ultra: publish, rehearse, or nothing (mode file)
   -Step Check -Auto | -Tag <tag>         a push to ultra, or a pushed tag
@@ -49,6 +49,8 @@ $root = Split-Path -Parent $PSScriptRoot
 $tauriCli = Join-Path $root 'node_modules/@tauri-apps/cli/tauri.js'
 $channelTag = 'ultra-latest'
 $workflow = 'ultra-release.yml'
+# Seconds between looks for a workflow run that has not appeared yet.
+$pollSeconds = 5
 # What ships: everything the installer is built from. A change here is published.
 $shippingPaths = @('src', 'src-tauri', 'package.json', 'pnpm-lock.yaml')
 # The release tooling: a change here alone rehearses the build.
@@ -193,9 +195,12 @@ function Get-RemoteTagCommit([string]$name) {
 }
 
 # The highest build number taken for this package: by an ultra-v tag on origin, or by the channel.
-function Get-HighestBuild([string]$package, [string]$current) {
-  $refs = @(git -C $root ls-remote --tags origin "refs/tags/ultra-v$package-ultra.*")
-  if ($LASTEXITCODE -ne 0) { throw 'Could not list the ultra-v tags on origin.' }
+# $refs: `git ls-remote --tags` lines already read, so a caller can count the tags it just looked at.
+function Get-HighestBuild([string]$package, [string]$current, [string[]]$refs = $null) {
+  if ($null -eq $refs) {
+    $refs = @(git -C $root ls-remote --tags origin "refs/tags/ultra-v$package-ultra.*")
+    if ($LASTEXITCODE -ne 0) { throw 'Could not list the ultra-v tags on origin.' }
+  }
   $taken = @($refs | ForEach-Object { if ($_ -match "refs/tags/ultra-v$([regex]::Escape($package))-ultra\.(\d+)$") { [int]$Matches[1] } })
   if ($current -match '^(\d+\.\d+\.\d+)-ultra\.(\d+)$' -and $Matches[1] -eq $package) { $taken += [int]$Matches[2] }
   return [int](($taken | Measure-Object -Maximum).Maximum ?? 0)
@@ -204,9 +209,10 @@ function Get-HighestBuild([string]$package, [string]$current) {
 # 0. On a push to ultra (the workflow): publish, rehearse or nothing. Compared with the channel's
 # release, not the previous push, so the next run catches up whatever an earlier one did not publish.
 function Invoke-Decide {
+  # The channel first: fetched after, its release's tag is here even if one lands in between.
+  $current = Get-ChannelVersion
   Invoke-Checked 'git fetch' { git -C $root fetch -q origin ultra --tags }
   $head = (git -C $root rev-parse HEAD).Trim()
-  $current = Get-ChannelVersion
   $built = if ($current) { Get-TagCommit "ultra-v$current" }
   if (-not $built -or (Test-Changed $built $head $shippingPaths)) {
     $mode = 'push'
@@ -225,11 +231,12 @@ function Invoke-Decide {
 function Invoke-Check {
   $conf = Read-Config
   $package = $conf.version
-  # origin/ultra and every tag, the channel's included (a fresh fetch, whatever the checkout fetched).
+  # The channel, then origin/ultra and every tag, the channel's included (a fresh fetch, whatever
+  # the checkout fetched; after the channel, so its tag is here even if a release lands in between).
+  $current = Get-ChannelVersion
   Invoke-Checked 'git fetch' { git -C $root fetch -q origin ultra --tags }
   if (git -C $root status --porcelain) { throw 'The checkout has uncommitted changes.' }
   $head = (git -C $root rev-parse HEAD).Trim()
-  $current = Get-ChannelVersion
   if ($Tag) {
     # A pushed tag names the version, and the checkout is its commit.
     if ($Tag -notmatch '^ultra-v(\d+\.\d+\.\d+)-ultra\.([1-9]\d*)$') {
@@ -433,7 +440,132 @@ function Invoke-Publish {
   Write-Summary @("Published [$version](https://github.com/$Repo/releases/tag/$name) and moved the update channel to it.")
 }
 
-# From a machine without the key: push the tag, let the workflow publish it, and confirm.
+# The newest release run for $branch (ultra, or a tag) at $commit, newer than run $after, or $null
+# when none appears. GitHub takes a few seconds to start one, so this asks up to $tries times.
+function Find-Run([string]$branch, [string]$commit, [long]$after = 0, [int]$tries = 24) {
+  for ($i = 0; $i -lt $tries; $i++) {
+    $json = gh run list -R $Repo --workflow $workflow --event push --branch $branch --commit $commit --limit 5 --json databaseId,url,status,conclusion
+    if ($LASTEXITCODE -eq 0 -and $json) {
+      $run = @(($json -join "`n") | ConvertFrom-Json | Where-Object { $_.databaseId -gt $after })[0]
+      if ($run) { return $run }
+    }
+    Start-Sleep -Seconds $pollSeconds
+  }
+  return $null
+}
+
+# The id of the workflow's newest run: runs that start later have higher ids.
+function Get-NewestRunId {
+  $json = gh run list -R $Repo --workflow $workflow --limit 1 --json databaseId
+  if ($LASTEXITCODE -ne 0) { throw "Could not list the runs of $workflow on $Repo." }
+  return [long](@(($json -join "`n") | ConvertFrom-Json)[0].databaseId ?? 0)
+}
+
+# A run of the workflow that has not finished, or $null. Each status is asked for on its own, so a
+# re-run of an old run counts too.
+function Get-UnfinishedRun {
+  foreach ($status in 'in_progress', 'queued', 'waiting', 'pending', 'requested') {
+    $json = gh run list -R $Repo --workflow $workflow --status $status --limit 1 --json databaseId,url,status
+    if ($LASTEXITCODE -ne 0) { throw "Could not list the runs of $workflow on $Repo." }
+    $run = @(($json -join "`n") | ConvertFrom-Json)[0]
+    if ($run) { return $run }
+  }
+  return $null
+}
+
+# Whether the release the channel holds has $commit. Its commit comes from origin, so a release
+# landing meanwhile, or a tag here that origin has since replaced, cannot mislead this.
+function Test-Published([string]$commit) {
+  $holds = Get-ChannelVersion
+  if (-not $holds) { return $false }
+  $null = Invoke-Checked 'git fetch' { git -C $root fetch -q origin ultra }
+  $built = Get-RemoteTagCommit "ultra-v$holds"
+  return [bool]($built -and (Test-Ancestor $commit $built))
+}
+
+function Get-Mode { Get-Content -LiteralPath (Join-Path $stageDir 'mode') -Raw }
+
+function Get-RemoteUltra {
+  $line = @(git -C $root ls-remote origin refs/heads/ultra)[0]
+  if ($LASTEXITCODE -ne 0 -or -not $line) { throw 'Could not read ultra on origin.' }
+  return ($line -split '\s+')[0]
+}
+
+function Watch-Run($run) {
+  if ($run.status -eq 'completed') { return }
+  Write-Host "Waiting for $($run.url) (usually 10 to 20 minutes; runs take turns)."
+  gh run watch $run.databaseId -R $Repo --interval 30 | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "Could not watch $($run.url); it may still be running." }
+}
+
+# A push that changes what ships publishes itself: follow its run, or the run of a newer push that
+# replaced it or came after it, which publishes $commit too. Pushes no tag: a tag's run would
+# replace whichever run waits. $null when a run ended without publishing $commit because nothing
+# that ships is missing any more (Decide runs again; the caller goes by its mode).
+function Wait-ForPush([string]$commit) {
+  $tip = $commit
+  for ($round = 0; $round -lt 10; $round++) {
+    $run = Find-Run 'ultra' $tip -tries 12
+    if (-not $run) { throw "GitHub has started no release run for the push of $tip, and nothing was pushed. See https://github.com/$Repo/actions/workflows/$workflow." }
+    Write-Host "The push of $tip publishes $commit by itself, so no tag is pushed."
+    Watch-Run $run
+    if (Test-Published $commit) { return $run }
+    $newer = Get-RemoteUltra
+    if ($newer -eq $tip) {
+      Invoke-Decide | Out-Host
+      if ((Get-Mode) -ne 'push') { return $null }
+      throw "$($run.url) ended without publishing $commit. Re-run it (gh run rerun $($run.databaseId) -R $Repo) or push again: either publishes it."
+    }
+    $tip = $newer
+  }
+  throw "ultra keeps moving and $commit is not published yet: see https://github.com/$Repo/actions/workflows/$workflow."
+}
+
+# A commit whose push publishes nothing although the release tooling changed since the channel's
+# release, so a build may differ: it gets a tag of its own, pushed only when no run can race it.
+function Publish-ByTag($release) {
+  $commit = $release.commit
+  # The tags, read once. One already on this commit (another run of this, or the release that just
+  # landed) is followed, not doubled.
+  $refs = @(git -C $root ls-remote --tags origin 'refs/tags/ultra-v*')
+  if ($LASTEXITCODE -ne 0) { throw 'Could not list the ultra-v tags on origin.' }
+  $tagged = @($refs | ForEach-Object {
+      $sha, $ref = $_ -split "`t"
+      if ($sha -eq $commit) { $ref -replace '^refs/tags/' -replace '\^\{\}$' }
+    } | Select-Object -Unique)
+  if ($tagged) {
+    $tag = $tagged[0]
+    if ($Build) { throw "-Build does not apply: $tag is already on $commit." }
+    if (Test-Published $commit) { return [pscustomobject]@{ url = "https://github.com/$Repo/releases/tag/$tag" } }
+    Write-Host "$tag is already on $commit; following its run."
+    $run = Find-Run $tag $commit
+  } else {
+    $package = $release.version -replace '-ultra\.\d+$'
+    $highest = Get-HighestBuild $package (Get-ChannelVersion) $refs
+    $number = if ($Build) { $Build } else { $highest + 1 }
+    if ($number -le $highest) { throw "Build $number is no longer higher than $package-ultra.$highest. Nothing was pushed." }
+    $tag = "ultra-v$package-ultra.$number"
+    # Last, right before the push: ultra is still this commit, and no run is unfinished. The tag's
+    # run then starts at once, where no newer run can replace it, and replaces no waiting run.
+    if ((Get-RemoteUltra) -ne $commit) { throw "ultra on origin moved on from $commit, and its push publishes what ships. Nothing was pushed." }
+    $busy = Get-UnfinishedRun
+    if ($busy) { throw "A release run has not finished ($($busy.url)); a tag's run would wait behind it, where a newer run could replace it. Nothing was pushed; run this again once it has finished." }
+    $floor = Get-NewestRunId
+    Invoke-Checked 'Pushing the tag' { git -C $root push -q origin "$($commit):refs/tags/$tag" }
+    Write-Host "Pushed $tag; the workflow builds, signs and publishes it."
+    $run = Find-Run $tag $commit $floor
+  }
+  if (-not $run) { throw "No release run started for $tag; see https://github.com/$Repo/actions/workflows/$workflow." }
+  Watch-Run $run
+  if (-not (Test-Published $commit)) { throw "$($run.url) ended without publishing $commit. Re-run it: gh run rerun $($run.databaseId) -R $Repo" }
+  return $run
+}
+
+# From a machine without the key: have the workflow publish origin/ultra, and confirm. A push that
+# changes what ships publishes itself and is followed, never raced with a tag: a tag pushed while
+# the push's run waits replaces that run, and one pushed while it runs loses (the run takes the next
+# number above the tag, and the tag's run then fails, older than the channel). A tag is pushed only
+# for a commit whose push publishes nothing although the release tooling changed.
 function Invoke-ViaActions {
   $release = Read-StageFile 'release.json'
   $names = @(gh secret list -R $Repo --json name --jq '.[].name')
@@ -446,23 +578,28 @@ function Invoke-ViaActions {
   if ($missing) {
     throw "$($missing -join ' and ') not set on $Repo, so the workflow would publish nothing. Add the secrets (docs/ULTRA-RELEASES.md) or publish on the machine with the key."
   }
-  Invoke-Checked 'Pushing the tag' { git -C $root push -q origin "$($release.commit):refs/tags/$($release.tag)" }
-  Write-Output "Pushed $($release.tag); the workflow builds, signs and publishes it."
-  $run = $null
-  for ($i = 0; $i -lt 24 -and -not $run; $i++) {
-    Start-Sleep -Seconds 5
-    $json = gh run list -R $Repo --workflow $workflow --event push --branch $release.tag --limit 1 --json databaseId,url
-    if ($LASTEXITCODE -eq 0 -and $json) { $run = @($json | ConvertFrom-Json)[0] }
+  $commit = $release.commit
+  if (Test-Published $commit) {
+    Write-Output "Nothing to publish: the channel's release already has $commit."
+    return
   }
-  if (-not $run) { throw "No workflow run started for $($release.tag); see https://github.com/$Repo/actions/workflows/$workflow." }
-  Write-Output "Waiting for $($run.url) (usually 10 to 20 minutes; runs take turns)."
-  gh run watch $run.databaseId -R $Repo --exit-status --interval 30 | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw "The workflow run failed: $($run.url)" }
-  $back = Save-Channel
-  $holds = if ($back) { (Get-Content -LiteralPath $back -Raw | ConvertFrom-Json).version }
-  if ($holds -ne $release.version) { throw "The run finished, but the channel holds $($holds ?? 'nothing'), not $($release.version): $($run.url)" }
-  Write-Output "Published $($release.version) through the workflow"
-  Write-Output "  release: https://github.com/$Repo/releases/tag/$($release.tag)"
+  Invoke-Decide
+  $run = $null
+  if ((Get-Mode) -eq 'push') {
+    if ($Build) { throw "-Build does not apply: the push of $commit publishes it by itself, under the next number." }
+    $run = Wait-ForPush $commit
+  }
+  if (-not $run) {
+    if ((Get-Mode) -eq 'none') {
+      Write-Output "Nothing to publish: nothing that ships, or builds it, changed since the channel's $(Get-ChannelVersion)."
+      return
+    }
+    $run = Publish-ByTag $release
+  }
+  # A push's run takes its own build number, so this reports what the channel holds.
+  $holds = Get-ChannelVersion
+  Write-Output "Published $holds through the workflow"
+  Write-Output "  release: https://github.com/$Repo/releases/tag/ultra-v$holds"
   Write-Output "  run: $($run.url)"
 }
 
