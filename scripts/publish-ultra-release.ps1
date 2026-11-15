@@ -156,9 +156,11 @@ function Get-HighestBuild([string]$package) {
 function Invoke-Check {
   $conf = Read-Config
   $package = $conf.version
+  # origin/ultra and every tag, the channel's included (a fresh fetch, whatever the checkout fetched).
+  Invoke-Checked 'git fetch' { git -C $root fetch -q origin ultra --tags }
+  if (git -C $root status --porcelain) { throw 'The checkout has uncommitted changes.' }
   if ($Tag) {
     # The workflow publishes a pushed tag: it names the version, and the checkout is its commit.
-    if (git -C $root status --porcelain) { throw 'The checkout has uncommitted changes.' }
     if ($Tag -notmatch '^ultra-v(\d+\.\d+\.\d+)-ultra\.([1-9]\d*)$') {
       throw "Tag $Tag must look like ultra-v<package version>-ultra.<build>, e.g. ultra-v$package-ultra.1."
     }
@@ -172,8 +174,6 @@ function Invoke-Check {
     if ($LASTEXITCODE -ne 0) { throw "$head is not on the ultra branch." }
   } else {
     # A machine releases the pushed ultra tip under the next free build number.
-    Invoke-Checked 'git fetch' { git -C $root fetch -q origin ultra --tags }
-    if (git -C $root status --porcelain) { throw 'The checkout has uncommitted changes.' }
     $head = (git -C $root rev-parse HEAD).Trim()
     if ($head -ne (git -C $root rev-parse origin/ultra).Trim()) { throw "HEAD $head is not origin/ultra; release only the pushed ultra tip." }
     $highest = Get-HighestBuild $package

@@ -120,6 +120,8 @@ $env:GITHUB_STEP_SUMMARY = $null
 try {
   git init -q --bare -b ultra $origin
   git init -q -b ultra $work
+  # No background maintenance: it would hold files the cleanup removes.
+  foreach ($gitDir in $origin, $work) { git -C $gitDir config gc.auto 0; git -C $gitDir config maintenance.auto false }
   Set-Conf $realConf.plugins.updater.pubkey
   Invoke-Work add -A
   Invoke-Work commit -q -m one
@@ -281,11 +283,11 @@ try {
 } finally {
   $env:GITHUB_STEP_SUMMARY = $summary
   Remove-Item Env:ULTRA_TAURI_SIGNING_PRIVATE_KEY, Env:ULTRA_TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
-  # A scanner may hold a new file for a moment.
+  # Another process (a scanner) may hold a new file for a moment; Windows then finishes the delete
+  # once it lets go.
   for ($i = 0; $i -lt 10 -and (Test-Path $tmp); $i++) {
     try { Remove-Item -Recurse -Force $tmp -ErrorAction Stop } catch { Start-Sleep -Milliseconds 500 }
   }
-  if (Test-Path $tmp) { Write-Output "note: could not remove $tmp" }
 }
 if ($failures) { Write-Output "$failures failed"; exit 1 }
 Write-Output 'all passed'
