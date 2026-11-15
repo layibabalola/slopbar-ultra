@@ -41,9 +41,48 @@ pub fn urls(asset: &Asset) -> [String; 2] {
 /// The zip is about 25 MB; anything far larger is not it.
 const MAX_ZIP: u64 = 128 * 1024 * 1024;
 
-/// A download that receives nothing for this long has stalled. It has no overall limit: a slow
-/// link may take minutes, and Cancel ends it sooner.
+/// A download that receives nothing for this long has stalled.
 const STALL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The most one source's download may take, however it trickles: every step of a setup ends, since
+/// an automatic update waits while one runs. Cancel ends it sooner.
+const DOWNLOAD_LIMIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The most unpacking may take (tar.exe, or PowerShell's Expand-Archive), and checking the
+/// unpacked rclone's version.
+const UNPACK_LIMIT: std::time::Duration = std::time::Duration::from_secs(3 * 60);
+const VERSION_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Runs a helper to its end within `limit`, its standard output collected, and kills it after: a
+/// helper that hangs must not keep the setup (and the automatic update waiting on it) forever.
+fn run_within(mut command: std::process::Command, limit: std::time::Duration) -> Option<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (send, read) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        let _ = send.send(out);
+    });
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            // Its output ends with it; one still held open elsewhere is not waited for.
+            Ok(Some(status)) => {
+                let stdout = read.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or_default();
+                return Some(std::process::Output { status, stdout, stderr: Vec::new() });
+            }
+            Ok(None) if started.elapsed() < limit => std::thread::sleep(std::time::Duration::from_millis(100)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
 
 /// The oldest installed rclone the setup uses (`config create` with `config_` settings and
 /// `--no-output`); with an older one, SlopBar gets its own copy.
@@ -205,8 +244,10 @@ async fn fetch(client: &reqwest::Client, url: &str, cancel: &std::sync::atomic::
     fn failed<E>(_: E) -> &'static str {
         "download_failed"
     }
-    // The client's own limit is for small requests; this one is bounded by STALL instead.
-    let send = client.get(url).timeout(std::time::Duration::from_secs(60 * 60)).send();
+    // The client's own limit is for small requests: this one may take minutes on a slow link, but
+    // never more than DOWNLOAD_LIMIT in all (reqwest's limit covers the body too), and never STALL
+    // without a byte.
+    let send = client.get(url).timeout(DOWNLOAD_LIMIT).send();
     let mut response = tokio::time::timeout(STALL, send).await.map_err(failed)?.map_err(failed)?;
     if !response.status().is_success() || response.content_length().is_some_and(|n| n > MAX_ZIP) {
         return Err("download_failed");
@@ -247,19 +288,24 @@ fn extract(zip: &[u8], asset: &Asset, dest: &std::path::Path) -> Result<(), &'st
         let inner = format!("{}/rclone.exe", asset.file.trim_end_matches(".zip"));
         let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\Windows".into());
         let tar = system.join(r"System32\tar.exe");
-        let unpacked = if tar.is_file() {
-            crate::sources::command(&tar.to_string_lossy()).arg("-xf").arg(&archive).arg("-C").arg(&work).arg(&inner).status().is_ok_and(|s| s.success())
+        let unpack = if tar.is_file() {
+            let mut tar = crate::sources::command(&tar.to_string_lossy());
+            tar.arg("-xf").arg(&archive).arg("-C").arg(&work).arg(&inner);
+            tar
         } else {
-            let ps = system.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
-            crate::sources::command(&ps.to_string_lossy())
-                .args(["-NoProfile", "-NonInteractive", "-Command", "Expand-Archive -LiteralPath $args[0] -DestinationPath $args[1] -Force"])
-                .arg(&archive).arg(&work).status().is_ok_and(|s| s.success())
+            let mut ps = crate::sources::command(&system.join(r"System32\WindowsPowerShell\v1.0\powershell.exe").to_string_lossy());
+            ps.args(["-NoProfile", "-NonInteractive", "-Command", "Expand-Archive -LiteralPath $args[0] -DestinationPath $args[1] -Force"])
+                .arg(&archive).arg(&work);
+            ps
         };
+        let unpacked = run_within(unpack, UNPACK_LIMIT).is_some_and(|out| out.status.success());
         let exe = work.join(&inner);
         if !unpacked || !exe.is_file() {
             return Err("extract_failed");
         }
-        let version = crate::sources::command(&exe.to_string_lossy()).arg("version").output().map_err(|_| "extract_failed")?;
+        let mut check = crate::sources::command(&exe.to_string_lossy());
+        check.arg("version");
+        let version = run_within(check, VERSION_LIMIT).ok_or("extract_failed")?;
         if !String::from_utf8_lossy(&version.stdout).starts_with(&format!("rclone {RCLONE_VERSION}")) {
             return Err("extract_failed");
         }
@@ -432,6 +478,31 @@ mod tests {
         let cancel = std::sync::atomic::AtomicBool::new(true);
         assert_eq!(install_rclone(&reqwest::Client::new(), &other, &cancel, &|_| {}).await, Err("cancelled"));
         assert!(!other.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_helper_that_hangs_is_ended_at_its_limit() {
+        let started = std::time::Instant::now();
+        let mut hang = crate::sources::command("ping");
+        hang.args(["-n", "30", "127.0.0.1"]);
+        assert!(run_within(hang, std::time::Duration::from_secs(1)).is_none(), "killed, not waited for");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        let mut echo = crate::sources::command("cmd");
+        echo.args(["/c", "echo", "rclone", "v1.76.0"]);
+        let out = run_within(echo, std::time::Duration::from_secs(20)).unwrap();
+        assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).starts_with("rclone v1.76.0"));
+    }
+
+    #[test]
+    fn every_download_and_unpacking_step_has_a_limit() {
+        assert!(DOWNLOAD_LIMIT <= std::time::Duration::from_secs(15 * 60) && STALL < DOWNLOAD_LIMIT);
+        assert!(UNPACK_LIMIT <= std::time::Duration::from_secs(5 * 60) && VERSION_LIMIT <= std::time::Duration::from_secs(60));
+        // No helper is run without one, and the download is never unbounded.
+        let code = include_str!("sharing_setup.rs");
+        let body = &code[code.find("fn extract(").unwrap()..code.find("/// How rclone gets a Dropbox remote here").unwrap()];
+        assert!(!body.contains(".status()") && !body.contains(".output()"), "every helper in extract runs through run_within");
+        assert!(code.contains(".timeout(DOWNLOAD_LIMIT)"));
     }
 
     #[test]
