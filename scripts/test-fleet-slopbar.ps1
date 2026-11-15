@@ -1,9 +1,12 @@
 #Requires -Version 7
 <#
-Tests fleet-slopbar.ps1 offline: how it reads each machine's last update check (get_app_info's
-update_check) and the problems it reports, on synthetic answers only. Nothing reaches a machine or
-GitHub. It also reads two constants from the Rust source of the checkout (update_check::PASS_LIMIT
-and ultra_release::CHECK_EVERY) and fails when the script's copies of them differ.
+Tests fleet-slopbar.ps1 offline, on synthetic answers only; nothing reaches a machine or GitHub:
+every rule that makes a row a problem (each pinned by the row's Problem flag), how it reads each
+machine's last update check (get_app_info's update_check) and the channel's release time
+(latest.json's pub_date), and its main body, run for real against stand-ins for latest.json and each
+machine's door: the line above the table, the summary and the exit code. It also reads two constants
+from the Rust source of the checkout (update_check::PASS_LIMIT and ultra_release::CHECK_EVERY) and
+fails when the script's copies of them differ.
 
   pwsh scripts/test-fleet-slopbar.ps1
 #>
@@ -28,8 +31,8 @@ function Record([hashtable]$fields = @{}) {
   foreach ($key in $fields.Keys) { $record[$key] = $fields[$key] }
   return $record
 }
-function Info($record, [string]$version = '0.1.0-ultra.13') {
-  $value = [ordered]@{ version = $version; updates_enabled = $true; pid = 4242 }
+function Info($record, [string]$version = '0.1.0-ultra.13', [bool]$updates = $true) {
+  $value = [ordered]@{ version = $version; updates_enabled = $updates; pid = 4242 }
   if ($null -ne $record) { $value.update_check = $record }
   return [pscustomobject]@{ State = 'ok'; Value = ($value | ConvertTo-Json -Depth 5 | ConvertFrom-Json) }
 }
@@ -54,6 +57,28 @@ Check 'up to date 5 minutes ago' ($r.LastCheck -eq '5 min ago: up to date' -and 
 $r = Row (Info (Record @{ at = (Ago 0); result = 'installing'; version = '0.1.0-ultra.14'; next_at = (Ago 0) }))
 Check 'installing' ($r.LastCheck -eq '0 min ago: installing 0.1.0-ultra.14' -and -not $r.Problem)
 
+# The rules about the machine itself, each pinned by the row's Problem flag, which the exit code
+# follows: a local build, a build without updates, a version newer than the channel's, "Update
+# automatically" off, settings that cannot be read, and a machine that does not answer are problems; a
+# machine without SlopBar is not. The last check is healthy throughout, so only the rule under test shows.
+$healthy = Record @{ at = (Ago 5); result = 'up_to_date'; next_at = (Ago -10) }
+$r = Row (Info $healthy '0.1.0')
+Check 'a local build is a problem' ($r.Problem -and -not $r.Behind -and $r.Status -eq 'local build: takes no releases')
+$r = Row (Info $healthy '0.1.0-ultra.13' $false)
+Check 'a build without updates is a problem' ($r.Problem -and -not $r.Behind -and $r.Status -eq 'build without updates')
+$r = Row (Info $healthy '0.1.0-ultra.14')
+Check 'a build newer than the channel is a problem' ($r.Problem -and -not $r.Behind -and $r.Status -eq 'newer than the channel')
+$r = Row (Info $healthy) $off
+Check '"Update automatically" off is a problem' ($r.Problem -and $r.AutoUpdate -eq 'off' -and $r.Status -eq 'current; auto-update off')
+$r = Row (Info $healthy) ([pscustomobject]@{ State = 'timeout'; Message = 'no answer within 45 s' })
+Check 'settings that cannot be read are a problem' ($r.Problem -and $r.AutoUpdate -eq '?' -and $r.Status -eq 'current; settings unreadable (timeout)')
+foreach ($state in 'unreachable', 'timeout', 'failed', 'error') {
+  $r = Row ([pscustomobject]@{ State = $state; Message = 'the door said so' })
+  Check "a machine whose door is $state is a problem, with what it said" ($r.Problem -and -not $r.Behind -and $r.Status -eq "${state}: the door said so")
+}
+$r = Row ([pscustomobject]@{ State = 'missing' })
+Check 'a machine without SlopBar is not installed, which is no problem' (-not $r.Problem -and $r.Status -eq 'not installed')
+
 # A failed check: a problem; the table cuts it to 40 characters and the full text follows it.
 $failure = 'The download failed: error decoding response body: operation timed out'
 $r = Row (Info (Record @{ at = (Ago 1); result = 'error'; error = $failure; next_at = (Ago -1) }))
@@ -71,13 +96,15 @@ Check 'a deferred check is no problem' (-not $r.Problem -and $r.CheckText -eq "3
 
 # No check for longer than the interval plus a pass's limit (15 + 35 2/3 = 50 2/3 minutes) is a
 # problem when the loop's next run does not explain it: none is shown, or it is overdue past a pass's
-# limit (a stopped loop). A loop that waits for a next run checks there.
+# limit and a minute (a stopped loop). A loop that waits for a next run checks there.
 $r = Row (Info (Record @{ at = (Ago 52); result = 'up_to_date' }))
 Check 'no check for 52 minutes, with no next run shown, is a problem' ($r.Problem -and $r.Status -eq 'current; no update check for 52 min')
 $r = Row (Info (Record @{ at = (Ago 49); result = 'up_to_date' }))
 Check '49 minutes is within a pass of the interval' (-not $r.Problem)
-$r = Row (Info (Record @{ at = (Ago 52); result = 'up_to_date'; next_at = (Ago -1) })) $off
-Check 'with automatic updates off, that alone is reported' ($r.Status -eq 'current; auto-update off')
+# With updates off the loop checks nothing, so an old last check is no news: only the setting is reported.
+# The record shows no next run, so nothing but the setting stops the old check from being reported too.
+$r = Row (Info (Record @{ at = (Ago 52); result = 'up_to_date' })) $off
+Check 'with automatic updates off, that alone is reported' ($r.Problem -and $r.Status -eq 'current; auto-update off')
 $r = Row (Info (Record @{ at = (Ago 380); result = 'up_to_date'; interval_seconds = 21600 }))
 Check 'a 6-hour interval allows longer' (-not $r.Problem)
 $r = Row (Info (Record @{ at = (Ago 400); result = 'up_to_date'; interval_seconds = 21600 }))
@@ -94,12 +121,15 @@ $r = Row (Info (Record @{ at = (Ago 1500); result = 'up_to_date'; next_at = (Ago
 Check '...nor 36 minutes overdue, still within a pass and a minute' (-not $r.Problem)
 $r = Row (Info (Record @{ at = (Ago 1500); result = 'up_to_date'; next_at = (Ago 40) }))
 Check '...but a loop 40 minutes overdue has stopped, and the old check is reported with it' ($r.Problem -and $r.Status -eq 'current; update loop stopped: next check 40 min overdue; no update check for 1500 min')
-$r = Row (Info (Record @{ at = (Ago 1500); result = 'up_to_date'; next_at = (Ago -7) })) $off
-Check '...and with updates off, only the setting is reported' ($r.Status -eq 'current; auto-update off')
+$r = Row (Info (Record @{ at = (Ago 1500); result = 'up_to_date' })) $off
+Check '...and with updates off, only the setting is reported (no next run to explain the old check)' ($r.Problem -and $r.Status -eq 'current; auto-update off')
+$r = Row (Info (Record @{ at = (Ago 1500); result = 'up_to_date'; next_at = (Ago 40) })) $off
+Check '...but a loop 40 minutes overdue has stopped with updates off too: it wakes at its interval either way' ($r.Problem -and $r.Status -eq 'current; auto-update off; update loop stopped: next check 40 min overdue')
 $r = Row (Info (Record @{ at = (Ago 1500); result = 'error'; error = 'The download failed'; next_at = (Ago -7) }))
 Check 'a failed check is a problem whatever the next run' ($r.Problem -and $r.Status -eq 'current; last update check failed')
 
-# A stopped loop: its next run overdue by more than a pass's limit, even after a check asked for.
+# A stopped loop: its next run overdue by more than a pass's limit and a minute, even after a check
+# asked for.
 $r = Row (Info (Record @{ at = (Ago 2); result = 'up_to_date'; by = 'manual'; next_at = (Ago 40) }))
 Check 'an overdue next run is a stopped loop, whatever a later check shows' ($r.Problem -and $r.Status -eq 'current; update loop stopped: next check 40 min overdue')
 $r = Row (Info (Record @{ at = (Ago 20); result = 'found'; version = '0.1.0-ultra.14'; next_at = (Ago 30) }))
@@ -146,24 +176,164 @@ Check 'a pub_date as ConvertFrom-Json reads it (a [datetime]) is used' ($r.Probl
 $r = TryRow (Info $behind '0.1.0-ultra.12') (Published ('"' + (Ago 20) + '"'))
 Check '...and within the grace it is no problem' ($r.Behind -and -not $r.Problem -and $r.Status -eq 'behind')
 
+# A pub_date ahead of this machine's clock. Within the clock skew ($ClockSkewSeconds, 5 minutes) it is
+# the release just published, seen by a slow clock, and counts: the machine is behind, within the grace.
+# Further ahead it is a wrong record (a time zone slip, a typo) and no release time: used, it would show
+# a stuck machine as plain "behind" until that time came. The limits are pinned to the second.
+function Ahead([double]$seconds) { $now.AddSeconds($seconds).ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture) }
+$future = 'behind; release time unknown (latest.json has a pub_date in the future)'
+$r = TryRow (Info $behind '0.1.0-ultra.12') (Published ('"' + (Ahead 240) + '"'))
+Check 'a pub_date 4 minutes ahead is within the clock skew: behind, no problem' ($r.Behind -and -not $r.Problem -and $r.Status -eq 'behind')
+$r = TryRow (Info $behind '0.1.0-ultra.12') (Published ('"' + (Ahead 300) + '"'))
+Check '...and exactly 5 minutes ahead is too' ($r.Behind -and -not $r.Problem -and $r.Status -eq 'behind')
+$r = TryRow (Info $behind '0.1.0-ultra.12') (Published ('"' + (Ahead 301) + '"'))
+Check 'a pub_date 5 minutes and a second ahead is no release time: a problem that says so' ($r.Behind -and $r.Problem -and $r.Status -eq $future)
+$r = TryRow (Info $behind '0.1.0-ultra.12') (Published ('"' + (Ahead 7200) + '"'))
+Check '...as is one 2 hours ahead (a time zone slip, say)' ($r.Behind -and $r.Problem -and $r.Status -eq $future)
+$r = TryRow (Info $null '0.1.0-ultra.10') (Published ('"' + (Ahead 7200) + '"'))
+Check 'a build without the record, behind, with a pub_date 2 hours ahead, is a problem too' ($r.Behind -and $r.Problem -and $r.Status -eq $future)
+$r = TryRow (Info $behind '0.1.0-ultra.12') (Ahead 7200)
+Check '...also when it arrives as text, not as a time ConvertFrom-Json read' ($r.Behind -and $r.Problem -and $r.Status -eq $future)
+$r = TryRow (Info (Record @{ at = (Ago 4); result = 'up_to_date'; next_at = (Ago -11) })) (Published ('"' + (Ahead 7200) + '"'))
+Check 'a current machine is not affected by a pub_date ahead' (-not $r.Behind -and -not $r.Problem -and $r.Status -eq 'current')
+
 # Times as the door and latest.json give them: text, or a [datetime] once ConvertFrom-Json read it.
 $hourAgo = $now.AddHours(-1)
 Check 'a time as text' ((ConvertTo-UtcTime '2026-11-15T11:00:00Z') -eq $hourAgo)
 Check 'a time with an offset' ((ConvertTo-UtcTime '2026-11-15T13:00:00+02:00') -eq $hourAgo)
 Check 'a time ConvertFrom-Json read' ((ConvertTo-UtcTime ('{"t":"2026-11-15T11:00:00Z"}' | ConvertFrom-Json).t) -eq $hourAgo)
 Check 'a time without a kind is UTC' ((ConvertTo-UtcTime ([datetime]::new(2026, 11, 15, 11, 0, 0))) -eq $hourAgo)
-$released = Get-ReleaseTime (Published '"2026-11-15T11:00:00Z"')
+$released = Get-ReleaseTime (Published '"2026-11-15T11:00:00Z"') $now
 Check 'a release time, as ConvertFrom-Json reads it, is a UTC time' ($released.Time -eq $hourAgo -and $null -eq $released.Why)
-$released = Get-ReleaseTime '2026-11-15T13:00:00+02:00'
+$released = Get-ReleaseTime '2026-11-15T13:00:00+02:00' $now
 Check 'a release time as text, with an offset' ($released.Time -eq $hourAgo -and $null -eq $released.Why)
-$released = Get-ReleaseTime $null
+# The shape the updater reads, RFC 3339, part by part: fractional seconds, a space or a lower-case t
+# between date and time, a lower-case z, and nothing before or after (.NET would read a time with a
+# space or a weekday in front, or a space behind it, and the updater would reject the file).
+$released = Get-ReleaseTime '2026-11-15T11:00:00.123Z' $now
+Check 'a release time with fractional seconds' ($released.Time -eq $hourAgo.AddMilliseconds(123) -and $null -eq $released.Why)
+$released = Get-ReleaseTime '2026-11-15 11:00:00Z' $now
+Check 'a release time with a space between the date and the time' ($released.Time -eq $hourAgo -and $null -eq $released.Why)
+$released = Get-ReleaseTime '2026-11-15t11:00:00z' $now
+Check 'a release time with a lower-case t and z' ($released.Time -eq $hourAgo -and $null -eq $released.Why)
+foreach ($padded in ' 2026-11-15T11:00:00Z', 'Sun 2026-11-15T11:00:00Z', '2026-11-15T11:00:00Z ') {
+  $released = Get-ReleaseTime $padded $now
+  Check "a pub_date of '$padded' is not a time" ($null -eq $released.Time -and $released.Why -eq 'latest.json has a pub_date that is not a time')
+}
+$released = Get-ReleaseTime $null $now
 Check 'no pub_date: no release time, and why' ($null -eq $released.Time -and $released.Why -eq 'latest.json has no pub_date')
-$released = Get-ReleaseTime '2026-13-45T25:61:61Z'
+$released = Get-ReleaseTime '2026-13-45T25:61:61Z' $now
 Check 'a pub_date of the right shape that is no time: no release time, and why' ($null -eq $released.Time -and $released.Why -eq 'latest.json has a pub_date that is not a time')
-Check 'the report says so above the table' ((Get-ReleaseTimeNote $null) -match '^Release time unknown \(latest\.json has no pub_date\): a machine that is behind is reported as a problem' -and
-  (Get-ReleaseTimeNote 'soon') -match 'not a time\)')
-Check 'and says nothing when the release time is known' ($null -eq (Get-ReleaseTimeNote (Published '"2026-11-15T11:00:00Z"')))
+$released = Get-ReleaseTime (Ahead 7200) $now
+Check 'a pub_date 2 hours ahead: no release time, and why' ($null -eq $released.Time -and $released.Why -eq 'latest.json has a pub_date in the future')
+Check 'the report says so above the table' ((Get-ReleaseTimeNote $null $now) -match '^Release time unknown \(latest\.json has no pub_date\): a machine that is behind is reported as a problem' -and
+  (Get-ReleaseTimeNote 'soon' $now) -match 'not a time\)' -and (Get-ReleaseTimeNote (Ahead 7200) $now) -match 'a pub_date in the future\)')
+Check 'and says nothing when the release time is known, or just ahead within the skew' ($null -eq (Get-ReleaseTimeNote (Published '"2026-11-15T11:00:00Z"') $now) -and $null -eq (Get-ReleaseTimeNote (Ahead 300) $now))
 Check 'short text is left alone' ((Get-Short 'up to date') -eq 'up to date')
+
+# The main body of the script (what runs after its functions: the channel, the machines, the line above
+# the table, the summary and the exit code) is run for real, with stand-ins for the only two things that
+# leave this computer: latest.json (Invoke-RestMethod) and each machine's door, here or over ssh
+# (Start-Process). The stand-ins live only inside Invoke-Report, which also gives the script a synthetic
+# name for this machine and a synthetic ssh config. A machine is what its door answers; the clock is the
+# real one, so a record's times are relative to now. -UpdateNow, which waits and asks again, is not run.
+$reportDir = Join-Path ([IO.Path]::GetTempPath()) "slopbar-fleet-test-$PID"
+$null = New-Item -ItemType Directory -Force $reportDir
+function RealAgo([double]$minutes) { [datetime]::UtcNow.AddMinutes(-$minutes).ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture) }
+# A door that answers: this version, with this update record (healthy by default) and the setting.
+function Door([string]$version = '0.1.0-ultra.13', [bool]$auto = $true) {
+  @{ version = $version; auto = $auto; record = (Record @{ at = (RealAgo 5); result = 'up_to_date'; by = 'auto'; next_at = (RealAgo -10) }) }
+}
+# $doors: 'here' and the ssh aliases of the other machines, each a Door, or a hashtable with only a
+# state: missing (no SlopBar: nothing printed, exit 0) or unreachable (ssh's exit 255).
+function Invoke-Report([string]$latestJson, [hashtable]$doors) {
+  $sshConfig = Join-Path $reportDir 'ssh_config'
+  $aliases = @($doors.Keys | Where-Object { $_ -ne 'here' } | Sort-Object)
+  @('# >>> fleet-ssh managed block'; foreach ($a in $aliases) { "Host $a"; "  HostName $a.invalid" }; '# <<< fleet-ssh managed block <<<') | Set-Content -LiteralPath $sshConfig
+  ${function:Invoke-RestMethod} = { param($Uri, $TimeoutSec) $latestJson | ConvertFrom-Json }.GetNewClosure()
+  ${function:Start-Process} = {
+    param($FilePath, $ArgumentList, $RedirectStandardOutput, $RedirectStandardError, [switch]$NoNewWindow, [switch]$PassThru)
+    # ssh: -n -o BatchMode=yes -o ConnectTimeout=10 <machine> cmd /d /c if exist <door> <door> --call <tool>
+    $words = @("$ArgumentList" -split '\s+')
+    $door = $doors[$(if ("$FilePath" -eq 'ssh') { $words[5] } else { 'here' })]
+    $code = 0; $text = ''; $message = ''
+    if ($door.state -eq 'unreachable') { $code = 255; $message = 'Connection timed out' }
+    elseif ($door.state -ne 'missing') {
+      $answer = switch ($words[-1]) {
+        'get_app_info' { [ordered]@{ version = $door.version; updates_enabled = $true; pid = 4242; update_check = $door.record } }
+        'get_settings' { [ordered]@{ auto_update = $door.auto } }
+      }
+      $text = @{ ok = $answer } | ConvertTo-Json -Depth 6 -Compress
+    }
+    Set-Content -LiteralPath $RedirectStandardOutput -Value $text -NoNewline
+    Set-Content -LiteralPath $RedirectStandardError -Value $message -NoNewline
+    $process = [pscustomobject]@{ Id = 0; Handle = 1; ExitCode = $code }
+    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($milliseconds) $true }
+    $process
+  }.GetNewClosure()
+  # The script's own exit code is what is read here, and none is left behind: a caller that exits with
+  # $LASTEXITCODE (as GitHub's pwsh steps do) would take the script's 1 for this test's.
+  $savedName = $env:COMPUTERNAME
+  $savedExit = $global:LASTEXITCODE
+  $env:COMPUTERNAME = 'DESK-1'
+  $global:LASTEXITCODE = $null
+  try {
+    $lines = @(& $fleet -SshConfig $sshConfig -TimeoutSeconds 5 2>&1 | ForEach-Object { "$_" })
+    return [pscustomobject]@{ Exit = $LASTEXITCODE; Lines = @($lines -join "`n" -split "`r?`n") }
+  } catch {
+    return [pscustomobject]@{ Exit = $null; Lines = @("THREW: $($_.Exception.Message)") }
+  } finally {
+    $env:COMPUTERNAME = $savedName
+    $global:LASTEXITCODE = $savedExit
+  }
+}
+function Latest([string]$pubDate = '') { if ($pubDate) { "{`"version`":`"$channel`",`"pub_date`":`"$pubDate`"}" } else { "{`"version`":`"$channel`"}" } }
+# How many lines of a report match a pattern, and where the first one is (-1 when none).
+function Matching($report, [string]$pattern) { @($report.Lines | Where-Object { $_ -match $pattern }).Count }
+function LineOf($report, [string]$pattern) { for ($i = 0; $i -lt $report.Lines.Count; $i++) { if ($report.Lines[$i] -match $pattern) { return $i } }; return -1 }
+function Summary($report) { @($report.Lines | Where-Object { $_ -like 'Summary: *' }) -join ' / ' }
+$noPubDate = 'Release time unknown (latest.json has no pub_date): a machine that is behind is reported as a problem, because how long it has been behind cannot be told.'
+$exitBefore = $global:LASTEXITCODE
+
+try {
+  $report = Invoke-Report (Latest (RealAgo 120)) @{ here = (Door); 'box-1' = (Door); 'lap-1' = (Door) }
+  Check 'a fleet that is all current says its channel and machines, summarises them, and exits 0' ($report.Exit -eq 0 -and
+    (Matching $report '^Channel: 0\.1\.0-ultra\.13\. Machines: 3 \(this one and the ssh managed block\)\.$') -eq 1 -and (Summary $report) -eq 'Summary: 3 current, 0 behind, 0 not installed, 0 with problems.')
+  Check '...lists each machine, this one by its name' ((Matching $report '^(desk-1 \(here\)|box-1|lap-1)\s+0\.1\.0-ultra\.13\s+on\s+5 min ago: up to date\s+current\s*$') -eq 3)
+  Check '...and has no line about the release time while it is known' ((Matching $report '^Release time unknown') -eq 0)
+
+  $report = Invoke-Report (Latest) @{ here = (Door); 'box-1' = (Door) }
+  $note = LineOf $report '^Release time unknown'
+  Check 'a latest.json without a pub_date is reported above the table, in full' ($note -ge 0 -and $note -lt (LineOf $report 'Machine\s+Version\s+AutoUpdate') -and $report.Lines[$note] -eq $noPubDate)
+  Check '...and fails nothing while every machine is current' ($report.Exit -eq 0 -and (Summary $report) -eq 'Summary: 2 current, 0 behind, 0 not installed, 0 with problems.')
+  $report = Invoke-Report (Latest (RealAgo 120)) @{ here = (Door); 'box-1' = (Door '0.1.0-ultra.12') }
+  Check 'a machine long behind the channel is a problem, and the exit code says so' ($report.Exit -eq 1 -and (Summary $report) -eq 'Summary: 1 current, 1 behind, 0 not installed, 1 with problems.' -and
+    (Matching $report '^box-1\s+0\.1\.0-ultra\.12\s+on\s.*\sbehind; still behind 1[12]\d min after the release\s*$') -eq 1)
+  $report = Invoke-Report (Latest (RealAgo 20)) @{ here = (Door); 'box-1' = (Door '0.1.0-ultra.12') }
+  Check 'a machine behind for less than the grace is no problem: exit 0' ($report.Exit -eq 0 -and (Summary $report) -eq 'Summary: 1 current, 1 behind, 0 not installed, 0 with problems.')
+  $report = Invoke-Report (Latest) @{ here = (Door); 'box-1' = (Door '0.1.0-ultra.12') }
+  Check 'a machine behind when the release time is unknown is a problem: the line, its row and exit 1' ($report.Exit -eq 1 -and (Matching $report '^Release time unknown') -eq 1 -and $report.Lines -contains $noPubDate -and
+    (Matching $report '^box-1\s.*\sbehind; release time unknown \(latest\.json has no pub_date\)\s*$') -eq 1 -and (Summary $report) -eq 'Summary: 1 current, 1 behind, 0 not installed, 1 with problems.')
+  $twoHoursAhead = [datetime]::UtcNow.AddHours(2).ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
+  $report = Invoke-Report (Latest $twoHoursAhead) @{ here = (Door); 'box-1' = (Door '0.1.0-ultra.12') }
+  Check 'a pub_date 2 hours ahead of the clock is reported above the table, and a machine behind is a problem' ($report.Exit -eq 1 -and
+    (Matching $report '^Release time unknown \(latest\.json has a pub_date in the future\): a machine that is behind') -eq 1 -and (Matching $report '^box-1\s.*\sbehind; release time unknown \(latest\.json has a pub_date in the future\)\s*$') -eq 1)
+  $report = Invoke-Report (Latest (RealAgo 120)) @{ here = (Door); 'box-1' = @{ state = 'unreachable' } }
+  Check 'a machine that does not answer is a problem: exit 1' ($report.Exit -eq 1 -and (Summary $report) -eq 'Summary: 1 current, 0 behind, 0 not installed, 1 with problems.' -and
+    (Matching $report '^box-1\s+unreachable: Connection timed out\s*$') -eq 1)
+  $report = Invoke-Report (Latest (RealAgo 120)) @{ here = (Door); 'box-1' = @{ state = 'missing' } }
+  Check 'a machine without SlopBar is not installed, which is no problem: exit 0' ($report.Exit -eq 0 -and (Summary $report) -eq 'Summary: 1 current, 0 behind, 1 not installed, 0 with problems.' -and
+    (Matching $report '^box-1\s+not installed\s*$') -eq 1)
+  $report = Invoke-Report (Latest (RealAgo 120)) @{ here = (Door '0.1.0-ultra.13' $false); 'box-1' = (Door) }
+  Check 'a machine with "Update automatically" off is a problem: exit 1' ($report.Exit -eq 1 -and (Summary $report) -eq 'Summary: 2 current, 0 behind, 0 not installed, 1 with problems.')
+} finally {
+  # The report folder goes when the scenarios are done. Another process (a scanner) may hold a new file
+  # for a moment; Windows then finishes the delete.
+  for ($i = 0; $i -lt 10 -and (Test-Path -LiteralPath $reportDir); $i++) {
+    try { Remove-Item -LiteralPath $reportDir -Recurse -Force -ErrorAction Stop } catch { Start-Sleep -Milliseconds 300 }
+  }
+}
+Check 'the runs leave no exit code of the script behind (a pwsh step would take it for this test''s)' ($LASTEXITCODE -eq $exitBefore)
 
 # A machine that reports neither its update interval nor its pass limit (a build from before the
 # record, or a record from before the limit) is judged by Ultra's own: the script holds copies of
@@ -230,3 +400,4 @@ Check '...where the default limit would still wait' (-not $r.Problem)
 
 if ($failures) { Write-Output "$failures failed"; exit 1 }
 Write-Output 'all passed'
+exit 0
