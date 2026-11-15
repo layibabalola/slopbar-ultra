@@ -26,7 +26,7 @@ const MAX_REPLY: u64 = 4 * 1024 * 1024;
 pub const REUSE_WINDOW: Duration = Duration::from_secs(30);
 /// How long the client waits for a reply: under MCP clients' usual 60-second tool timeout, so the
 /// agent hears "still working" rather than nothing. The app finishes the operation regardless.
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(55);
+pub(crate) const CLIENT_TIMEOUT: Duration = Duration::from_secs(55);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]

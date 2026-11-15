@@ -20,7 +20,7 @@ exe = root / "src-tauri/target/release/slopbar.exe"
 mcp = exe.with_name("slopbar-mcp.exe")
 head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
 base = "60a7c8e0835b4cd320dba3e0b1352d7a8161c9e1"
-repository = os.environ.get("GITHUB_REPOSITORY", "layibabalola/slopbar")
+repository = os.environ.get("GITHUB_REPOSITORY", "thelioo/slopbar")
 run = os.environ.get("GITHUB_RUN_ID")
 ci = f"https://github.com/{repository}/actions/runs/{run}" if run else None
 with tempfile.TemporaryDirectory() as temporary:
