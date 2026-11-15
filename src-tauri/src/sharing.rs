@@ -406,7 +406,7 @@ impl<S: Forget> Sharing<S> {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::SeqCst};
     use std::sync::Condvar;
 
     /// How long a test waits for what should happen at once (a withdrawal at a place that answers).
@@ -490,15 +490,33 @@ mod tests {
     }
 
     /// The withdrawals, as `Files` makes them, in the test's world.
-    #[derive(Clone)]
     struct Io {
         world: Arc<Mutex<World>>,
         hung: Arc<Hung>,
         /// Set when a withdrawal waited on a place until SELF_ENDING: then no limit ended it.
         self_ended: Arc<AtomicBool>,
+        /// Every withdrawal started, counted as `catch_up` starts it: it takes a copy of this
+        /// (`start`) before its thread runs, however late a starved run schedules that thread.
+        started: Arc<AtomicUsize>,
+    }
+
+    impl Clone for Io {
+        fn clone(&self) -> Self {
+            self.started.fetch_add(1, SeqCst);
+            self.shared()
+        }
     }
 
     impl Io {
+        fn new() -> Self {
+            Io { world: Arc::default(), hung: Arc::default(), self_ended: Arc::default(), started: Arc::default() }
+        }
+
+        /// The same world, without counting a withdrawal.
+        fn shared(&self) -> Self {
+            Io { world: self.world.clone(), hung: self.hung.clone(), self_ended: self.self_ended.clone(), started: self.started.clone() }
+        }
+
         fn reach(&self, what: String, place: &Place) -> MutexGuard<'_, World> {
             self.world.lock().unwrap().attempts.push(what);
             if self.hung.wait(&name(place)) {
@@ -535,14 +553,13 @@ mod tests {
 
     impl App {
         fn new(settings: Settings) -> Self {
-            let io = Io { world: Arc::default(), hung: Arc::default(), self_ended: Arc::default() };
-            App { settings: Mutex::new(settings), sharing: Sharing::default(), io, accounts: AtomicU32::new(1) }
+            App { settings: Mutex::new(settings), sharing: Sharing::default(), io: Io::new(), accounts: AtomicU32::new(1) }
         }
 
         /// The same computer started again, keeping what is due in `file`.
         fn started(&self, file: PathBuf) -> Self {
             let settings = Mutex::new(self.settings.lock().unwrap().clone());
-            App { settings, sharing: Sharing::kept_in(file), io: self.io.clone(), accounts: AtomicU32::new(self.accounts.load(SeqCst)) }
+            App { settings, sharing: Sharing::kept_in(file), io: self.io.shared(), accounts: AtomicU32::new(self.accounts.load(SeqCst)) }
         }
 
         fn world(&self) -> MutexGuard<'_, World> {
@@ -784,16 +801,17 @@ mod tests {
             assert_eq!((world.presence["B"], world.roster.contains("B")), ("in use", true), "the refresh went on to share at B");
             assert_eq!(world.news_cleared, 1, "the roster sync started afresh");
         }
+        assert_eq!(app.io.started.load(SeqCst), 2, "A's presence and roster withdrawals, started");
         assert!(app.sharing.is_due(), "what A still has stays due");
         app.refresh_within(SHORT);
-        let attempts = app.world().attempts.clone();
-        assert_eq!(attempts.len(), 2, "not started again while it runs: {attempts:?}");
+        assert_eq!(app.io.started.load(SeqCst), 2, "not started again while they run");
 
         app.io.hung.answer("A");
         eventually("the late withdrawals end once A answers", || app.world().withdrawals.len() == 2);
         app.refresh();
+        assert_eq!(app.io.started.load(SeqCst), 4, "made again once ended, in order with the writes");
         let world = app.world();
-        assert_eq!(world.attempts.len(), 4, "made again once ended, in order with the writes: {:?}", world.attempts);
+        assert_eq!(world.attempts.len(), 4, "{:?}", world.attempts);
         assert_eq!(world.presence, BTreeMap::from([("A".into(), "withdrawn"), ("B".into(), "in use")]));
         assert_eq!(world.roster, BTreeSet::from(["B".to_string()]), "and B's roster written again after A's withdrawal");
         drop(world);
@@ -856,13 +874,14 @@ mod tests {
         assert!(app.save(at("B", true)));
         assert!(file.exists(), "a save keeps what it left in the file");
         app.exit(SHORT);
+        eventually("the exit withdraws presence where sharing is now", || app.world().withdrawals.iter().any(|w| w == "presence B"));
         let withdrawals = app.world().withdrawals.clone();
-        assert!(!app.io.self_ended.load(SeqCst) && withdrawals == ["presence B"], "the limit ended the exit: {withdrawals:?}");
+        assert!(!app.io.self_ended.load(SeqCst) && withdrawals == ["presence B"], "the limit ended the exit, not A: {withdrawals:?}");
 
         let next = app.started(file.clone());
         drop(app);
         assert!(next.sharing.is_due(), "the next start has what the exit could not withdraw");
-        answers(&next, "A");
+        answers(&next, "A", 2);
         next.refresh();
         let world = next.world();
         assert!(!world.roster.contains("A") && world.presence["A"] == "withdrawn", "{:?} {:?}", world.roster, world.presence);
@@ -880,12 +899,11 @@ mod tests {
         assert!(!file.exists());
     }
 
-    /// Lets `place` answer again, and waits until what was waiting there has ended.
-    fn answers(app: &App, place: &str) {
+    /// Lets `place` answer again, and waits until the `waiting` withdrawals there have ended.
+    fn answers(app: &App, place: &str, waiting: usize) {
         app.io.hung.answer(place);
         let at = |list: &[String]| list.iter().filter(|w| w.ends_with(&format!(" {place}"))).count();
-        let started = at(&app.world().attempts);
-        eventually("what waited at the place ended", || at(&app.world().withdrawals) == started);
+        eventually("what waited at the place ended", || at(&app.world().withdrawals) == waiting);
     }
 
     /// The limit lets a working remote finish, keeps a refresh that meets a place that does not
