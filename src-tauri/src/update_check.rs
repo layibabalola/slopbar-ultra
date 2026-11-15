@@ -923,6 +923,13 @@ mod tests {
             assert_eq!(function(&code, "the test's code", "fn f(", "guards_read_tokens_not_layout"), tokens(&body), "the body ends at its own brace");
             assert_eq!(count(&code, "signin::close_all"), 1);
         }
+        // So does a word from a string or `#` after it: in a macro, `r "a\"b"` run together would
+        // read as the raw string `r"a\"`, and its last quote would open a string that hid the code
+        // after it.
+        let body = r#"fn f() { let _m = stringify!(r "a\"b"); let _s = state.lock().unwrap(); let _q = identity('"'); }"#;
+        let code = tokens(&format!("{body}\nfn g() {{ wait(); }}"));
+        assert_eq!(function(&code, "the test's code", "fn f(", "guards_read_tokens_not_layout"), tokens(body), "the body ends at its own brace");
+        assert!(has(&code, ".lock().unwrap()"), "the code after the string is read as code");
         // Text in a literal is not code: a needle spelled there is not found, though a needle that
         // is the whole literal is.
         let spelled = tokens("fn f() { let s = \"update.download( turn \"; let c = '('; }");
@@ -1139,10 +1146,11 @@ pub(crate) mod guard {
     }
 
     /// `source` as a guard reads it, code and needles alike: no comments; whitespace only where it
-    /// keeps two words apart, a word from a quote after it (`break 'a '}'`, which run together
-    /// would read as the literal `'a'`), or `/` from a `/` or `*` after it, as one space; and no
-    /// comma right before a closing bracket, which rustfmt adds when it breaks a call over lines.
-    /// String and character literals are kept as written.
+    /// keeps two words apart, a word from a quote or `#` after it (`break 'a '}'`, or `r "a\"b"`
+    /// in a macro, which run together would read as the literal `'a'` or the raw string `r"a\"`),
+    /// or `/` from a `/` or `*` after it, as one space; and no comma right before a closing
+    /// bracket, which rustfmt adds when it breaks a call over lines. String and character literals
+    /// are kept as written.
     pub fn tokens(source: &str) -> String {
         let mut out = String::with_capacity(source.len());
         let mut gap = false;
@@ -1164,7 +1172,7 @@ pub(crate) mod guard {
                     out.pop();
                 }
                 let last = out.chars().next_back();
-                if gap && (((word(c) || c == '\'') && last.is_some_and(word)) || (last == Some('/') && matches!(c, '/' | '*'))) {
+                if gap && (((word(c) || matches!(c, '\'' | '"' | '#')) && last.is_some_and(word)) || (last == Some('/') && matches!(c, '/' | '*'))) {
                     out.push(' ');
                 }
                 out.push_str(&source[i..end]);
@@ -1330,7 +1338,7 @@ pub(crate) mod guard {
     pub fn function<'a>(code: &'a str, file: &str, signature: &str, test: &str) -> &'a str {
         let start = find(code, signature).unwrap_or_else(|| panic!("{}", lost(file, signature, test)));
         let open = outside_literals(code, start).find(|&(_, c)| c == '{').map(|(at, _)| at);
-        let close = open.and_then(|open| closing(code, open)).unwrap_or_else(|| panic!("`{signature}` in {file} has no body that closes"));
+        let close = open.and_then(|open| closing(code, open)).unwrap_or_else(|| panic!("`{signature}` in {file} has no body that closes, as {test} reads it"));
         &code[start..=close]
     }
 
