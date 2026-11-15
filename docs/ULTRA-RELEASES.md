@@ -55,12 +55,45 @@ then every 15 minutes (`ultra_release::CHECK_EVERY`; upstream builds keep 6 hour
 every machine about 10 minutes for the build plus at most 15 for the check after the push. To have
 every machine install now, run `pwsh scripts/fleet-slopbar.ps1 -UpdateNow` (below).
 
-Nothing can stall the checks: the request for `latest.json` has 30 seconds, the installer's download
-10 minutes, and a whole check and install 12½ minutes. A check that fails (no answer in time, a
-failed download, a sign-in that puts the install off) is tried again after 2 minutes, once, and then
-every 15 minutes as usual. `get_app_info` (door) reports the last check as `update_check`: its time
-(UTC), result (`up_to_date`, `found`, `installing` or `error`), version and error, and when the next
-one runs.
+### What bounds a check and an install
+
+Each pass of a machine's update loop is a check and, when it finds a release, the install. What is
+bounded, and how (`src-tauri/src/update_check.rs`):
+
+| What | Limit | How |
+| --- | --- | --- |
+| The check's request for `latest.json` | 30 s | the updater's own deadline (`UpdaterBuilder::timeout`) |
+| Any request without data, the download's included | 60 s | reqwest's read timeout, through `UpdaterBuilder::configure_client` |
+| The download | 30 min in all | the update's own deadline (the check's does not carry over to it) |
+| Each step of an install | the check 40 s, the download 31 min, waiting for a refresh to finish 2 min, handing over to the installer 1 min | the step's limit; its error names the step |
+| A whole pass, and an install asked for (`install_update`, Settings) | 35 min 40 s | a task of its own: a panic or this limit ends that pass and nothing else |
+| The exit cleanup the handover runs | 15 s for each part that can wait, 3 s for the diagnostics journal | a thread of its own |
+
+Not bounded: the installer once it has started, which is a separate program; and a handover that
+outlives its limit, whose thread cannot be stopped. That thread keeps the install's turn, so the
+next pass is deferred, and fails once the stuck install is past the pass limit, which the fleet
+script reports.
+
+One install runs at a time: the loop, `install_update` and the fleet script's repeated requests never
+download in parallel. A request while one runs is answered at once ("An update is already being
+installed") and recorded as `deferred`. An open sign-in also defers an install, before the download
+and again before the handover, because the installer ends SlopBar while tokens may be rotating. A
+deferral is no failure: the next try is at the usual interval. A failure is tried again after 2
+minutes, once, and then every 15 minutes.
+
+`get_app_info` (door) reports the last check as `update_check`: its time (UTC), result
+(`up_to_date`, `found`, `installing`, `deferred` or `error`), version, error or the reason it was
+deferred, who asked (`auto` or `manual`), when the loop runs next (`next_at`), the interval and the
+pass limit. The record lives in memory only. An install's last record is `installing`, because the
+process that keeps it exits as the installer starts; the new version has no record until its first
+check, about 20 seconds after it starts.
+
+**A change to the install path is proven one release late.** A machine installs a release with the
+updater of the build it runs, so the first release that carries a change to `updates.rs` or
+`update_check.rs` is installed by the old code. Only the release after it goes through the new
+download, deadlines and handover: that second release is the canary for the install half. Watch it
+reach every machine (`pwsh scripts/fleet-slopbar.ps1`), and if it does not, install by hand
+("Installing a release by hand", below).
 
 The workflow runs the steps of `scripts/publish-ultra-release.ps1`. The script also publishes by
 hand, for example while Actions is down:
@@ -279,22 +312,30 @@ pwsh scripts/fleet-slopbar.ps1 -UpdateNow
   in files, a timeout and a tree kill, because on some machines an `ssh.exe` whose output is piped
   never exits.
 - **What it reports:** version, "Update automatically", the last update check (`LastCheck`: how
-  long ago, and what it found or its error), and current, behind or not installed. A machine without
-  SlopBar is "not installed", not an error. A build from before the update-check record shows n/a,
-  which is no problem, because machines update one by one.
+  long ago, and what it found, why it was deferred, or its error, cut to 40 characters; each one cut
+  follows the table in full), and current, behind or not installed. A machine without SlopBar is
+  "not installed", not an error. A build from before the update-check record shows n/a, which is no
+  problem, because machines update one by one.
 - **Updating:** `install_update` replies at once and installs in the background. The app records how
-  the install went in `update_check`, and it puts an update off while a sign-in is open. So a machine
-  still answering on the old version after 90 seconds says why and is asked again, up to three times
-  in all.
+  the install went in `update_check`; a request while an install runs is deferred at once, and so is
+  an install while a sign-in is open. So a machine still answering on the old version after 90
+  seconds says why and is asked again, up to three times in all.
 - **Problems (exit code 1):**
   - a local build (a version without `-ultra.`, which takes no releases),
   - a build without updates,
   - "Update automatically" off,
-  - a failed last update check,
-  - no update check for over twice the update interval (30 minutes) while "Update automatically" is
-    on,
   - a machine that does not answer,
-  - an update that does not arrive within 5 minutes.
+  - an update that does not arrive within 5 minutes,
+  - and, from each machine's record, with its own interval and pass limit (15 minutes and 35 min 40 s
+    on Ultra builds):
+    - a failed last update check (a deferred one is no problem),
+    - no update check for longer than the interval plus the pass limit (about 51 minutes) while
+      "Update automatically" is on,
+    - an update loop whose next run is overdue by more than the pass limit: it has stopped, even if
+      a check asked for since then shows a recent time,
+    - a machine still behind the channel longer than the interval plus the pass limit after the
+      channel's release was published (`pub_date` in `latest.json`).
+- **Tested** offline by `pwsh scripts/test-fleet-slopbar.ps1`, on synthetic answers.
 
 ## Optional: Authenticode signing (paid, not purchased)
 
@@ -319,13 +360,53 @@ the same on the key's machine. The updater key stays as it is.
 ```powershell
 cargo test --locked --no-default-features --lib --manifest-path src-tauri/Cargo.toml ultra_release
 pwsh scripts/test-publish-ultra-release.ps1
+pwsh scripts/test-fleet-slopbar.ps1
 ```
 
 The second tests the publisher offline, against synthetic repositories and a stand-in for `gh`.
-After `pnpm install` it also signs with a throwaway key.
+After `pnpm install` it also signs with a throwaway key. The third tests the fleet report's rules
+on synthetic answers.
 
 Don't set the signing variables in a shell by hand: they pass to every process it starts. To sign,
 use `scripts/publish-ultra-release.ps1`, which gives the password to the signer's process alone.
+
+## Installing a release by hand
+
+When a machine's updater cannot install a release (the canary above failed, say), install it over
+ssh. Never start SlopBar from the ssh session: it would run there, invisible, instead of on the
+user's desktop. `<alias>` is the machine's ssh alias, `<tag>` the release's `ultra-v…` tag.
+
+1. Download the release's NSIS installer and check it against the SHA-256 digest GitHub keeps for
+   the asset:
+
+   ```powershell
+   $tag = '<tag>'; $dir = Join-Path $env:TEMP 'slopbar-manual'
+   gh release download $tag -R layibabalola/slopbar-ultra -p '*-setup.exe' -D $dir
+   $asset = gh release view $tag -R layibabalola/slopbar-ultra --json assets --jq '.assets[] | select(.name | endswith("-setup.exe"))' | ConvertFrom-Json
+   $file = Join-Path $dir $asset.name
+   if ("sha256:$((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant())" -ne $asset.digest) { throw 'The installer does not match its release.' }
+   ```
+
+2. Copy it to the machine's profile folder and check it there too:
+   `scp $file <alias>:` then `ssh <alias> "cmd /d /c certutil -hashfile %USERPROFILE%\<name> SHA256"`
+   must print the same digest.
+3. Quit SlopBar there through its door, so it exits cleanly (presence, sign-ins, journal) rather
+   than being ended by the installer:
+   `ssh <alias> "cmd /d /c %LOCALAPPDATA%\SlopBar\slopbar-mcp.exe --call quit_app"`.
+4. Run the installer silently: `ssh <alias> "cmd /d /c %USERPROFILE%\<name> /S"`. Leave out `/R`,
+   which the updater passes: it would start SlopBar inside the ssh session.
+5. Start SlopBar in the signed-in user's session through a one-shot scheduled task, and delete the
+   task at once. `/IT` runs it only in that interactive session, so someone must be signed in there:
+
+   ```
+   ssh <alias> "cmd /d /c schtasks /Create /TN SlopBarStart /TR %LOCALAPPDATA%\SlopBar\slopbar.exe /SC ONCE /ST 23:59 /IT /F"
+   ssh <alias> "cmd /d /c schtasks /Run /TN SlopBarStart"
+   ssh <alias> "cmd /d /c schtasks /Delete /TN SlopBarStart /F"
+   ```
+
+6. Check that `pwsh scripts/fleet-slopbar.ps1` shows the machine on the release.
+
+As with the fleet script, the commands assume a profile path without spaces.
 
 ## Rolling back a bad release
 

@@ -248,7 +248,7 @@ The app is at `src-tauri/target/x86_64-pc-windows-msvc/release/slopbar.exe`.
 
 The upstream release workflow publishes from `main` (`v0.2.<run>`), runs the telemetry tests on Windows, and enables signed upstream updates for those releases. Local builds use manual updates.
 
-Builds with updates check about 20 seconds after starting and then every 6 hours, and install what they find while **Update automatically** is on. What is bounded, and by how much:
+Builds with updates check about 20 seconds after starting and then every 6 hours (SlopBar Ultra release builds every 15 minutes, and they also wait for a refresh and an open sign-in: see `docs/ULTRA-RELEASES.md`), and install what they find while **Update automatically** is on. What is bounded, and by how much:
 
 - the check's request: 30 seconds; any request, the download's included, without data: 60 seconds; the download: 30 minutes in all;
 - each step of an install, whose error then names it: the check 40 seconds, the download 31 minutes, handing over to the installer 1 minute;
