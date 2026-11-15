@@ -157,14 +157,27 @@ try {
         $r = $replies[$m]
         Write-Output "  ${m}: $(if ($r.State -eq 'ok') { 'installing' } else { "$($r.State) $($r.Message)" })"
       }
-      # The app restarts into the new build; wait until each one reports it.
+      # The app restarts into the new build; wait until each one reports it. It installs in the
+      # background and drops the error (it puts an update off while a sign-in is open, for example),
+      # so a machine still answering on the old version is asked again, up to three times in all.
       $waiting = [Collections.Generic.List[string]]::new([string[]]$behind)
+      $attempts = @{}
+      foreach ($m in $behind) { $attempts[$m] = 1 }
+      $asked = Get-Date
       $until = (Get-Date).AddSeconds($InstallWaitSeconds)
       while ($waiting.Count -and (Get-Date) -lt $until) {
         Start-Sleep -Seconds 10
         $now = Invoke-Everywhere $waiting.ToArray() 'get_app_info' 20
         foreach ($m in @($waiting)) {
           if ($now[$m].State -eq 'ok' -and "$($now[$m].Value.version)" -eq $channel) { $null = $waiting.Remove($m); Write-Output "  ${m}: on $channel" }
+        }
+        if ($waiting.Count -and ((Get-Date) - $asked).TotalSeconds -ge 90) {
+          $again = @($waiting | Where-Object { $attempts[$_] -lt 3 -and $now[$_].State -eq 'ok' })
+          if ($again) {
+            $null = Invoke-Everywhere $again 'install_update'
+            foreach ($m in $again) { $attempts[$m]++; Write-Output "  ${m}: still on $($now[$m].Value.version); asked again (attempt $($attempts[$m]))" }
+          }
+          $asked = Get-Date
         }
       }
       foreach ($m in $waiting) { Write-Output "  ${m}: still not on $channel after $InstallWaitSeconds s" }

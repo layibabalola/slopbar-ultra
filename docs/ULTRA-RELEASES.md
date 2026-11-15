@@ -248,6 +248,9 @@ pwsh scripts/fleet-slopbar.ps1 -UpdateNow
   never exits.
 - **What it reports:** version, "Update automatically", and current, behind or not installed. A
   machine without SlopBar is "not installed", not an error.
+- **Updating:** `install_update` replies at once and installs in the background. The app drops the
+  install's error, and it puts an update off while a sign-in is open. So a machine still answering
+  on the old version after 90 seconds is asked again, up to three times in all.
 - **Problems (exit code 1):**
   - a local build (a version without `-ultra.`, which takes no releases),
   - a build without updates,
