@@ -219,7 +219,7 @@ fn catalog() -> Vec<Tool> {
             }), &["folder", "provider"]), false, true, true, false),
         tool("check_for_updates", "Check for updates", "Check for a newer SlopBar release (only builds with automatic updates).", none(), true, false, true, true),
         tool("install_update", "Install update", "Download and install the available SlopBar update; SlopBar restarts shortly after replying.", none(), false, true, false, true),
-        tool("get_app_info", "Get app info", "SlopBar's version, build (commit, dirty flag) and whether automatic updates are available.", none(), true, false, true, false),
+        tool("get_app_info", "Get app info", "SlopBar's version, build (commit, dirty flag), whether automatic updates are available, and update_check: the last update check's time (UTC), result (up_to_date, found, installing, deferred or error), error or the reason it was deferred, and when the update loop runs next.", none(), true, false, true, false),
         tool("inspect_window", "Inspect a SlopBar window", "The visible text of the Settings window (optionally on one page), the taskbar flyout, the quick switcher or the taskbar widget itself (its tooltips, drawn by the same native code), and the local path of a PNG of it that you can read. A closed window is drawn off-screen without focus or a taskbar button and hidden again, and a page chosen for the look is switched back, so the user sees nothing change. The PNG shows account emails; it stays on this machine (the last 10 are kept).",
             schema(json!({
                 "window": { "type": "string", "enum": ["settings", "flyout", "switcher", "widget"] },

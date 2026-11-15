@@ -42,6 +42,7 @@ mod session_hook;
 mod turn_hook;
 mod wind_down;
 mod leases;
+mod update_check;
 mod launcher;
 mod i18n;
 mod i18n_format;
