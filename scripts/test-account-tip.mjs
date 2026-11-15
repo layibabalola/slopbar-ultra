@@ -5,10 +5,11 @@ import assert from "node:assert/strict";
 
 // i18n.js sets the page language on load.
 globalThis.document ??= { documentElement: {} };
-const { t, setLanguage, windowResetText } = await import("../src/i18n.js");
+const { t, setLanguage, setThisMachine, windowResetText, placesText, overlapText } = await import("../src/i18n.js");
 const { accountTip, accountTipLines, adviceText } = await import("../src/accounttext.js");
 const { sparkline, sparklineText } = await import("../src/sparkline.js");
 setLanguage("en");
+setThisMachine("DESK-1");
 
 let passed = 0;
 const test = (name, fn) => {
@@ -98,7 +99,7 @@ test("a full account says everything the full card does, grouped", () => {
   const [who, usage, state, held, plan] = groups;
   assert.equal(who[0], "Work (max@example.invalid)");
   assert.equal(who[1], "Claude · Max 20x");
-  assert.equal(who[2], `${t("inUse")}: Windows, LAPTOP-2 (WSL: Ubuntu)`);
+  assert.equal(who[2], "In use on DESK-1 (this PC), LAPTOP-2 (WSL: Ubuntu)");
   assert.ok(who.some((l) => l.startsWith("DESK-3:")), "machines that went quiet");
   assert.ok(who.includes(t("usedOutside")) && who.includes(t("leased", { purpose: "nightly build" })));
   // Each window, model-specific ones too, with its reset relative and absolute, as the full card words it.
@@ -126,6 +127,58 @@ test("missing fields are left out, not shown empty", () => {
     active: false, sources: [], windows: [], credits: null, error: null, stale: false, fetched_at: null,
     monitor_connected: false, resets: [] };
   assert.deepEqual(accountTipLines(bare, { now }), [["solo@example.invalid", "Codex"], [t("tipMonitorOff")]]);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Machines an account is in use on
+
+const laptop = { machine: "LAPTOP-2", where: ["WSL: Ubuntu"], seen_at: iso(now), live: true };
+const used = (over) => ({ active: false, desktop: false, sources: [], remote: [], overlap: [], ...over });
+
+test("every machine an account is in use on is named, this one first and marked", () => {
+  const cases = [
+    [used({ active: true, sources: ["Windows"] }), "In use on DESK-1 (this PC)", ["DESK-1 (this PC)"]],
+    [used({ active: true, desktop: true, sources: ["Windows"] }), "In use on DESK-1 (this PC, Windows, Desktop app)", ["DESK-1 (this PC)"]],
+    [used({ desktop: true }), "In use on DESK-1 (this PC, Desktop app)", ["DESK-1 (this PC)"]],
+    [used({ active: true, sources: ["Windows"], remote: [laptop] }), "In use on DESK-1 (this PC), LAPTOP-2 (WSL: Ubuntu)", ["DESK-1 (this PC)", "LAPTOP-2"]],
+    [used({ remote: [laptop] }), "In use on LAPTOP-2 (WSL: Ubuntu)", ["LAPTOP-2"]],
+    [used({ remote: [{ ...laptop, live: false }] }), "", []],
+    [used({}), "", []],
+  ];
+  for (const [a, inUse, machines] of cases) {
+    const p = placesText(a);
+    assert.equal(p.inUse, inUse);
+    assert.deepEqual(p.machines, machines);
+    assert.deepEqual(p.names, machines.map((m) => m.replace(" (this PC)", "")));
+  }
+  assert.ok(placesText(used({ remote: [{ ...laptop, live: false }] })).seen[0].startsWith("LAPTOP-2 (WSL: Ubuntu): seen "));
+});
+
+test("an unknown name for this machine still says this PC", () => {
+  setThisMachine("");
+  try {
+    assert.equal(placesText(used({ active: true, sources: ["Windows"] })).inUse, "In use on this PC");
+    assert.equal(placesText(used({ active: true, sources: ["WSL: Ubuntu"], remote: [laptop] })).inUse, "In use on this PC (WSL: Ubuntu), LAPTOP-2 (WSL: Ubuntu)");
+    assert.deepEqual(placesText(used({ active: true })).names, []);
+    assert.deepEqual(overlapText(used({ overlap: ["DESK-1", "LAPTOP-2"] })).lines[0], "In use on 2 machines at once: DESK-1, LAPTOP-2");
+  } finally {
+    setThisMachine("DESK-1");
+  }
+});
+
+test("an overlap names its machines, this one marked whatever its case", () => {
+  const o = overlapText(used({ overlap: ["desk-1", "LAPTOP-2"] }));
+  assert.equal(o.chip, t("overlapChip", { n: 2 }));
+  assert.equal(o.lines[0], "In use on 2 machines at once: desk-1 (this PC), LAPTOP-2");
+});
+
+test("machine names are translated around, never translated themselves", () => {
+  setLanguage("de");
+  try {
+    assert.equal(placesText(used({ active: true, desktop: true, sources: ["Windows"] })).inUse, "Aktiv auf DESK-1 (dieser PC, Windows, Desktop-App)");
+  } finally {
+    setLanguage("en");
+  }
 });
 
 test("errors are worded with their fix, and stale readings say so", () => {

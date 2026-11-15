@@ -170,6 +170,10 @@ pub trait Texts {
     fn lang(&self) -> &str {
         "en"
     }
+    /// This machine's name, to name it among the machines an account is in use on.
+    fn machine(&self) -> Option<String> {
+        None
+    }
 }
 
 pub struct Lang(pub String);
@@ -180,6 +184,9 @@ impl Texts for Lang {
     }
     fn lang(&self) -> &str {
         &self.0
+    }
+    fn machine(&self) -> Option<String> {
+        crate::presence::this_machine()
     }
 }
 
@@ -213,26 +220,13 @@ pub fn account_detail(texts: &dyn Texts, a: &AccountUsage, now: chrono::DateTime
     let lang = texts.lang();
     let provider = provider_name(a.provider);
     let name = a.alias.clone().or_else(|| a.email.clone()).unwrap_or_else(|| texts.t("unknownAccount", &[]));
-    let desktop_app = texts.t("desktopApp", &[]);
-    let place = |w: &String| if w == crate::desktop_apps::PLACE { desktop_app.clone() } else { w.clone() };
-    let machine = |r: &crate::model::RemoteSeat| {
-        if r.where_.is_empty() || (r.where_.len() == 1 && r.where_[0] == "Windows") { r.machine.clone() } else { format!("{} ({})", r.machine, r.where_.iter().map(place).collect::<Vec<_>>().join(", ")) }
-    };
-    let live: Vec<String> = a.remote.iter().filter(|r| r.live).map(machine).collect();
-    let mut here = if a.active { a.sources.clone() } else { vec![] };
-    if a.desktop { here.push(desktop_app.clone()); }
-    let in_use = if !here.is_empty() {
-        format!("{}: {}", texts.t("inUse", &[]), [here, live.clone()].concat().join(", "))
-    } else if !live.is_empty() {
-        texts.t("inUseOn", &[("list", &live.join(", "))])
-    } else {
-        String::new()
-    };
+    // Every machine it is in use on by name, this one first and marked (`placesText` in i18n.js).
+    let me = texts.machine();
     let ago = |at: chrono::DateTime<chrono::Utc>| f::duration(lang, ((now - at).num_minutes()).max(1));
     let mut who = vec![
         match (&a.alias, &a.email) { (Some(_), Some(email)) => format!("{name} ({email})"), _ => name.clone() },
         [Some(provider.to_string()), a.plan.clone(), a.org.clone()].into_iter().flatten().collect::<Vec<_>>().join(" · "),
-        in_use,
+        f::in_use_text(lang, a, me.as_deref()),
     ];
     if let Some(d) = &a.seats {
         let unknown = texts.t("seatsUnknown", &[]);
@@ -240,10 +234,11 @@ pub fn account_detail(texts: &dyn Texts, a: &AccountUsage, now: chrono::DateTime
     }
     if a.overlap.len() > 1 {
         let n = a.overlap.len().to_string();
-        who.push(texts.t("overlapOn", &[("n", &n), ("list", &a.overlap.join(", "))]));
+        let list: Vec<String> = a.overlap.iter().map(|m| f::machine_name(lang, m, me.as_deref())).collect();
+        who.push(texts.t("overlapOn", &[("n", &n), ("list", &list.join(", "))]));
         who.push(texts.t("overlapWhy", &[("n", &n)]));
     }
-    who.extend(a.remote.iter().filter(|r| !r.live).map(|r| texts.t("seenOn", &[("machine", &machine(r)), ("t", &ago(r.seen_at))])));
+    who.extend(a.remote.iter().filter(|r| !r.live).map(|r| texts.t("seenOn", &[("machine", &f::remote_text(lang, r)), ("t", &ago(r.seen_at))])));
     if a.used_outside { who.push(texts.t("usedOutside", &[])); }
     if let Some(purpose) = &a.leased { who.push(texts.t("leased", &[("purpose", purpose)])); }
 
@@ -711,6 +706,17 @@ mod tests {
         }
     }
 
+    /// English on a machine named DESK-1.
+    struct OnDesk1;
+    impl Texts for OnDesk1 {
+        fn t(&self, key: &str, vars: &[(&str, &str)]) -> String {
+            crate::i18n::t("en", key, vars)
+        }
+        fn machine(&self) -> Option<String> {
+            Some("DESK-1".into())
+        }
+    }
+
     fn account(provider: Provider, id: &str, active: bool, used: &[f64]) -> AccountUsage {
         let mut a: AccountUsage = serde_json::from_value(serde_json::json!({
             "id": id, "provider": provider, "active": active, "windows": [], "email": null, "alias": null,
@@ -778,11 +784,14 @@ mod tests {
     fn an_account_on_several_machines_gets_a_badge_and_says_why() {
         let mut codex = account(Provider::Codex, "c1", true, &[10.0]);
         codex.overlap = vec!["DESK-1".into(), "LAPTOP-2".into()];
-        let v = view(&snap(vec![account(Provider::Claude, "a1", true, &[5.0]), codex]), None, 0, &En);
+        let v = view(&snap(vec![account(Provider::Claude, "a1", true, &[5.0]), codex.clone()]), None, 0, &En);
         assert_eq!(v.overlap, [false, true]);
         assert!(!v.details[0].contains("machines"));
         assert!(v.details[1].contains("In use on 2 machines at once: DESK-1, LAPTOP-2"), "{}", v.details[1]);
         assert!(v.details[1].contains("Limits drain about 2× as fast"), "{}", v.details[1]);
+        // On DESK-1 itself, the tooltip says which of the two this is.
+        let here = view(&snap(vec![codex]), None, 0, &OnDesk1);
+        assert!(here.details[0].contains("In use on 2 machines at once: DESK-1 (this PC), LAPTOP-2"), "{}", here.details[0]);
         // Lower right of the ring, clear of the health dot at the widget's upper right.
         let l = layout(&v, 48.0, &measure);
         let ((x, y), r) = overlap_badge(&l.items[1]);
@@ -911,15 +920,20 @@ mod tests {
             ],
         })).unwrap();
         a.runs_out_at = Some(now + chrono::Duration::hours(30));
-        let d = account_detail(&En, &a, now);
+        let d = account_detail(&OnDesk1, &a, now);
         let groups: Vec<&str> = d.split("\n\n").collect();
         assert_eq!(groups.len(), 4, "{d}");
         assert_eq!(groups[0].lines().collect::<Vec<_>>(), [
             "Work (max@example.invalid)".to_string(),
             "Claude · Max 20x".into(),
-            format!("{}: Windows, LAPTOP-2 (WSL: Ubuntu)", en("inUse", &[])),
+            // Every machine it is in use on, by name: this one first and marked.
+            "In use on DESK-1 (this PC), LAPTOP-2 (WSL: Ubuntu)".into(),
             en("leased", &[("purpose", "nightly build")]),
         ]);
+        // The desktop app here is named as a place, like the CLI's.
+        let mut both = a.clone();
+        both.desktop = true;
+        assert!(account_detail(&OnDesk1, &both, now).contains("In use on DESK-1 (this PC, Windows, Desktop app), LAPTOP-2 (WSL: Ubuntu)"));
         let reset = crate::i18n_format::window_reset_text("en", &a.windows[0], false, a.fetched_at, now);
         assert!(reset.starts_with(&en("resetsIn", &[("t", "2d 4h")])) && reset.contains(" · "), "relative and absolute: {reset}");
         assert!(groups[1].starts_with(&format!("{}: 77% {} · {reset}", en("weekly", &[]), en("used", &[]))), "{}", groups[1]);

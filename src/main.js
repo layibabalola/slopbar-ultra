@@ -1,4 +1,4 @@
-import { t, windowResetText, windowLabel, errorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, duration, resetText, groupResets, visibleResetWindows, placesText, overlapText, seatsText } from "./i18n.js";
+import { t, windowResetText, windowLabel, errorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, setThisMachine, duration, resetText, groupResets, visibleResetWindows, placesText, overlapText, seatsText } from "./i18n.js";
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { creditAdviceText } from "./alerts.js";
@@ -197,9 +197,9 @@ function renderDetails(snap) {
     </section>`).join(""));
 }
 
-/** One line per account: provider mark, name, the binding window's %, the sparkline, and Use.
- * The row's tooltip says everything the full card would (accountTip), and screen readers get
- * the same text as the row's description. */
+/** One line per account: provider mark, name, the binding window's %, the sparkline, and Use;
+ * under the name, the machines it is in use on. The row's tooltip says everything the full card
+ * would (accountTip), and screen readers get the same text as the row's description. */
 function renderCompactList(snap) {
   const list = ["claude", "codex"].flatMap((p) => snap.accounts.filter((a) => a.provider === p));
   patch($accounts, `<div class="compact-list" role="list" aria-label="${esc(t("title"))}">${list.map((a, i) => {
@@ -209,11 +209,13 @@ function renderCompactList(snap) {
     const used = w ? `${Math.round(w.used_percent)}%` : "—";
     const usedText = w ? `${windowLabel(w)}: ${used} ${t("used")}` : t("usageUnknown");
     const tip = accountTip(a, { sub: subs[key], trail: trails[key], creditAdvice: creditAdvice[key] });
+    const machines = placesText(a).machines;
     return `
       <div class="acct line ${a.active ? "active" : ""}" role="listitem" data-key="${a.provider}:${esc(a.id)}" title="${esc(tip)}" aria-describedby="tip-${i}">
         <span class="sr-only" id="tip-${i}">${esc(tip)}</span>
         <span class="provider-mark ${a.provider}" role="img" aria-label="${PROVIDER_NAME[a.provider]}">${MARK[a.provider]}</span>
-        <span class="who">${esc(accountName(a))}</span>
+        <span class="who"><span class="name">${esc(accountName(a))}</span>${machines.length
+          ? `<small class="where"><span class="glyph" aria-hidden="true">\uE977</span>${esc(machines.join(", "))}</small>` : ""}</span>
         ${problem ? `<span class="problem" role="img" aria-label="${esc(problem)}">!</span>` : ""}
         ${overlapBadge(a)}
         ${sparkline(trails[key], { tooltip: false })}
@@ -361,6 +363,8 @@ listen("settings-changed", (e) => applySettings(e.payload));
 invoke("system_locale")
   .then(setSystemLocale, () => {})
   .finally(() => invoke("get_settings").then(applySettings));
+// This computer's name, to tell it apart from the other machines an account is in use on.
+invoke("this_machine").then((name) => { setThisMachine(name); if (lastSnap.updated_at) render(lastSnap); }, () => {});
 
 $refresh.addEventListener("click", async () => {
   $refresh.classList.add("spin");

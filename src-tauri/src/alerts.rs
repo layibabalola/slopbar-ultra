@@ -215,8 +215,9 @@ pub fn check_usage(state: &mut State, snap: &Snapshot, prefs: &Notifications, la
 /// notification per overlap, once it has lasted `OVERLAP_SETTLE_MS` without a break. The same
 /// overlap is not said again while it lasts, nor when it comes back within `OVERLAP_FORGET_MS`,
 /// nor when a machine drops out of it; another machine joining is news. `state` is updated
-/// whatever the settings say. Only snapshots with freshly read presence belong here.
-pub fn check_overlap(state: &mut State, snap: &Snapshot, prefs: &Notifications, lang: &str, now: DateTime<Utc>) -> Vec<Notice> {
+/// whatever the settings say. Only snapshots with freshly read presence belong here. `me` is this
+/// machine's name, marked in the list of machines.
+pub fn check_overlap(state: &mut State, snap: &Snapshot, prefs: &Notifications, lang: &str, me: Option<&str>, now: DateTime<Utc>) -> Vec<Notice> {
     let mut out = Vec::new();
     // Forgotten first, by when each was last seen (a night asleep makes the next one new).
     state.overlaps.retain(|_, s| (now - s.seen).num_milliseconds() < OVERLAP_FORGET_MS);
@@ -240,9 +241,10 @@ pub fn check_overlap(state: &mut State, snap: &Snapshot, prefs: &Notifications, 
             seen.notified = true;
             if prefs.multi_machine {
                 let n = a.overlap.len().to_string();
+                let list: Vec<String> = a.overlap.iter().map(|m| fmt::machine_name(lang, m, me)).collect();
                 out.push(Notice::Plain {
                     title: t(lang, "nOverlapTitle", &[("provider", provider_name(pstr)), ("n", &n)]),
-                    body: t(lang, "nOverlapBody", &[("account", &account_name(lang, a)), ("list", &a.overlap.join(", ")), ("n", &n)]),
+                    body: t(lang, "nOverlapBody", &[("account", &account_name(lang, a)), ("list", &list.join(", ")), ("n", &n)]),
                     page: Some("accounts"),
                     phone: None,
                 });
@@ -499,7 +501,8 @@ mod glue {
             let before = state.clone();
             let mut notices = check_usage(&mut state, &snapshot, &prefs, &lang, now);
             if presence_fresh {
-                notices.extend(check_overlap(&mut state, &snapshot, &prefs, &lang, now));
+                let me = crate::presence::this_machine();
+                notices.extend(check_overlap(&mut state, &snapshot, &prefs, &lang, me.as_deref(), now));
             }
             if *state != before {
                 if let Some(p) = path() { let _ = save_to(&p, &state); }
@@ -663,45 +666,50 @@ mod tests {
         let alone = snap(vec![alone]);
 
         // A moment's overlap (a switch on another machine) says nothing.
-        assert!(check_overlap(&mut s, &both, &prefs, "en", mins(0)).is_empty());
-        assert!(check_overlap(&mut s, &both, &prefs, "en", mins(2)).is_empty());
-        let out = check_overlap(&mut s, &both, &prefs, "en", mins(5));
+        assert!(check_overlap(&mut s, &both, &prefs, "en", None, mins(0)).is_empty());
+        assert!(check_overlap(&mut s, &both, &prefs, "en", None, mins(2)).is_empty());
+        let out = check_overlap(&mut s, &both, &prefs, "en", None, mins(5));
         assert_eq!(titles(&out), ["Claude account in use on 2 machines"]);
         let Notice::Plain { body, page, .. } = &out[0] else { panic!() };
         assert!(body.starts_with("me@example.invalid is in use on DESK-1, LAPTOP-2 at once"), "{body}");
         assert_eq!(*page, Some("accounts"));
+        // Said on DESK-1, it marks which of them this is.
+        let mut fresh = State::default();
+        check_overlap(&mut fresh, &both, &prefs, "en", Some("DESK-1"), mins(0));
+        let Notice::Plain { body, .. } = &check_overlap(&mut fresh, &both, &prefs, "en", Some("DESK-1"), mins(5))[0] else { panic!() };
+        assert!(body.starts_with("me@example.invalid is in use on DESK-1 (this PC), LAPTOP-2 at once"), "{body}");
         // Never again while it lasts, nor after a short gap.
-        assert!(check_overlap(&mut s, &both, &prefs, "en", mins(10)).is_empty());
-        assert!(check_overlap(&mut s, &alone, &prefs, "en", mins(20)).is_empty());
-        assert!(check_overlap(&mut s, &both, &prefs, "en", mins(30)).is_empty());
-        assert!(check_overlap(&mut s, &both, &prefs, "en", mins(40)).is_empty());
+        assert!(check_overlap(&mut s, &both, &prefs, "en", None, mins(10)).is_empty());
+        assert!(check_overlap(&mut s, &alone, &prefs, "en", None, mins(20)).is_empty());
+        assert!(check_overlap(&mut s, &both, &prefs, "en", None, mins(30)).is_empty());
+        assert!(check_overlap(&mut s, &both, &prefs, "en", None, mins(40)).is_empty());
         // A third machine joining is news.
         let mut three = a.clone();
         three.overlap.push("TOWER-3".into());
         let three = snap(vec![three]);
-        assert!(check_overlap(&mut s, &three, &prefs, "en", mins(41)).is_empty());
-        assert_eq!(titles(&check_overlap(&mut s, &three, &prefs, "en", mins(46))), ["Claude account in use on 3 machines"]);
+        assert!(check_overlap(&mut s, &three, &prefs, "en", None, mins(41)).is_empty());
+        assert_eq!(titles(&check_overlap(&mut s, &three, &prefs, "en", None, mins(46))), ["Claude account in use on 3 machines"]);
         // Over long enough apart, it is a new overlap.
-        assert!(check_overlap(&mut s, &alone, &prefs, "en", mins(90)).is_empty());
+        assert!(check_overlap(&mut s, &alone, &prefs, "en", None, mins(90)).is_empty());
         assert!(s.overlaps.is_empty());
-        check_overlap(&mut s, &both, &prefs, "en", mins(91));
-        assert_eq!(check_overlap(&mut s, &both, &prefs, "en", mins(96)).len(), 1);
+        check_overlap(&mut s, &both, &prefs, "en", None, mins(91));
+        assert_eq!(check_overlap(&mut s, &both, &prefs, "en", None, mins(96)).len(), 1);
 
         // Broken off before it settled: the clock starts again.
         let mut s = State::default();
-        check_overlap(&mut s, &both, &prefs, "en", mins(0));
-        check_overlap(&mut s, &alone, &prefs, "en", mins(1));
-        assert!(check_overlap(&mut s, &both, &prefs, "en", mins(4)).is_empty());
-        assert_eq!(check_overlap(&mut s, &both, &prefs, "en", mins(8)).len(), 1);
+        check_overlap(&mut s, &both, &prefs, "en", None, mins(0));
+        check_overlap(&mut s, &alone, &prefs, "en", None, mins(1));
+        assert!(check_overlap(&mut s, &both, &prefs, "en", None, mins(4)).is_empty());
+        assert_eq!(check_overlap(&mut s, &both, &prefs, "en", None, mins(8)).len(), 1);
         // After a long sleep the same machines are a new overlap, which must settle first.
-        assert!(check_overlap(&mut s, &both, &prefs, "en", mins(100)).is_empty());
-        assert_eq!(check_overlap(&mut s, &both, &prefs, "en", mins(105)).len(), 1);
+        assert!(check_overlap(&mut s, &both, &prefs, "en", None, mins(100)).is_empty());
+        assert_eq!(check_overlap(&mut s, &both, &prefs, "en", None, mins(105)).len(), 1);
 
         // Turned off: remembered, never said.
         let off = Notifications { multi_machine: false, ..Notifications::default() };
         let mut s = State::default();
-        check_overlap(&mut s, &both, &off, "en", mins(0));
-        assert!(check_overlap(&mut s, &both, &off, "en", mins(5)).is_empty());
+        check_overlap(&mut s, &both, &off, "en", None, mins(0));
+        assert!(check_overlap(&mut s, &both, &off, "en", None, mins(5)).is_empty());
         assert!(s.overlaps["claude:a1"].notified);
     }
 
