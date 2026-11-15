@@ -235,6 +235,8 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
 .who input::placeholder { color: var(--text); opacity: 1; }
 .who small { display: flex; gap: 6px; align-items: center; color: var(--dim); font-size: 12px; line-height: 16px; overflow: hidden; white-space: nowrap; }
 .who small span { overflow: hidden; text-overflow: ellipsis; }
+/* The trailing text (organization, email) takes only the room the chips leave. */
+.who small > span { flex: 1 1 0; min-width: 0; }
 .chip {
   font-style: normal; flex: none; padding: 0 6px; border-radius: 4px; font-size: 12px; line-height: 18px;
   background: var(--control); border: 1px solid var(--control-stroke); color: var(--dim);
@@ -363,8 +365,8 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
 }
 .presence-path input:focus { outline: none; border-bottom: 2px solid var(--accent); }
 .chip.elsewhere { background: transparent; border-color: var(--ok); color: var(--ok); }
-/* Where it is in use, by machine: gives way first (its tooltip has it all), so a warning chip
-   after it stays in view. */
+/* Where it is in use, by machine: the one chip that gives way when the chips alone do not fit
+   (its tooltip has it all), so a warning chip after it stays in view. */
 .chip.where { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chip.outside { background: transparent; border-color: var(--warn); color: var(--warn); }
 .chip.overlap { background: transparent; border-color: var(--warn); color: var(--warn); font-weight: 600; }

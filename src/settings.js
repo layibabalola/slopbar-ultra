@@ -97,7 +97,7 @@ function accountRow(p, a) {
         <input data-alias="${esc(key)}" value="${esc(settings.aliases[key] ?? "")}"
           placeholder="${esc(a.email ?? t("unknownAccount"))}" aria-label="${t("alias")}" title="${t("alias")}" />
         <small>
-          ${places.inUse ? `<em class="chip where ${a.active || a.desktop ? "live" : "elsewhere"}" title="${esc(places.inUse)}">${esc(places.inUse)}</em>` : ""}
+          ${places.inUse ? `<em class="chip where ${a.active || a.desktop ? "live" : "elsewhere"}" title="${esc(places.inUse)}">${esc(places.short)}</em>` : ""}
           ${seatsChip(a)}
           ${overlapChip(a)}
           ${a.used_outside ? `<em class="chip outside" title="${esc(t("usedOutsideHint"))}">${t("usedOutside")}</em>` : ""}
@@ -404,13 +404,17 @@ function subscriptionRow(e) {
   const extra = extraUsageLine(e.extra_usage);
   // Anything resting on this PC's history says what it cannot see.
   const caveat = e.local && (a.basis === "local_codex" || a.verdict === "insufficient_data") ? t("subLocalCaveat") : "";
+  // The machines it is in use on, as Accounts says it.
+  const used = snapshot.accounts.find((x) => x.provider === e.provider && x.id === e.id);
+  const places = used ? placesText(used) : null;
   return `
     <div class="account sub" data-key="${esc(key)}">
       <div class="avatar" style="background:hsl(${hue(e.id)} 55% 48%)">${esc((e.alias || e.email || "?").trim()[0].toUpperCase())}</div>
       <div class="who">
         <div class="name">${esc(e.alias || e.email || t("unknownAccount"))}</div>
         <small>
-          ${e.active ? `<em class="chip live">${t("inUse")}</em>` : ""}
+          ${places?.inUse ? `<em class="chip where ${used.active || used.desktop ? "live" : "elsewhere"}" title="${esc(places.inUse)}">${esc(places.short)}</em>`
+            : e.active ? `<em class="chip live">${t("inUse")}</em>` : ""}
           ${e.plan ? `<em class="chip">${esc(e.plan)}</em>` : ""}
           ${e.ends_at ? `<em class="chip">${t("chipCancelled")}</em>` : e.cancel_after ? `<em class="chip">${t("chipLapsing")}</em>` : ""}
           <em class="chip verdict ${VERDICT_TONE[a.verdict]}">${t(`subVerdict_${a.verdict}`)}</em>

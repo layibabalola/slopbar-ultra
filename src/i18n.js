@@ -1925,9 +1925,9 @@ const machineText = (r) => {
  * Where an account is in use, by machine: this one first while its CLI or desktop app is signed
  * in to the account, then the other machines that are still writing (shared presence).
  * `inUse` says it in full ("In use on ULTRA-1 (this PC, Desktop app), LAPTOP-2 (WSL: Ubuntu)"),
- * `machines` names them only ("ULTRA-1 (this PC)", "LAPTOP-2") and `names` are the bare names;
- * `elsewhere` is whether other machines have it, and `seen` are machines that went quiet within
- * the last day.
+ * `short` without the places, for chips ("In use on ULTRA-1 (this PC), LAPTOP-2"); `machines`
+ * names them only ("ULTRA-1 (this PC)", "LAPTOP-2") and `names` are the bare names; `elsewhere`
+ * is whether other machines have it, and `seen` are machines that went quiet within the last day.
  */
 export function placesText(a) {
   const remote = a.remote ?? [];
@@ -1937,11 +1937,12 @@ export function placesText(a) {
   const using = [...here, ...live];
   const inUse = using.length ? t("inUseOn", { list: using.map(machineText).join(", ") }) : "";
   const machines = using.map((r) => machineText({ ...r, where: [] }));
+  const short = machines.length ? t("inUseOn", { list: machines.join(", ") }) : "";
   const names = using.map((r) => r.machine).filter(Boolean);
   const seen = remote.filter((r) => !r.live).map((r) => t("seenOn", {
     machine: machineText(r), t: duration(Math.max(1, Math.round((Date.now() - new Date(r.seen_at)) / 60000))),
   }));
-  return { inUse, machines, names, elsewhere: live.length > 0, seen };
+  return { inUse, short, machines, names, elsewhere: live.length > 0, seen };
 }
 
 /**
