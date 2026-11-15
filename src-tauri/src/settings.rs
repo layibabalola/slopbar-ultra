@@ -67,11 +67,14 @@ pub struct Notifications {
     /// An account in use on more than one of the user's machines at once (see
     /// `presence::overlap`), once per overlap. Needs in-use sharing.
     pub multi_machine: bool,
+    /// A sharing setup (here, or one this computer finishes for another) waiting for the user to
+    /// allow access in Dropbox; clicking it opens Dropbox's page (see `sharing_setup`).
+    pub sharing_sign_in: bool,
 }
 
 impl Default for Notifications {
     fn default() -> Self {
-        Self { usage: true, resets: true, switches: true, renewals: true, unexpected_use: true, digest: true, extra_usage: true, burn: true, reset_credits: true, multi_machine: true }
+        Self { usage: true, resets: true, switches: true, renewals: true, unexpected_use: true, digest: true, extra_usage: true, burn: true, reset_credits: true, multi_machine: true, sharing_sign_in: true }
     }
 }
 
@@ -195,6 +198,9 @@ pub struct Settings {
     /// Claude Desktop (it has no supported way to be signed in from outside), and a reminder to
     /// restart the Codex app, which shares the CLI's sign-in (see `desktop_apps`). Off until proven.
     pub switch_desktop: bool,
+    /// A sharing setup (here, or one this computer finishes for another) opens Dropbox's page in
+    /// the default browser by itself. Off: it waits for the notification or the setup's button.
+    pub sharing_open_browser: bool,
 }
 
 /// Phone alerts through a push service (ntfy). The access token is not here: it is kept with
@@ -306,6 +312,7 @@ impl Default for Settings {
             signin_window: crate::signin::Window::Profile,
             account_roster: false,
             switch_desktop: false,
+            sharing_open_browser: true,
         }
     }
 }
@@ -368,7 +375,7 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
 /// `project_pins` has its own operations (see `pins`).
-const PATCHABLE: [&str; 30] = ["rotate_at", "rotate_grace_minutes", "refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "compact_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed", "native_widget", "wsl_accounts", "account_roster", "switch_desktop"];
+const PATCHABLE: [&str; 31] = ["rotate_at", "rotate_grace_minutes", "refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "compact_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed", "native_widget", "wsl_accounts", "account_roster", "switch_desktop", "sharing_open_browser"];
 
 /// Modifier names a shortcut may use, as the Settings window writes them.
 const HOTKEY_MODIFIERS: [&str; 4] = ["Ctrl", "Alt", "Shift", "Win"];
@@ -579,6 +586,17 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
 mod patch_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn dropbox_sign_ins_open_the_browser_and_notify_unless_turned_off() {
+        let fresh = Settings::default();
+        assert!(fresh.sharing_open_browser && fresh.notifications.sharing_sign_in);
+        // Settings saved before these existed take them on.
+        let older: Settings = serde_json::from_value(json!({ "refresh_minutes": 5, "notifications": { "usage": false } })).unwrap();
+        assert!(older.sharing_open_browser && older.notifications.sharing_sign_in && !older.notifications.usage);
+        let off = patched(&fresh, &json!({ "sharing_open_browser": false, "notifications": { "sharing_sign_in": false } }), false).unwrap();
+        assert!(!off.sharing_open_browser && !off.notifications.sharing_sign_in && off.notifications.usage);
+    }
 
     #[test]
     fn merges_like_the_settings_window() {
