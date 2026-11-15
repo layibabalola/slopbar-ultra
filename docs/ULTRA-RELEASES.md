@@ -201,8 +201,8 @@ re-running the failed run. A run on a tag that already has its release only stan
 - `gate` takes seconds. On a push it runs Decide; on a tag, the stand-down checks above. It fails
   while a secret under a retired name exists (below).
 - `build` runs on Windows with no secrets and a read-only token, because the build runs third-party
-  build scripts. It runs Check and Build, then the publisher's offline tests, and keeps the
-  installer for `publish` (except in a rehearsal).
+  build scripts. It runs Check and Build, then the offline tests of the publisher and of the fleet
+  script, and keeps the installer for `publish` (except in a rehearsal).
 - `publish` runs on a fresh Windows runner. It installs the signer from the lockfile, then runs
   Sign, the only step that gets the secrets, and Publish, the only step whose token can write.
 
@@ -397,6 +397,7 @@ without spaces.
    [IO.File]::WriteAllBytes("$dir\fork.pub", [Convert]::FromBase64String($pubkey))
    [IO.File]::WriteAllBytes("$file.minisig", [Convert]::FromBase64String((Get-Content -Raw "$file.sig").Trim()))
    minisign -Vm $file -p "$dir\fork.pub"
+   if ($LASTEXITCODE) { throw 'The installer''s signature does not verify.' }
    ```
 
    `minisign` (`winget install jedisct1.minisign`) must print "Signature and comment signature
@@ -417,10 +418,10 @@ without spaces.
    ssh <alias> 'powershell -NoProfile -Command "Wait-Process -Name slopbar -Timeout 60 -ErrorAction SilentlyContinue; if (Get-Process -Name slopbar -ErrorAction SilentlyContinue) { exit 1 } else { exit 0 }"'
    ```
 
-   The second exits with 1 if SlopBar is still running after a minute: stop there. Quitting lets it exit
-   cleanly: a refresh rotating a token finishes first, and presence, sign-ins and the journal are
-   closed. A silent install would end it abruptly instead, because Tauri's installer kills a running
-   app in silent mode.
+   The second exits with 1 if SlopBar is still running after a minute: stop there. Quitting closes
+   presence, sign-ins and the journal before SlopBar exits. Like Quit in the tray, it does not wait
+   for a refresh, so a token being rotated at that moment is cut off. A silent install would end the
+   app without closing anything, because Tauri's installer kills a running app in silent mode.
 4. Run the installer silently, in update mode: `ssh <alias> "cmd /d /c %USERPROFILE%\<name> /S /UPDATE"`.
    `/UPDATE` is the flag the updater itself passes. With it, Tauri's installer (tauri-cli 2.11.5)
    skips uninstalling the old version and installing WebView2, and does not recreate the desktop and
