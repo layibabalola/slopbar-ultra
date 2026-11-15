@@ -1898,10 +1898,15 @@ export function setThisMachine(name) {
   thisMachine = name || "";
 }
 
-/** A machine by name, marked when it is this one: "ULTRA-1 (this PC)". Names compare without
- * case, as the app's overlap does. */
-export const machineName = (name) =>
-  thisMachine && String(name).toLowerCase() === thisMachine.toLowerCase() ? t("thisPc", { machine: name }) : name;
+/** Whether in-use sharing is on. This computer is named only then: without other machines there is
+ * nothing to tell it apart from, and its name would only travel in screenshots. */
+let sharing = false;
+export function setSharing(settings) {
+  sharing = Boolean(settings?.presence_folder || settings?.presence_remote);
+}
+const me = () => (sharing ? thisMachine : "");
+/** Names compare ignoring ASCII case only, as the app's (Rust) overlap does. */
+const sameName = (x, y) => String(x).replace(/[A-Z]/g, (c) => c.toLowerCase()) === String(y).replace(/[A-Z]/g, (c) => c.toLowerCase());
 
 /** A place an account is in use, translated when it is the desktop app (presence says "Desktop app"). */
 const placeText = (w) => (w === "Desktop app" ? t("desktopApp") : w);
@@ -1926,18 +1931,22 @@ const machineText = (r) => {
  * in to the account, then the other machines that are still writing (shared presence).
  * `inUse` says it in full ("In use on ULTRA-1 (this PC, Desktop app), LAPTOP-2 (WSL: Ubuntu)"),
  * `short` without the places, for chips ("In use on ULTRA-1 (this PC), LAPTOP-2"); `machines`
- * names them only ("ULTRA-1 (this PC)", "LAPTOP-2") and `names` are the bare names; `elsewhere`
+ * lists the named ones on their own ("ULTRA-1 (this PC)", "LAPTOP-2"; never a bare "this PC",
+ * which some languages inflect after "in use on") and `names` are their bare names; `elsewhere`
  * is whether other machines have it, and `seen` are machines that went quiet within the last day.
+ * Another record under this machine's name (a second install, a clone) is this machine again and
+ * is not listed twice, as in the app's overlap.
  */
 export function placesText(a) {
   const remote = a.remote ?? [];
-  const live = remote.filter((r) => r.live);
   const here = a.active || a.desktop
-    ? [{ machine: thisMachine, here: true, where: [...(a.active ? a.sources ?? [] : []), ...(a.desktop ? ["Desktop app"] : [])] }] : [];
+    ? [{ machine: me(), here: true, where: [...(a.active ? a.sources ?? [] : []), ...(a.desktop ? ["Desktop app"] : [])] }] : [];
+  const live = remote.filter((r) => r.live && !(here.length && me() && sameName(r.machine, me())));
   const using = [...here, ...live];
   const inUse = using.length ? t("inUseOn", { list: using.map(machineText).join(", ") }) : "";
-  const machines = using.map((r) => machineText({ ...r, where: [] }));
-  const short = machines.length ? t("inUseOn", { list: machines.join(", ") }) : "";
+  const labels = using.map((r) => machineText({ ...r, where: [] }));
+  const short = labels.length ? t("inUseOn", { list: labels.join(", ") }) : "";
+  const machines = labels.filter((_, i) => using[i].machine);
   const names = using.map((r) => r.machine).filter(Boolean);
   const seen = remote.filter((r) => !r.live).map((r) => t("seenOn", {
     machine: machineText(r), t: duration(Math.max(1, Math.round((Date.now() - new Date(r.seen_at)) / 60000))),
@@ -1947,14 +1956,17 @@ export function placesText(a) {
 
 /**
  * An account in use on several machines at once (`overlap`, set by the app): `chip` is the short
- * label ("In use on 2 machines"), `lines` name the machines (this one marked) and say why it
- * matters. Empty when it is in use on one machine or none.
+ * label ("In use on 2 machines"), `lines` name the machines and say why it matters. The app lists
+ * this machine first while its CLI or desktop app uses the account, so that one is marked by its
+ * place, never by a name another machine may share. Empty when in use on one machine or none.
  */
 export function overlapText(a) {
   const machines = a.overlap ?? [];
   if (machines.length < 2) return { chip: "", lines: [] };
   const n = machines.length;
-  return { chip: t("overlapChip", { n }), lines: [t("overlapOn", { n, list: machines.map(machineName).join(", ") }), t("overlapWhy", { n })] };
+  const here = a.active || a.desktop;
+  const list = machines.map((m, i) => (here && i === 0 ? (me() ? t("thisPc", { machine: m }) : t("thisPcUnnamed")) : m));
+  return { chip: t("overlapChip", { n }), lines: [t("overlapOn", { n, list: list.join(", ") }), t("overlapWhy", { n })] };
 }
 
 /**

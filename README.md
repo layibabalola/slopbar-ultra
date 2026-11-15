@@ -37,7 +37,7 @@ Add accounts in **Settings → Accounts**: SlopBar opens the CLI's own sign-in (
 
 ### Which computer uses which account
 
-Wherever SlopBar Ultra shows an account, it names the computers the account is in use on, this PC first and marked: "In use on DESK-1 (this PC, Desktop app), LAPTOP-2 (WSL: Ubuntu)". That is the account's tooltip in the flyout and in the taskbar widget, a short line under its name in the compact flyout, the cards in the full flyout and in Settings → Accounts, the notification about an account in use on two computers, and the quick switcher, where typing a computer's name finds the account it uses. Other computers appear with in-use sharing on (Settings → Data → Other computers); their names are the ones their sharing already carries, so nothing more is shared.
+With in-use sharing on (Settings → Data → Other computers), wherever SlopBar Ultra shows an account it names the computers the account is in use on, this PC first and marked: "In use on DESK-1 (this PC, Desktop app), LAPTOP-2 (WSL: Ubuntu)". That is the account's tooltip in the flyout and in the taskbar widget, a short line under its name in the compact flyout, the cards in the full flyout and in Settings → Accounts and Subscriptions, the notification about an account in use on two computers, and the quick switcher, where typing a computer's name finds the account it uses. The names are the ones sharing already carries, so nothing more is shared; with sharing off, no computer's name is shown.
 
 ### One account on two computers
 

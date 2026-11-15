@@ -176,7 +176,8 @@ pub trait Texts {
     }
 }
 
-pub struct Lang(pub String);
+/// A language, and this machine's name when it is to be shown (with in-use sharing on).
+pub struct Lang(pub String, pub Option<String>);
 
 impl Texts for Lang {
     fn t(&self, key: &str, vars: &[(&str, &str)]) -> String {
@@ -186,7 +187,7 @@ impl Texts for Lang {
         &self.0
     }
     fn machine(&self) -> Option<String> {
-        crate::presence::this_machine()
+        self.1.clone()
     }
 }
 
@@ -234,8 +235,7 @@ pub fn account_detail(texts: &dyn Texts, a: &AccountUsage, now: chrono::DateTime
     }
     if a.overlap.len() > 1 {
         let n = a.overlap.len().to_string();
-        let list: Vec<String> = a.overlap.iter().map(|m| f::machine_name(lang, m, me.as_deref())).collect();
-        who.push(texts.t("overlapOn", &[("n", &n), ("list", &list.join(", "))]));
+        who.push(texts.t("overlapOn", &[("n", &n), ("list", &f::overlap_list(lang, a, me.as_deref()))]));
         who.push(texts.t("overlapWhy", &[("n", &n)]));
     }
     who.extend(a.remote.iter().filter(|r| !r.live).map(|r| texts.t("seenOn", &[("machine", &f::remote_text(lang, r)), ("t", &ago(r.seen_at))])));
@@ -787,7 +787,7 @@ mod tests {
         let v = view(&snap(vec![account(Provider::Claude, "a1", true, &[5.0]), codex.clone()]), None, 0, &En);
         assert_eq!(v.overlap, [false, true]);
         assert!(!v.details[0].contains("machines"));
-        assert!(v.details[1].contains("In use on 2 machines at once: DESK-1, LAPTOP-2"), "{}", v.details[1]);
+        assert!(v.details[1].contains("In use on 2 machines at once: this PC, LAPTOP-2"), "{}", v.details[1]);
         assert!(v.details[1].contains("Limits drain about 2× as fast"), "{}", v.details[1]);
         // On DESK-1 itself, the tooltip says which of the two this is.
         let here = view(&snap(vec![codex]), None, 0, &OnDesk1);

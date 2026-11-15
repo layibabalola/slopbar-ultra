@@ -5,11 +5,12 @@ import assert from "node:assert/strict";
 
 // i18n.js sets the page language on load.
 globalThis.document ??= { documentElement: {} };
-const { t, setLanguage, setThisMachine, windowResetText, placesText, overlapText } = await import("../src/i18n.js");
+const { t, setLanguage, setThisMachine, setSharing, windowResetText, placesText, overlapText } = await import("../src/i18n.js");
 const { accountTip, accountTipLines, adviceText } = await import("../src/accounttext.js");
 const { sparkline, sparklineText } = await import("../src/sparkline.js");
 setLanguage("en");
 setThisMachine("DESK-1");
+setSharing({ presence_remote: "synthetic-remote" });
 
 let passed = 0;
 const test = (name, fn) => {
@@ -155,22 +156,49 @@ test("every machine an account is in use on is named, this one first and marked"
   assert.ok(placesText(used({ remote: [{ ...laptop, live: false }] })).seen[0].startsWith("LAPTOP-2 (WSL: Ubuntu): seen "));
 });
 
+test("without in-use sharing this machine goes unnamed, and nothing is marked", () => {
+  setSharing({ presence_folder: null, presence_remote: null });
+  try {
+    const p = placesText(used({ active: true, desktop: true, sources: ["Windows"] }));
+    assert.equal(p.inUse, "In use on this PC (Windows, Desktop app)");
+    assert.deepEqual(p.names, [], "no name, so no compact line and the old chips");
+    assert.equal(overlapText(used({ overlap: ["DESK-1", "LAPTOP-2"] })).lines[0], "In use on 2 machines at once: DESK-1, LAPTOP-2");
+  } finally {
+    setSharing({ presence_remote: "synthetic-remote" });
+  }
+  assert.deepEqual(placesText(used({ active: true, sources: ["Windows"] })).names, ["DESK-1"]);
+});
+
 test("an unknown name for this machine still says this PC", () => {
   setThisMachine("");
   try {
     assert.equal(placesText(used({ active: true, sources: ["Windows"] })).inUse, "In use on this PC");
     assert.equal(placesText(used({ active: true, sources: ["WSL: Ubuntu"], remote: [laptop] })).inUse, "In use on this PC (WSL: Ubuntu), LAPTOP-2 (WSL: Ubuntu)");
     assert.deepEqual(placesText(used({ active: true })).names, []);
+    const both = placesText(used({ active: true, sources: ["Windows"], remote: [laptop] }));
+    assert.deepEqual(both.machines, ["LAPTOP-2"], "the compact line never shows a bare (inflected) this PC");
+    assert.equal(both.short, "In use on this PC, LAPTOP-2");
+    assert.equal(overlapText(used({ active: true, overlap: ["?", "LAPTOP-2"] })).lines[0], "In use on 2 machines at once: this PC, LAPTOP-2");
     assert.deepEqual(overlapText(used({ overlap: ["DESK-1", "LAPTOP-2"] })).lines[0], "In use on 2 machines at once: DESK-1, LAPTOP-2");
   } finally {
     setThisMachine("DESK-1");
   }
 });
 
-test("an overlap names its machines, this one marked whatever its case", () => {
-  const o = overlapText(used({ overlap: ["desk-1", "LAPTOP-2"] }));
+test("an overlap marks this PC by its place, never by a name a clone may share", () => {
+  const o = overlapText(used({ active: true, overlap: ["DESK-1", "LAPTOP-2"] }));
   assert.equal(o.chip, t("overlapChip", { n: 2 }));
-  assert.equal(o.lines[0], "In use on 2 machines at once: desk-1 (this PC), LAPTOP-2");
+  assert.equal(o.lines[0], "In use on 2 machines at once: DESK-1 (this PC), LAPTOP-2");
+  assert.equal(overlapText(used({ overlap: ["DESK-1", "LAPTOP-2"] })).lines[0], "In use on 2 machines at once: DESK-1, LAPTOP-2",
+    "not in use here: a machine named like this one is another machine");
+});
+
+test("another record under this machine's name is not listed twice", () => {
+  const twin = { machine: "desk-1", where: ["WSL: Ubuntu"], seen_at: iso(now), live: true };
+  const p = placesText(used({ active: true, sources: ["Windows"], remote: [twin, laptop] }));
+  assert.equal(p.inUse, "In use on DESK-1 (this PC), LAPTOP-2 (WSL: Ubuntu)");
+  assert.deepEqual(p.names, ["DESK-1", "LAPTOP-2"]);
+  assert.equal(placesText(used({ remote: [twin] })).inUse, "In use on desk-1 (WSL: Ubuntu)", "not in use here: listed as it is");
 });
 
 test("machine names are translated around, never translated themselves", () => {
