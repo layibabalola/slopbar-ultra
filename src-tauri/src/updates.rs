@@ -1,6 +1,6 @@
-//! Self-update from GitHub releases (signed; see `plugins.updater` in tauri.conf.json). Every
-//! request has a deadline, and every check and install is recorded for `get_app_info` (see
-//! `update_check`).
+//! Self-update from GitHub releases (signed; see `plugins.updater` in tauri.conf.json), within the
+//! deadlines and limits in `update_check`, one install at a time. Every check and install is
+//! recorded for `get_app_info`.
 
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::UpdaterExt;
 
-use crate::update_check::{self, describe, Outcome, Trigger};
+use crate::update_check::{self, describe, Outcome, Steps, Trigger};
 use crate::AppState;
 
 const FIRST_CHECK: Duration = Duration::from_secs(20);
@@ -24,12 +24,13 @@ pub struct UpdateInfo {
 /// Looks for a newer release (Settings, agents) and records what it found.
 pub async fn check(app: &AppHandle) -> Result<UpdateInfo, String> {
     if !cfg!(feature = "upstream-updates") { return Err("Manual updates only in this build".into()); }
-    let result = update_check::bounded(update_check::CHECK_LIMIT, "The update check", async {
-        let current = app.package_info().version.to_string();
-        let update = updater(app)?.check().await.map_err(|e| describe(&e))?;
-        Ok::<_, String>(UpdateInfo { current, latest: update.map(|u| u.version) })
-    })
-    .await;
+    let result = Steps::default()
+        .run("The update check", update_check::CHECK_LIMIT, async {
+            let current = app.package_info().version.to_string();
+            let update = updater(app)?.check().await.map_err(|e| describe(&e))?;
+            Ok::<_, String>(UpdateInfo { current, latest: update.map(|u| u.version) })
+        })
+        .await;
     record(app, Trigger::Manual, match &result {
         Ok(UpdateInfo { latest: Some(version), .. }) => Outcome::Found(version.clone()),
         Ok(_) => Outcome::UpToDate,
@@ -38,35 +39,75 @@ pub async fn check(app: &AppHandle) -> Result<UpdateInfo, String> {
     result
 }
 
-/// The updater, with the check's deadline (it applies to the check's request only).
+/// The updater, with the check's request deadline and the stall limit (both through reqwest; the
+/// stall limit reaches the download too, which gets its own deadline in `install_now`).
 fn updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
-    app.updater_builder().timeout(update_check::CHECK_TIMEOUT).build().map_err(|e| describe(&e))
+    app.updater_builder()
+        .timeout(update_check::CHECK_TIMEOUT)
+        .configure_client(|client| client.read_timeout(update_check::STALL_TIMEOUT))
+        .build()
+        .map_err(|e| describe(&e))
 }
 
-/// Downloads and installs the newest release, then restarts into it (Settings, agents). Records
-/// what happened; an installer that starts ends this process.
+/// Why an install asked for now could not start (another one runs), recorded as such; None when it
+/// can start.
+pub fn install_blocked(app: &AppHandle) -> Option<String> {
+    let status = &app.state::<AppState>().update_check;
+    let outcome = status.install_blocked()?;
+    let reason = match &outcome {
+        Outcome::Deferred(text) | Outcome::Failed(text) => text.clone(),
+        _ => update_check::ALREADY_INSTALLING.into(),
+    };
+    status.record(Trigger::Manual, outcome);
+    Some(reason)
+}
+
+/// Downloads and installs the newest release, then restarts into it (Settings, agents), in a task of
+/// its own within the pass limit. Records what happened; an installer that starts ends this
+/// process. A deferral (another install runs) comes back as an error, for the caller to show.
 pub async fn install(app: &AppHandle) -> Result<(), String> {
     if !cfg!(feature = "upstream-updates") { return Err("Manual updates only in this build".into()); }
-    let result = update_check::bounded(update_check::INSTALL_LIMIT, "The update", install_now(app, Trigger::Manual)).await;
-    record(app, Trigger::Manual, match &result {
-        Ok(()) => Outcome::UpToDate,
-        Err(e) => Outcome::Failed(e.clone()),
-    });
+    let h = app.clone();
+    let outcome = update_check::isolated(update_check::PASS_LIMIT, move |steps| async move { install_now(&h, Trigger::Manual, &steps).await }).await;
+    let result = match &outcome {
+        Outcome::Failed(text) | Outcome::Deferred(text) => Err(text.clone()),
+        _ => Ok(()),
+    };
+    record(app, Trigger::Manual, outcome);
     result
 }
 
-/// Installs the newest release, if there is one, and restarts into it. Returns only when there is
-/// none (`Ok`) or on failure.
-async fn install_now(app: &AppHandle, by: Trigger) -> Result<(), String> {
-    let Some(mut update) = updater(app)?.check().await.map_err(|e| describe(&e))? else {
-        return Ok(());
+/// Installs the newest release, if there is one, and restarts into it, each step within its limit.
+/// Returns only when there is none, when it is deferred, or on failure.
+async fn install_now(app: &AppHandle, by: Trigger, steps: &Steps) -> Result<Outcome, String> {
+    let turn = match app.state::<AppState>().update_check.begin_install() {
+        Ok(turn) => turn,
+        Err(Outcome::Failed(error)) => return Err(error),
+        Err(outcome) => return Ok(outcome),
     };
-    // The updater leaves the download without a deadline (the check's is not carried over).
+    let found = steps
+        .run("The update check", update_check::CHECK_LIMIT, async { updater(app)?.check().await.map_err(|e| describe(&e)) })
+        .await?;
+    let Some(mut update) = found else { return Ok(Outcome::UpToDate) };
+    // The check's deadline does not carry over: the updater leaves the download without one.
     update.timeout = Some(update_check::DOWNLOAD_TIMEOUT);
-    let bytes = update.download(|_, _| {}, || {}).await.map_err(|e| describe(&e))?;
+    let bytes = steps
+        .run("The download", update_check::DOWNLOAD_LIMIT, async { update.download(|_, _| {}, || {}).await.map_err(|e| describe(&e)) })
+        .await?;
     record(app, by, Outcome::Installing(update.version.clone()));
     let _ = app.emit("update-installing", &update.version);
-    update.install(bytes).map_err(|e| describe(&e))?;
+    // Synchronous, and on Windows it ends this process: on a thread of its own, so its limit can end
+    // the wait. The turn goes with it, so no other install starts while that thread runs.
+    steps
+        .run("Handing over to the installer", update_check::HANDOFF_LIMIT, async move {
+            tokio::task::spawn_blocking(move || {
+                let _turn = turn;
+                update.install(bytes).map_err(|e| describe(&e))
+            })
+            .await
+            .map_err(|e| describe(&e))?
+        })
+        .await?;
     app.restart();
 }
 
@@ -79,24 +120,16 @@ pub fn report(app: &AppHandle) -> serde_json::Value {
     app.state::<AppState>().update_check.report(EVERY)
 }
 
-/// Checks shortly after launch and then every `EVERY`, sooner after a failure; installs when
-/// auto-update is on. Each pass has a deadline, so none can stall the loop, and is recorded.
+/// Checks shortly after launch and then every `EVERY`, sooner after a failure, and installs what it
+/// finds while automatic updates are on (`update_check::run_loop`): each pass in a task of its own
+/// within the pass limit, recorded.
 pub async fn run_loop(app: AppHandle) {
     if !cfg!(feature = "upstream-updates") { return; }
     let state = app.state::<AppState>();
-    state.update_check.schedule(update_check::after(FIRST_CHECK));
-    tokio::time::sleep(FIRST_CHECK).await;
-    let mut failures = 0;
-    loop {
-        let auto = state.settings.lock().unwrap_or_else(|e| e.into_inner()).auto_update;
-        let wait = if auto {
-            let attempt = async { install_now(&app, Trigger::Auto).await.map(|()| Outcome::UpToDate) };
-            update_check::pass(&state.update_check, update_check::INSTALL_LIMIT, attempt, &mut failures, EVERY).await
-        } else {
-            failures = 0;
-            state.update_check.schedule(update_check::after(EVERY));
-            EVERY
-        };
-        tokio::time::sleep(wait).await;
-    }
+    let auto = || state.settings.lock().unwrap_or_else(|e| e.into_inner()).auto_update;
+    let attempt = |steps: Steps| {
+        let app = app.clone();
+        async move { install_now(&app, Trigger::Auto, &steps).await }
+    };
+    update_check::run_loop(&state.update_check, FIRST_CHECK, EVERY, update_check::PASS_LIMIT, auto, attempt, tokio::time::sleep).await;
 }
