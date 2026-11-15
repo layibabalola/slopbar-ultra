@@ -398,9 +398,11 @@ mod imp {
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
     use windows_sys::Win32::Foundation::HANDLE;
 
-    /// Connections served at once; more wait for a slot.
-    const MAX_CONNECTIONS: usize = 16;
-    /// Reading the request and writing the reply; the operation itself is not bounded here.
+    /// Connections served at once; more wait for a slot. A connection holds its slot until its
+    /// answer is written, or its client has given up (see `answer`).
+    pub(super) const MAX_CONNECTIONS: usize = 16;
+    /// Reading the request and writing the reply. The operation itself is not bounded here: a
+    /// connection waits for it until its client gives up, and it carries on after (see `answer`).
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const RETRY: Duration = if cfg!(test) { Duration::from_secs(1) } else { Duration::from_secs(15) };
 
@@ -543,11 +545,20 @@ mod imp {
     pub async fn serve<F, Fut>(name: String, handle: F)
     where
         F: Fn(Request) -> Fut + Clone + Send + 'static,
-        Fut: Future<Output = Result<Value, String>> + Send,
+        Fut: Future<Output = Result<Value, String>> + Send + 'static,
+    {
+        serve_within(name, CLIENT_TIMEOUT, handle).await
+    }
+
+    /// `serve`, letting a connection go once its operation has run `limit` (see `answer`).
+    pub(super) async fn serve_within<F, Fut>(name: String, limit: Duration, handle: F)
+    where
+        F: Fn(Request) -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = Result<Value, String>> + Send + 'static,
     {
         let reuse = Arc::new(Reuse::default());
         loop {
-            if let Err(e) = listen(&name, handle.clone(), reuse.clone()).await {
+            if let Err(e) = listen(&name, limit, handle.clone(), reuse.clone()).await {
                 set_state(2);
                 eprintln!("door closed, retrying: {e}");
             }
@@ -555,10 +566,10 @@ mod imp {
         }
     }
 
-    async fn listen<F, Fut>(name: &str, handle: F, reuse: Arc<Reuse>) -> std::io::Result<()>
+    async fn listen<F, Fut>(name: &str, limit: Duration, handle: F, reuse: Arc<Reuse>) -> std::io::Result<()>
     where
         F: Fn(Request) -> Fut + Clone + Send + 'static,
-        Fut: Future<Output = Result<Value, String>> + Send,
+        Fut: Future<Output = Result<Value, String>> + Send + 'static,
     {
         let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
         // Exports are serialized so a burst reuses the first one.
@@ -571,36 +582,51 @@ mod imp {
             let connected = std::mem::replace(&mut server, create(name, false)?);
             let (handle, reuse, exporting) = (handle.clone(), reuse.clone(), exporting.clone());
             tokio::spawn(async move {
-                let _ = answer(connected, handle, reuse, exporting).await;
+                let _ = answer(connected, limit, handle, reuse, exporting).await;
                 drop(slot);
             });
         }
     }
 
-    async fn answer<F, Fut>(pipe: NamedPipeServer, handle: F, reuse: Arc<Reuse>, exporting: Arc<tokio::sync::Mutex<()>>) -> std::io::Result<()>
+    /// Reads one request, performs it and writes the answer. The operation runs in a task of its
+    /// own: once it has run `limit` (CLIENT_TIMEOUT, so its client has given up by then) the door
+    /// answers "timeout" and lets the connection, and its slot, go, while the operation carries on.
+    /// So operations that wait long (for a refresh, a sign-in, a stuck folder) never use up the
+    /// slots that get_app_info, restart_app, install_update and quit_app need.
+    async fn answer<F, Fut>(pipe: NamedPipeServer, limit: Duration, handle: F, reuse: Arc<Reuse>, exporting: Arc<tokio::sync::Mutex<()>>) -> std::io::Result<()>
     where
-        F: Fn(Request) -> Fut,
-        Fut: Future<Output = Result<Value, String>>,
+        F: Fn(Request) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Value, String>> + Send + 'static,
     {
         let mut reader = BufReader::new(pipe);
         let mut line = String::new();
         let mut limited = (&mut reader).take(MAX_REQUEST);
         let read = limited.read_line(&mut line);
         tokio::time::timeout(IO_TIMEOUT, read).await.map_err(|_| std::io::ErrorKind::TimedOut)??;
-        let result = match serde_json::from_str::<Request>(line.trim()) {
-            Ok(Request::ExportDiagnostics) => {
-                let _one = exporting.lock().await;
-                match reuse.recent() {
-                    Some(path) => Ok(export_value(&path, true)),
-                    None => handle(Request::ExportDiagnostics).await.and_then(|result| {
-                        let path = PathBuf::from(result.get("path").and_then(Value::as_str).ok_or("diagnostic_storage")?);
-                        reuse.remember(&path);
-                        Ok(export_value(&path, false))
-                    }),
+        let request = serde_json::from_str::<Request>(line.trim());
+        let operation = tokio::spawn(async move {
+            match request {
+                Ok(Request::ExportDiagnostics) => {
+                    let _one = exporting.lock().await;
+                    match reuse.recent() {
+                        Some(path) => Ok(export_value(&path, true)),
+                        None => handle(Request::ExportDiagnostics).await.and_then(|result| {
+                            let path = PathBuf::from(result.get("path").and_then(Value::as_str).ok_or("diagnostic_storage")?);
+                            reuse.remember(&path);
+                            Ok(export_value(&path, false))
+                        }),
+                    }
                 }
+                Ok(request) => handle(request).await,
+                Err(_) => Err("unsupported_request".into()),
             }
-            Ok(request) => handle(request).await,
-            Err(_) => Err("unsupported_request".into()),
+        });
+        let result = match tokio::time::timeout(limit, operation).await {
+            Ok(Ok(result)) => result,
+            // It panicked: no answer, so the client reads a closed pipe, as it always has.
+            Ok(Err(_)) => return Ok(()),
+            // Its client has given up by now; the operation carries on in its own task.
+            Err(_) => Err("timeout".into()),
         };
         let reply = match result {
             Ok(result) => Reply { door: VERSION, result: Some(result), error: None },
@@ -877,5 +903,249 @@ mod tests {
     #[test]
     fn reports_when_the_app_is_not_running() {
         assert_eq!(call(&test_pipe(), &Request::GetUsage).unwrap_err(), "not_running");
+    }
+
+    use crate::refresh_wait;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    use std::sync::Arc;
+
+    /// How long a test waits for what should happen at once (an answer, a door listening). The wait
+    /// ends as soon as it happens, so only a starved run waits at all, and none this long.
+    const PATIENT: Duration = Duration::from_secs(5 * 60);
+    /// What the tests stall on ends by itself after this. A limit in the code ends a wait far
+    /// sooner, however starved the run (tokio fires timers in deadline order); with the limit gone,
+    /// the wait ends here and the test fails, rather than hanging.
+    const SELF_ENDING: Duration = Duration::from_secs(60);
+    /// The limits the tests give the code: far inside SELF_ENDING.
+    const SHORT: Duration = Duration::from_millis(100);
+    /// A last backstop for each test.
+    const TEST_LIMIT: Duration = Duration::from_secs(5 * 60);
+
+    async fn within_test_limit<T>(test: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(TEST_LIMIT, test).await.expect("the test ran past its limit: a limit in the code is missing")
+    }
+
+    /// Waits up to PATIENT for `check` to hold, without racing the task that makes it so.
+    async fn eventually(what: &str, check: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + PATIENT;
+        while !check() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Marks a test over once it is dropped (passed, failed or past its limit), so its clients stop
+    /// asking a door that is gone.
+    struct Over(Arc<AtomicBool>);
+
+    impl Over {
+        fn new() -> Self {
+            Over(Arc::new(AtomicBool::new(false)))
+        }
+    }
+
+    impl Drop for Over {
+        fn drop(&mut self) {
+            self.0.store(true, SeqCst);
+        }
+    }
+
+    /// One request, as a client that waits up to PATIENT, through a door that is busy or not open
+    /// yet, as a starved run may find it; until the test is `over`. On a thread of its own, which
+    /// the runtime does not wait for as a failed test ends: the runtime ends without closing a pipe
+    /// instance whose connect was pending, so a client can be left waiting there for PATIENT.
+    fn ask_patiently(over: &Over, name: &str, request: Request) -> tokio::sync::oneshot::Receiver<Reply> {
+        let (name, over) = (name.to_owned(), over.0.clone());
+        let (send, answer) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + PATIENT;
+            let reply = loop {
+                match imp::request_raw(&name, &request, PATIENT) {
+                    Ok(reply) => break reply,
+                    Err(e) if over.load(SeqCst) || std::time::Instant::now() >= deadline => {
+                        break Reply { door: VERSION, result: None, error: Some(format!("no answer: {e}")) };
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            };
+            let _ = send.send(reply);
+        });
+        answer
+    }
+
+    /// A fake app served within `limit`, whose refresh is `refresh` and which echoes the rest.
+    fn fake_app_within<R, RF>(name: &str, limit: Duration, refresh: R)
+    where
+        R: Fn() -> RF + Clone + Send + Sync + 'static,
+        RF: std::future::Future<Output = Result<Value, String>> + Send + 'static,
+    {
+        tokio::spawn(imp::serve_within(name.to_owned(), limit, move |request| {
+            let refresh = refresh.clone();
+            async move {
+                match request {
+                    Request::Refresh => refresh().await,
+                    other => Ok(serde_json::to_value(&other).unwrap()),
+                }
+            }
+        }));
+    }
+
+    /// Takes `lock` now and keeps it until SELF_ENDING, as an update's handover that never returns
+    /// keeps the refresh lock. Returns a flag set once it lets go.
+    fn hold_for_good(lock: &Arc<tokio::sync::Mutex<()>>) -> Arc<AtomicBool> {
+        let held = lock.clone().try_lock_owned().expect("a free lock");
+        let let_go = Arc::new(AtomicBool::new(false));
+        let flag = let_go.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(SELF_ENDING).await;
+            drop(held);
+            flag.store(true, SeqCst);
+        });
+        let_go
+    }
+
+    /// Every slot taken by a request whose operation is stuck (a refresh on a folder that never
+    /// answers, say): each connection goes once its client has given up, so get_app_info answers.
+    #[tokio::test]
+    async fn a_request_still_running_when_its_client_gives_up_frees_its_slot() {
+        within_test_limit(async {
+            let over = Over::new();
+            let name = test_pipe();
+            let (started, ended) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+            let (s, e) = (started.clone(), ended.clone());
+            fake_app_within(&name, SHORT, move || {
+                let (s, e) = (s.clone(), e.clone());
+                async move {
+                    s.fetch_add(1, SeqCst);
+                    tokio::time::sleep(SELF_ENDING).await;
+                    e.store(true, SeqCst);
+                    Ok(serde_json::json!({ "accounts": [] }))
+                }
+            });
+            ask_patiently(&over, &name, Request::GetAppInfo).await.unwrap();
+            let stuck: Vec<_> = (0..imp::MAX_CONNECTIONS).map(|_| ask_patiently(&over, &name, Request::Refresh)).collect();
+            eventually("every slot holds a stuck operation", || started.load(SeqCst) >= imp::MAX_CONNECTIONS).await;
+            let info = ask_patiently(&over, &name, Request::GetAppInfo).await.unwrap();
+            assert!(!ended.load(SeqCst), "get_app_info was answered only once a stuck operation ended and gave its slot up");
+            assert_eq!(info.result.unwrap()["op"], "get_app_info");
+            for reply in stuck {
+                assert_eq!(reply.await.unwrap().error.as_deref(), Some("timeout"), "its client hears it is still running");
+            }
+        })
+        .await
+    }
+
+    /// The refresh lock held for good (an update's handover that never returns) and more refreshes
+    /// asked for than the door has slots: each answers, saying it gave up, and get_app_info,
+    /// install_update, restart_app and quit_app answer while the lock is still held. The door's own
+    /// limit is out of reach here: the refreshes' limit alone keeps the slots free.
+    #[tokio::test]
+    async fn refreshes_waiting_on_a_lock_held_for_good_answer_and_the_door_keeps_answering() {
+        within_test_limit(async {
+            let over = Over::new();
+            let name = test_pipe();
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            let let_go = hold_for_good(&lock);
+            let started = Arc::new(AtomicUsize::new(0));
+            let (l, s) = (lock.clone(), started.clone());
+            // The door's refresh as the app answers it (`app::door_reply`, `app::refresh_within`).
+            fake_app_within(&name, PATIENT, move || {
+                let (l, s) = (l.clone(), s.clone());
+                async move {
+                    s.fetch_add(1, SeqCst);
+                    let fresh = || async { serde_json::json!({ "accounts": [], "fresh": true }) };
+                    refresh_wait::noted(async { Ok(refresh_wait::under(&l, SHORT, fresh).await.unwrap_or_else(|| serde_json::json!({ "accounts": [] }))) }).await
+                }
+            });
+            ask_patiently(&over, &name, Request::GetAppInfo).await.unwrap();
+            let refreshes: Vec<_> = (0..imp::MAX_CONNECTIONS + 4).map(|_| ask_patiently(&over, &name, Request::Refresh)).collect();
+            eventually("the refreshes take every slot", || started.load(SeqCst) >= imp::MAX_CONNECTIONS).await;
+            for request in [Request::GetAppInfo, Request::InstallUpdate, Request::RestartApp, Request::QuitApp] {
+                let op = serde_json::to_value(&request).unwrap()["op"].clone();
+                let reply = ask_patiently(&over, &name, request).await.unwrap();
+                assert_eq!(reply.result.map(|r| r["op"].clone()), Some(op));
+            }
+            assert!(!let_go.load(SeqCst), "the door answered only once the lock was let go");
+            for reply in refreshes {
+                let result = reply.await.unwrap().result.expect("each refresh answers");
+                assert_eq!(result[refresh_wait::WAITING], refresh_wait::WAITING_NOTE, "and says it gave up: {result}");
+                assert!(result.get("fresh").is_none(), "{result}");
+            }
+        })
+        .await
+    }
+
+    /// Notes an operation dropped before it finished: one the door stopped.
+    struct Unfinished {
+        finished: Arc<AtomicBool>,
+        stopped: Arc<AtomicBool>,
+    }
+
+    impl Drop for Unfinished {
+        fn drop(&mut self) {
+            if !self.finished.load(SeqCst) {
+                self.stopped.store(true, SeqCst);
+            }
+        }
+    }
+
+    /// An operation whose client gave up carries on: the door only lets the connection go, as the
+    /// "timeout" it answers says (mcp's explain: "it keeps going"). The operation finishes only
+    /// once its client has heard that, so the test waits on neither a clock nor a guess.
+    #[tokio::test]
+    async fn an_operation_whose_client_gave_up_carries_on() {
+        within_test_limit(async {
+            let over = Over::new();
+            let name = test_pipe();
+            let (finished, stopped, go) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(tokio::sync::Notify::new()));
+            let (f, s, g) = (finished.clone(), stopped.clone(), go.clone());
+            fake_app_within(&name, SHORT, move || {
+                let (f, s, g) = (f.clone(), s.clone(), g.clone());
+                async move {
+                    let _watch = Unfinished { finished: f.clone(), stopped: s };
+                    g.notified().await;
+                    f.store(true, SeqCst);
+                    Ok(serde_json::json!({ "accounts": [] }))
+                }
+            });
+            let reply = ask_patiently(&over, &name, Request::Refresh).await.unwrap();
+            assert_eq!(reply.error.as_deref(), Some("timeout"), "its client hears it is still running");
+            go.notify_one();
+            eventually("the operation finished, or was stopped", || finished.load(SeqCst) || stopped.load(SeqCst)).await;
+            assert!(finished.load(SeqCst) && !stopped.load(SeqCst), "the operation carried on after its client gave up");
+        })
+        .await
+    }
+
+    /// The door the app opens waits for an operation as long as its client does (CLIENT_TIMEOUT):
+    /// never less, which would answer "timeout" to a client still waiting for the answer.
+    #[test]
+    fn the_door_the_app_opens_waits_as_long_as_its_client() {
+        let source = include_str!("door.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(production.contains("serve_within(name, CLIENT_TIMEOUT, handle).await"), "serve passes the client's own limit");
+        assert_eq!(production.matches("serve_within(").count(), 1, "the app's door is opened that way only");
+    }
+
+    /// An operation that panics leaves its client a closed pipe, as it always has: never an answer
+    /// that it is still running.
+    #[tokio::test]
+    async fn an_operation_that_panics_leaves_its_client_a_closed_pipe() {
+        within_test_limit(async {
+            let over = Over::new();
+            let name = test_pipe();
+            tokio::spawn(imp::serve_within(name.clone(), PATIENT, |request| async move {
+                match request {
+                    Request::GetSettings => panic!("synthetic panic"),
+                    other => Ok(serde_json::to_value(&other).unwrap()),
+                }
+            }));
+            ask_patiently(&over, &name, Request::GetAppInfo).await.unwrap();
+            let n = name.clone();
+            let answer = tokio::task::spawn_blocking(move || imp::request_raw(&n, &Request::GetSettings, PATIENT)).await.unwrap();
+            assert_eq!(answer.err().as_deref(), Some("door_unavailable"), "a closed pipe, not an answer");
+            assert!(ask_patiently(&over, &name, Request::GetAppInfo).await.unwrap().result.is_some(), "and the door goes on");
+        })
+        .await
     }
 }
