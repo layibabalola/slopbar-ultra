@@ -28,7 +28,7 @@ pub fn is_ultra_version(version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::update_check::guard::{find, function, has, lost, tokens, update, words};
+    use crate::update_check::guard::{find, function, has, lost, places, tokens, update, words};
 
     const UPSTREAM_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE0MDdFRDM5QzIxRTZGMTEKUldRUmJ4N0NPZTBIcEcvT2F1YThXMTB0UVRRREpMUmtPSjJUS1V4M2poTzdFUXBtejB0V1FNUFAK";
 
@@ -95,8 +95,9 @@ mod tests {
         let install = function(&code, "updates.rs", "async fn install_now(", ROTATION);
         let at = |needle: &str| find(install, needle).unwrap_or_else(|| panic!("{}\n{install}", lost("install_now in updates.rs", needle, ROTATION)));
         let deferral = "if crate::signin::any_active() {\n        return Ok(Outcome::Deferred(SIGN_IN_OPEN.into()));";
-        assert_eq!(install.matches(&tokens(deferral)).count(), 2, "an open sign-in defers the update twice, at `{deferral}`. {}\n{install}", update(ROTATION));
-        let (first, second) = (at(deferral), install.rfind(&tokens(deferral)).unwrap());
+        let deferrals = places(install, deferral);
+        assert_eq!(deferrals.len(), 2, "an open sign-in defers the update twice, at `{deferral}`. {}\n{install}", update(ROTATION));
+        let (first, second) = (deferrals[0], deferrals[1]);
         let (download, refresh, handover) = (at("update.download("), at("let refresh = steps"), at("update_check::hand_over("));
         assert!(first < download && download < refresh && refresh < second && second < handover,
             "a sign-in defers before the download and again before the handover, after the refresh lock. {}\n{install}", update(ROTATION));
