@@ -84,13 +84,15 @@ For automated build verification, `slopbar.exe --build-info-to <path>` writes th
 
 ### Agent access (MCP)
 
-`slopbar-mcp.exe`, built next to `slopbar.exe`, is a stdio [MCP](https://modelcontextprotocol.io) server that gives coding agents what the Settings window offers, without driving the UI. Register it with your agent, for example:
+`slopbar-mcp.exe`, built next to `slopbar.exe`, is a stdio [MCP](https://modelcontextprotocol.io) server that gives coding agents what the Settings window offers, without driving the UI. Register it with your agent. For Claude Code, from PowerShell:
 
-```
-claude mcp add --scope user slopbar -- "%LOCALAPPDATA%\SlopBar\slopbar-mcp.exe"
+```powershell
+claude mcp add --scope user slopbar -- "$env:LOCALAPPDATA\SlopBar\slopbar-mcp.exe"
 ```
 
-or in Codex's `~/.codex/config.toml`:
+From Command Prompt, write the path as `"%LOCALAPPDATA%\SlopBar\slopbar-mcp.exe"` instead. Either way the shell expands the path before Claude Code stores it. Claude Code runs the stored command exactly as written and does not expand `%LOCALAPPDATA%` itself, so if you type the `%…%` form into PowerShell or Git Bash, the server is registered but never starts. Check with `claude mcp get slopbar`: it shows the stored path and should report the server as connected.
+
+For Codex, in `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.slopbar]
