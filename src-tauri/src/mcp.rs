@@ -768,6 +768,23 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
     }
 
+    /// What agents hear about a refresh that waited names an update as its cause only in builds
+    /// whose install holds the refresh lock (updates.rs takes it before the handover): the door's
+    /// note, refresh_usage's description and the README alike. And a switch recommend_account
+    /// makes passes on switch_account's null.
+    #[test]
+    fn what_agents_hear_about_a_refresh_that_waited() {
+        let tools = tools();
+        let description = |name: &str| tools.as_array().unwrap().iter().find(|t| t["name"] == name).unwrap()["description"].as_str().unwrap().to_string();
+        let install_holds = crate::source_guard::has(&crate::source_guard::tokens(include_str!("updates.rs")), "refresh_lock");
+        let readme = include_str!("../../README.md").lines().find(|l| l.starts_with("| `get_usage`, `refresh_usage` |")).expect("README's row for refresh_usage");
+        for (what, text) in [("the door's note", crate::refresh_wait::WAITING_NOTE.to_string()), ("refresh_usage", description("refresh_usage")), ("the README", readme.to_string())] {
+            assert_eq!(text.contains("or an update"), install_holds, "{what} names an update exactly when an install holds the refresh lock: {text}");
+        }
+        let recommend = description("recommend_account");
+        assert!(recommend.contains("switched_to_requested") && recommend.contains("null, with a waiting_for_refresh note"), "{recommend}");
+    }
+
     #[test]
     fn the_server_answers_then_exits_when_input_closes() {
         let input = concat!(
