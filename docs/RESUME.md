@@ -40,9 +40,11 @@ them with `~/.claude/ops/remote-slopbar/README.md`.
   merge, and pushed.
 - Then merge into `ultra` in `C:\code\slopbar-worktrees\ultra`. On conflict, keep ultra's
   `tauri.conf.json` `plugins.updater` block and re-brand visible strings. Push `ultra`, then publish
-  a release with `scripts/publish-ultra-release.ps1` (`docs/ULTRA-RELEASES.md`, "Publishing a
-  release"): all machines update themselves from it. Don't run `scripts\install-local-build.ps1` on
-  a machine that takes releases, because its `0.1.0` outranks every `0.1.0-ultra.<n>`.
+  a release with `scripts/publish-ultra-release.ps1` on the machine with the key, or with
+  `-ViaActions` from any machine once `gh secret list -R layibabalola/slopbar-ultra` shows both
+  `ULTRA_` secrets (`docs/ULTRA-RELEASES.md`, "Publishing a release"): all machines update
+  themselves from it. Don't run `scripts\install-local-build.ps1` on a machine that takes releases,
+  because its `0.1.0` outranks every `0.1.0-ultra.<n>`.
 - Verify on screen before calling anything done: `scripts\test-flyout-click.ps1` must PASS, and you
   look at the PNG. Unit tests alone are not verification.
 - Each feature goes upstream as a PR to thelioo/slopbar, cut as a pinned `pr/<name>` branch and
