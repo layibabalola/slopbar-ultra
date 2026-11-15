@@ -2837,15 +2837,42 @@ fn publish_sharing(app: &AppHandle, change: impl FnOnce(&mut sharing_setup::Setu
     out
 }
 
-/// Whether a sharing setup is under way: an automatic update waits for it (see `updates`), since
-/// restarting would end its Dropbox sign-in.
+/// Whether a sharing setup is under way here, or this computer holds the tunnel for another
+/// computer's sign-in: an automatic update waits for either (see `updates`), since restarting would
+/// end the Dropbox sign-in. A tunnel closes within `SIGN_IN_TIMEOUT` and two minutes at the latest.
 pub(crate) fn sharing_setup_running(app: &AppHandle) -> bool {
-    app.state::<AppState>().sharing_setup.lock().unwrap().phase.running()
+    let state = app.state::<AppState>();
+    let here = state.sharing_setup.lock().unwrap().phase.running();
+    here || state.sharing_tunnel.lock().unwrap().is_some()
 }
 
-/// Opens one of rclone's loopback sign-in links in the default browser.
+/// Opens one of rclone's loopback sign-in links in the default browser. Windows lets a window come
+/// to the front only for the app the user is using, so whatever right this one has is passed on.
 fn open_in_browser(link: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, ASFW_ANY};
+        AllowSetForegroundWindow(ASFW_ANY);
+    }
     std::process::Command::new("explorer.exe").arg(link).spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Opens Dropbox's page and says so in a notification whose click opens it again: a page opened
+/// while SlopBar works in the background can stay behind other windows, where nobody sees it, and
+/// the click lets the browser come to the front. `machine` names the computer the sign-in is for,
+/// when it is another one.
+fn offer_sharing_page(app: &AppHandle, link: String, machine: Option<&str>) {
+    let _ = open_in_browser(&link);
+    let settings = app.state::<AppState>().settings.lock().unwrap().clone();
+    let lang = crate::i18n::resolve(&settings.language);
+    let body = match machine {
+        Some(machine) => crate::i18n::t(&lang, "sharingStepDropboxFor", &[("machine", machine)]),
+        None => crate::i18n::t(&lang, "sharingStepDropboxBusy", &[]),
+    };
+    let buttons = vec![(crate::i18n::t(&lang, "sharingStepDropboxAgain", &[]), "open")];
+    let _ = notify::notify_choice(app.clone(), crate::i18n::t(&lang, "sharingStepDropbox", &[]), body, buttons, move |_| {
+        let _ = open_in_browser(&link);
+    });
 }
 
 /// Starts a setup and answers at once with its state. Dropbox's page opens on this screen, so it
@@ -2941,7 +2968,7 @@ async fn run_sharing_setup(app: &AppHandle, remote: String, via_tunnel: bool, re
                 // rclone opens no browser: SlopBar opens its page here, unless a browser on another
                 // computer finishes the sign-in through a tunnel.
                 if !via_tunnel {
-                    let _ = open_in_browser(&link);
+                    offer_sharing_page(&signal, link.clone(), None);
                 }
                 publish_sharing(&signal, |s| {
                     s.waiting = true;
@@ -3028,7 +3055,7 @@ async fn sharing_tunnel(app: &AppHandle, host: String, state: Option<String>, cl
             *tunnel = None;
         }
     });
-    open_in_browser(&link)?;
+    offer_sharing_page(app, link, Some(&host));
     Ok(serde_json::json!({ "opened": true }))
 }
 
