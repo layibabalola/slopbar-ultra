@@ -71,8 +71,9 @@ the getting-started guide), or the `setup_sharing` agent tool, connects a comput
    takes it only when the zip's SHA-256 matches the one pinned in the code (as rclone's
    `SHA256SUMS` and winget's reviewed manifest publish it). It unpacks only `rclone.exe` with
    Windows' `tar.exe` (PowerShell's `Expand-Archive` where tar is missing), checks that it runs and
-   reports that version, then moves it into SlopBar's folder. The download shows its progress, has
-   no overall limit but fails after 30 seconds without data, and Cancel stops it.
+   reports that version, then moves it into SlopBar's folder. The download shows its progress, fails
+   after 30 seconds without data or 10 minutes in all, and Cancel stops it; unpacking and the version
+   check are killed after 3 minutes and 20 seconds.
 2. **Dropbox.** A remote of that name (the one sharing already uses, else `dropbox`) that reaches
    its storage is used as it is. Otherwise rclone signs in with its own flow:
    `rclone config create <remote> dropbox` for a new remote, `rclone config update <remote>
@@ -94,7 +95,8 @@ the getting-started guide), or the `setup_sharing` agent tool, connects a comput
    (`uses_folder`) rather than moved off it.
 
 rclone and the tunnel below run in the app's job object, so they end with SlopBar, and an
-automatic update waits while a setup runs here or the tunnel for another computer is open.
+automatic update waits while a setup runs here or the tunnel for another computer is open. Every
+step has a time limit, and a setup that panics ends as failed (`setup_failed`), so that wait always ends.
 
 **Another computer, over SSH.** `setup_sharing` with `ssh_host` sets up that computer from this
 one, and Dropbox's page opens on that computer's own screen, in its browser, as if the setup had
