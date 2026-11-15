@@ -57,6 +57,6 @@ them with `~/.claude/ops/remote-slopbar/README.md`.
 ## Known open items (re-derive; don't trust this list)
 
 - Work after the top upstream PR with no PR yet (the derive command above counts it).
-- Release channel and each machine's build: `gh release list -R layibabalola/slopbar-ultra`, and
-  `get_app_info` (`version`) on each machine through the door.
+- Release channel and each machine's build: `pwsh scripts/fleet-slopbar.ps1` (on `ultra`), and the
+  release runs: `gh run list -R layibabalola/slopbar-ultra --workflow ultra-release.yml`.
 - Leftover worktrees from finished sessions.
