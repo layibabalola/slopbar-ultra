@@ -1121,10 +1121,15 @@ mod tests {
     /// never less, which would answer "timeout" to a client still waiting for the answer.
     #[test]
     fn the_door_the_app_opens_waits_as_long_as_its_client() {
-        let source = include_str!("door.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap();
-        assert!(production.contains("serve_within(name, CLIENT_TIMEOUT, handle).await"), "serve passes the client's own limit");
-        assert_eq!(production.matches("serve_within(").count(), 1, "the app's door is opened that way only");
+        use crate::source_guard::{args, calls, find, function, tokens, update};
+        const TEST: &str = "door::tests::the_door_the_app_opens_waits_as_long_as_its_client (src-tauri/src/door.rs)";
+        let door = tokens(include_str!("door.rs"));
+        let production = &door[..find(&door, "#[cfg(test)]").expect("door.rs has tests")];
+        let opened = calls(production, "serve_within");
+        assert_eq!(opened.len(), 1, "the app's door is opened that way only. {}", update(TEST));
+        assert_eq!(args(opened[0]), ["name", "CLIENT_TIMEOUT", "handle"], "serve passes the client's own limit. {}", update(TEST));
+        let serve = function(production, "door.rs", "pub async fn serve<", TEST);
+        assert!(serve.ends_with(&tokens("{ serve_within(name, CLIENT_TIMEOUT, handle).await }")), "and waits for it. {}\n{serve}", update(TEST));
     }
 
     /// An operation that panics leaves its client a closed pipe, as it always has: never an answer
