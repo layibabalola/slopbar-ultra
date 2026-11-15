@@ -70,16 +70,19 @@ bounded, and how (`src-tauri/src/update_check.rs`):
 | The exit cleanup the handover runs | 15 s for each part that can wait, 3 s for the diagnostics journal | a thread of its own |
 
 Not bounded: the installer once it has started, which is a separate program; and a handover that
-outlives its limit, whose thread cannot be stopped. That thread keeps the install's turn, so the
-next pass is deferred, and fails once the stuck install is past the pass limit, which the fleet
-script reports.
+outlives its limit, whose thread cannot be stopped. That thread keeps what the handover holds until
+it ends: the install's turn, so the next pass is deferred, and fails once the stuck install is past
+the pass limit, which the fleet script reports; and the refresh lock, so no refresh starts while the
+installer may still end SlopBar and cut a token rotation short. A handover that never returns keeps
+both until SlopBar restarts, and refreshes wait until then.
 
-One install runs at a time: the loop, `install_update` and the fleet script's repeated requests never
-download in parallel. A request while one runs is answered at once ("An update is already being
-installed") and recorded as `deferred`. An open sign-in also defers an install, before the download
-and again before the handover, because the installer ends SlopBar while tokens may be rotating. A
-deferral is no failure: the next try is at the usual interval. A failure is tried again after 2
-minutes, once, and then every 15 minutes.
+One install runs at a time, from its download to the end of its handover: the loop, `install_update`
+and the fleet script's repeated requests never download in parallel. A check alone takes no turn. A
+request while an install runs is answered at once ("An update is already being installed") and
+recorded as `deferred`. An open sign-in also defers an install, before the download and again before
+the handover, because the installer ends SlopBar while tokens may be rotating. A deferral is no
+failure: the next try is at the usual interval. A failure is tried again after 2 minutes, once, and
+then every 15 minutes.
 
 `get_app_info` (door) reports the last check as `update_check`: its time (UTC), result
 (`up_to_date`, `found`, `installing`, `deferred` or `error`), version, error or the reason it was
@@ -314,8 +317,8 @@ pwsh scripts/fleet-slopbar.ps1 -UpdateNow
 - **What it reports:** version, "Update automatically", the last update check (`LastCheck`: how
   long ago, and what it found, why it was deferred, or its error, cut to 40 characters; each one cut
   follows the table in full), and current, behind or not installed. A machine without SlopBar is
-  "not installed", not an error. A build from before the update-check record shows n/a, which is no
-  problem, because machines update one by one.
+  "not installed", not an error. A build from before the update-check record shows n/a there, which
+  is no problem in itself, because machines update one by one.
 - **Updating:** `install_update` replies at once and installs in the background. The app records how
   the install went in `update_check`; a request while an install runs is deferred at once, and so is
   an install while a sign-in is open. So a machine still answering on the old version after 90
@@ -326,15 +329,17 @@ pwsh scripts/fleet-slopbar.ps1 -UpdateNow
   - "Update automatically" off,
   - a machine that does not answer,
   - an update that does not arrive within 5 minutes,
+  - a machine still behind the channel longer than its interval plus its pass limit after the
+    channel's release was published (`pub_date` in `latest.json`). A build from before the record,
+    whose old updater could stall, gets 15 minutes plus the new pass limit (50 2/3 minutes), so a
+    machine stuck on it shows during a rollout,
   - and, from each machine's record, with its own interval and pass limit (15 minutes and 35 min 40 s
     on Ultra builds):
     - a failed last update check (a deferred one is no problem),
     - no update check for longer than the interval plus the pass limit (about 51 minutes) while
       "Update automatically" is on,
     - an update loop whose next run is overdue by more than the pass limit: it has stopped, even if
-      a check asked for since then shows a recent time,
-    - a machine still behind the channel longer than the interval plus the pass limit after the
-      channel's release was published (`pub_date` in `latest.json`).
+      a check asked for since then shows a recent time.
 - **Tested** offline by `pwsh scripts/test-fleet-slopbar.ps1`, on synthetic answers.
 
 ## Optional: Authenticode signing (paid, not purchased)
@@ -374,39 +379,75 @@ use `scripts/publish-ultra-release.ps1`, which gives the password to the signer'
 
 When a machine's updater cannot install a release (the canary above failed, say), install it over
 ssh. Never start SlopBar from the ssh session: it would run there, invisible, instead of on the
-user's desktop. `<alias>` is the machine's ssh alias, `<tag>` the release's `ultra-v…` tag.
+user's desktop. `<alias>` is the machine's ssh alias, `<tag>` the release's `ultra-v…` tag and
+`<name>` its installer's file name. As with the fleet script, the commands assume a profile path
+without spaces.
 
-1. Download the release's NSIS installer and check it against the SHA-256 digest GitHub keeps for
-   the asset:
+1. In a checkout of `ultra`, download the release's NSIS installer and its signature, and check
+   both:
 
    ```powershell
    $tag = '<tag>'; $dir = Join-Path $env:TEMP 'slopbar-manual'
-   gh release download $tag -R layibabalola/slopbar-ultra -p '*-setup.exe' -D $dir
+   gh release download $tag -R layibabalola/slopbar-ultra -p '*-setup.exe' -p '*-setup.exe.sig' -D $dir
    $asset = gh release view $tag -R layibabalola/slopbar-ultra --json assets --jq '.assets[] | select(.name | endswith("-setup.exe"))' | ConvertFrom-Json
    $file = Join-Path $dir $asset.name
-   if ("sha256:$((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant())" -ne $asset.digest) { throw 'The installer does not match its release.' }
+   if ("sha256:$((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant())" -ne $asset.digest) { throw 'The installer is not the release''s asset.' }
+   # The fork's public key and the release's .sig are base64 of minisign files.
+   $pubkey = (Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json).plugins.updater.pubkey
+   [IO.File]::WriteAllBytes("$dir\fork.pub", [Convert]::FromBase64String($pubkey))
+   [IO.File]::WriteAllBytes("$file.minisig", [Convert]::FromBase64String((Get-Content -Raw "$file.sig").Trim()))
+   minisign -Vm $file -p "$dir\fork.pub"
    ```
 
-2. Copy it to the machine's profile folder and check it there too:
-   `scp $file <alias>:` then `ssh <alias> "cmd /d /c certutil -hashfile %USERPROFILE%\<name> SHA256"`
-   must print the same digest.
-3. Quit SlopBar there through its door, so it exits cleanly (presence, sign-ins, journal) rather
-   than being ended by the installer:
-   `ssh <alias> "cmd /d /c %LOCALAPPDATA%\SlopBar\slopbar-mcp.exe --call quit_app"`.
-4. Run the installer silently: `ssh <alias> "cmd /d /c %USERPROFILE%\<name> /S"`. Leave out `/R`,
-   which the updater passes: it would start SlopBar inside the ssh session.
-5. Start SlopBar in the signed-in user's session through a one-shot scheduled task, and delete the
-   task at once. `/IT` runs it only in that interactive session, so someone must be signed in there:
+   `minisign` (`winget install jedisct1.minisign`) must print "Signature and comment signature
+   verified". The two checks prove different things. The digest proves only that the file is the
+   asset GitHub holds for that release, unchanged since it was uploaded: whoever can upload to the
+   release could have replaced the asset, and GitHub would then show that file's digest. The
+   signature proves the installer was signed with the fork's updater key (key id
+   `593D8A8B75A9A204`), which only the key's machine and the release workflow's secrets hold: the
+   check the updater itself makes before it installs anything. Don't install a file whose signature
+   does not verify.
+2. Copy it to the machine's profile folder and check it there too: `scp $file <alias>:`, then
+   `ssh <alias> "cmd /d /c certutil -hashfile %USERPROFILE%\<name> SHA256"` must print the same
+   digest.
+3. Quit SlopBar there through its door, then wait, a minute at most, until its process has exited:
+
+   ```
+   ssh <alias> "cmd /d /c %LOCALAPPDATA%\SlopBar\slopbar-mcp.exe --call quit_app"
+   ssh <alias> 'powershell -NoProfile -Command "Wait-Process -Name slopbar -Timeout 60 -ErrorAction SilentlyContinue; if (Get-Process -Name slopbar -ErrorAction SilentlyContinue) { exit 1 } else { exit 0 }"'
+   ```
+
+   The second exits with 1 if SlopBar is still running after a minute: stop there. Quitting lets it exit
+   cleanly: a refresh rotating a token finishes first, and presence, sign-ins and the journal are
+   closed. A silent install would end it abruptly instead, because Tauri's installer kills a running
+   app in silent mode.
+4. Run the installer silently, in update mode: `ssh <alias> "cmd /d /c %USERPROFILE%\<name> /S /UPDATE"`.
+   `/UPDATE` is the flag the updater itself passes. With it, Tauri's installer (tauri-cli 2.11.5)
+   skips uninstalling the old version and installing WebView2, and does not recreate the desktop and
+   Start-menu shortcuts. Leave out `/R`, which the updater also passes: it would start SlopBar from
+   the installer, inside the ssh session.
+5. Start SlopBar in the signed-in user's session through a one-shot scheduled task, and check that
+   it runs before deleting the task. `/IT` runs the task only in that interactive session, so
+   someone must be signed in there:
 
    ```
    ssh <alias> "cmd /d /c schtasks /Create /TN SlopBarStart /TR %LOCALAPPDATA%\SlopBar\slopbar.exe /SC ONCE /ST 23:59 /IT /F"
    ssh <alias> "cmd /d /c schtasks /Run /TN SlopBarStart"
-   ssh <alias> "cmd /d /c schtasks /Delete /TN SlopBarStart /F"
+   ssh <alias> "cmd /d /c %LOCALAPPDATA%\SlopBar\slopbar-mcp.exe --call get_app_info"
    ```
 
-6. Check that `pwsh scripts/fleet-slopbar.ps1` shows the machine on the release.
+   The last must answer with the release's `version`. SlopBar takes a few seconds to start, so ask
+   again until it answers, for a minute at most. If it never does, nobody is signed in there: run
+   the task again when someone is.
+6. Once SlopBar answers, delete the task and query it to prove it is gone:
 
-As with the fleet script, the commands assume a profile path without spaces.
+   ```
+   ssh <alias> "cmd /d /c schtasks /Delete /TN SlopBarStart /F"
+   ssh <alias> "cmd /d /c schtasks /Query /TN SlopBarStart"
+   ```
+
+   The query must fail ("The system cannot find the file specified").
+7. Check that `pwsh scripts/fleet-slopbar.ps1` shows the machine on the release.
 
 ## Rolling back a bad release
 
