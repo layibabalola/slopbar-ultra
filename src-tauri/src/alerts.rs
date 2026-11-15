@@ -241,10 +241,9 @@ pub fn check_overlap(state: &mut State, snap: &Snapshot, prefs: &Notifications, 
             seen.notified = true;
             if prefs.multi_machine {
                 let n = a.overlap.len().to_string();
-                let list: Vec<String> = a.overlap.iter().map(|m| fmt::machine_name(lang, m, me)).collect();
                 out.push(Notice::Plain {
                     title: t(lang, "nOverlapTitle", &[("provider", provider_name(pstr)), ("n", &n)]),
-                    body: t(lang, "nOverlapBody", &[("account", &account_name(lang, a)), ("list", &list.join(", ")), ("n", &n)]),
+                    body: t(lang, "nOverlapBody", &[("account", &account_name(lang, a)), ("list", &fmt::overlap_list(lang, a, me)), ("n", &n)]),
                     page: Some("accounts"),
                     phone: None,
                 });
@@ -668,16 +667,20 @@ mod tests {
         // A moment's overlap (a switch on another machine) says nothing.
         assert!(check_overlap(&mut s, &both, &prefs, "en", None, mins(0)).is_empty());
         assert!(check_overlap(&mut s, &both, &prefs, "en", None, mins(2)).is_empty());
-        let out = check_overlap(&mut s, &both, &prefs, "en", None, mins(5));
+        // Said on DESK-1, where the account is in use: it marks which of them this is.
+        let out = check_overlap(&mut s, &both, &prefs, "en", Some("DESK-1"), mins(5));
         assert_eq!(titles(&out), ["Claude account in use on 2 machines"]);
         let Notice::Plain { body, page, .. } = &out[0] else { panic!() };
-        assert!(body.starts_with("me@example.invalid is in use on DESK-1, LAPTOP-2 at once"), "{body}");
-        assert_eq!(*page, Some("accounts"));
-        // Said on DESK-1, it marks which of them this is.
-        let mut fresh = State::default();
-        check_overlap(&mut fresh, &both, &prefs, "en", Some("DESK-1"), mins(0));
-        let Notice::Plain { body, .. } = &check_overlap(&mut fresh, &both, &prefs, "en", Some("DESK-1"), mins(5))[0] else { panic!() };
         assert!(body.starts_with("me@example.invalid is in use on DESK-1 (this PC), LAPTOP-2 at once"), "{body}");
+        assert_eq!(*page, Some("accounts"));
+        // Not in use here: a peer that shares this machine's name (a cloned machine) is not this PC.
+        let mut elsewhere = a.clone();
+        elsewhere.active = false;
+        let mut fresh = State::default();
+        check_overlap(&mut fresh, &snap(vec![elsewhere.clone()]), &prefs, "en", Some("DESK-1"), mins(0));
+        let out = check_overlap(&mut fresh, &snap(vec![elsewhere]), &prefs, "en", Some("DESK-1"), mins(5));
+        let Notice::Plain { body, .. } = &out[0] else { panic!() };
+        assert!(body.starts_with("me@example.invalid is in use on DESK-1, LAPTOP-2 at once"), "{body}");
         // Never again while it lasts, nor after a short gap.
         assert!(check_overlap(&mut s, &both, &prefs, "en", None, mins(10)).is_empty());
         assert!(check_overlap(&mut s, &alone, &prefs, "en", None, mins(20)).is_empty());

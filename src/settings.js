@@ -2,7 +2,7 @@ import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { sparkline } from "./sparkline.js";
 import { money, pct, amount, renewalText, adviceText, creditsLine, extraUsageLine } from "./accounttext.js";
-import { t, translateDom, setLanguage, setSystemLocale, setThisMachine, LANGUAGES, resetText, errorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText, overlapText, seatsText } from "./i18n.js";
+import { t, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, LANGUAGES, resetText, errorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText, overlapText, seatsText } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -97,7 +97,9 @@ function accountRow(p, a) {
         <input data-alias="${esc(key)}" value="${esc(settings.aliases[key] ?? "")}"
           placeholder="${esc(a.email ?? t("unknownAccount"))}" aria-label="${t("alias")}" title="${t("alias")}" />
         <small>
-          ${places.inUse ? `<em class="chip where ${a.active || a.desktop ? "live" : "elsewhere"}" title="${esc(places.inUse)}">${esc(places.short)}</em>` : ""}
+          ${places.names.length ? `<em class="chip where ${a.active || a.desktop ? "live" : "elsewhere"}" title="${esc(places.inUse)}">${esc(places.short)}</em>`
+            : a.active ? `<em class="chip live" title="${esc(places.inUse)}">${t("inUse")}</em>`
+            : a.desktop ? `<em class="chip live" title="${esc(places.inUse)}">${t("desktopApp")}</em>` : ""}
           ${seatsChip(a)}
           ${overlapChip(a)}
           ${a.used_outside ? `<em class="chip outside" title="${esc(t("usedOutsideHint"))}">${t("usedOutside")}</em>` : ""}
@@ -413,7 +415,7 @@ function subscriptionRow(e) {
       <div class="who">
         <div class="name">${esc(e.alias || e.email || t("unknownAccount"))}</div>
         <small>
-          ${places?.inUse ? `<em class="chip where ${used.active || used.desktop ? "live" : "elsewhere"}" title="${esc(places.inUse)}">${esc(places.short)}</em>`
+          ${places?.names.length ? `<em class="chip where ${used.active || used.desktop ? "live" : "elsewhere"}" title="${esc(places.inUse)}">${esc(places.short)}</em>`
             : e.active ? `<em class="chip live">${t("inUse")}</em>` : ""}
           ${e.plan ? `<em class="chip">${esc(e.plan)}</em>` : ""}
           ${e.ends_at ? `<em class="chip">${t("chipCancelled")}</em>` : e.cancel_after ? `<em class="chip">${t("chipLapsing")}</em>` : ""}
@@ -947,6 +949,7 @@ listen("usage-updated", () => { if (settings) renderRoster(); });
 
 async function render() {
   setLanguage(settings.language);
+  setSharing(settings);
   translateDom();
   document.title = `SlopBar · ${t("settings")}`;
 
