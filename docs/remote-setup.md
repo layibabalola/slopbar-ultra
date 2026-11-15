@@ -25,10 +25,16 @@ On the **new computer** (the one being set up), in an elevated PowerShell:
 Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
 Start-Service sshd
 Set-Service sshd -StartupType Automatic
-# PowerShell as the shell for SSH sessions (SlopBar's commands work from cmd too).
-New-ItemProperty -Path HKLM:\SOFTWARE\OpenSSH -Name DefaultShell -PropertyType String -Force `
-  -Value "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+# PowerShell 7 as the shell for SSH sessions, where it is installed; otherwise OpenSSH keeps cmd.
+$pwsh = "$env:ProgramFiles\PowerShell\7\pwsh.exe"
+if (Test-Path $pwsh) {
+  New-ItemProperty -Path HKLM:\SOFTWARE\OpenSSH -Name DefaultShell -PropertyType String -Force -Value $pwsh
+}
 ```
+
+SlopBar's commands work from either shell, and run under PowerShell 7 where it is installed,
+otherwise under Windows PowerShell. Don't make Windows PowerShell (`powershell.exe`) the SSH shell:
+started over SSH, it can outlive the session and keep growing (one reached 85 GiB of memory).
 
 On the **computer with the accounts**, create a key once and copy its public half over:
 
