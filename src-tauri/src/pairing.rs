@@ -552,15 +552,20 @@ fn setup_remote_sharing(door: &dyn Door, ssh: &dyn Remote, host: &str, args: &Va
     loop {
         let link = answer(&ssh.run(host, &remote_command(&["--sharing-state", STATE_WAIT]), b"")?)?;
         if let Some(state) = link.get("state").and_then(Value::as_str) {
-            if let Err(e) = door.call(&Request::SharingTunnel { host: host.into(), state: Some(state.into()), close: false }) {
-                let _ = cancel_there();
-                return Err(e);
-            }
-            return Ok(json!({
-                "phase": "dropbox",
-                "browser": "this computer",
-                "next": "Dropbox's page opened in this computer's browser, and a notification here opens it again (a page opened while nobody uses SlopBar can stay behind other windows: tell the user to look for it). The user signs in with the Dropbox account their other computers use and clicks Allow on dropbox.com; then call get_sharing_setup with this ssh_host, wait_seconds: 45 and since: the last revision, until phase is done or failed.",
-            }));
+            let shown = match door.call(&Request::SharingTunnel { host: host.into(), state: Some(state.into()), close: false }) {
+                Ok(shown) => shown,
+                Err(e) => {
+                    let _ = cancel_there();
+                    return Err(e);
+                }
+            };
+            let (opened, notified) = (shown["opened"] == true, shown["notified"] == true);
+            let next = if opened || notified {
+                "Dropbox's page is ready in this computer's browser: opened says whether it opened by itself, notified whether a notification here offers it (a page opened while nobody uses SlopBar can stay behind other windows, so tell the user where to look). The user signs in with the Dropbox account their other computers use and clicks Allow on dropbox.com; then call get_sharing_setup with this ssh_host, wait_seconds: 45 and since: the last revision, until phase is done or failed."
+            } else {
+                "Nothing was shown here: the user turned off both opening Dropbox's page (sharing_open_browser) and its notification (notifications.sharing_sign_in). Ask the user before turning one on with update_settings, then call setup_sharing again with this ssh_host and confirm: true (it joins the same setup)."
+            };
+            return Ok(json!({ "phase": "dropbox", "browser": "this computer", "opened": opened, "notified": notified, "next": next }));
         }
         if !setup_running(&link) {
             // Already connected (no sign-in needed), or it stopped: its own state says which.
