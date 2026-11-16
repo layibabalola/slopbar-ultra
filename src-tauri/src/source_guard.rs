@@ -226,11 +226,18 @@ pub fn calls<'a>(code: &'a str, name: &str, test: &str) -> Vec<&'a str> {
 }
 
 /// Whether `head`, the text of an argument before its first `|`, makes it a closure: nothing, or
-/// `move`, `async`, `async move`, or a reference to one (`&`, `&mut`).
+/// `move`, `async`, `async move`, or a reference to one (`&`, `&mut`). `mut` and `async` count only
+/// as whole words: `asyncmove` is a name.
 fn closure_head(head: &str) -> bool {
-    let head = head.strip_prefix('&').map_or(head, |rest| rest.strip_prefix("mut").map_or(rest, str::trim_start));
-    let head = head.strip_prefix("async").map_or(head, str::trim_start);
+    let head = head.strip_prefix('&').map_or(head, |rest| after_word(rest, "mut").unwrap_or(rest));
+    let head = after_word(head, "async").unwrap_or(head);
     matches!(head, "" | "move")
+}
+
+/// What follows `word` at the start of `text` when it is a whole word there: the end follows it, or
+/// the space the reader keeps between two words.
+fn after_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    text.strip_prefix(word).filter(|rest| rest.is_empty() || rest.starts_with(' ')).map(str::trim_start)
 }
 
 /// The arguments of `call` (a call's brackets, as `calls` gives them), in order: split at the
@@ -430,8 +437,8 @@ mod tests {
         assert_eq!(closure_body("a|b|c"), None, "two `|` after a word are operators, not a closure's parameters");
         // A closure that returns a type with a comma in it (app.rs's rclone check), a turbofish,
         // and closures after `&`, `&mut`, `async` and `async move`: each is one argument.
-        let rclone = tokens("(move || -> Result<Option<Connect>, &'static str> { let listed = f()?; Ok(None) })");
-        assert_eq!(args(&rclone), ["move||->Result<Option<Connect>,&'static str>{let listed=f()?;Ok(None)}"], "a closure's return type");
+        let rclone = tokens("(move || -> Result<Option<Connect>, &'static str> { let listed = f()?; Ok(None) }, after)");
+        assert_eq!(args(&rclone), ["move||->Result<Option<Connect>,&'static str>{let listed=f()?;Ok(None)}", "after"], "a closure's return type ends at its body");
         assert_eq!(closure_body(args(&rclone)[0]), Some("->Result<Option<Connect>,&'static str>{let listed=f()?;Ok(None)}"), "its body as written, return type and all");
         assert_eq!(args(&tokens("(HashMap::<u8, u8>::new(), m.n::<B, C>(o), x)")), ["HashMap::<u8,u8>::new()", "m.n::<B,C>(o)", "x"], "turbofish");
         // Inside a turbofish, a `<` opens another level and the `>` of an arrow closes none.
@@ -441,6 +448,10 @@ mod tests {
         assert_eq!(referenced, ["&|a,b|a+b", "&mut|a,b|a", "async|a,b|a", "async move|a,b|a", "a>b", "c"], "a closure after `&`, `&mut`, `async`");
         assert_eq!(referenced[..4].iter().map(|arg| closure_body(arg)).collect::<Vec<_>>(), [Some("a+b"), Some("a"), Some("a"), Some("a")]);
         assert_eq!(closure_body(&tokens("|(A(x) | B(x))| x")), Some("x"), "a `|` inside the parameters' brackets");
+        assert_eq!(closure_body(&tokens("|x| x | y")), Some("x|y"), "a `|` in the body is the body's own");
+        // `mut` and `async` are words: a name that starts with them, then `|`, is no closure.
+        assert_eq!(args(&tokens("(&mutmove | y, z | w)")), ["&mutmove|y", "z|w"], "a name and `|` operators");
+        assert_eq!((closure_body("asyncmove|a|b"), closure_body("&mutasync|a|b"), closure_body("&mutmove|a|b")), (None, None, None), "names, not closure heads");
         let code = tokens("let live = || { f(x) }; let Some(a) = b else { return; }; g();");
         assert_eq!(statement(&code, "let live ="), Some("let live=||{f(x)};"));
         assert_eq!(statement(&code, "let Some(a) = b else {"), Some("let Some(a)=b else{return;};"), "a `;` inside a block ends no statement");
