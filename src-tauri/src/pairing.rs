@@ -589,13 +589,14 @@ pub fn ssh_shell() -> Option<&'static str> {
 /// What DefaultShell's value names, as sshd starts it: missing or empty is cmd. sshd quotes the
 /// value itself and starts it as a path, never from PATH, so a quoted, relative or `%VAR%` value,
 /// or a path to no file, starts nothing at all (`missing`); a path without an extension starts its
-/// `.exe`. Otherwise the program's file name tells pwsh, windows_powershell, cmd or other.
+/// `.exe`. A path from a drive letter, or rooted at `\` or `/` (the current drive, or a share), is
+/// a path. Otherwise the program's file name tells pwsh, windows_powershell, cmd or other.
 /// `exists` says whether a file (not a folder) is there; it sees a Store app's alias as one.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn shell_kind(value: Option<&str>, exists: impl Fn(&str) -> bool) -> &'static str {
     let Some(value) = value.filter(|v| !v.is_empty()) else { return "cmd" };
     let bytes = value.as_bytes();
-    let absolute = (bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/')) || value.starts_with(r"\\");
+    let absolute = (bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/')) || matches!(bytes[0], b'\\' | b'/');
     let name = value.rsplit(['\\', '/']).next().unwrap_or(value).trim_end().to_ascii_lowercase();
     let bare = !name.contains('.');
     if !absolute || value.contains('"') || !(exists(value) || (bare && exists(&format!("{value}.exe")))) {
@@ -615,6 +616,13 @@ fn is_file_there(path: &str) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| !m.is_dir())
 }
 
+/// A registry string as sshd reads it, a C string: up to the first NUL.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn c_string(units: &[u16]) -> String {
+    let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+    String::from_utf16_lossy(&units[..end])
+}
+
 #[cfg(windows)]
 mod registry {
     /// A string value under HKEY_LOCAL_MACHINE as sshd reads DefaultShell: the 64-bit view, with no
@@ -631,8 +639,7 @@ mod registry {
                 std::ptr::null_mut(), data.as_mut_ptr().cast(), &mut size)
         };
         match status {
-            // Read as sshd reads it, a C string: up to the first NUL.
-            ERROR_SUCCESS => Ok(Some(String::from_utf16_lossy(&data[..(size as usize / 2).min(data.len())]).split('\0').next().unwrap_or_default().to_string())),
+            ERROR_SUCCESS => Ok(Some(super::c_string(&data[..(size as usize / 2).min(data.len())]))),
             ERROR_FILE_NOT_FOUND => Ok(None),
             error => Err(error),
         }
@@ -1451,9 +1458,13 @@ mod tests {
         for other in [r"C:\Program Files\Git\bin\bash.exe", r"C:\tools\pwsh.cmd"] {
             assert_eq!(shell_kind(Some(other), there), "other", "{other}");
         }
-        // A path without an extension starts its .exe, as CreateProcess does.
+        // A path without an extension starts its .exe, as CreateProcess does; one rooted at \ or /
+        // (the current drive, or a share) is a path too.
         let only_exe = |p: &str| p.ends_with(".exe");
         assert_eq!(shell_kind(Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell"), only_exe), "windows_powershell");
+        for rooted in [r"\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", "/Windows/System32/WindowsPowerShell/v1.0/powershell", "//server/share/powershell.exe"] {
+            assert_eq!(shell_kind(Some(rooted), only_exe), "windows_powershell", "{rooted}");
+        }
         // sshd starts nothing for a path to no file (or a folder), a quoted value, a relative name
         // (it never searches PATH) or an unexpanded %VAR%.
         for gone in [r"C:\Program Files\PowerShell\7\pwsh.exe", r"\\server\share\pwsh.exe", r"C:\Program Files\PowerShell\7"] {
@@ -1462,6 +1473,15 @@ mod tests {
         for gone in [r#""C:\Program Files\PowerShell\7\pwsh.exe""#, "pwsh.exe", "pwsh", r"%ProgramFiles%\PowerShell\7\pwsh.exe"] {
             assert_eq!(shell_kind(Some(gone), there), "missing", "{gone}");
         }
+    }
+
+    #[test]
+    fn registry_strings_end_at_their_first_nul_as_sshd_reads_them() {
+        let units = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        assert_eq!(c_string(&units("C:\\pwsh.exe\0")), r"C:\pwsh.exe");
+        assert_eq!(c_string(&units("C:\\pwsh.exe\0powershell.exe\0\0")), r"C:\pwsh.exe", "a value with a NUL inside");
+        assert_eq!(c_string(&units("no terminator")), "no terminator");
+        assert_eq!(c_string(&[]), "");
     }
 
     #[test]
