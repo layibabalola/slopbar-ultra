@@ -320,10 +320,11 @@ impl<S: Forget> Sharing<S> {
     }
 
     /// Whether a save left anything for `catch_up`, or a withdrawal that ran late has ended since
-    /// (its roster sync then starts afresh). A roster sync holding the roster's lock leaves the
-    /// second for the refresh after.
+    /// (its roster sync then starts afresh). It never waits for the roster's lock (`lock_by` with no
+    /// time left): a roster sync holding it leaves the second for the refresh after, and a lock a
+    /// panic poisoned is read as `lock` reads it.
     pub fn is_due(&self) -> bool {
-        !lock(&self.due).is_empty() || self.roster.try_lock().is_ok_and(|roster| roster.late.iter().any(|late| late.ended.load(Ordering::SeqCst)))
+        !lock(&self.due).is_empty() || lock_by(&self.roster, Instant::now()).is_some_and(|roster| roster.late.iter().any(|late| late.ended.load(Ordering::SeqCst)))
     }
 
     /// A refresh's first step, under the refresh lock and before it reads the settings (on a
@@ -715,7 +716,19 @@ mod tests {
     /// Whether every withdrawal the code noted as running late has ended, as the code sees it: its
     /// own flag, which a withdrawal's thread sets after the fake's last write.
     fn late_ended(app: &App) -> bool {
-        app.sharing.roster.try_lock().is_ok_and(|roster| roster.late.iter().all(|late| late.ended.load(SeqCst)))
+        lock_by(&app.sharing.roster, Instant::now()).is_some_and(|roster| roster.late.iter().all(|late| late.ended.load(SeqCst)))
+    }
+
+    /// Poisons `mutex`, as a panic while it is held would.
+    fn poison<T: Send>(mutex: &Mutex<T>) {
+        std::thread::scope(|scope| {
+            let panicked = scope.spawn(|| {
+                let _held = mutex.lock().unwrap_or_else(|e| e.into_inner());
+                panic!("a panic under the lock, on purpose");
+            });
+            assert!(panicked.join().is_err());
+        });
+        assert!(mutex.is_poisoned());
     }
 
     /// Lets the withdrawals started at slow `place` so far end, and waits until the code sees them
@@ -1082,6 +1095,27 @@ mod tests {
         app.refresh();
         assert_eq!(as_saved(&app, &["A", "B"]), Ok(()), "written at A again");
         assert!(!app.sharing.is_due() && !app.io.self_ended.load(SeqCst));
+        app.io.hung.fast("A");
+    }
+
+    /// The same, after a panic under the roster's lock poisoned it: the code reads a poisoned lock as
+    /// `lock` does, so `is_due` still sees the late roster withdrawal that ended, and the refresh
+    /// after it starts the roster sync afresh.
+    #[test]
+    fn a_poisoned_roster_lock_still_starts_the_roster_sync_afresh() {
+        let app = App::new(at("A", true));
+        app.refresh();
+        app.io.hung.slow("A");
+        assert!(app.save(at("B", true)));
+        app.refresh_within(SHORT);
+        assert!(app.save(at("A", true)), "back at A while A's withdrawals still run");
+        app.refresh();
+        poison(&app.sharing.roster);
+        release(&app, "A");
+        assert!(as_saved(&app, &["A"]).is_err(), "the late withdrawals removed those writes");
+        assert!(app.sharing.is_due(), "a poisoned lock is read, not taken for one a sync holds");
+        app.refresh();
+        assert_eq!(as_saved(&app, &["A", "B"]), Ok(()), "the roster sync started afresh and wrote at A again");
         app.io.hung.fast("A");
     }
 
