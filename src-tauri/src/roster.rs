@@ -553,7 +553,9 @@ mod tests {
         let key = SealKey::new(&pass("correct horse battery")).unwrap();
         let bytes = seal(&roster, &key).unwrap();
         let text = String::from_utf8_lossy(&bytes);
-        for secret in ["cl-one", "example.invalid", "DESK-1", "Synthetic", "max"] {
+        // The plan as the roster's JSON writes it, quotes and all: the three letters alone turn up in
+        // the base64 ciphertext by chance (about once in 700 runs), a quote never does.
+        for secret in ["cl-one", "example.invalid", "DESK-1", "Synthetic", "\"max\""] {
             assert!(!text.contains(secret), "{secret} in {text}");
         }
         let mut keys = HashMap::new();
