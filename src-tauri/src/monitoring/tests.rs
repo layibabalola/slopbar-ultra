@@ -403,6 +403,63 @@ fn connect_remove_and_disconnect_share_a_reservation_until_mutations_finish() {
     assert!(operations.begin(Provider::Claude, "one").is_ok());
 }
 
+#[test]
+fn sign_ins_are_counted_and_none_is_refused() {
+    let sign_ins = SignIns::default();
+    assert!(!sign_ins.any());
+    let first = sign_ins.open();
+    let second = sign_ins.open();
+    assert!(sign_ins.any(), "two sign-ins at once: neither is refused");
+    drop(first);
+    assert!(sign_ins.any(), "one is still open");
+    drop(second);
+    assert!(!sign_ins.any());
+}
+
+/// A sign-in's mark goes however the sign-in ends: it finishes, it fails, it is stopped (its
+/// future dropped while it waits on the user, as a stopped "Sign in all accounts" drops its step,
+/// or its task aborted) or its task panics.
+#[tokio::test]
+async fn a_sign_in_lets_go_of_its_mark_however_it_ends() {
+    // As an entry point does: the mark first, then the sign-in, which can fail.
+    async fn sign_in(sign_ins: &SignIns, ends: Result<(), &str>) -> Result<(), String> {
+        let _open = sign_ins.open();
+        tokio::task::yield_now().await;
+        ends?;
+        Ok(())
+    }
+    let sign_ins = SignIns::default();
+    for ends in [Ok(()), Err("monitor_login_failed")] {
+        assert_eq!(sign_in(&sign_ins, ends).await.is_ok(), ends.is_ok());
+        assert!(!sign_ins.any(), "{ends:?}");
+    }
+    let mut waiting = Box::pin(async {
+        let _open = sign_ins.open();
+        std::future::pending::<()>().await
+    });
+    assert!(futures::poll!(waiting.as_mut()).is_pending());
+    assert!(sign_ins.any(), "open while it waits on the user");
+    drop(waiting);
+    assert!(!sign_ins.any(), "stopped");
+    let open = sign_ins.open();
+    let task = tokio::spawn(async move {
+        let _open = open;
+        std::future::pending::<()>().await
+    });
+    tokio::task::yield_now().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(!sign_ins.any(), "its task aborted");
+    let open = sign_ins.open();
+    let task = tokio::spawn(async move {
+        let _open = open;
+        tokio::task::yield_now().await;
+        panic!("a sign-in's task panics (synthetic)");
+    });
+    assert!(task.await.unwrap_err().is_panic());
+    assert!(!sign_ins.any(), "its task panicked");
+}
+
 #[tokio::test]
 async fn reconnect_saves_new_login_before_revoking_old_chain_and_never_revokes_after_failed_save() {
     struct Inspect {
