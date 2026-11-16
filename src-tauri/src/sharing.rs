@@ -14,13 +14,16 @@
 //! after a sync as a whole. A roster sync notes where it synced last: a sync at another place
 //! starts afresh, so a move never leaves the new place without this machine's roster.
 //!
-//! What a save noted stays due until a withdrawal of it ends in time:
+//! What a save noted stays due until a withdrawal of it ends in time, or a later save brings sharing
+//! back to that place (its roster only once the roster is on again there):
 //! - each withdrawal runs on a thread of its own, all of them side by side, and a refresh waits
 //!   `WITHDRAW_LIMIT` at most for them and for the roster's lock, so a folder that does not answer
 //!   holds the refresh lock that long at most. One still running then stays due: it is not started
 //!   again while it runs, and once it has ended the next refresh withdraws there again, in order
 //!   with the writes. Nothing writes to a place sharing has left, so a withdrawal that ends late
-//!   harms nothing there; where sharing has come back, the refresh after it writes again;
+//!   harms nothing there. Where sharing has come back, one still running may end after the next
+//!   refresh's writes: the refresh after that starts the roster sync afresh, so it writes the roster
+//!   there again, and writes the presence record, as every refresh does;
 //! - SlopBar's exit withdraws what is due as a refresh would (`Sharing::exit`), so an exit between
 //!   a save and its refresh (a refresh still running, or waiting for the refresh lock) loses
 //!   nothing;
@@ -104,6 +107,16 @@ pub struct Due {
 
 impl Due {
     fn note(&mut self, before: &Place, after: &Place) {
+        // Sharing is back where an earlier save left it: nothing is withdrawn there any more, and
+        // the next refresh writes there; its roster stays due only while the roster is off. A
+        // withdrawal still running there may end after those writes: the refresh after it starts
+        // the roster sync afresh (`catch_up`), and every refresh writes the presence record again.
+        if after.shares() {
+            self.presence.retain(|p| !p.same_location(after));
+            if after.roster {
+                self.roster.retain(|p| !p.same_location(after));
+            }
+        }
         let moved = !before.same_location(after);
         if moved && before.shares() && !self.presence.contains(before) {
             self.presence.push(before.clone());
@@ -280,18 +293,21 @@ impl<S: Forget> Sharing<S> {
         let (from, to) = (Place::of(before), Place::of(after));
         {
             let mut due = lock(&self.due);
-            let noted = due.presence.len() + due.roster.len();
+            // Kept whenever what is listed changed: a return drops a place as a move adds one.
+            let noted = (due.presence.clone(), due.roster.clone());
             due.note(&from, &to);
-            if due.presence.len() + due.roster.len() != noted {
+            if (&due.presence, &due.roster) != (&noted.0, &noted.1) {
                 self.keep(&due);
             }
         }
         before.providers.claude != after.providers.claude || before.providers.codex != after.providers.codex || from != to
     }
 
-    /// Whether a save left anything for `catch_up`.
+    /// Whether a save left anything for `catch_up`, or a withdrawal that ran late has ended since
+    /// (its roster sync then starts afresh). A roster sync holding the roster's lock leaves the
+    /// second for the refresh after.
     pub fn is_due(&self) -> bool {
-        !lock(&self.due).is_empty()
+        !lock(&self.due).is_empty() || self.roster.try_lock().is_ok_and(|roster| roster.late.iter().any(|late| late.ended.load(Ordering::SeqCst)))
     }
 
     /// A refresh's first step, under the refresh lock and before it reads the settings (on a
@@ -326,7 +342,10 @@ impl<S: Forget> Sharing<S> {
             let mut due = lock(&self.due);
             (due.withdrawals(), std::mem::take(&mut due.reset))
         };
-        // One that ran late and has ended since is made again below, in order with the writes.
+        // One that ran late and has ended since is made again below, in order with the writes, if
+        // it is still due. A roster withdrawal that ended late may have removed a newer write (where
+        // sharing came back): the roster sync starts afresh, so its next sync writes there again.
+        let ended_late = roster.late.iter().any(|late| late.kind == Kind::Roster && late.ended.load(Ordering::SeqCst));
         roster.late.retain(|late| !late.ended.load(Ordering::SeqCst));
         let (done, ended) = mpsc::channel();
         let mut started = Vec::new();
@@ -353,7 +372,7 @@ impl<S: Forget> Sharing<S> {
             }
         }
         // A roster withdrawn where sharing has come back is written there again by the next sync.
-        let reset = asked || made.iter().any(|&index| due[index].0 == Kind::Roster);
+        let reset = asked || ended_late || made.iter().any(|&index| due[index].0 == Kind::Roster);
         if reset {
             roster.syncer.forget();
             roster.place = None;
@@ -456,29 +475,55 @@ mod tests {
         place.folder.clone().unwrap_or_default()
     }
 
-    /// The places that do not answer: anything done there waits until the test lets it go
-    /// (`answer`), or until SELF_ENDING.
+    /// Places that do not answer, and places that stay slow.
+    #[derive(Default)]
+    struct Places {
+        /// Anything done there waits until the test lets it go (`answer`).
+        hung: BTreeSet<String>,
+        /// A withdrawal there waits for the next `release`, however many come: each one ends late.
+        slow: BTreeMap<String, u64>,
+    }
+
+    /// The places that do not answer or are slow; anything waiting there ends by itself after
+    /// SELF_ENDING.
     #[derive(Default)]
     struct Hung {
-        places: Mutex<BTreeSet<String>>,
+        places: Mutex<Places>,
         answered: Condvar,
     }
 
     impl Hung {
         fn hang(&self, place: &str) {
-            self.places.lock().unwrap().insert(place.into());
+            self.places.lock().unwrap().hung.insert(place.into());
         }
 
         fn answer(&self, place: &str) {
-            self.places.lock().unwrap().remove(place);
+            self.places.lock().unwrap().hung.remove(place);
             self.answered.notify_all();
         }
 
-        /// Waits while `place` does not answer; whether it waited until SELF_ENDING.
-        fn wait(&self, place: &str) -> bool {
+        fn slow(&self, place: &str) {
+            self.places.lock().unwrap().slow.entry(place.into()).or_default();
+        }
+
+        /// Lets the withdrawals waiting at a slow place end; the next ones wait again.
+        fn release(&self, place: &str) {
+            *self.places.lock().unwrap().slow.entry(place.into()).or_default() += 1;
+            self.answered.notify_all();
+        }
+
+        fn fast(&self, place: &str) {
+            self.places.lock().unwrap().slow.remove(place);
+            self.answered.notify_all();
+        }
+
+        /// Waits while `place` does not answer, and with `withdrawal`, for the next release when it
+        /// is slow; whether it waited until SELF_ENDING.
+        fn wait(&self, place: &str, withdrawal: bool) -> bool {
             let deadline = Instant::now() + SELF_ENDING;
             let mut places = self.places.lock().unwrap();
-            while places.contains(place) {
+            let round = places.slow.get(place).copied().filter(|_| withdrawal);
+            while places.hung.contains(place) || round.is_some_and(|round| places.slow.get(place) == Some(&round)) {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     return true;
@@ -519,7 +564,7 @@ mod tests {
 
         fn reach(&self, what: String, place: &Place) -> MutexGuard<'_, World> {
             self.world.lock().unwrap().attempts.push(what);
-            if self.hung.wait(&name(place)) {
+            if self.hung.wait(&name(place), true) {
                 self.self_ended.store(true, SeqCst);
             }
             self.world.lock().unwrap()
@@ -609,7 +654,7 @@ mod tests {
             self.sharing.sync_roster(copy, || self.live(), |syncer| {
                 if syncer.written != Some(accounts) {
                     syncer.written = Some(accounts);
-                    self.io.hung.wait(&name(copy));
+                    self.io.hung.wait(&name(copy), false);
                     let live = name(&self.live());
                     let mut world = self.world();
                     world.roster.insert(name(copy));
@@ -641,6 +686,18 @@ mod tests {
             assert!(Instant::now() < deadline, "{what}");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Whether every withdrawal the code noted as running late has ended, as the code sees it: its
+    /// own flag, which a withdrawal's thread sets after the fake's last write.
+    fn late_ended(app: &App) -> bool {
+        app.sharing.roster.try_lock().is_ok_and(|roster| roster.late.iter().all(|late| late.ended.load(SeqCst)))
+    }
+
+    /// Lets the withdrawals waiting at slow `place` end, and waits until the code sees them ended.
+    fn release(app: &App, place: &str) {
+        app.io.hung.release(place);
+        eventually("the late withdrawals have ended", || late_ended(app));
     }
 
     /// Two saves within one refresh (the Sharing dropdown arrowed through: it saves at every
@@ -734,7 +791,7 @@ mod tests {
     }
 
     /// A place left twice (A, B, A, B) is withdrawn once, and the last save is where the refresh
-    /// writes.
+    /// writes: each return takes the place sharing came back to off the list.
     #[test]
     fn a_place_left_twice_is_withdrawn_once_and_written_last() {
         let app = App::new(at("A", true));
@@ -744,7 +801,8 @@ mod tests {
         }
         {
             let due = lock(&app.sharing.due);
-            assert_eq!((due.presence.len(), due.roster.len(), due.reset), (2, 2, true), "{due:?}");
+            let a = Place::of(&at("A", true));
+            assert_eq!((&due.presence, &due.roster, due.reset), (&vec![a.clone()], &vec![a], true), "only A, the place sharing left last");
         }
         app.refresh();
         let world = app.world();
@@ -807,7 +865,8 @@ mod tests {
         assert_eq!(app.io.started.load(SeqCst), 2, "not started again while they run");
 
         app.io.hung.answer("A");
-        eventually("the late withdrawals end once A answers", || app.world().withdrawals.len() == 2);
+        // Ended as the fake sees them, and as the code does: its own flag is set a moment later.
+        eventually("the late withdrawals end once A answers", || app.world().withdrawals.len() == 2 && late_ended(&app));
         app.refresh();
         assert_eq!(app.io.started.load(SeqCst), 4, "made again once ended, in order with the writes");
         let world = app.world();
@@ -904,6 +963,90 @@ mod tests {
         app.io.hung.answer(place);
         let at = |list: &[String]| list.iter().filter(|w| w.ends_with(&format!(" {place}"))).count();
         eventually("what waited at the place ended", || at(&app.world().withdrawals) == waiting);
+    }
+
+    /// The files the last save asks for, against what is at each place in `places`.
+    fn as_saved(app: &App, places: &[&str]) -> Result<(), String> {
+        let (live, world) = (app.live(), app.world());
+        for place in places {
+            let here = live.folder.as_deref() == Some(*place);
+            let in_use = world.presence.get(*place) == Some(&"in use");
+            if in_use != here || world.roster.contains(*place) != (here && live.roster) {
+                return Err(format!("at {place}: presence {:?}, roster {}; the last save shares at {live:?}", world.presence.get(*place), world.roster.contains(*place)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Sharing leaves A, whose folder then stays slow: every withdrawal there ends late, past the
+    /// limit, whether before the writes of the refresh that started it or after them. A save brings
+    /// sharing back to A: A is off the list, so no refresh starts a withdrawal there again, and every
+    /// refresh after the return leaves A in use with its roster. (Kept due, each refresh would start
+    /// A's withdrawals again, and they would remove what it wrote.)
+    #[test]
+    fn sharing_back_at_a_place_whose_withdrawals_end_late_ends_there() {
+        for ends_before_writes in [true, false] {
+            let app = App::new(at("A", true));
+            app.refresh();
+            app.io.hung.slow("A");
+            assert!(app.save(at("B", true)));
+            app.refresh_within(SHORT);
+            release(&app, "A");
+            assert!(app.save(at("A", true)), "sharing back at A");
+            for refresh in 1..=3 {
+                let copy = app.start_within(SHORT);
+                if ends_before_writes {
+                    release(&app, "A");
+                }
+                app.finish(&copy);
+                if !ends_before_writes {
+                    release(&app, "A");
+                }
+                let state = as_saved(&app, &["A"]);
+                let when = if ends_before_writes { "before" } else { "after" };
+                assert_eq!(state, Ok(()), "refresh {refresh} after the return, a late withdrawal ending {when} its writes");
+            }
+            app.refresh();
+            assert_eq!(as_saved(&app, &["A", "B"]), Ok(()), "and B withdrawn");
+            assert!(!app.sharing.is_due() && !app.io.self_ended.load(SeqCst), "nothing left due");
+            app.io.hung.fast("A");
+        }
+    }
+
+    /// Sharing comes back to A while A's withdrawals still run there, late. They end after the next
+    /// refresh's writes and remove them; the refresh after that writes them again: a late roster
+    /// withdrawal that has ended starts the roster sync afresh, though nothing else is due.
+    #[test]
+    fn a_withdrawal_still_running_when_sharing_comes_back_is_written_over() {
+        let app = App::new(at("A", true));
+        app.refresh();
+        app.io.hung.slow("A");
+        assert!(app.save(at("B", true)));
+        app.refresh_within(SHORT);
+        assert!(app.save(at("A", true)), "back at A while A's withdrawals still run");
+        app.refresh();
+        assert_eq!(as_saved(&app, &["A"]), Ok(()), "written at A");
+        release(&app, "A");
+        assert!(as_saved(&app, &["A"]).is_err(), "the late withdrawals removed those writes");
+        assert!(app.sharing.is_due(), "a late roster withdrawal that ended is the next refresh's to see");
+        app.refresh();
+        assert_eq!(as_saved(&app, &["A", "B"]), Ok(()), "written at A again");
+        assert!(!app.sharing.is_due() && !app.io.self_ended.load(SeqCst));
+        app.io.hung.fast("A");
+    }
+
+    /// A save that brings sharing back keeps the new list in the file, though it holds as many
+    /// places as before (A off it, B on it): after a crash, the next start withdraws at B, never at
+    /// A, where sharing is.
+    #[test]
+    fn a_return_keeps_what_is_due_now_in_the_file() {
+        let dir = crate::test_support::TempDir::new();
+        let file = dir.0.join(DUE_FILE);
+        let app = App::new(at("A", true)).started(file.clone());
+        assert!(app.save(at("B", true)) && app.save(at("A", true)));
+        let kept: Due = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let b = Place::of(&at("B", true));
+        assert_eq!((kept.presence, kept.roster), (vec![b.clone()], vec![b]), "the file lists B, not A");
     }
 
     /// The limit lets a working remote finish, keeps a refresh that meets a place that does not
