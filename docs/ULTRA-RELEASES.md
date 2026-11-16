@@ -82,7 +82,7 @@ both until SlopBar restarts, and refreshes wait until then.
 One install runs at a time, from its download to the end of its handover: the loop, `install_update`
 and the fleet script's repeated requests never download in parallel. A check alone takes no turn. A
 request while an install runs is answered at once ("An update is already being installed") and
-recorded as `deferred`. An open sign-in also defers an install, before the download and again before
+recorded as `deferred`. Any open sign-in, in any window, also defers an install, before the download and again before
 the handover, because the installer ends SlopBar while tokens may be rotating. A deferral is no
 failure: the next try is at the usual interval. A failure is tried again after 2 minutes, once, and
 then every 15 minutes.

@@ -81,7 +81,8 @@ mod tests {
         assert!(has(&code, every), "Ultra builds check every CHECK_EVERY. {}", lost("updates.rs", every, PINS));
     }
 
-    /// Installs wait for token rotation as named, bounded steps: an open sign-in defers the update
+    /// Installs wait for token rotation as named, bounded steps: any open sign-in, whatever started
+    /// it and in any window (`AppState::sign_in_open`, never a fresh profile alone), defers the update
     /// before the download and again before the handover, and a refresh in progress is waited for
     /// within its limit. The refresh lock is an owned guard, bound once and then only handed, with
     /// the turn, to the handover, whose thread holds it until it ends; the exit cleanup runs before
@@ -97,7 +98,7 @@ mod tests {
             "{}\n{updater}", lost("updater() in updates.rs", ".on_before_exit(move || crate::app::on_exit(&h))", ROTATION));
         let install = function(&code, "updates.rs", "async fn install_now(", ROTATION);
         let at = |needle: &str| find(install, needle).unwrap_or_else(|| panic!("{}\n{install}", lost("install_now in updates.rs", needle, ROTATION)));
-        let deferral = "if crate::signin::any_active() {\n        return Ok(Outcome::Deferred(SIGN_IN_OPEN.into()));";
+        let deferral = "if app.state::<AppState>().sign_in_open() {\n        return Ok(Outcome::Deferred(SIGN_IN_OPEN.into()));";
         let deferrals = places(install, deferral);
         assert_eq!(deferrals.len(), 2, "an open sign-in defers the update twice, at `{deferral}`. {}\n{install}", update(ROTATION));
         let (first, second) = (deferrals[0], deferrals[1]);

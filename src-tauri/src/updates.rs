@@ -106,11 +106,12 @@ async fn install_now(app: &AppHandle, by: Trigger, steps: &Steps) -> Result<Outc
         .await?;
     let Some(mut update) = found else { return Ok(Outcome::UpToDate) };
     // On Windows the installer ends this process without an Exit event. Monitoring tokens rotate
-    // only during a refresh or a sign-in, so it waits for both: an open sign-in page puts the update
-    // off (deferred, not failed) before anything is downloaded and again before the handover, and
-    // the refresh lock goes with the handover's thread, held until that thread ends: a handover that
-    // never returns keeps refreshes waiting until SlopBar restarts.
-    if crate::signin::any_active() {
+    // only during a refresh or a sign-in, so it waits for both: any open sign-in, whatever started
+    // it and in any window (`AppState::sign_in_open`), puts the update off (deferred, not failed)
+    // before anything is downloaded and again before the handover, and the refresh lock goes with
+    // the handover's thread, held until that thread ends: a handover that never returns keeps
+    // refreshes waiting until SlopBar restarts.
+    if app.state::<AppState>().sign_in_open() {
         return Ok(Outcome::Deferred(SIGN_IN_OPEN.into()));
     }
     // An automatic install waits while a sharing setup runs: restarting would end its sign-in.
@@ -132,7 +133,7 @@ async fn install_now(app: &AppHandle, by: Trigger, steps: &Steps) -> Result<Outc
     let refresh = steps
         .run("Waiting for a refresh to finish", update_check::REFRESH_WAIT_LIMIT, async move { Ok::<_, String>(refresh_lock.lock_owned().await) })
         .await?;
-    if crate::signin::any_active() {
+    if app.state::<AppState>().sign_in_open() {
         return Ok(Outcome::Deferred(SIGN_IN_OPEN.into()));
     }
     record(app, by, Outcome::Installing(update.version.clone()));
