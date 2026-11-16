@@ -433,6 +433,8 @@ mod tests {
         assert_eq!(args(&rclone), ["move||->Result<Option<Connect>,&'static str>{let listed=f()?;Ok(None)}"], "a closure's return type");
         assert_eq!(closure_body(args(&rclone)[0]), Some("->Result<Option<Connect>,&'static str>{let listed=f()?;Ok(None)}"), "its body as written, return type and all");
         assert_eq!(args(&tokens("(HashMap::<u8, u8>::new(), m.n::<B, C>(o), x)")), ["HashMap::<u8,u8>::new()", "m.n::<B,C>(o)", "x"], "turbofish");
+        // Inside a turbofish, a `<` opens another level and the `>` of an arrow closes none.
+        assert_eq!(args(&tokens("(f::<Vec<u8>, B>(x), g::<fn() -> u8, C>(y), z)")), ["f::<Vec<u8>,B>(x)", "g::<fn()->u8,C>(y)", "z"], "a turbofish's own levels");
         let closures = tokens("(&|a, b| a + b, &mut |a, b| a, async |a, b| a, async move |a, b| a, a > b, c)");
         let referenced = args(&closures);
         assert_eq!(referenced, ["&|a,b|a+b", "&mut|a,b|a", "async|a,b|a", "async move|a,b|a", "a>b", "c"], "a closure after `&`, `&mut`, `async`");
