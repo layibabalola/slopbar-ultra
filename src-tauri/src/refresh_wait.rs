@@ -335,6 +335,7 @@ mod tests {
     const SETTINGS: &str = "refresh_wait::tests::nothing_waits_while_holding_settings_lock (src-tauri/src/refresh_wait.rs)";
     const HANDS: &str = "refresh_wait::tests::the_app_hands_its_waits_to_the_helpers (src-tauri/src/refresh_wait.rs)";
     const ROSTER: &str = "refresh_wait::tests::the_roster_is_waited_for_on_the_blocking_pool_only (src-tauri/src/refresh_wait.rs)";
+    const WIRES: &str = "refresh_wait::tests::the_app_wires_the_exit_and_the_due_file (src-tauri/src/refresh_wait.rs)";
     const REAL: &str = "refresh_wait::tests::the_real_withdrawals_go_to_the_place_they_are_given (src-tauri/src/refresh_wait.rs)";
 
     fn named(c: char) -> bool {
@@ -561,6 +562,28 @@ mod tests {
             let inside: usize = blocking.iter().map(|call| count(call, method)).sum();
             assert!(inside == count(&app, method) && inside >= at_least, "`{method}` runs within spawn_blocking only ({inside} of {}). {}", count(&app, method), update(ROSTER));
         }
+    }
+
+    /// How app.rs wires `Sharing`, which sharing's tests drive through a fake: Tauri's exit event runs
+    /// `on_exit`; its part for sharing hands the exit where the live settings share, with the
+    /// interval a refresh's presence record states, within WITHDRAW_LIMIT; and the app's `Sharing`
+    /// keeps what is due in the due file, so the next start finds it.
+    #[test]
+    fn the_app_wires_the_exit_and_the_due_file() {
+        let app = tokens(include_str!("app.rs"));
+        let event = "if matches!(event, tauri::RunEvent::Exit) { on_exit(app); }";
+        assert!(has(&app, event), "{}", lost("app.rs", event, WIRES));
+        let exit = function(&app, "app.rs", "pub(crate) fn on_exit(", WIRES);
+        let shared = one_call(exit, ".sharing.exit", "on_exit in app.rs", WIRES);
+        assert_eq!(args(shared), ["&sharing::Place::of(&settings)", "&files", "sharing::WITHDRAW_LIMIT"], "the exit, where sharing is now. {}\n{exit}", update(WIRES));
+        for (start, want) in [("let settings =", "let settings = state.settings.lock().unwrap_or_else(|e| e.into_inner()).clone();"),
+            ("let files =", "let files = sharing::Files { interval: settings.refresh_minutes.max(1) as u64 * 60 };")] {
+            assert_eq!(statement(exit, start), Some(tokens(want).as_str()), "{}\n{exit}", lost("on_exit in app.rs", want, WIRES));
+        }
+        let kept = one_call(&app, "sharing::Sharing::kept_in", "app.rs", WIRES);
+        assert_eq!(args(kept), [tokens("settings::app_dir().expect(\"config directory\").join(sharing::DUE_FILE)")], "the due file. {}", update(WIRES));
+        let field = "sharing: std::sync::Arc::new(sharing::Sharing::kept_in(";
+        assert!(has(&app, field), "the app's own Sharing keeps it. {}", lost("app.rs", field, WIRES));
     }
 
     /// `sharing`'s tests withdraw through a fake: the real withdrawals (`sharing::Files`) need this
