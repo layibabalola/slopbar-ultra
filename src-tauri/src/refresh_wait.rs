@@ -595,6 +595,9 @@ mod tests {
         for (start, want) in [("let settings =", "let settings = state.settings.lock().unwrap_or_else(|e| e.into_inner()).clone();"),
             ("let files =", "let files = sharing::Files { interval: settings.refresh_minutes.max(1) as u64 * 60 };")] {
             assert_eq!(statement(exit, start), Some(tokens(want).as_str()), "{}\n{exit}", lost("on_exit in app.rs", want, WIRES));
+            // Bound once: a second binding of the same name would hand the exit something else.
+            let binding = start.trim_end_matches(" =");
+            assert_eq!(count(exit, binding), 1, "`{binding}` once in on_exit in app.rs. {}\n{exit}", update(WIRES));
         }
         let kept = one_call(&app, "sharing::Sharing::kept_in", "app.rs", WIRES);
         assert_eq!(args(kept), [tokens("settings::app_dir().expect(\"config directory\").join(sharing::DUE_FILE)")], "the due file. {}", update(WIRES));
