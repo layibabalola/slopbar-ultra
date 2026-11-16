@@ -28,7 +28,7 @@ pub fn is_ultra_version(version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::update_check::guard::{find, function, has, lost, places, tokens, update, words};
+    use crate::source_guard::{find, function, has, lost, places, tokens, update, words};
 
     const UPSTREAM_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE0MDdFRDM5QzIxRTZGMTEKUldRUmJ4N0NPZTBIcEcvT2F1YThXMTB0UVRRREpMUmtPSjJUS1V4M2poTzdFUXBtejB0V1FNUFAK";
 
@@ -59,7 +59,7 @@ mod tests {
         assert!(!is_ultra_version("0.1-ultra.1"));
     }
 
-    /// Where each guard's needles are, for its failure (see `update_check::guard`).
+    /// Where each guard's needles are, for its failure (see `source_guard`).
     const PINS: &str = "ultra_release::tests::ultra_builds_pin_the_fork_updater_in_code (src-tauri/src/ultra_release.rs)";
     const ROTATION: &str = "ultra_release::tests::ultra_updates_wait_for_token_rotation (src-tauri/src/ultra_release.rs)";
 
