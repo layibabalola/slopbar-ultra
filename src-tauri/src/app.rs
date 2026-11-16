@@ -24,6 +24,8 @@ pub struct AppState {
     /// Held from reading settings to storing them, so the window and agents never lose a change.
     settings_lock: tokio::sync::Mutex<()>,
     account_operations: monitoring::Operations,
+    /// Every sign-in open now, from any entry point and in any window (see `sign_in_open`).
+    sign_ins: monitoring::SignIns,
     pub(crate) snapshot: Mutex<Snapshot>,
     pub(crate) settings: Mutex<Settings>,
     /// The widget's right-click menu and its items (relabeled when the language changes).
@@ -104,6 +106,26 @@ pub struct AppState {
     sharing_cancel: Arc<std::sync::atomic::AtomicBool>,
     /// The SSH tunnel while another computer's Dropbox sign-in waits for this computer's browser.
     sharing_tunnel: Mutex<Option<sharing_setup::Tunnel>>,
+}
+
+impl AppState {
+    /// Whether a sign-in is open now, whatever started it and whichever window its page opened in
+    /// (see `any_sign_in_open`). Tokens rotate in a sign-in, and one cut off while it writes them
+    /// leaves the account signed out until its owner signs in again, so whatever would cut one off
+    /// can ask this first.
+    // Read only where an install waits for sign-ins.
+    #[allow(dead_code)]
+    pub(crate) fn sign_in_open(&self) -> bool {
+        any_sign_in_open(signin::any_active(), &self.account_operations, &self.sign_ins)
+    }
+}
+
+/// Whether a sign-in is open, from each thing that shows one: a fresh profile in use
+/// (`profile_open`, which `signin::any_active` says), a monitoring sign-in's hold on
+/// `monitoring::SIGN_IN`, and the mark every sign-in holds while it is open (`sign_ins`). Only the
+/// mark shows "Add account" in a private window or the default browser.
+fn any_sign_in_open(profile_open: bool, operations: &monitoring::Operations, sign_ins: &monitoring::SignIns) -> bool {
+    profile_open || operations.busy(monitoring::SIGN_IN) || sign_ins.any()
 }
 
 pub(crate) const SWITCHER_LABEL: &str = "switcher";
@@ -888,7 +910,8 @@ async fn add_account(app: AppHandle, provider: Provider) -> Result<(), String> {
 }
 
 /// Starts the CLI sign-in; `pending` (held until the sign-in ends, not through the refresh after
-/// it) keeps a second one from starting.
+/// it) keeps a second one from starting, and carries the sign-in's mark as open for as long (see
+/// `AppState::sign_in_open`).
 async fn start_add_account(app: AppHandle, provider: Provider, pending: Option<monitoring::Operation>) -> Result<(), String> {
     let found = {
         let known = app.state::<AppState>().sources.lock().unwrap().clone();
@@ -898,6 +921,8 @@ async fn start_add_account(app: AppHandle, provider: Provider, pending: Option<m
             known
         }
     };
+    // Open from before its page can open until the account is saved or the sign-in ends otherwise.
+    let pending = (pending, app.state::<AppState>().sign_ins.open());
     // A fresh profile of its own (who signs in is not known yet), held until the sign-in ends.
     let session = signin_session(&app);
     let options = signin_options(&app, None, session.as_deref());
@@ -950,6 +975,7 @@ async fn add_expected(app: &AppHandle, expected: &bulk::Step, session: Option<&s
     let provider = expected.target.provider;
     let _operation = app.state::<AppState>().account_operations.begin(provider, "add-account")?;
     let _sign_in = app.state::<AppState>().account_operations.begin_key(monitoring::SIGN_IN)?;
+    let _open = app.state::<AppState>().sign_ins.open();
     let found = app.state::<AppState>().sources.lock().unwrap().clone();
     let options = signin_options(app, expected.email.as_deref(), session);
     let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, None, options))
@@ -1017,6 +1043,7 @@ async fn connect_monitoring(app: AppHandle, provider: Provider, id: String) -> R
 async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, auto: bool, session: Option<Arc<signin::Session>>) -> Result<tauri::async_runtime::JoinHandle<Result<(), String>>, String> {
     let operation = app.state::<AppState>().account_operations.begin(provider, &id)?;
     let sign_in = app.state::<AppState>().account_operations.begin_key(monitoring::SIGN_IN)?;
+    let open = app.state::<AppState>().sign_ins.open();
     let expected = accounts::load_slots().into_iter().find(|s| s.provider == provider && s.id == id)
         .ok_or("monitor_wrong_account")?;
     let key = monitoring::key(&expected);
@@ -1044,6 +1071,7 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
     Ok(tauri::async_runtime::spawn(async move {
         let operation = operation;
         let sign_in = sign_in;
+        let open = open;
         let outcome = match job.wait_isolated(&http_client()).await {
             Some(login) => {
                 let slots = accounts::load_slots();
@@ -1062,6 +1090,7 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
         drop(session);
         drop(operation);
         drop(sign_in);
+        drop(open);
         if auto {
             let ok = outcome.is_ok();
             auto_monitor_saved(&app, |t| t.finished(&key, ok, chrono::Utc::now()));
@@ -3493,6 +3522,9 @@ mod sign_in_tests {
 }
 
 #[cfg(test)]
+mod sign_in_open_tests;
+
+#[cfg(test)]
 mod exit_tests {
     #[test]
     fn closing_the_last_window_never_quits_but_an_explicit_exit_does() {
@@ -3531,6 +3563,7 @@ pub fn run() {
         refresh_lock: tokio::sync::Mutex::new(()),
         settings_lock: tokio::sync::Mutex::new(()),
         account_operations: monitoring::Operations::default(),
+        sign_ins: monitoring::SignIns::default(),
         last_switch: Mutex::default(),
         wind_down: Mutex::default(),
         recent: Mutex::default(),

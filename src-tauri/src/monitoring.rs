@@ -50,14 +50,42 @@ impl Operations {
         })
     }
 
-    /// Whether an operation holds the account, by `key`.
+    /// Whether an operation holds the account, by `key`. A lock poisoned by a panic is still read:
+    /// whether a sign-in is open is asked before every install.
     pub fn busy(&self, key: &str) -> bool {
-        self.0.lock().unwrap().contains(key)
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).contains(key)
     }
 }
 impl Drop for Operation {
     fn drop(&mut self) {
         self.operations.lock().unwrap().remove(&self.key);
+    }
+}
+
+/// Every sign-in open now, whatever started it and whichever window its page opens in: each holds
+/// an [`OpenSignIn`] from before its page can open until what it signed in is kept, or until it
+/// ends otherwise (it fails, is stopped or panics). Unlike an [`Operation`] it refuses nothing; it
+/// only counts.
+#[derive(Default)]
+pub struct SignIns(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+/// One sign-in, counted as open until this is dropped (see [`SignIns`]).
+#[must_use = "a sign-in counts as open only while this is held"]
+pub struct OpenSignIn(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl SignIns {
+    /// Counts a sign-in as open until what this returns is dropped.
+    pub fn open(&self) -> OpenSignIn {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        OpenSignIn(self.0.clone())
+    }
+
+    /// Whether any sign-in is open now.
+    pub fn any(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+}
+impl Drop for OpenSignIn {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
