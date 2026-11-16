@@ -114,8 +114,6 @@ impl AppState {
     /// (see `any_sign_in_open`). Tokens rotate in a sign-in, and one cut off while it writes them
     /// leaves the account signed out until its owner signs in again, so whatever would cut one off
     /// can ask this first.
-    // Read only where an install waits for sign-ins.
-    #[allow(dead_code)]
     pub(crate) fn sign_in_open(&self) -> bool {
         any_sign_in_open(signin::any_active(), &self.account_operations, &self.sign_ins)
     }
