@@ -3208,10 +3208,13 @@ async fn readiness(app: &AppHandle) -> serde_json::Value {
         if !rclone_remotes().await.remotes.iter().any(|r| r.name == name) {
             problems.push("rclone_remote_missing");
             if ready {
-                next = format!("Sharing names the rclone remote {name}, but rclone here is missing or lacks it, so no roster is written or read: install rclone and create that remote (rclone config) at this computer's screen.");
+                next = pairing::rclone_missing_next(&name);
             }
         }
     }
+    // A registry read and a file check: off the async threads.
+    let ssh_shell = tauri::async_runtime::spawn_blocking(pairing::ssh_shell).await.ok().flatten();
+    pairing::note_ssh_shell(ssh_shell, &mut problems, &mut next);
     let snapshot = state.snapshot.lock().unwrap().clone();
     let signin_window = state.settings.lock().unwrap().signin_window;
     let mut summary = roster.clone();
@@ -3221,7 +3224,7 @@ async fn readiness(app: &AppHandle) -> serde_json::Value {
         "app": { "running": true, "version": app_version(app.clone()), "build": diagnostics::build_info(), "pid": std::process::id() },
         // The id its roster carries: the computer asking notes which SSH host reaches it.
         "machine": presence::identity().map(|(id, name)| serde_json::json!({ "id": id, "name": name })),
-        "desktop": desktop, "idle_seconds": desktop::idle_seconds(), "browser": browser, "signin_window": signin_window,
+        "desktop": desktop, "idle_seconds": desktop::idle_seconds(), "browser": browser, "ssh_shell": ssh_shell, "signin_window": signin_window,
         "accounts": { "here": snapshot.accounts.len(), "unmonitored": bulk::unmonitored(&snapshot).len() },
         "roster": summary, "waiting": waiting,
         // Sign in all accounts as it runs: email g of emails, done of total, who is signing in
