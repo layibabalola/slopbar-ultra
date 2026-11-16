@@ -82,11 +82,11 @@ mod tests {
     }
 
     /// Installs wait for token rotation as named, bounded steps: any open sign-in, whatever started
-    /// it and in any window (`AppState::sign_in_open`, never a fresh profile alone), defers the update
-    /// before the download and again before the handover, and a refresh in progress is waited for
-    /// within its limit. The refresh lock is an owned guard, bound once and then only handed, with
-    /// the turn, to the handover, whose thread holds it until it ends; the exit cleanup runs before
-    /// the installer ends SlopBar.
+    /// it and in any window (`AppState::sign_in_open`, never a fresh profile alone), defers every
+    /// update, automatic or asked for, as soon as one is found and again right before the install
+    /// is recorded, and a refresh in progress is waited for within its limit. The refresh lock is
+    /// an owned guard, bound once and then only handed, with the turn, to the handover, whose
+    /// thread holds it until it ends; the exit cleanup runs before the installer ends SlopBar.
     #[test]
     fn ultra_updates_wait_for_token_rotation() {
         let code = tokens(include_str!("updates.rs"));
@@ -105,6 +105,20 @@ mod tests {
         let (download, refresh, handover) = (at("update.download("), at("let refresh = steps"), at("update_check::hand_over("));
         assert!(first < download && download < refresh && refresh < second && second < handover,
             "a sign-in defers before the download and again before the handover, after the refresh lock. {}\n{install}", update(ROTATION));
+        // Asked of every install, automatic or asked for: in install_now's own body, under no other
+        // condition (install_now has no brace in a literal before them; one would fail this, never
+        // pass it), the first as soon as an update is found, the second right before the install is
+        // recorded and announced.
+        let depth = |at: usize| install[..at].chars().fold(0i32, |depth, c| depth + match c { '{' => 1, '}' => -1, _ => 0 });
+        assert!(deferrals.iter().all(|&at| depth(at) == 1), "each sign-in deferral stands in install_now's own body, under no other condition. {}\n{install}", update(ROTATION));
+        let deferred = format!("{deferral} }}");
+        // rustfmt ends the `return` with a semicolon.
+        let found = ["let Some(mut update) = found else { return Ok(Outcome::UpToDate) };", "let Some(mut update) = found else { return Ok(Outcome::UpToDate); };"];
+        assert!(found.iter().any(|form| install[..first].ends_with(&tokens(form))), "the first deferral comes as soon as an update is found. {}\n{install}",
+            lost("install_now in updates.rs", &format!("{} {deferred}", found[0]), ROTATION));
+        let installing = format!("{deferred} record(app, by, Outcome::Installing(update.version.clone()));");
+        assert!(install[second..].starts_with(&tokens(&installing)), "the second deferral comes right before the install is recorded and announced. {}\n{install}",
+            lost("install_now in updates.rs", &installing, ROTATION));
         let wait = ".run(\"Waiting for a refresh to finish\", update_check::REFRESH_WAIT_LIMIT, async move { Ok::<_, String>(refresh_lock.lock_owned().await) })";
         assert!(has(install, wait), "an owned guard, within its limit. {}\n{install}", lost("install_now in updates.rs", wait, ROTATION));
         let after = &install[refresh..];
