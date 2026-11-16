@@ -231,10 +231,26 @@ impl<S: Default> Default for Sharing<S> {
 
 impl<S: Default> Sharing<S> {
     /// Sharing that keeps what is due in `file`, starting with what an earlier run left there:
-    /// a crash, an update that ended SlopBar without its exit, or an exit that ran out of time.
+    /// a crash, an update that ended SlopBar without its exit, or an exit that ran out of time. A
+    /// file that does not parse is nothing due (the next save that notes something replaces it), and
+    /// what a write cut short left beside it (`private_store::write`'s temporary files) goes.
     pub fn kept_in(file: PathBuf) -> Self {
+        sweep_temporary(&file);
         let due = std::fs::read(&file).ok().and_then(|bytes| serde_json::from_slice::<Due>(&bytes).ok()).unwrap_or_default();
         Sharing { due: Mutex::new(due), file: Some(file), ..Sharing::default() }
+    }
+}
+
+/// Removes what a write of `file` that a crash cut short left beside it: `private_store::write`
+/// writes `<stem>.tmp-<process>-<n>` and then renames it over `file`.
+fn sweep_temporary(file: &std::path::Path) {
+    let (Some(dir), Some(stem)) = (file.parent(), file.file_stem().and_then(|s| s.to_str())) else { return };
+    let prefix = format!("{stem}.tmp-");
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        if entry.file_name().to_str().is_some_and(|name| name.starts_with(&prefix)) {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -887,15 +903,21 @@ mod tests {
         app.io.hung.hang("A");
         app.accounts.fetch_add(1, SeqCst);
         let a = app.live();
-        std::thread::scope(|scope| {
+        // Read while the sync hangs, then A answers before anything is checked, so a failure ends
+        // the test at once rather than after the sync ends by itself.
+        let (saved, caught_up, sync_ran, withdrawn, due) = std::thread::scope(|scope| {
             let syncing = scope.spawn(|| app.sync(&a));
             eventually("the sync holds the roster's lock", || app.sharing.roster.try_lock().is_err());
-            assert!(app.save(at("B", true)));
-            assert!(!app.sharing.catch_up(&app.io, SHORT), "nothing done without the roster's lock");
-            assert!(!syncing.is_finished() && app.world().withdrawals.is_empty(), "the limit ended the wait, not the sync");
-            assert_eq!(lock(&app.sharing.due).withdrawals().len(), 2, "everything stays due");
+            let saved = app.save(at("B", true));
+            let caught_up = app.sharing.catch_up(&app.io, SHORT);
+            let (sync_ran, withdrawn) = (syncing.is_finished(), app.world().withdrawals.clone());
+            let due = lock(&app.sharing.due).withdrawals().len();
             app.io.hung.answer("A");
+            (saved, caught_up, sync_ran, withdrawn, due)
         });
+        assert!(saved && !caught_up, "nothing done without the roster's lock");
+        assert!(!sync_ran && withdrawn.is_empty(), "the limit ended the wait, not the sync: {withdrawn:?}");
+        assert_eq!(due, 2, "everything stays due");
         assert!(app.world().roster.contains("A"), "the sync wrote at A late, after the move");
         app.refresh();
         let world = app.world();
@@ -933,14 +955,15 @@ mod tests {
         assert!(app.save(at("B", true)));
         assert!(file.exists(), "a save keeps what it left in the file");
         app.exit(SHORT);
-        eventually("the exit withdraws presence where sharing is now", || app.world().withdrawals.iter().any(|w| w == "presence B"));
+        assert_eq!(app.io.started.load(SeqCst), 3, "presence where sharing is now, and A's presence and roster");
+        eventually("the exit withdraws where sharing is now", || !app.world().withdrawals.is_empty());
         let withdrawals = app.world().withdrawals.clone();
         assert!(!app.io.self_ended.load(SeqCst) && withdrawals == ["presence B"], "the limit ended the exit, not A: {withdrawals:?}");
 
         let next = app.started(file.clone());
         drop(app);
         assert!(next.sharing.is_due(), "the next start has what the exit could not withdraw");
-        answers(&next, "A", 2);
+        answers(&next, "A", 2, 3);
         next.refresh();
         let world = next.world();
         assert!(!world.roster.contains("A") && world.presence["A"] == "withdrawn", "{:?} {:?}", world.roster, world.presence);
@@ -958,8 +981,10 @@ mod tests {
         assert!(!file.exists());
     }
 
-    /// Lets `place` answer again, and waits until the `waiting` withdrawals there have ended.
-    fn answers(app: &App, place: &str, waiting: usize) {
+    /// Lets `place` answer again, and waits until the `waiting` withdrawals there have ended. Fails at
+    /// once unless `started` withdrawals were started in all (so it never waits for one that was not).
+    fn answers(app: &App, place: &str, waiting: usize, started: usize) {
+        assert_eq!(app.io.started.load(SeqCst), started, "withdrawals started");
         app.io.hung.answer(place);
         let at = |list: &[String]| list.iter().filter(|w| w.ends_with(&format!(" {place}"))).count();
         eventually("what waited at the place ended", || at(&app.world().withdrawals) == waiting);
@@ -1035,6 +1060,49 @@ mod tests {
         app.io.hung.fast("A");
     }
 
+    /// The exit returns only once this machine's presence is withdrawn where sharing is now: a place
+    /// that answers a moment late is waited for, within the exit's limit.
+    #[test]
+    fn the_exit_waits_for_the_presence_it_withdraws() {
+        let app = App::new(at("B", false));
+        app.refresh();
+        app.io.hung.hang("B");
+        let at_return = std::thread::scope(|scope| {
+            let exiting = scope.spawn(|| {
+                app.exit(PATIENT);
+                app.world().presence.get("B").copied()
+            });
+            eventually("the exit started the withdrawal", || app.io.started.load(SeqCst) == 1);
+            std::thread::sleep(Duration::from_millis(300));
+            app.io.hung.answer("B");
+            exiting.join().unwrap()
+        });
+        assert_eq!(at_return, Some("withdrawn"), "the exit returned before the withdrawal ended");
+    }
+
+    /// The exit's two parts run side by side: a live place that does not answer leaves what saves
+    /// left to be withdrawn at once, not once it ends by itself.
+    #[test]
+    fn the_exit_drains_while_the_live_place_does_not_answer() {
+        let app = App::new(at("A", true));
+        app.refresh();
+        app.io.hung.hang("B");
+        assert!(app.save(at("B", true)));
+        let drained_first = std::thread::scope(|scope| {
+            let exiting = scope.spawn(|| app.exit(PATIENT));
+            eventually("A is drained", || {
+                let world = app.world();
+                ["presence A", "roster A"].iter().all(|w| world.withdrawals.iter().any(|made| made == w))
+            });
+            let drained_first = !app.io.self_ended.load(SeqCst);
+            app.io.hung.answer("B");
+            exiting.join().unwrap();
+            drained_first
+        });
+        assert!(drained_first, "A was drained only once B ended by itself");
+        assert!(!app.sharing.is_due());
+    }
+
     /// A save that brings sharing back keeps the new list in the file, though it holds as many
     /// places as before (A off it, B on it): after a crash, the next start withdraws at B, never at
     /// A, where sharing is.
@@ -1047,6 +1115,74 @@ mod tests {
         let kept: Due = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         let b = Place::of(&at("B", true));
         assert_eq!((kept.presence, kept.roster), (vec![b.clone()], vec![b]), "the file lists B, not A");
+    }
+
+    /// A move with the roster off leaves only a presence withdrawal due, and that is kept too.
+    #[test]
+    fn a_move_with_the_roster_off_is_kept_too() {
+        let dir = crate::test_support::TempDir::new();
+        let file = dir.0.join(DUE_FILE);
+        let app = App::new(at("A", false)).started(file.clone());
+        assert!(app.save(at("B", false)));
+        assert!(file.exists(), "presence left at A is kept in the file");
+        let next = app.started(file.clone());
+        assert_eq!(lock(&next.sharing.due).withdrawals(), [(Kind::Presence, Place::of(&at("A", false)))], "and found by the next start");
+    }
+
+    /// A start reads a file that does not parse as nothing due (and goes on), the next save that
+    /// notes something replaces it, and what a write cut short left beside it goes.
+    #[test]
+    fn a_start_ignores_a_file_that_does_not_parse_and_what_a_cut_write_left() {
+        let dir = crate::test_support::TempDir::new();
+        let file = dir.0.join(DUE_FILE);
+        std::fs::write(&file, b"{ not json").unwrap();
+        let (stray, other) = (dir.0.join("sharing-due.tmp-4242-7"), dir.0.join("settings.tmp-4242-7"));
+        std::fs::write(&stray, b"{\"presence\":[").unwrap();
+        std::fs::write(&other, b"{}").unwrap();
+        let sharing: Sharing<Syncer> = Sharing::kept_in(file.clone());
+        assert!(!sharing.is_due(), "nothing due from a file that does not parse");
+        assert!(!stray.exists() && other.exists(), "only what a write of the due file left goes");
+        assert!(sharing.saved(&at("A", true), &at("B", true)));
+        let kept: Due = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!((kept.presence, kept.roster), (vec![Place::of(&at("A", true))], vec![Place::of(&at("A", true))]), "the next save keeps what it left");
+    }
+
+    /// A place that does not answer holds back no other place's withdrawals: its own still run when
+    /// the next refresh comes, and that refresh makes the others.
+    #[test]
+    fn a_place_that_does_not_answer_holds_back_no_other() {
+        let app = App::new(at("A", true));
+        app.refresh();
+        app.io.hung.hang("A");
+        assert!(app.save(at("B", true)));
+        app.refresh_within(SHORT);
+        assert!(app.save(at("C", true)));
+        app.refresh();
+        let withdrawn = app.world().withdrawals.clone();
+        app.io.hung.answer("A");
+        assert!(["presence B", "roster B"].iter().all(|w| withdrawn.iter().any(|made| made == w)), "{withdrawn:?}");
+        eventually("A's late withdrawals end", || app.world().withdrawals.iter().filter(|w| w.ends_with(" A")).count() == 2);
+    }
+
+    /// Withdrawals at different places run side by side within one refresh: one at a place that
+    /// does not answer holds back none at another, however long the refresh may wait.
+    #[test]
+    fn withdrawals_run_side_by_side() {
+        let app = App::new(at("A", true));
+        app.refresh();
+        app.io.hung.hang("A");
+        assert!(app.save(at("B", true)));
+        assert!(app.save(at("C", true)));
+        let side_by_side = std::thread::scope(|scope| {
+            let refreshing = scope.spawn(|| app.refresh());
+            eventually("B is withdrawn", || app.world().withdrawals.iter().any(|w| w == "presence B"));
+            let side_by_side = !app.io.self_ended.load(SeqCst);
+            app.io.hung.answer("A");
+            refreshing.join().unwrap();
+            side_by_side
+        });
+        assert!(side_by_side, "B's withdrawal waited until A's ended by itself");
+        assert_eq!(as_saved(&app, &["A", "B", "C"]), Ok(()));
     }
 
     /// The limit lets a working remote finish, keeps a refresh that meets a place that does not
