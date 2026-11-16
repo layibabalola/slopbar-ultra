@@ -228,7 +228,13 @@ fn end(dir: &Path) {
 /// Whether a sign-in in a fresh profile is open now: from its profile's making until its browser
 /// is closed and the profile deleted (see `AppState::sign_in_open`).
 pub fn any_active() -> bool {
-    ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| !s.is_empty())
+    any_in(&ACTIVE.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Whether the profiles in use, as [`ACTIVE`] keeps them, include any: none before the first is
+/// made, and none again once every one made has ended.
+fn any_in(active: &Option<HashSet<PathBuf>>) -> bool {
+    active.as_ref().is_some_and(|s| !s.is_empty())
 }
 
 /// Closes every running session's browser and deletes its profile, as SlopBar exits.
@@ -783,6 +789,25 @@ mod tests {
         let session = Session::create_in(&root.0).unwrap();
         assert!(any_active(), "open from its profile's making");
         drop(session);
+    }
+
+    /// Where the guard below looks, for its failure (see `source_guard::update`).
+    const LISTED: &str = "signin::tests::a_sign_in_is_open_only_while_its_profile_is_listed (src-tauri/src/signin.rs)";
+
+    /// Both ways, on profiles of the test's own: the running ones are shared by every test, so only
+    /// "open" can be asked of them. An update would otherwise wait forever, or never.
+    #[test]
+    fn a_sign_in_is_open_only_while_its_profile_is_listed() {
+        let mut active: Option<HashSet<PathBuf>> = None;
+        assert!(!any_in(&active), "no profile made yet");
+        active.get_or_insert_with(HashSet::new).insert(PathBuf::from("synthetic-profile"));
+        assert!(any_in(&active), "a profile in use");
+        active.as_mut().unwrap().clear();
+        assert!(!any_in(&active), "every profile made has ended, though the list is there");
+        let code = crate::source_guard::tokens(include_str!("signin.rs"));
+        let asks = crate::source_guard::function(&code, "signin.rs", "pub fn any_active() -> bool {", LISTED);
+        assert_eq!(asks, crate::source_guard::tokens("pub fn any_active() -> bool { any_in(&ACTIVE.lock().unwrap_or_else(|e| e.into_inner())) }"),
+            "any_active asks any_in of the running profiles themselves. {}", crate::source_guard::update(LISTED));
     }
 
     #[test]
