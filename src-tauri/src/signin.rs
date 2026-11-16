@@ -225,7 +225,8 @@ fn end(dir: &Path) {
     set_active(dir, false);
 }
 
-/// Whether a sign-in page is open now (an update waits for it rather than closing it).
+/// Whether a sign-in in a fresh profile is open now: from its profile's making until its browser
+/// is closed and the profile deleted (see `AppState::sign_in_open`).
 pub fn any_active() -> bool {
     ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| !s.is_empty())
 }
@@ -774,6 +775,14 @@ mod tests {
         drop(shared);
         assert!(!dir.exists());
         assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_fresh_profile_shows_its_sign_in_open() {
+        let root = TempDir::new();
+        let session = Session::create_in(&root.0).unwrap();
+        assert!(any_active(), "open from its profile's making");
+        drop(session);
     }
 
     #[test]
