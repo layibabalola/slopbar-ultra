@@ -873,6 +873,10 @@ mod tests {
     /// and the test fails at its own limit instead.
     #[tokio::test]
     async fn silent_clients_time_out_without_blocking_others() {
+        // First the limit itself: idle clients go after it, long before a client gives up, and a
+        // client that does send has time to.
+        assert!(imp::IO_TIMEOUT * 2 < CLIENT_TIMEOUT, "idle clients are let go after the I/O limit, long before a client gives up");
+        assert!(imp::IO_TIMEOUT >= Duration::from_secs(1), "a client that connects has time to send its request");
         within_test_limit(async {
             let over = Over::new();
             let name = test_pipe();
@@ -894,7 +898,6 @@ mod tests {
             }).await.unwrap();
             let reply = ask_patiently(&over, &name, Request::GetUsage).await.unwrap();
             assert_eq!(reply.result.map(|r| r["op"].clone()), Some("get_usage".into()), "{:?}", reply.error);
-            assert!(imp::IO_TIMEOUT * 2 < CLIENT_TIMEOUT, "idle clients are let go after the I/O limit, long before a client gives up");
             drop(idle);
         })
         .await
