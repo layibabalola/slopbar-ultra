@@ -496,7 +496,8 @@ mod tests {
     struct Places {
         /// Anything done there waits until the test lets it go (`answer`).
         hung: BTreeSet<String>,
-        /// A withdrawal there waits for the next `release`, however many come: each one ends late.
+        /// Each slow place's count of releases: a withdrawal there waits for the first `release`
+        /// after `catch_up` started it, however many come, so each one ends late.
         slow: BTreeMap<String, u64>,
     }
 
@@ -522,7 +523,7 @@ mod tests {
             self.places.lock().unwrap().slow.entry(place.into()).or_default();
         }
 
-        /// Lets the withdrawals waiting at a slow place end; the next ones wait again.
+        /// Lets the withdrawals started at a slow place so far end; the ones started after wait again.
         fn release(&self, place: &str) {
             *self.places.lock().unwrap().slow.entry(place.into()).or_default() += 1;
             self.answered.notify_all();
@@ -533,13 +534,17 @@ mod tests {
             self.answered.notify_all();
         }
 
-        /// Waits while `place` does not answer, and with `withdrawal`, for the next release when it
-        /// is slow; whether it waited until SELF_ENDING.
-        fn wait(&self, place: &str, withdrawal: bool) -> bool {
+        /// Each slow place's count of releases now: a withdrawal takes them as it is started.
+        fn releases(&self) -> BTreeMap<String, u64> {
+            self.places.lock().unwrap().slow.clone()
+        }
+
+        /// Waits while `place` does not answer, and, for a withdrawal started when slow `place` had
+        /// had `released` releases, until the next one; whether it waited until SELF_ENDING.
+        fn wait(&self, place: &str, released: Option<u64>) -> bool {
             let deadline = Instant::now() + SELF_ENDING;
             let mut places = self.places.lock().unwrap();
-            let round = places.slow.get(place).copied().filter(|_| withdrawal);
-            while places.hung.contains(place) || round.is_some_and(|round| places.slow.get(place) == Some(&round)) {
+            while places.hung.contains(place) || released.is_some_and(|count| places.slow.get(place) == Some(&count)) {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     return true;
@@ -559,28 +564,31 @@ mod tests {
         /// Every withdrawal started, counted as `catch_up` starts it: it takes a copy of this
         /// (`start`) before its thread runs, however late a starved run schedules that thread.
         started: Arc<AtomicUsize>,
+        /// In a withdrawal's copy, the slow places' releases when `catch_up` started it: a release
+        /// that comes before a starved thread first waits still lets that withdrawal end.
+        releases: BTreeMap<String, u64>,
     }
 
     impl Clone for Io {
         fn clone(&self) -> Self {
             self.started.fetch_add(1, SeqCst);
-            self.shared()
+            Io { releases: self.hung.releases(), ..self.shared() }
         }
     }
 
     impl Io {
         fn new() -> Self {
-            Io { world: Arc::default(), hung: Arc::default(), self_ended: Arc::default(), started: Arc::default() }
+            Io { world: Arc::default(), hung: Arc::default(), self_ended: Arc::default(), started: Arc::default(), releases: BTreeMap::new() }
         }
 
         /// The same world, without counting a withdrawal.
         fn shared(&self) -> Self {
-            Io { world: self.world.clone(), hung: self.hung.clone(), self_ended: self.self_ended.clone(), started: self.started.clone() }
+            Io { world: self.world.clone(), hung: self.hung.clone(), self_ended: self.self_ended.clone(), started: self.started.clone(), releases: BTreeMap::new() }
         }
 
         fn reach(&self, what: String, place: &Place) -> MutexGuard<'_, World> {
             self.world.lock().unwrap().attempts.push(what);
-            if self.hung.wait(&name(place), true) {
+            if self.hung.wait(&name(place), self.releases.get(&name(place)).copied()) {
                 self.self_ended.store(true, SeqCst);
             }
             self.world.lock().unwrap()
@@ -670,7 +678,7 @@ mod tests {
             self.sharing.sync_roster(copy, || self.live(), |syncer| {
                 if syncer.written != Some(accounts) {
                     syncer.written = Some(accounts);
-                    self.io.hung.wait(&name(copy), false);
+                    self.io.hung.wait(&name(copy), None);
                     let live = name(&self.live());
                     let mut world = self.world();
                     world.roster.insert(name(copy));
@@ -710,7 +718,8 @@ mod tests {
         app.sharing.roster.try_lock().is_ok_and(|roster| roster.late.iter().all(|late| late.ended.load(SeqCst)))
     }
 
-    /// Lets the withdrawals waiting at slow `place` end, and waits until the code sees them ended.
+    /// Lets the withdrawals started at slow `place` so far end, and waits until the code sees them
+    /// ended.
     fn release(app: &App, place: &str) {
         app.io.hung.release(place);
         eventually("the late withdrawals have ended", || late_ended(app));
