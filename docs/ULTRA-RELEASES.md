@@ -82,10 +82,12 @@ both until SlopBar restarts, and refreshes wait until then.
 One install runs at a time, from its download to the end of its handover: the loop, `install_update`
 and the fleet script's repeated requests never download in parallel. A check alone takes no turn. A
 request while an install runs is answered at once ("An update is already being installed") and
-recorded as `deferred`. Any open sign-in, in any window, also defers an install, before the download and again before
-the handover, because the installer ends SlopBar while tokens may be rotating. A deferral is no
-failure: the next try is at the usual interval. A failure is tried again after 2 minutes, once, and
-then every 15 minutes.
+recorded as `deferred`. A sign-in to an account defers an install too, in any window, while it is
+open: adding an account, connecting monitoring, or "Sign in all accounts". It is checked before the
+download and again before the handover, because the installer ends SlopBar while tokens may be
+rotating. The Dropbox sign-in of "Set up with Dropbox" holds back automatic installs only. A
+deferral is no failure: the next try is at the usual interval. A failure is tried again after 2
+minutes, once, and then every 15 minutes.
 
 `get_app_info` (door) reports the last check as `update_check`: its time (UTC), result
 (`up_to_date`, `found`, `installing`, `deferred` or `error`), version, error or the reason it was
