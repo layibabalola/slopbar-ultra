@@ -37,7 +37,7 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(30);
 /// The field a door answer gets when a refresh it needed gave up waiting (`noted`)...
 pub const WAITING: &str = "waiting_for_refresh";
 /// ...and what it says.
-pub const WAITING_NOTE: &str = "SlopBar is still busy with an earlier refresh or an update, so these are the last numbers it has. \
+pub const WAITING_NOTE: &str = "SlopBar is still busy with an earlier refresh, so these are the last numbers it has. \
 A new refresh runs as soon as that one ends: check get_usage shortly.";
 
 tokio::task_local! {
@@ -147,6 +147,7 @@ impl CacheDue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source_guard::{args, calls, closure_body, count, find, function, has, lost, places, statement, tokens, update};
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
     use std::sync::Arc;
@@ -313,138 +314,34 @@ mod tests {
 
     #[test]
     fn a_door_call_that_waited_still_answers_before_its_client_gives_up() {
-        let app = normalized(include_str!("app.rs"));
-        let client = function(&app, "fn http_client(");
-        assert!(has(client, ".timeout(Duration::from_secs(20))"), "{client}");
+        let app = tokens(include_str!("app.rs"));
+        let client = function(&app, "app.rs", "fn http_client(", CLIENT);
+        let timeout = ".timeout(Duration::from_secs(20))";
+        assert!(has(client, timeout), "{}\n{client}", lost("http_client in app.rs", timeout, CLIENT));
         assert!(LOCK_WAIT + Duration::from_secs(20) < crate::door::CLIENT_TIMEOUT, "the wait and one request of its own fit in the door's time");
         assert!(LOCK_WAIT >= Duration::from_secs(30), "a refresh normally ends well inside it");
     }
 
     // ------------------------------------------------------------------------------------------
     // Reading the source. app.rs needs a running app; what it does with the helpers above is one
-    // call each, and these checks read those calls, as code: comments dropped, literals emptied and
-    // line breaks ignored (`normalized`).
+    // call each, and these checks read those calls as the source guards read code (`source_guard`):
+    // tokens, not layout, and a call that takes a closure argument by argument, so a default
+    // rustfmt run over app.rs reads the same. Each call is read with the statements around it, so
+    // one that is skipped (`if false`, a block that never runs) no longer reads the same.
+
+    /// Where each guard's needles are, for its failure (see `source_guard::update`).
+    const CLIENT: &str = "refresh_wait::tests::a_door_call_that_waited_still_answers_before_its_client_gives_up (src-tauri/src/refresh_wait.rs)";
+    const BOUNDED: &str = "refresh_wait::tests::every_wait_for_the_refresh_lock_is_bounded_or_holds_nothing (src-tauri/src/refresh_wait.rs)";
+    const SETTINGS: &str = "refresh_wait::tests::nothing_waits_while_holding_settings_lock (src-tauri/src/refresh_wait.rs)";
+    const HANDS: &str = "refresh_wait::tests::the_app_hands_its_waits_to_the_helpers (src-tauri/src/refresh_wait.rs)";
+    const ROSTER: &str = "refresh_wait::tests::the_roster_is_waited_for_on_the_blocking_pool_only (src-tauri/src/refresh_wait.rs)";
+    const REAL: &str = "refresh_wait::tests::the_real_withdrawals_go_to_the_place_they_are_given (src-tauri/src/refresh_wait.rs)";
 
     fn named(c: char) -> bool {
         c.is_alphanumeric() || c == '_'
     }
 
-    /// The length of the raw string literal (`r".."`, `r#".."#`, `br".."`) at `i`, if one starts there.
-    fn raw_string(chars: &[char], i: usize) -> Option<usize> {
-        let mut j = i + usize::from(chars.get(i) == Some(&'b'));
-        if chars.get(j) != Some(&'r') {
-            return None;
-        }
-        j += 1;
-        let hashes = chars[j..].iter().take_while(|&&c| c == '#').count();
-        j += hashes;
-        if chars.get(j) != Some(&'"') {
-            return None;
-        }
-        j += 1;
-        while j < chars.len() {
-            if chars[j] == '"' && chars[j + 1..].iter().take(hashes).filter(|&&c| c == '#').count() == hashes {
-                return Some(j + 1 + hashes - i);
-            }
-            j += 1;
-        }
-        Some(chars.len() - i)
-    }
-
-    /// `source` as code: comments dropped, string and char literals emptied (`""`, `''`), and
-    /// whitespace kept only between two parts of a name ("let x", but "a.b" for "a . b"), so a check
-    /// reads code however rustfmt lays it out, and never text in a literal or a comment.
-    fn normalized(source: &str) -> String {
-        let chars: Vec<char> = source.chars().collect();
-        let mut out = String::with_capacity(source.len());
-        let mut gap = false;
-        let mut i = 0;
-        let emit = |out: &mut String, gap: &mut bool, text: &str| {
-            if *gap && out.chars().next_back().is_some_and(named) && text.chars().next().is_some_and(named) {
-                out.push(' ');
-            }
-            *gap = false;
-            out.push_str(text);
-        };
-        while i < chars.len() {
-            let (c, next) = (chars[i], chars.get(i + 1).copied());
-            let after_name = out.chars().next_back().is_some_and(named) && !gap;
-            if c.is_whitespace() {
-                gap = true;
-                i += 1;
-            } else if c == '/' && next == Some('/') {
-                while i < chars.len() && chars[i] != '\n' {
-                    i += 1;
-                }
-                gap = true;
-            } else if c == '/' && next == Some('*') {
-                let mut depth = 0;
-                while i < chars.len() {
-                    if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
-                        depth += 1;
-                        i += 2;
-                    } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                        depth -= 1;
-                        i += 2;
-                        if depth == 0 {
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-                gap = true;
-            } else if let Some(len) = (!after_name).then(|| raw_string(&chars, i)).flatten() {
-                emit(&mut out, &mut gap, "\"\"");
-                i += len;
-            } else if c == '"' {
-                i += 1;
-                while i < chars.len() && chars[i] != '"' {
-                    i += if chars[i] == '\\' { 2 } else { 1 };
-                }
-                i += 1;
-                emit(&mut out, &mut gap, "\"\"");
-            } else if c == '\'' && (next == Some('\\') || chars.get(i + 2) == Some(&'\'')) {
-                i += if next == Some('\\') { 3 } else { 2 };
-                while i < chars.len() && chars[i] != '\'' {
-                    i += 1;
-                }
-                i += 1;
-                emit(&mut out, &mut gap, "''");
-            } else {
-                emit(&mut out, &mut gap, c.encode_utf8(&mut [0; 4]));
-                i += 1;
-            }
-        }
-        out
-    }
-
-    fn has(code: &str, needle: &str) -> bool {
-        code.contains(&normalized(needle))
-    }
-
-    /// The item in `code` (normalized) that starts with `signature`, through its closing brace.
-    fn function<'a>(code: &'a str, signature: &str) -> &'a str {
-        let signature = normalized(signature);
-        let start = code.find(&signature).unwrap_or_else(|| panic!("no `{signature}`"));
-        let open = start + code[start..].find('{').expect("a body");
-        let mut depth = 0;
-        for (i, c) in code[open..].char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return &code[start..=open + i];
-                    }
-                }
-                _ => {}
-            }
-        }
-        panic!("`{signature}` never closes")
-    }
-
-    /// Every source file under src, by its path from there, normalized.
+    /// Every source file under src, by its path from there, as the guards read it.
     fn sources() -> Vec<(String, String)> {
         fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
             for entry in std::fs::read_dir(dir).unwrap().flatten() {
@@ -453,7 +350,7 @@ mod tests {
                     walk(&path, root, out);
                 } else if path.extension().is_some_and(|e| e == "rs") {
                     let name = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
-                    out.push((name, normalized(&std::fs::read_to_string(&path).unwrap())));
+                    out.push((name, tokens(&std::fs::read_to_string(&path).unwrap())));
                 }
             }
         }
@@ -478,12 +375,17 @@ mod tests {
         &code[start..end]
     }
 
-    #[test]
-    fn the_source_is_read_as_code() {
-        let code = normalized("let a = \"refresh_lock.lock()\"; // refresh_lock\n/* refresh_lock */ let b = r#\"x\"#;\nlet c: &'static str = x . y ( '{' ) ;");
-        assert_eq!(code, "let a=\"\";let b=\"\";let c:&'static str=x.y('');");
-        assert!(!code.contains("refresh_lock"), "not in a literal or a comment");
-        assert_eq!(function("fn f(){if x{y}}fn g(){}", "fn f("), "fn f(){if x{y}}");
+    /// The code of `scope` before and after `call`, a call's brackets in it as `calls` gives them.
+    fn either_side<'a>(scope: &'a str, call: &str) -> (&'a str, &'a str) {
+        let at = call.as_ptr() as usize - scope.as_ptr() as usize;
+        (&scope[..at], &scope[at + call.len()..])
+    }
+
+    /// The one call of `name` in `scope`, which `test` reads in `place`.
+    fn one_call<'a>(scope: &'a str, name: &str, place: &str, test: &str) -> &'a str {
+        let found = calls(scope, name);
+        assert_eq!(found.len(), 1, "{place} calls `{name}` once. {}\n{scope}", update(test));
+        found[0]
     }
 
     /// Every wait for the refresh lock, in every source file, is one of three: a refresh's, within
@@ -495,8 +397,8 @@ mod tests {
     fn every_wait_for_the_refresh_lock_is_bounded_or_holds_nothing() {
         let (mut bounded, mut soon, mut install, mut unknown) = (0, 0, 0, vec![]);
         for (file, code) in sources() {
-            for (at, word) in code.match_indices("refresh_lock") {
-                let (before, after) = (&code[..at], &code[at + word.len()..]);
+            for at in places(&code, "refresh_lock") {
+                let (before, after) = (&code[..at], &code[at + "refresh_lock".len()..]);
                 if before.chars().next_back().is_some_and(named) || after.chars().next().is_some_and(named) {
                     continue;
                 }
@@ -512,32 +414,41 @@ mod tests {
             }
         }
         assert!(unknown.is_empty(), "a wait for the refresh lock with no limit, or that holds something (or a new kind of use):\n{}", unknown.join("\n"));
-        assert_eq!((bounded, soon), (1, 1), "the refresh's bounded wait and refresh_soon's");
-        assert!(install <= 1, "the install's, in builds that wait for a refresh");
+        assert_eq!((bounded, soon), (1, 1), "the refresh's bounded wait and refresh_soon's. {}", update(BOUNDED));
+        assert!(install <= 1, "the install's, in builds that wait for a refresh. {}", update(BOUNDED));
 
-        let app = normalized(include_str!("app.rs"));
-        // Each call is read with the statements around it, so one that is skipped (`if false`, a
-        // block that never runs) no longer reads the same.
-        let within = function(&app, "async fn refresh_within(");
-        assert!(has(within, "let state = app.state::<AppState>(); \
-            let refreshed = refresh_wait::under(&state.refresh_lock, refresh_wait::LOCK_WAIT, || refresh_locked(app)).await; \
-            if refreshed.is_none() { refresh_soon(app); } refreshed }"), "a refresh that gave up is followed by one once the lock is free:\n{within}");
-        let soon = function(&app, "fn refresh_soon(");
+        let app = tokens(include_str!("app.rs"));
+        let within = function(&app, "app.rs", "async fn refresh_within(", BOUNDED);
+        let under = one_call(within, "refresh_wait::under", "refresh_within in app.rs", BOUNDED);
+        let [lock, limit, refresh] = args(under)[..] else { panic!("refresh_wait::under takes the lock, a limit and a refresh: {under}") };
+        assert_eq!((lock, limit, closure_body(refresh)), ("&state.refresh_lock", "refresh_wait::LOCK_WAIT", Some("refresh_locked(app)")),
+            "the refresh runs under the refresh lock, within LOCK_WAIT. {}\n{within}", update(BOUNDED));
+        let (before, after) = either_side(within, under);
+        assert!(before == tokens("async fn refresh_within(app: &AppHandle) -> Option<Snapshot> { let state = app.state::<AppState>(); let refreshed = refresh_wait::under")
+            && after == tokens(".await; if refreshed.is_none() { refresh_soon(app); } refreshed }"),
+            "a refresh that gave up is followed by one once the lock is free. {}\n{within}", update(BOUNDED));
+        let soon = function(&app, "app.rs", "fn refresh_soon(", BOUNDED);
         assert!(has(soon, "static WAITING: refresh_wait::Coalesce = refresh_wait::Coalesce::new(); if !WAITING.ask() { return; } \
             let app = app.clone(); tauri::async_runtime::spawn(async move { \
             drop(app.state::<AppState>().refresh_lock.lock().await); WAITING.started(); do_refresh(&app).await; }); }"),
-            "one task however many ask, which nobody waits for:\n{soon}");
-        let fallback = function(&app, "async fn do_refresh(");
+            "one task however many ask, which nobody waits for. {}\n{soon}", update(BOUNDED));
+        let fallback = function(&app, "app.rs", "async fn do_refresh(", BOUNDED);
         assert!(has(fallback, "match refresh_within(app).await { Some(snapshot) => snapshot, None => app.state::<AppState>().snapshot.lock().unwrap().clone(), }"),
-            "a refresh that gave up returns the last numbers:\n{fallback}");
-        let locked = function(&app, "async fn refresh_locked(");
-        let read = locked.find(&normalized("let settings = state.settings.lock().unwrap().clone();")).expect("the refresh reads the settings");
-        assert!(has(&locked[..read], "let state = app.state::<AppState>(); state.cache_due.drain_into(&mut state.usage_cache.lock().unwrap()); \
+            "a refresh that gave up returns the last numbers. {}\n{fallback}", update(BOUNDED));
+        let locked = function(&app, "app.rs", "async fn refresh_locked(", BOUNDED);
+        let reads = "let settings = state.settings.lock().unwrap().clone();";
+        let read = find(locked, reads).unwrap_or_else(|| panic!("{}", lost("refresh_locked in app.rs", reads, BOUNDED)));
+        let first = &locked[..read];
+        let catch_up = one_call(first, "tauri::async_runtime::spawn_blocking", "refresh_locked in app.rs, before it reads the settings", BOUNDED);
+        let [withdraw] = args(catch_up)[..] else { panic!("spawn_blocking takes one closure: {catch_up}") };
+        assert!(withdraw.starts_with("move||") && closure_body(withdraw) == Some(tokens("sharing.catch_up(&sharing::Files { interval }, sharing::WITHDRAW_LIMIT)").as_str()),
+            "what saves left is withdrawn on the blocking pool, within its limit. {}\n{first}", update(BOUNDED));
+        let (before, after) = either_side(first, catch_up);
+        assert!(before.ends_with(&tokens("let state = app.state::<AppState>(); state.cache_due.drain_into(&mut state.usage_cache.lock().unwrap()); \
             if state.sharing.is_due() { let interval = state.settings.lock().unwrap().refresh_minutes.max(1) as u64 * 60; \
-            let sharing = state.sharing.clone(); \
-            let reset = tauri::async_runtime::spawn_blocking(move || sharing.catch_up(&mut sharing::Files { interval })).await.unwrap_or(false); \
-            if reset { *state.roster_seen.lock().unwrap() = roster::Seen::default(); } }"),
-            "first, under the lock: the cache changes left to it, then what saves left, before it reads the settings:\n{locked}");
+            let sharing = state.sharing.clone(); let reset = tauri::async_runtime::spawn_blocking"))
+            && after.starts_with(&tokens(".await.unwrap_or(false); if reset { *state.roster_seen.lock().unwrap() = roster::Seen::default(); } }")),
+            "first, under the lock: the cache changes left to it, then what saves left, before it reads the settings. {}\n{first}", update(BOUNDED));
     }
 
     /// `settings_lock` is never held while anything waits: `store_settings` cannot wait (it is no
@@ -545,34 +456,36 @@ mod tests {
     /// I/O, a refresh or anything else) between taking the lock and handing it to `store_settings`.
     #[test]
     fn nothing_waits_while_holding_settings_lock() {
-        let app = normalized(include_str!("app.rs"));
+        let app = tokens(include_str!("app.rs"));
         let refreshes = ["do_refresh(", "refresh_within(", "refresh_soon(", "refresh_locked("];
-        let store = function(&app, "fn store_settings(");
-        assert!(has(&app, "\nfn store_settings(app: &AppHandle, held: tokio::sync::MutexGuard<'_, ()>, settings: Settings) -> Result<bool, String> {")
-            && !has(&app, "async fn store_settings("), "{store}");
-        assert!(has(store, "let refresh = state.sharing.saved(&previous, &settings); drop(held); Ok(refresh)"), "what the save moved is left to the refresh it asks for:\n{store}");
+        let store = function(&app, "app.rs", "fn store_settings(", SETTINGS);
+        assert!(has(&app, "fn store_settings(app: &AppHandle, held: tokio::sync::MutexGuard<'_, ()>, settings: Settings) -> Result<bool, String> {")
+            && !has(&app, "async fn store_settings("), "store_settings is no async fn and takes the lock's guard. {}\n{store}", update(SETTINGS));
+        assert!(has(store, "let refresh = state.sharing.saved(&previous, &settings); drop(held); Ok(refresh)"),
+            "what the save moved is left to the refresh it asks for. {}\n{store}", update(SETTINGS));
         for call in refreshes {
-            assert!(!store.contains(call), "store_settings refreshes (`{call}`) while its caller holds settings_lock:\n{store}");
+            assert!(!has(store, call), "store_settings refreshes (`{call}`) while its caller holds settings_lock:\n{store}");
         }
+        let taking = "settings_lock.lock().await";
         let mut taken = 0;
-        let mut from = 0;
-        while let Some(at) = app[from..].find("settings_lock.lock().await").map(|i| i + from) {
+        for at in places(&app, taking) {
             taken += 1;
-            from = at + 1;
-            let store = at + app[at..].find("store_settings(").expect("each settings change ends in store_settings");
+            let store = at + find(&app[at..], "store_settings(").expect("each settings change ends in store_settings");
             let held = &app[at..store];
             for call in refreshes {
-                assert!(!held.contains(call), "a refresh (`{call}`) while settings_lock is held:\n{held}");
+                assert!(!has(held, call), "a refresh (`{call}`) while settings_lock is held:\n{held}");
             }
-            assert!(!held["settings_lock.lock().await".len()..].contains(".await"), "a wait while settings_lock is held:\n{held}");
+            assert!(!has(&held[taking.len()..], ".await"), "a wait while settings_lock is held:\n{held}");
             assert!(app[store..].starts_with("store_settings(&app,held,") || app[store..].starts_with("store_settings(app,held,"), "the lock goes with the change:\n{}", around(&app, store, 80));
         }
-        assert_eq!(taken, 7, "save_settings, update_settings, apply_backup, remove_one, set_project_pin, the compact toggle, the sharing setup");
-        assert!(has(&app, "let held = state.settings_lock.lock().await; if store_settings(&app, held, settings)? { do_refresh(&app).await; } Ok(())"), "save_settings refreshes when the save asks");
-        assert!(has(&app, "if store_settings(&app, held, next.clone())? { do_refresh(&app).await; } value(next)"), "update_settings refreshes when the save asks");
-        let restore = function(&app, "async fn apply_backup(");
-        let stored = restore.find(&normalized("store_settings(app, held, merged_settings)?;")).expect("a restore stores its settings");
-        assert_eq!((restore.matches("do_refresh(").count(), restore[stored..].matches("do_refresh(app).await;").count()), (1, 1), "a restore refreshes once, at its end:\n{restore}");
+        assert_eq!(taken, 7, "save_settings, update_settings, apply_backup, remove_one, set_project_pin, the compact toggle, the sharing setup. {}", update(SETTINGS));
+        assert!(has(&app, "let held = state.settings_lock.lock().await; if store_settings(&app, held, settings)? { do_refresh(&app).await; } Ok(())"),
+            "save_settings refreshes when the save asks. {}", update(SETTINGS));
+        assert!(has(&app, "if store_settings(&app, held, next.clone())? { do_refresh(&app).await; } value(next)"), "update_settings refreshes when the save asks. {}", update(SETTINGS));
+        let restore = function(&app, "app.rs", "async fn apply_backup(", SETTINGS);
+        let stores = "store_settings(app, held, merged_settings)?;";
+        let stored = find(restore, stores).unwrap_or_else(|| panic!("{}", lost("apply_backup in app.rs", stores, SETTINGS)));
+        assert_eq!((count(restore, "do_refresh("), count(&restore[stored..], "do_refresh(app).await;")), (1, 1), "a restore refreshes once, at its end:\n{restore}");
     }
 
     /// What app.rs does with the rest: an account's reservation ends before anything waits for a
@@ -580,40 +493,74 @@ mod tests {
     /// its refresh waited.
     #[test]
     fn the_app_hands_its_waits_to_the_helpers() {
-        let app = normalized(include_str!("app.rs"));
-        let disconnect = function(&app, "async fn disconnect_one(");
-        assert!(has(disconnect, "drop(operation); retry_soon(app, monitoring::key(&slot)); Ok(revoked) }"), "the reservation ends, then the backoff is left to the next refresh:\n{disconnect}");
-        assert!(has(&app, "fn retry_soon(app: &AppHandle, key: String) { app.state::<AppState>().cache_due.retry(key); }"), "a cleared backoff is queued for the next refresh");
-        let remove = function(&app, "async fn remove_one(");
+        let app = tokens(include_str!("app.rs"));
+        let disconnect = function(&app, "app.rs", "async fn disconnect_one(", HANDS);
+        assert!(has(disconnect, "drop(operation); retry_soon(app, monitoring::key(&slot)); Ok(revoked) }"),
+            "the reservation ends, then the backoff is left to the next refresh. {}\n{disconnect}", update(HANDS));
+        assert!(has(&app, "fn retry_soon(app: &AppHandle, key: String) { app.state::<AppState>().cache_due.retry(key); }"), "a cleared backoff is queued for the next refresh. {}", update(HANDS));
+        let remove = function(&app, "app.rs", "async fn remove_one(", HANDS);
         assert!(has(remove, "app.state::<AppState>().monitor.disconnect(&slot, &http_client()).await?; app.state::<AppState>().cache_due.forget(monitoring::key(&slot)); }"),
-            "so is a removed account's cache entry:\n{remove}");
-        assert!(!remove.contains("usage_cache"), "and nothing else touches the cache there");
-        let add = function(&app, "async fn start_add_account(");
+            "so is a removed account's cache entry. {}\n{remove}", update(HANDS));
+        assert!(!has(remove, "usage_cache"), "and nothing else touches the cache there:\n{remove}");
+        let add = function(&app, "app.rs", "async fn start_add_account(", HANDS);
         assert!(has(add, "let added = job.wait(&http_client()).await; drop(session); drop(pending); if let Some(slot) = added {")
-            && add.find("job.wait(") < add.find(&normalized("do_refresh(&app).await")), "it covers the sign-in, not the refresh:\n{add}");
-        let login = function(&app, "async fn start_monitoring_login(");
-        assert!(has(login, "retry_soon(&app, key); refresh_soon(&app); outcome"), "{login}");
+            && find(add, "job.wait(") < find(add, "do_refresh(&app).await"), "it covers the sign-in, not the refresh. {}\n{add}", update(HANDS));
+        let login = function(&app, "app.rs", "async fn start_monitoring_login(", HANDS);
+        assert!(has(login, "retry_soon(&app, key); refresh_soon(&app); outcome"), "{}\n{login}", update(HANDS));
 
-        assert!(has(&app, "door::serve(door::pipe_name(), move |request| door_reply(h.clone(), request))"), "the door answers through door_reply");
+        let serve = one_call(&app, "door::serve", "app.rs", HANDS);
+        let [pipe, handle] = args(serve)[..] else { panic!("door::serve takes the pipe and what answers it: {serve}") };
+        assert!(pipe == "door::pipe_name()" && handle.starts_with("move|request|") && closure_body(handle) == Some("door_reply(h.clone(),request)"),
+            "the door answers through door_reply. {}\n{serve}", update(HANDS));
         assert!(has(&app, "async fn door_reply(app: AppHandle, request: door::Request) -> Result<serde_json::Value, String> { refresh_wait::noted(door_call(app, request)).await }"),
-            "noted exactly when a refresh waited");
-        let switch = function(&app, "async fn agent_switch(");
-        assert!(has(switch, "let refreshed = refresh_within(app).await; let held = refresh_wait::switch_held(refreshed.as_ref(), provider, &id); \
-            let snapshot = refreshed.unwrap_or_else(|| app.state::<AppState>().snapshot.lock().unwrap().clone()); \
-            let mut result = serde_json::to_value(snapshot).map_err(|e| e.to_string())?; result[\"switched_to_requested\"] = held.into(); result[\"desktop\"] ="),
-            "the last numbers, and unknown (null), when its refresh waited:\n{switch}");
+            "noted exactly when a refresh waited. {}", update(HANDS));
+        let switch = function(&app, "app.rs", "async fn agent_switch(", HANDS);
+        let fallback = one_call(switch, "refreshed.unwrap_or_else", "agent_switch in app.rs", HANDS);
+        let [last] = args(fallback)[..] else { panic!("unwrap_or_else takes one closure: {fallback}") };
+        assert_eq!(closure_body(last), Some(tokens("app.state::<AppState>().snapshot.lock().unwrap().clone()").as_str()), "the last numbers, when its refresh waited. {}\n{switch}", update(HANDS));
+        let (before, after) = either_side(switch, fallback);
+        assert!(before.ends_with(&tokens("let refreshed = refresh_within(app).await; let held = refresh_wait::switch_held(refreshed.as_ref(), provider, &id); let snapshot = refreshed.unwrap_or_else"))
+            && after.starts_with(&tokens("; let mut result = serde_json::to_value(snapshot).map_err(|e| e.to_string())?; result[\"switched_to_requested\"] = held.into(); result[\"desktop\"] =")),
+            "and unknown (null), when its refresh waited. {}\n{switch}", update(HANDS));
 
-        let sync = function(&app, "async fn sync_roster(");
-        assert!(has(sync, "let live = || sharing::Place::of(&h.state::<AppState>().settings.lock().unwrap()); sharing.sync_roster(&place, live, |sync| { \
-            if let Some(run) = run { sync.offer_run(run); } sync.sync(store.as_ref(), &passphrase, (id, name), &accounts, now, force, soon); sync.seen.clone() })"),
-            "a roster sync only where the settings still share:\n{sync}");
-        let locked = function(&app, "async fn refresh_locked(");
-        assert!(has(locked, "let Some((id, name)) = presence::identity() else { return Some((vec![], false, false)) }; \
-            if !sharing::still(&place, &sharing::Place::of(&h.state::<AppState>().settings.lock().unwrap())) { return None; } let wrote = store.write("),
-            "a refresh's presence record only where the settings still share:\n{locked}");
-        assert_eq!(app.matches("presence::withdraw(").count(), 1, "presence is withdrawn on exit, and otherwise by the refresh (sharing::Files), never by a save");
-        assert!(has(function(&app, "pub(crate) fn on_exit("), "presence::withdraw("));
-        assert!(!app.contains("roster::withdraw("), "the roster is withdrawn by the refresh (sharing::Files), never by a save");
+        let sync = function(&app, "app.rs", "async fn sync_roster(", HANDS);
+        let lives = "let live =";
+        let live = statement(sync, lives).unwrap_or_else(|| panic!("{}", lost("sync_roster in app.rs", lives, HANDS)));
+        assert_eq!(live.strip_prefix(&tokens(lives)).and_then(|v| v.strip_suffix(';')).and_then(closure_body), Some(tokens("sharing::Place::of(&h.state::<AppState>().settings.lock().unwrap())").as_str()),
+            "the live settings, read where the roster's lock is held. {}\n{sync}", update(HANDS));
+        let synced = one_call(sync, "sharing.sync_roster", "sync_roster in app.rs", HANDS);
+        let [place, read, run] = args(synced)[..] else { panic!("sharing.sync_roster takes the place, the live settings and the sync: {synced}") };
+        assert!(place == "&place" && read == "live" && closure_body(run) == Some(tokens("{ if let Some(run) = run { sync.offer_run(run); } \
+            sync.sync(store.as_ref(), &passphrase, (id, name), &accounts, now, force, soon); sync.seen.clone() }").as_str()) && run.starts_with("|sync|"),
+            "a roster sync only where the settings still share. {}\n{sync}", update(HANDS));
+        let locked = function(&app, "app.rs", "async fn refresh_locked(", HANDS);
+        let identity = "let Some((id, name)) = presence::identity() else {";
+        let unknown = statement(locked, identity).unwrap_or_else(|| panic!("{}", lost("refresh_locked in app.rs", identity, HANDS)));
+        // rustfmt ends the `return` with a semicolon.
+        assert!([tokens("let Some((id, name)) = presence::identity() else { return Some((vec![], false, false)) };"),
+            tokens("let Some((id, name)) = presence::identity() else { return Some((vec![], false, false)); };")].iter().any(|s| s == unknown),
+            "{}\n{locked}", lost("refresh_locked in app.rs", identity, HANDS));
+        let next = &locked[unknown.as_ptr() as usize - locked.as_ptr() as usize + unknown.len()..];
+        assert!(next.starts_with(&tokens("if !sharing::still(&place, &sharing::Place::of(&h.state::<AppState>().settings.lock().unwrap())) { return None; } let wrote = store.write(")),
+            "a refresh's presence record only where the settings still share. {}\n{locked}", update(HANDS));
+        assert!(!has(&app, "presence::withdraw(") && !has(&app, "roster::withdraw("),
+            "this machine's files are withdrawn through sharing (sharing::Files): by the refresh and on exit, never by a save. {}", update(HANDS));
+        let exit = function(&app, "app.rs", "pub(crate) fn on_exit(", HANDS);
+        assert!(has(exit, ".sharing.exit("), "the exit withdraws where sharing is and what saves left. {}\n{exit}", update(HANDS));
+    }
+
+    /// `Sharing::with_syncer`, `sync_roster` and `catch_up` wait for the roster's lock, which a sync
+    /// that hangs on a folder holds: app.rs calls them on the blocking pool only (`spawn_blocking`),
+    /// never on a thread of the runtime, which would then stay pinned. The exit's own part for
+    /// sharing runs on a thread of its own, within its limit (update_check's guard of `on_exit`).
+    #[test]
+    fn the_roster_is_waited_for_on_the_blocking_pool_only() {
+        let app = tokens(include_str!("app.rs"));
+        let blocking = calls(&app, "spawn_blocking");
+        for (method, at_least) in [(".with_syncer(", 2), (".sync_roster(", 1), (".catch_up(", 1)] {
+            let inside: usize = blocking.iter().map(|call| count(call, method)).sum();
+            assert!(inside == count(&app, method) && inside >= at_least, "`{method}` runs within spawn_blocking only ({inside} of {}). {}", count(&app, method), update(ROSTER));
+        }
     }
 
     /// `sharing`'s tests withdraw through a fake: the real withdrawals (`sharing::Files`) need this
@@ -622,13 +569,13 @@ mod tests {
     /// forgetting the real roster sync is its whole reset.
     #[test]
     fn the_real_withdrawals_go_to_the_place_they_are_given() {
-        let sharing = normalized(include_str!("sharing.rs"));
-        let files = function(&sharing, "impl Withdraw for Files {");
-        assert!(has(files, "fn presence(&mut self, place: &Place) { if let Some(store) = crate::presence::store(&place.settings()) { \
-            crate::presence::withdraw(store.as_ref(), self.interval); } }"), "{files}");
-        assert!(has(files, "fn roster(&mut self, place: &Place) { if let Some(store) = crate::roster::store(&place.settings()) { \
-            let _ = crate::roster::withdraw(store.as_ref()); } }"), "{files}");
-        let forget = function(&sharing, "impl Forget for crate::roster::Syncer {");
-        assert!(has(forget, "fn forget(&mut self) { self.reset(); } }"), "{forget}");
+        let sharing = tokens(include_str!("sharing.rs"));
+        let files = function(&sharing, "sharing.rs", "impl Withdraw for Files {", REAL);
+        assert!(has(files, "fn presence(&self, place: &Place) { if let Some(store) = crate::presence::store(&place.settings()) { \
+            crate::presence::withdraw(store.as_ref(), self.interval); } }"), "{}\n{files}", update(REAL));
+        assert!(has(files, "fn roster(&self, place: &Place) { if let Some(store) = crate::roster::store(&place.settings()) { \
+            let _ = crate::roster::withdraw(store.as_ref()); } }"), "{}\n{files}", update(REAL));
+        let forget = function(&sharing, "sharing.rs", "impl Forget for crate::roster::Syncer {", REAL);
+        assert!(has(forget, "fn forget(&mut self) { self.reset(); } }"), "{}\n{forget}", update(REAL));
     }
 }
