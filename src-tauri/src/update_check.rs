@@ -521,7 +521,7 @@ fn span(d: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::source_guard::{args, calls, count, find, function, has, lost, tokens, update, words};
+    use crate::source_guard::{args, calls, closure_body, count, find, function, has, lost, tokens, update, words};
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
@@ -796,7 +796,7 @@ mod tests {
     /// Each step (`.run("<name>", <limit>, ..)`) in `code` (tokens): its name, its limit and the
     /// whole call.
     fn steps_in(code: &str) -> Vec<(&str, &str, &str)> {
-        calls(code, ".run")
+        calls(code, ".run", WIRING)
             .into_iter()
             .filter(|call| call.starts_with("(\""))
             .map(|call| {
@@ -814,10 +814,14 @@ mod tests {
     fn updates_rs_wires_each_deadline_to_its_own_step() {
         let code = tokens(include_str!("updates.rs"));
         let updater = function(&code, "updates.rs", "fn updater(", WIRING);
-        // The check's request deadline, on the builder, and the stall limit.
-        for needle in [".timeout(update_check::CHECK_TIMEOUT)", ".configure_client(|client| client.read_timeout(update_check::STALL_TIMEOUT))"] {
-            assert!(has(updater, needle), "{}\n{updater}", lost("updater() in updates.rs", needle, WIRING));
-        }
+        // The check's request deadline, on the builder, and the stall limit, whose closure is read
+        // argument by argument: rustfmt may put its body in braces.
+        let timeout = ".timeout(update_check::CHECK_TIMEOUT)";
+        assert!(has(updater, timeout), "{}\n{updater}", lost("updater() in updates.rs", timeout, WIRING));
+        let configured = calls(updater, ".configure_client", WIRING);
+        let stall = if let [call] = configured[..] { args(call) } else { vec![] };
+        assert!(matches!(stall[..], [client] if client.starts_with("|client|") && closure_body(client) == Some("client.read_timeout(update_check::STALL_TIMEOUT)")),
+            "{}\n{updater}", lost("updater() in updates.rs", ".configure_client(|client| client.read_timeout(update_check::STALL_TIMEOUT))", WIRING));
 
         let expected = [
             ("The update check", "update_check::CHECK_LIMIT", "updater(app)?.check()"),
@@ -840,7 +844,7 @@ mod tests {
         assert!(at("\"The update check\"") < turn && turn < at("\"The download\""), "a check holds no turn; the download does. {}\n{install}", update(WIRING));
         assert!(at("update.timeout = Some(update_check::DOWNLOAD_TIMEOUT)") < at("\"The download\""),
             "the download's deadline is on the update before it downloads. {}\n{install}", update(WIRING));
-        let handovers = calls(install, "update_check::hand_over");
+        let handovers = calls(install, "update_check::hand_over", WIRING);
         assert_eq!(handovers.len(), 1, "one handover. {}\n{install}", update(WIRING));
         let handover = handovers[0];
         let within = "(steps, update_check::HANDOFF_LIMIT, ";
@@ -850,10 +854,10 @@ mod tests {
         let after = &after[find(after, "};").unwrap_or_else(|| panic!("{}", lost("The turn's binding in updates.rs", "};", WIRING))) + 2..];
         assert_eq!((words(after, "turn"), words(handover, "turn")), (1, 1), "once bound, the turn is used only to hand it to the handover. {}\n{install}", update(WIRING));
 
-        let manual = calls(function(&code, "updates.rs", "pub async fn install(", WIRING), "update_check::isolated");
+        let manual = calls(function(&code, "updates.rs", "pub async fn install(", WIRING), "update_check::isolated", WIRING);
         assert!(manual.len() == 1 && find(manual[0], "(update_check::PASS_LIMIT, ") == Some(0) && has(manual[0], "install_now("),
             "an install asked for runs isolated within PASS_LIMIT. {}\n{manual:?}", update(WIRING));
-        let looped = calls(function(&code, "updates.rs", "pub async fn run_loop(", WIRING), "update_check::run_loop");
+        let looped = calls(function(&code, "updates.rs", "pub async fn run_loop(", WIRING), "update_check::run_loop", WIRING);
         assert!(looped.len() == 1 && find(looped[0], "(&state.update_check, FIRST_CHECK, EVERY, update_check::PASS_LIMIT, ") == Some(0),
             "the update loop runs each pass within PASS_LIMIT, every EVERY. {}\n{looped:?}", update(WIRING));
         let interval = "const EVERY: Duration = Duration::from_secs(6 * 60 * 60);";
@@ -879,14 +883,14 @@ mod tests {
         let app = tokens(include_str!("app.rs"));
         let exit = function(&app, "app.rs", "pub(crate) fn on_exit(", EXIT);
         assert!(!has(exit, ".lock().unwrap()"), "a poisoned lock cannot panic the exit. {}\n{exit}", update(EXIT));
-        let bounded = calls(exit, "wait_at_most");
+        let bounded = calls(exit, "wait_at_most", EXIT);
         assert!(bounded.len() == 2 && bounded.iter().all(|c| find(c, "(EXIT_PART_LIMIT, ") == Some(0)),
             "each part of the exit cleanup that can wait runs within wait_at_most(EXIT_PART_LIMIT, ..). {}\n{bounded:?}", update(EXIT));
         for part in ["settings.lock()", ".sharing.exit(", "signin::close_all"] {
             let inside: usize = bounded.iter().map(|c| count(c, part)).sum();
             assert!(inside == 1 && count(exit, part) == 1, "`{part}` runs within wait_at_most(EXIT_PART_LIMIT, ..). {}\n{exit}", update(EXIT));
         }
-        let shared = calls(exit, ".sharing.exit");
+        let shared = calls(exit, ".sharing.exit", EXIT);
         assert!(shared.len() == 1 && args(shared[0]).last() == Some(&"sharing::WITHDRAW_LIMIT") && crate::sharing::WITHDRAW_LIMIT < EXIT_PART_LIMIT,
             "the part for sharing ends within WITHDRAW_LIMIT, inside the part's own limit. {}\n{shared:?}", update(EXIT));
         // The journal waits FLUSH_WAIT at most.

@@ -383,7 +383,7 @@ mod tests {
 
     /// The one call of `name` in `scope`, which `test` reads in `place`.
     fn one_call<'a>(scope: &'a str, name: &str, place: &str, test: &str) -> &'a str {
-        let found = calls(scope, name);
+        let found = calls(scope, name, test);
         assert_eq!(found.len(), 1, "{place} calls `{name}` once. {}\n{scope}", update(test));
         found[0]
     }
@@ -420,7 +420,7 @@ mod tests {
         let app = tokens(include_str!("app.rs"));
         let within = function(&app, "app.rs", "async fn refresh_within(", BOUNDED);
         let under = one_call(within, "refresh_wait::under", "refresh_within in app.rs", BOUNDED);
-        let [lock, limit, refresh] = args(under)[..] else { panic!("refresh_wait::under takes the lock, a limit and a refresh: {under}") };
+        let [lock, limit, refresh] = args(under)[..] else { panic!("refresh_wait::under takes the lock, a limit and a refresh: {under}. {}", update(BOUNDED)) };
         assert_eq!((lock, limit, closure_body(refresh)), ("&state.refresh_lock", "refresh_wait::LOCK_WAIT", Some("refresh_locked(app)")),
             "the refresh runs under the refresh lock, within LOCK_WAIT. {}\n{within}", update(BOUNDED));
         let (before, after) = either_side(within, under);
@@ -440,7 +440,7 @@ mod tests {
         let read = find(locked, reads).unwrap_or_else(|| panic!("{}", lost("refresh_locked in app.rs", reads, BOUNDED)));
         let first = &locked[..read];
         let catch_up = one_call(first, "tauri::async_runtime::spawn_blocking", "refresh_locked in app.rs, before it reads the settings", BOUNDED);
-        let [withdraw] = args(catch_up)[..] else { panic!("spawn_blocking takes one closure: {catch_up}") };
+        let [withdraw] = args(catch_up)[..] else { panic!("spawn_blocking takes one closure: {catch_up}. {}", update(BOUNDED)) };
         assert!(withdraw.starts_with("move||") && closure_body(withdraw) == Some(tokens("sharing.catch_up(&sharing::Files { interval }, sharing::WITHDRAW_LIMIT)").as_str()),
             "what saves left is withdrawn on the blocking pool, within its limit. {}\n{first}", update(BOUNDED));
         let (before, after) = either_side(first, catch_up);
@@ -509,14 +509,14 @@ mod tests {
         assert!(has(login, "retry_soon(&app, key); refresh_soon(&app); outcome"), "{}\n{login}", update(HANDS));
 
         let serve = one_call(&app, "door::serve", "app.rs", HANDS);
-        let [pipe, handle] = args(serve)[..] else { panic!("door::serve takes the pipe and what answers it: {serve}") };
+        let [pipe, handle] = args(serve)[..] else { panic!("door::serve takes the pipe and what answers it: {serve}. {}", update(HANDS)) };
         assert!(pipe == "door::pipe_name()" && handle.starts_with("move|request|") && closure_body(handle) == Some("door_reply(h.clone(),request)"),
             "the door answers through door_reply. {}\n{serve}", update(HANDS));
         assert!(has(&app, "async fn door_reply(app: AppHandle, request: door::Request) -> Result<serde_json::Value, String> { refresh_wait::noted(door_call(app, request)).await }"),
             "noted exactly when a refresh waited. {}", update(HANDS));
         let switch = function(&app, "app.rs", "async fn agent_switch(", HANDS);
         let fallback = one_call(switch, "refreshed.unwrap_or_else", "agent_switch in app.rs", HANDS);
-        let [last] = args(fallback)[..] else { panic!("unwrap_or_else takes one closure: {fallback}") };
+        let [last] = args(fallback)[..] else { panic!("unwrap_or_else takes one closure: {fallback}. {}", update(HANDS)) };
         assert_eq!(closure_body(last), Some(tokens("app.state::<AppState>().snapshot.lock().unwrap().clone()").as_str()), "the last numbers, when its refresh waited. {}\n{switch}", update(HANDS));
         let (before, after) = either_side(switch, fallback);
         assert!(before.ends_with(&tokens("let refreshed = refresh_within(app).await; let held = refresh_wait::switch_held(refreshed.as_ref(), provider, &id); let snapshot = refreshed.unwrap_or_else"))
@@ -529,7 +529,7 @@ mod tests {
         assert_eq!(live.strip_prefix(&tokens(lives)).and_then(|v| v.strip_suffix(';')).and_then(closure_body), Some(tokens("sharing::Place::of(&h.state::<AppState>().settings.lock().unwrap())").as_str()),
             "the live settings, read where the roster's lock is held. {}\n{sync}", update(HANDS));
         let synced = one_call(sync, "sharing.sync_roster", "sync_roster in app.rs", HANDS);
-        let [place, read, run] = args(synced)[..] else { panic!("sharing.sync_roster takes the place, the live settings and the sync: {synced}") };
+        let [place, read, run] = args(synced)[..] else { panic!("sharing.sync_roster takes the place, the live settings and the sync: {synced}. {}", update(HANDS)) };
         assert!(place == "&place" && read == "live" && closure_body(run) == Some(tokens("{ if let Some(run) = run { sync.offer_run(run); } \
             sync.sync(store.as_ref(), &passphrase, (id, name), &accounts, now, force, soon); sync.seen.clone() }").as_str()) && run.starts_with("|sync|"),
             "a roster sync only where the settings still share. {}\n{sync}", update(HANDS));
@@ -556,7 +556,7 @@ mod tests {
     #[test]
     fn the_roster_is_waited_for_on_the_blocking_pool_only() {
         let app = tokens(include_str!("app.rs"));
-        let blocking = calls(&app, "spawn_blocking");
+        let blocking = calls(&app, "spawn_blocking", ROSTER);
         for (method, at_least) in [(".with_syncer(", 2), (".sync_roster(", 1), (".catch_up(", 1)] {
             let inside: usize = blocking.iter().map(|call| count(call, method)).sum();
             assert!(inside == count(&app, method) && inside >= at_least, "`{method}` runs within spawn_blocking only ({inside} of {}). {}", count(&app, method), update(ROSTER));

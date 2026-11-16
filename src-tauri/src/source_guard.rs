@@ -4,8 +4,9 @@
 //! broken over lines or a block indented anew reads the same; and only code: a needle spelled
 //! inside a string or character literal is not found there. rustfmt also puts braces around a
 //! closure's body when it breaks one over lines, so a call that takes a closure is read argument by
-//! argument (`calls`, `args`, `closure_body`), never as one needle. A rename does not read the same,
-//! and then the failure names the text that went and the test to update (`lost`, `update`).
+//! argument (`calls`, `args`, `closure_body`), never as one needle, and the body it reads is compared
+//! by equality (see `closure_body`). A rename does not read the same, and then the failure names the
+//! text that went and the test to update (`lost`, `update`).
 
 fn word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
@@ -209,37 +210,64 @@ pub fn function<'a>(code: &'a str, file: &str, signature: &str, test: &str) -> &
 }
 
 /// Every call of `name` in `code` (tokens), each from its opening parenthesis to its closing one;
-/// a call spelled in a literal is none.
-pub fn calls<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
+/// a call spelled in a literal is none. A call that never closes fails, naming `test` to update.
+pub fn calls<'a>(code: &'a str, name: &str, test: &str) -> Vec<&'a str> {
     let name = tokens(name);
     let named = |at: usize| name.starts_with(word) && code[..at].chars().next_back().is_some_and(word);
     occurrences(code, &name)
         .into_iter()
         .map(|at| at + name.len())
         .filter(|&open| code[open..].starts_with('(') && !named(open - name.len()))
-        .map(|open| &code[open..=closing(code, open).unwrap_or_else(|| panic!("the call of `{name}` at byte {open} never closes"))])
+        .map(|open| {
+            let close = closing(code, open).unwrap_or_else(|| panic!("the call of `{name}` at byte {open} never closes, as {test} reads it. {}", update(test)));
+            &code[open..=close]
+        })
         .collect()
 }
 
+/// Whether `head`, the text of an argument before its first `|`, makes it a closure: nothing, or
+/// `move`, `async`, `async move`, or a reference to one (`&`, `&mut`).
+fn closure_head(head: &str) -> bool {
+    let head = head.strip_prefix('&').map_or(head, |rest| rest.strip_prefix("mut").map_or(rest, str::trim_start));
+    let head = head.strip_prefix("async").map_or(head, str::trim_start);
+    matches!(head, "" | "move")
+}
+
 /// The arguments of `call` (a call's brackets, as `calls` gives them), in order: split at the
-/// commas between them, never at one inside a bracket, a literal or a closure's parameters
-/// (`|a, b|`). An argument stays as the reader has it (`tokens`).
+/// commas between them, never at one inside a bracket, a literal, a closure's parameters
+/// (`|a, b|`) or return type (`|..| -> R<A, B> {`), or a turbofish (`f::<A, B>(..)`). An argument
+/// stays as the reader has it (`tokens`).
 pub fn args(call: &str) -> Vec<&str> {
     let inner = call.strip_prefix('(').and_then(|c| c.strip_suffix(')')).unwrap_or_else(|| panic!("`{call}` is no call's brackets"));
     let (mut out, mut start, mut depth, mut params) = (Vec::new(), 0, 0usize, false);
+    let (mut angle, mut returns, mut last) = (0usize, false, None);
     for (at, c) in outside_literals(inner, 0) {
         match c {
+            // The body's brace ends a closure's return type.
+            '{' if depth == 0 && returns => {
+                returns = false;
+                depth += 1;
+            }
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            // A closure's parameters open where an argument starts (after `move`) and close at the
+            // A turbofish's `<` follows `::`; a `>` after `-` is an arrow.
+            '<' if depth == 0 && (angle > 0 || last == Some(':')) => angle += 1,
+            '>' if depth == 0 && angle > 0 && last != Some('-') => angle -= 1,
+            // A closure's parameters open where an argument starts (`closure_head`) and close at the
             // next `|`; a `|` anywhere else is an operator.
-            '|' if depth == 0 => params = !params && matches!(&inner[start..at], "" | "move"),
-            ',' if depth == 0 && !params => {
+            '|' if depth == 0 && angle == 0 && !returns => {
+                if params && inner[at + 1..].starts_with("->") {
+                    returns = true;
+                }
+                params = !params && closure_head(&inner[start..at]);
+            }
+            ',' if depth == 0 && angle == 0 && !params && !returns => {
                 out.push(&inner[start..at]);
                 start = at + 1;
             }
             _ => {}
         }
+        last = Some(c);
     }
     if !inner.is_empty() {
         out.push(&inner[start..]);
@@ -247,12 +275,30 @@ pub fn args(call: &str) -> Vec<&str> {
     out
 }
 
-/// What the closure `arg` returns (`|..| body` or `move |..| body`), without the braces rustfmt puts
-/// around a body that holds one expression when it breaks it over lines: `||{f(x)}` and `||f(x)`
-/// read the same. None when `arg` is no closure.
+/// What the closure `arg` returns (`|..| body`, after `move`, `async` or `&` as `closure_head` reads
+/// them), without the braces rustfmt puts around a body that holds one expression when it breaks
+/// it over lines: `||{f(x)}` and `||f(x)` read the same. The parameters end at the first `|`
+/// outside brackets. None when `arg` is no closure.
+///
+/// A guard compares a body it reads this way by equality, never with `has` or `find`: a body with
+/// a return type (`->T{x}`) or a block of statements is read as written, and a needle found inside
+/// one would pass a closure that does more than the needle says.
 pub fn closure_body(arg: &str) -> Option<&str> {
-    let rest = arg.strip_prefix("move").filter(|r| r.starts_with('|')).unwrap_or(arg).strip_prefix('|')?;
-    let body = &rest[rest.find('|')? + 1..];
+    let bar = arg.find('|')?;
+    if !closure_head(&arg[..bar]) {
+        return None;
+    }
+    let rest = &arg[bar + 1..];
+    let mut depth = 0usize;
+    let (end, _) = outside_literals(rest, 0).find(|&(_, c)| {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        c == '|' && depth == 0
+    })?;
+    let body = &rest[end + 1..];
     if body.starts_with('{') && closing(body, 0) == Some(body.len() - 1) {
         let inner = &body[1..body.len() - 1];
         let mut depth = 0usize;
@@ -326,7 +372,10 @@ mod tests {
         // Literals are kept as written, with what looks like a comment or a bracket inside them.
         let literals = r##"f("a  //  b ) {", '}', '\'', '"', r#"x ) "y" // z"#, b"(", &'a str, 'label: loop {})"##;
         assert_eq!(tokens(literals), r##"f("a  //  b ) {",'}','\'','"',r#"x ) "y" // z"#,b"(",&'a str,'label:loop{})"##);
-        assert_eq!(calls(&tokens(literals), "f"), [tokens(literals)[1..].to_string()], "the call ends at its own bracket, past every literal");
+        assert_eq!(calls(&tokens(literals), "f", TEST), [tokens(literals)[1..].to_string()], "the call ends at its own bracket, past every literal");
+        // A raw string ends at its own quote and hashes, past a quote inside it.
+        let raw = tokens(r##"f(r#"a"b"#, x)"##);
+        assert_eq!(args(calls(&raw, "f", TEST)[0]), [r##"r#"a"b"#"##, "x"], "the raw string is one argument");
         assert_eq!(tokens("a / *b"), "a/ *b", "no comment is made where there was none");
         // A label stays apart from a character literal after it: run together, `'a '}'` would read
         // as the literal `'a'` and a `}` that ends the body early (or, with `'"'`, a string that
@@ -348,7 +397,7 @@ mod tests {
         // is the whole literal is.
         let spelled = tokens("fn f() { let s = \"update.download( turn \"; let c = '('; }");
         assert!(!has(&spelled, "update.download("), "a needle spelled in a string");
-        assert_eq!((words(&spelled, "turn"), calls(&spelled, "update.download").len()), (0, 0), "a word, and a call, spelled in a string");
+        assert_eq!((words(&spelled, "turn"), calls(&spelled, "update.download", TEST).len()), (0, 0), "a word, and a call, spelled in a string");
         assert_eq!(find(&spelled, "\"update.download( turn \""), spelled.find('"'), "a whole literal");
         assert_eq!(function(&spelled, "the test's code", "fn f(", TEST), spelled, "a bracket in a literal does not count");
         for source in [include_str!("updates.rs"), include_str!("app.rs"), include_str!("update_check.rs"), include_str!("door.rs"), include_str!("sharing.rs"), include_str!("refresh_wait.rs")] {
@@ -364,7 +413,7 @@ mod tests {
         let one_line = tokens("let r = refresh_wait::under(&state.refresh_lock, refresh_wait::LOCK_WAIT, || refresh_locked(app)).await;");
         let rustfmt = tokens("let r = refresh_wait::under(&state.refresh_lock, refresh_wait::LOCK_WAIT, || {\n    refresh_locked(app)\n})\n.await;");
         for code in [&one_line, &rustfmt] {
-            let call = calls(code, "refresh_wait::under");
+            let call = calls(code, "refresh_wait::under", TEST);
             assert_eq!(call.len(), 1, "{code}");
             let [lock, limit, refresh] = args(call[0])[..] else { panic!("three arguments: {:?}", args(call[0])) };
             assert_eq!((lock, limit, closure_body(refresh)), ("&state.refresh_lock", "refresh_wait::LOCK_WAIT", Some("refresh_locked(app)")));
@@ -377,7 +426,18 @@ mod tests {
         assert_eq!(closure_body("||{let x=f();x}"), Some("{let x=f();x}"), "a block of statements is the body as written");
         assert_eq!(closure_body(r#"||{f(";")}"#), Some(r#"f(";")"#), "a `;` in a literal ends no statement");
         assert_eq!(closure_body("||{f()}.g()"), Some("{f()}.g()"), "braces that end before the body does are the body's own");
-        assert_eq!((closure_body("async move{f()}"), closure_body("f(x)")), (None, None), "no closure");
+        assert_eq!((closure_body("async move{f()}"), closure_body("f(x)"), closure_body("a|b")), (None, None, None), "no closure");
+        // A closure that returns a type with a comma in it (app.rs's rclone check), a turbofish,
+        // and closures after `&`, `&mut`, `async` and `async move`: each is one argument.
+        let rclone = tokens("(move || -> Result<Option<Connect>, &'static str> { let listed = f()?; Ok(None) })");
+        assert_eq!(args(&rclone), ["move||->Result<Option<Connect>,&'static str>{let listed=f()?;Ok(None)}"], "a closure's return type");
+        assert_eq!(closure_body(args(&rclone)[0]), Some("->Result<Option<Connect>,&'static str>{let listed=f()?;Ok(None)}"), "its body as written, return type and all");
+        assert_eq!(args(&tokens("(HashMap::<u8, u8>::new(), m.n::<B, C>(o), x)")), ["HashMap::<u8,u8>::new()", "m.n::<B,C>(o)", "x"], "turbofish");
+        let closures = tokens("(&|a, b| a + b, &mut |a, b| a, async |a, b| a, async move |a, b| a, a > b, c)");
+        let referenced = args(&closures);
+        assert_eq!(referenced, ["&|a,b|a+b", "&mut|a,b|a", "async|a,b|a", "async move|a,b|a", "a>b", "c"], "a closure after `&`, `&mut`, `async`");
+        assert_eq!(referenced[..4].iter().map(|arg| closure_body(arg)).collect::<Vec<_>>(), [Some("a+b"), Some("a"), Some("a"), Some("a")]);
+        assert_eq!(closure_body(&tokens("|(A(x) | B(x))| x")), Some("x"), "a `|` inside the parameters' brackets");
         let code = tokens("let live = || { f(x) }; let Some(a) = b else { return; }; g();");
         assert_eq!(statement(&code, "let live ="), Some("let live=||{f(x)};"));
         assert_eq!(statement(&code, "let Some(a) = b else {"), Some("let Some(a)=b else{return;};"), "a `;` inside a block ends no statement");

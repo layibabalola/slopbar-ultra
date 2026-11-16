@@ -1127,7 +1127,7 @@ mod tests {
         const TEST: &str = "door::tests::the_door_the_app_opens_waits_as_long_as_its_client (src-tauri/src/door.rs)";
         let door = tokens(include_str!("door.rs"));
         let production = &door[..find(&door, "#[cfg(test)]").expect("door.rs has tests")];
-        let opened = calls(production, "serve_within");
+        let opened = calls(production, "serve_within", TEST);
         assert_eq!(opened.len(), 1, "the app's door is opened that way only. {}", update(TEST));
         assert_eq!(args(opened[0]), ["name", "CLIENT_TIMEOUT", "handle"], "serve passes the client's own limit. {}", update(TEST));
         let serve = function(production, "door.rs", "pub async fn serve<", TEST);
