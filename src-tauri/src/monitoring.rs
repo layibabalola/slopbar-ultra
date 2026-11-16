@@ -50,9 +50,10 @@ impl Operations {
         })
     }
 
-    /// Whether an operation holds the account, by `key`.
+    /// Whether an operation holds the account, by `key`. A lock poisoned by a panic is still read:
+    /// whether a sign-in is open is asked before every install.
     pub fn busy(&self, key: &str) -> bool {
-        self.0.lock().unwrap().contains(key)
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).contains(key)
     }
 }
 impl Drop for Operation {
@@ -68,6 +69,7 @@ impl Drop for Operation {
 #[derive(Default)]
 pub struct SignIns(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 /// One sign-in, counted as open until this is dropped (see [`SignIns`]).
+#[must_use = "a sign-in counts as open only while this is held"]
 pub struct OpenSignIn(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 impl SignIns {
     /// Counts a sign-in as open until what this returns is dropped.

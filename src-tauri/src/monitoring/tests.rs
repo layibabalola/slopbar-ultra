@@ -403,6 +403,33 @@ fn connect_remove_and_disconnect_share_a_reservation_until_mutations_finish() {
     assert!(operations.begin(Provider::Claude, "one").is_ok());
 }
 
+/// Whether a sign-in is open is asked before every install: a lock a panic poisoned still answers,
+/// rather than panicking every install until SlopBar restarts.
+#[test]
+fn a_poisoned_reservation_lock_still_answers_busy() {
+    let operations = Operations::default();
+    operations.0.lock().unwrap().insert(SIGN_IN.to_string());
+    let lock = operations.0.clone();
+    let _ = std::thread::spawn(move || {
+        let _held = lock.lock().unwrap();
+        panic!("a panic while the lock is held poisons it (synthetic)");
+    })
+    .join();
+    assert!(operations.0.is_poisoned());
+    assert!(operations.busy(SIGN_IN), "a monitoring sign-in still shows");
+    assert!(!operations.busy("Claude:synthetic-id"));
+}
+
+/// An `OpenSignIn` that is taken and not held counts for nothing: `#[must_use]` makes that a warning
+/// where it is taken.
+#[test]
+fn a_sign_in_s_mark_must_be_held() {
+    let code = crate::source_guard::tokens(include_str!("../monitoring.rs"));
+    let marked = "#[must_use = \"a sign-in counts as open only while this is held\"] pub struct OpenSignIn(";
+    assert!(crate::source_guard::has(&code, marked),
+        "{}", crate::source_guard::lost("monitoring.rs", marked, "monitoring::tests::a_sign_in_s_mark_must_be_held (src-tauri/src/monitoring/tests.rs)"));
+}
+
 #[test]
 fn sign_ins_are_counted_and_none_is_refused() {
     let sign_ins = SignIns::default();
