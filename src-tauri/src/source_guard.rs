@@ -427,6 +427,7 @@ mod tests {
         assert_eq!(closure_body(r#"||{f(";")}"#), Some(r#"f(";")"#), "a `;` in a literal ends no statement");
         assert_eq!(closure_body("||{f()}.g()"), Some("{f()}.g()"), "braces that end before the body does are the body's own");
         assert_eq!((closure_body("async move{f()}"), closure_body("f(x)"), closure_body("a|b")), (None, None, None), "no closure");
+        assert_eq!(closure_body("a|b|c"), None, "two `|` after a word are operators, not a closure's parameters");
         // A closure that returns a type with a comma in it (app.rs's rclone check), a turbofish,
         // and closures after `&`, `&mut`, `async` and `async move`: each is one argument.
         let rclone = tokens("(move || -> Result<Option<Connect>, &'static str> { let listed = f()?; Ok(None) })");
