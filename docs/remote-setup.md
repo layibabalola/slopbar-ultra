@@ -38,6 +38,8 @@ if (Test-Path $pwsh) {
 SlopBar's commands work from either shell, and run under PowerShell 7 where it is installed,
 otherwise under Windows PowerShell. Don't make Windows PowerShell (`powershell.exe`) the SSH shell:
 started over SSH, it can outlive the session and keep growing (one reached 85 GiB of memory).
+Install PowerShell 7 first if it isn't there (`winget install --id Microsoft.PowerShell`), then
+run the block above: SSH then never needs Windows PowerShell on that computer.
 
 On the **computer with the accounts**, create a key once and copy its public half over:
 
@@ -97,7 +99,10 @@ The agent should:
 
 1. Call `get_machine_readiness` with `ssh_host: "newpc"`. `problems` names anything in the way:
    `no_desktop_session` (nobody is signed in at its desktop), `app_not_running`, `desktop_locked`,
-   `desktop_not_shown` (a closed Remote Desktop or another user switched in), `no_browser`.
+   `desktop_not_shown` (a closed Remote Desktop or another user switched in), `no_browser`. Two
+   codes never stop sign-ins but say SSH starts Windows PowerShell there: `ssh_shell_windows_powershell`
+   (its SSH shell is set to it: run the OpenSSH block above there) and `no_pwsh_over_ssh`
+   (PowerShell 7 did not start there, so SlopBar used it: install PowerShell 7 there).
 2. If the new computer has no sharing location yet (readiness lists `no_sharing_location` or
    `rclone_remote_missing`), ask you to sit at its screen, then call `setup_sharing` with
    `ssh_host: "newpc"` and `confirm: true`. SlopBar there gets rclone (a fixed, checksum-verified
@@ -148,3 +153,5 @@ for example `| Out-String`.
 | `setup_sharing` with `ssh_host` and `open_here` fails with `tunnel_failed` | Port 53682 is in use on this computer (another rclone sign-in is waiting), or SSH could not connect. Close the other sign-in and try again. |
 | `setup_sharing` with `ssh_host` fails with `update_slopbar_there` | The other computer's SlopBar predates the guided setup: update it there. |
 | The other computer answered without a SlopBar result | Update SlopBar there; pairing needs the same version on both. |
+| Readiness lists `ssh_shell_windows_powershell` | That computer's SSH shell is Windows PowerShell: run the OpenSSH block above there, in an elevated PowerShell (it sets PowerShell 7, or removes the setting so OpenSSH uses cmd). |
+| Readiness lists `no_pwsh_over_ssh` | PowerShell 7 did not start there over SSH, so SlopBar used Windows PowerShell: install PowerShell 7 there (`winget install --id Microsoft.PowerShell`). |
