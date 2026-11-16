@@ -560,7 +560,8 @@ mod tests {
     struct Io {
         world: Arc<Mutex<World>>,
         hung: Arc<Hung>,
-        /// Set when a withdrawal waited on a place until SELF_ENDING: then no limit ended it.
+        /// Set when a withdrawal or a roster sync waited on a place until SELF_ENDING: then no limit
+        /// ended it.
         self_ended: Arc<AtomicBool>,
         /// Every withdrawal started, counted as `catch_up` starts it: it takes a copy of this
         /// (`start`) before its thread runs, however late a starved run schedules that thread.
@@ -679,7 +680,9 @@ mod tests {
             self.sharing.sync_roster(copy, || self.live(), |syncer| {
                 if syncer.written != Some(accounts) {
                     syncer.written = Some(accounts);
-                    self.io.hung.wait(&name(copy), None);
+                    if self.io.hung.wait(&name(copy), None) {
+                        self.io.self_ended.store(true, SeqCst);
+                    }
                     let live = name(&self.live());
                     let mut world = self.world();
                     world.roster.insert(name(copy));
@@ -963,6 +966,28 @@ mod tests {
         assert_eq!(world.presence["A"], "withdrawn");
     }
 
+    /// The refresh asks `is_due` on a runtime thread, so `is_due` never waits for the roster's lock:
+    /// while a sync that hangs holds it, `is_due` answers at once.
+    #[test]
+    fn is_due_does_not_wait_for_a_sync_that_hangs() {
+        let app = App::new(at("A", true));
+        app.refresh();
+        app.io.hung.hang("A");
+        app.accounts.fetch_add(1, SeqCst);
+        let a = app.live();
+        let (due, sync_ended) = std::thread::scope(|scope| {
+            let syncing = scope.spawn(|| app.sync(&a));
+            eventually("the sync holds the roster's lock", || app.sharing.roster.try_lock().is_err());
+            let asking = scope.spawn(|| app.sharing.is_due());
+            eventually("is_due answered", || asking.is_finished());
+            let sync_ended = syncing.is_finished();
+            app.io.hung.answer("A");
+            (asking.join().unwrap(), sync_ended)
+        });
+        assert!(!due && !sync_ended, "is_due answered, nothing due, while the sync still hung");
+        assert!(!app.io.self_ended.load(SeqCst), "is_due waited until the sync ended by itself");
+    }
+
     /// SlopBar exits between a save and its refresh (a refresh still running, or waiting for the
     /// refresh lock): the exit withdraws what the save left, as the refresh would have. Without
     /// that, another computer would honour this machine's roster left at A for 60 days, and show
@@ -1203,6 +1228,19 @@ mod tests {
         assert!(file.exists(), "presence left at A is kept in the file");
         let next = app.started(file.clone());
         assert_eq!(lock(&next.sharing.due).withdrawals(), [(Kind::Presence, Place::of(&at("A", false)))], "and found by the next start");
+    }
+
+    /// Turning the roster off where sharing stays leaves only a roster withdrawal due, and that is
+    /// kept too.
+    #[test]
+    fn turning_the_roster_off_is_kept_in_the_file() {
+        let dir = crate::test_support::TempDir::new();
+        let file = dir.0.join(DUE_FILE);
+        let app = App::new(at("A", true)).started(file.clone());
+        assert!(app.save(at("A", false)));
+        assert!(file.exists(), "the roster left at A is kept in the file");
+        let next = app.started(file.clone());
+        assert_eq!(lock(&next.sharing.due).withdrawals(), [(Kind::Roster, Place::of(&at("A", true)))], "and found by the next start");
     }
 
     /// A start reads a file that does not parse as nothing due (and goes on), the next save that
