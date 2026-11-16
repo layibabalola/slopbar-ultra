@@ -3,11 +3,12 @@
 //! starts a sign-in (calls `accounts::start_login_observed`), and every function that calls one.
 
 use super::*;
-use crate::source_guard::{calls, find, function, has, places, statement, tokens, update};
+use crate::source_guard::{args, calls, find, function, has, lost, places, statement, tokens, update, words};
 
 /// Where each guard's needles are, for its failure (see `source_guard::update`).
 const ENTRY: &str = "app::sign_in_open_tests::each_entry_point_s_sign_in_is_open_in_any_window (src-tauri/src/app/sign_in_open_tests.rs)";
 const MARK: &str = "app::sign_in_open_tests::every_sign_in_holds_its_mark_until_it_ends (src-tauri/src/app/sign_in_open_tests.rs)";
+const SAVE: &str = "app::sign_in_open_tests::each_sign_in_holds_its_mark_past_its_last_save (src-tauri/src/app/sign_in_open_tests.rs)";
 const HELPER: &str = "app::sign_in_open_tests::the_helper_asks_everything_that_shows_a_sign_in (src-tauri/src/app/sign_in_open_tests.rs)";
 
 /// A sign-in in a private window or the default browser has no fresh profile, so there
@@ -170,6 +171,54 @@ fn every_sign_in_holds_its_mark_until_it_ends() {
         for kept in ["forget(", "::leak(", "ManuallyDrop"] {
             assert!(!has(body, kept), "{}", fail(&format!("nothing keeps the mark from being dropped (`{kept}`)")));
         }
+    }
+}
+
+/// The one task `opener` spawns for its sign-in: its `async move` block, as the guards read it.
+fn task<'a>(body: &'a str, opener: &str) -> &'a str {
+    let spawned = calls(body, "tauri::async_runtime::spawn", SAVE);
+    let [call] = spawned[..] else { panic!("{opener} spawns one task for its sign-in. {}\n{body}", update(SAVE)) };
+    let [block] = args(call)[..] else { panic!("{opener} spawns its task as one block: {call}. {}", update(SAVE)) };
+    assert!(block.starts_with("async move{"), "{opener} spawns its task as an `async move` block. {}\n{block}", update(SAVE));
+    block
+}
+
+/// Each function that starts a sign-in holds its mark past the last save of what it signed in, and
+/// where a task of its own does the saving, that task holds it: "Add account" until `job.wait` has
+/// saved the account to the vault (its task holds `pending`, which carries the mark); a restore to
+/// its end, past `accounts::store_login`; a monitoring sign-in until its task has stored the new
+/// monitoring sign-in (`connect_replacing`), holding the account's reservation, `monitoring::SIGN_IN`
+/// and the mark together until then. Released any earlier, the sign-in is no longer open to
+/// `AppState::sign_in_open` while the user is still signing in, or while its tokens are written.
+#[test]
+fn each_sign_in_holds_its_mark_past_its_last_save() {
+    let app = tokens(include_str!("../app.rs"));
+
+    let add = function(&app, "app.rs", "async fn start_add_account(", SAVE);
+    let held = task(add, "start_add_account");
+    let saved = "async move { let added = job.wait(&http_client()).await; drop(session); drop(pending); if let Some(slot) = added {";
+    assert!(held.starts_with(&tokens(saved)), "Add account's task holds `pending`, and the mark in it, until `job.wait` has saved the account. {}\n{held}",
+        lost("start_add_account's task in app.rs", saved, SAVE));
+    assert_eq!(words(add, "pending"), 4, "`pending` is the parameter, rebound once with the mark and let go of once, in the task: nowhere else. {}\n{add}", update(SAVE));
+
+    let restore = function(&app, "app.rs", "async fn add_expected(", SAVE);
+    assert_eq!(words(restore, "_open"), 1, "a restore's mark stands alone where it is taken: never let go of or handed on before the function ends. {}\n{restore}", update(SAVE));
+    let (taken, stored) = (find(restore, "let _open = app.state::<AppState>().sign_ins.open();"), find(restore, "accounts::store_login(&login)"));
+    assert!(matches!((taken, stored), (Some(t), Some(s)) if t < s), "a restore holds its mark from before its sign-in to its end, past `accounts::store_login`. {}\n{restore}", update(SAVE));
+
+    let login = function(&app, "app.rs", "async fn start_monitoring_login(", SAVE);
+    let held = task(login, "start_monitoring_login");
+    let captures = "async move { let operation = operation; let sign_in = sign_in; let open = open; let outcome = match job.wait_isolated(&http_client()).await {";
+    assert!(held.starts_with(&tokens(captures)), "a monitoring sign-in's task first takes in the account's reservation, SIGN_IN and the mark. {}\n{held}",
+        lost("start_monitoring_login's task in app.rs", captures, SAVE));
+    let outcome = statement(held, "let outcome =").unwrap_or_else(|| panic!("{}", lost("start_monitoring_login's task in app.rs", "let outcome =", SAVE)));
+    assert!(has(outcome, ".connect_replacing("), "the outcome is where the new monitoring sign-in is stored. {}\n{outcome}", update(SAVE));
+    let after = &held[outcome.as_ptr() as usize - held.as_ptr() as usize + outcome.len()..];
+    let drops = "drop(session); drop(operation); drop(sign_in); drop(open);";
+    assert!(after.starts_with(&tokens(drops)), "the task lets go of all three together, right after the outcome is stored. {}\n{held}",
+        lost("start_monitoring_login's task in app.rs", drops, SAVE));
+    for name in ["operation", "sign_in", "open"] {
+        assert_eq!(words(held, name), 3, "the task takes `{name}` in and lets go of it once, after the outcome, and uses it nowhere else. {}\n{held}", update(SAVE));
     }
 }
 
