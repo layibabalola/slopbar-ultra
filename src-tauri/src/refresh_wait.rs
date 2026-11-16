@@ -197,6 +197,22 @@ mod tests {
         .await
     }
 
+    /// A refresh gives up at the limit it is given, not at LOCK_WAIT: a lock let go halfway to
+    /// LOCK_WAIT is still given up on, however starved the run (the earlier timer fires first).
+    #[tokio::test]
+    async fn a_refresh_gives_up_at_the_limit_it_is_given() {
+        within_test_limit(async {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            let held = lock.clone().try_lock_owned().expect("a free lock");
+            tokio::spawn(async move {
+                tokio::time::sleep(LOCK_WAIT / 2).await;
+                drop(held);
+            });
+            assert_eq!(under(&lock, SHORT, || async { 1 }).await, None, "given up after SHORT, though the lock is let go before LOCK_WAIT");
+        })
+        .await
+    }
+
     #[tokio::test]
     async fn a_free_lock_is_taken_and_held_through_the_refresh() {
         within_test_limit(async {
