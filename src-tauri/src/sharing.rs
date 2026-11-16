@@ -835,6 +835,22 @@ mod tests {
         assert_eq!(world.roster, BTreeSet::from(["B".to_string()]));
     }
 
+    /// A start can find the place sharing is at in the due file (the settings came back there and a
+    /// crash came before the file did): sharing that leaves it again lists it once on each list.
+    #[test]
+    fn a_place_the_file_lists_is_listed_once_when_left_again() {
+        let dir = crate::test_support::TempDir::new();
+        let file = dir.0.join(DUE_FILE);
+        let first: Sharing<Syncer> = Sharing::kept_in(file.clone());
+        assert!(first.saved(&at("A", true), &at("B", true)), "the file lists A");
+        drop(first);
+        let next: Sharing<Syncer> = Sharing::kept_in(file.clone());
+        assert!(next.saved(&at("A", true), &at("C", true)), "sharing, back at A, leaves it again");
+        let a = Place::of(&at("A", true));
+        let due = lock(&next.due);
+        assert_eq!((&due.presence, &due.roster), (&vec![a.clone()], &vec![a]), "A once on each list");
+    }
+
     /// What the refresh does with a save, through the app's own gate (`is_due`): the roster turned
     /// off where it was, then a move, each leaves something due; the next refresh withdraws each
     /// file once and clears the roster news shown, and leaves nothing due, so the refresh after it
