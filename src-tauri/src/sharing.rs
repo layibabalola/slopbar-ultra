@@ -1060,6 +1060,23 @@ mod tests {
         app.io.hung.fast("A");
     }
 
+    /// Sharing comes back to A with the roster off: A's presence comes off the list, since the next
+    /// refresh writes it there, but the roster written at A before the move stays due, and that
+    /// refresh withdraws it.
+    #[test]
+    fn a_return_with_the_roster_off_still_withdraws_the_roster_there() {
+        let app = App::new(at("A", true));
+        app.refresh();
+        assert!(app.save(at("B", true)) && app.save(at("A", false)), "back at A, the roster off");
+        {
+            let due = lock(&app.sharing.due);
+            let (a, b) = (Place::of(&at("A", true)), Place::of(&at("B", true)));
+            assert_eq!((&due.presence, &due.roster), (&vec![b.clone()], &vec![a, b]), "A's roster stays due");
+        }
+        app.refresh();
+        assert_eq!(as_saved(&app, &["A", "B"]), Ok(()), "A in use without its roster, B withdrawn");
+    }
+
     /// The exit returns only once this machine's presence is withdrawn where sharing is now: a place
     /// that answers a moment late is waited for, within the exit's limit.
     #[test]
