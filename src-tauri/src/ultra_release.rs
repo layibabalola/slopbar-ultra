@@ -28,7 +28,7 @@ pub fn is_ultra_version(version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source_guard::{find, function, has, lost, places, tokens, update, words};
+    use crate::source_guard::{args, calls, closure_body, find, function, has, lost, places, tokens, update, words};
 
     const UPSTREAM_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE0MDdFRDM5QzIxRTZGMTEKUldRUmJ4N0NPZTBIcEcvT2F1YThXMTB0UVRRREpMUmtPSjJUS1V4M2poTzdFUXBtejB0V1FNUFAK";
 
@@ -90,8 +90,11 @@ mod tests {
     fn ultra_updates_wait_for_token_rotation() {
         let code = tokens(include_str!("updates.rs"));
         let updater = function(&code, "updates.rs", "fn updater(", ROTATION);
-        let exit = ".on_before_exit(move || crate::app::on_exit(&h))";
-        assert!(has(updater, exit), "{}\n{updater}", lost("updater() in updates.rs", exit, ROTATION));
+        // The exit cleanup's closure is read argument by argument: rustfmt may put its body in braces.
+        let exits = calls(updater, ".on_before_exit", ROTATION);
+        let cleanup = if let [call] = exits[..] { args(call) } else { vec![] };
+        assert!(matches!(cleanup[..], [exit] if exit.starts_with("move||") && closure_body(exit) == Some("crate::app::on_exit(&h)")),
+            "{}\n{updater}", lost("updater() in updates.rs", ".on_before_exit(move || crate::app::on_exit(&h))", ROTATION));
         let install = function(&code, "updates.rs", "async fn install_now(", ROTATION);
         let at = |needle: &str| find(install, needle).unwrap_or_else(|| panic!("{}\n{install}", lost("install_now in updates.rs", needle, ROTATION)));
         let deferral = "if crate::signin::any_active() {\n        return Ok(Outcome::Deferred(SIGN_IN_OPEN.into()));";
