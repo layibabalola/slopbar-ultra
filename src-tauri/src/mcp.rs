@@ -153,7 +153,7 @@ fn catalog() -> Vec<Tool> {
                 "provider": { "type": "string", "enum": ["claude", "codex"] },
                 "id": { "type": "string", "description": "An account id from get_usage; default: the account in use." },
             }), &[]), true, false, true, false),
-        tool("recommend_account", "Recommend account", "Rank one provider's accounts for a job: fresh, error-free accounts with room for it, preferring the one whose weekly reset or plan renewal comes soonest (its unused capacity is lost then). Accounts in use on another machine, lapsed or ending plans, failed or stale readings and accounts at a limit are listed as excluded with the reason. Returns the ranking with reasons, action (stay, switch or none), the recommended account and overlap (the machines the account in use here is in use on at once, when more than one; it is then excluded and a free account is recommended instead). Read-only unless switch is true, which then switches to it as switch_account does (with the automatic-switching cooldown); use switch only when the user allowed switching.",
+        tool("recommend_account", "Recommend account", "Rank one provider's accounts for a job: fresh, error-free accounts with room for it, preferring the one whose weekly reset or plan renewal comes soonest (its unused capacity is lost then). Accounts in use on another machine, lapsed or ending plans, failed or stale readings and accounts at a limit are listed as excluded with the reason. Returns the ranking with reasons, action (stay, switch or none), the recommended account and overlap (the machines the account in use here is in use on at once, when more than one; it is then excluded and a free account is recommended instead). Read-only unless switch is true, which then switches to it as switch_account does (with the automatic-switching cooldown) and passes on switch_account's switched_to_requested as it is: null, with a waiting_for_refresh note, when SlopBar was too busy to refresh and tell; use switch only when the user allowed switching.",
             schema(json!({
                 "provider": { "type": "string", "enum": ["claude", "codex"] },
                 "expected_percent": { "type": "number", "minimum": 0, "maximum": 100, "description": "How much of a week's limit the job needs, in percent." },
@@ -766,6 +766,23 @@ mod tests {
     impl Write for Shared {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().write(bytes) }
         fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    /// What agents hear about a refresh that waited names an update as its cause only in builds
+    /// whose install holds the refresh lock (updates.rs takes it before the handover): the door's
+    /// note, refresh_usage's description and the README alike. And a switch recommend_account
+    /// makes passes on switch_account's null.
+    #[test]
+    fn what_agents_hear_about_a_refresh_that_waited() {
+        let tools = tools();
+        let description = |name: &str| tools.as_array().unwrap().iter().find(|t| t["name"] == name).unwrap()["description"].as_str().unwrap().to_string();
+        let install_holds = crate::source_guard::has(&crate::source_guard::tokens(include_str!("updates.rs")), "refresh_lock");
+        let readme = include_str!("../../README.md").lines().find(|l| l.starts_with("| `get_usage`, `refresh_usage` |")).expect("README's row for refresh_usage");
+        for (what, text) in [("the door's note", crate::refresh_wait::WAITING_NOTE.to_string()), ("refresh_usage", description("refresh_usage")), ("the README", readme.to_string())] {
+            assert_eq!(text.contains("or an update"), install_holds, "{what} names an update exactly when an install holds the refresh lock: {text}");
+        }
+        let recommend = description("recommend_account");
+        assert!(recommend.contains("switched_to_requested") && recommend.contains("null, with a waiting_for_refresh note"), "{recommend}");
     }
 
     #[test]

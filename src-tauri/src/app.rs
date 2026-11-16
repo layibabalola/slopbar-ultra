@@ -2444,10 +2444,10 @@ async fn do_refresh(app: &AppHandle) -> Snapshot {
 }
 
 /// A refresh, once the refresh lock is free: it waits `refresh_wait::LOCK_WAIT` at most for a
-/// refresh running long, or for an update's handover that keeps the lock
-/// (`update_check::hand_over`). Then it gives up (None), the door call it serves says so
-/// (`refresh_wait::noting_waits`), and a refresh follows as soon as the lock is free
-/// (`refresh_soon`).
+/// refresh running long, or, in builds that wait for a refresh before an update's installer, for
+/// that update's handover, which keeps the lock (`update_check::hand_over`). Then it gives up
+/// (None), the door call it serves says so (`refresh_wait::noting_waits`), and a refresh follows
+/// as soon as the lock is free (`refresh_soon`).
 async fn refresh_within(app: &AppHandle) -> Option<Snapshot> {
     let state = app.state::<AppState>();
     let refreshed = refresh_wait::under(&state.refresh_lock, refresh_wait::LOCK_WAIT, || refresh_locked(app)).await;
@@ -2469,10 +2469,12 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
     state.cache_due.drain_into(&mut state.usage_cache.lock().unwrap());
     // What settings saves left (`sharing`): this machine's presence and roster withdrawn from the
     // places sharing left, before the settings are read and anything is written where they point.
+    // A place that does not answer holds the refresh up for WITHDRAW_LIMIT at most; what it still
+    // has stays due.
     if state.sharing.is_due() {
         let interval = state.settings.lock().unwrap().refresh_minutes.max(1) as u64 * 60;
         let sharing = state.sharing.clone();
-        let reset = tauri::async_runtime::spawn_blocking(move || sharing.catch_up(&mut sharing::Files { interval })).await.unwrap_or(false);
+        let reset = tauri::async_runtime::spawn_blocking(move || sharing.catch_up(&sharing::Files { interval }, sharing::WITHDRAW_LIMIT)).await.unwrap_or(false);
         if reset {
             *state.roster_seen.lock().unwrap() = roster::Seen::default();
         }
@@ -3299,8 +3301,10 @@ async fn retry_peer_sign_in(app: AppHandle, machine_id: String) -> Result<(), St
     let arguments = serde_json::json!({ "confirm": true, "monitoring": monitoring, "retry": true });
     tauri::async_runtime::spawn_blocking(move || pairing::remote_call(&pairing::Ssh, &host, "sign_in_all", &arguments))
         .await.map_err(|_| "ssh_failed".to_string())??;
-    // Its new run reaches the roster a few seconds later: read it at the live pace meanwhile.
-    app.state::<AppState>().sharing.with_syncer(|sync| sync.expect_news(&machine_id, chrono::Utc::now()));
+    // Its new run reaches the roster a few seconds later: read it at the live pace meanwhile. On the
+    // blocking pool: a sync that hangs on a folder holds the roster's lock.
+    let sharing = app.state::<AppState>().sharing.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || sharing.with_syncer(|sync| sync.expect_news(&machine_id, chrono::Utc::now()))).await;
     Ok(())
 }
 
@@ -3316,7 +3320,10 @@ async fn set_roster_passphrase(app: &AppHandle, passphrase: Option<backup::Passp
     tauri::async_runtime::spawn_blocking(move || roster::store_passphrase(&dir, passphrase.as_ref()))
         .await.map_err(|_| "roster_passphrase_storage".to_string())??;
     let state = app.state::<AppState>();
-    state.sharing.with_syncer(|sync| sync.reset());
+    // On the blocking pool (a sync that hangs on a folder holds the roster's lock), and before the
+    // sync below, which then starts from the new passphrase.
+    let sharing = state.sharing.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || sharing.with_syncer(|sync| sync.reset())).await;
     *state.roster_seen.lock().unwrap() = roster::Seen::default();
     Ok(roster_status(app, true).await)
 }
@@ -3532,7 +3539,8 @@ pub fn run() {
         recent: Mutex::default(),
         sources: Mutex::default(),
         presence_tracks: Mutex::default(),
-        sharing: Default::default(),
+        // What saves left for the next refresh to withdraw, kept between runs (see `sharing`).
+        sharing: std::sync::Arc::new(sharing::Sharing::kept_in(settings::app_dir().expect("config directory").join(sharing::DUE_FILE))),
         roster_seen: Mutex::default(),
         roster_run: Mutex::default(),
         unexpected_log: Mutex::new(unexpected::load()),
@@ -3760,13 +3768,16 @@ pub fn run() {
 /// limit, so exiting never hangs on a stuck disk, network folder or lock.
 pub(crate) fn on_exit(app: &AppHandle) {
     use crate::update_check::{wait_at_most, EXIT_PART_LIMIT};
-    // Other machines stop showing this one's accounts as in use.
+    // Other machines stop showing this one's accounts as in use, where sharing is now and where
+    // saves moved it from: what they left that no refresh has withdrawn yet (a refresh still
+    // running, or waiting for the refresh lock), which the next start withdraws if this runs out
+    // of time (see `sharing::Sharing::exit`).
     let h = app.clone();
     wait_at_most(EXIT_PART_LIMIT, move || {
-        let settings = h.state::<AppState>().settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(store) = presence::store(&settings) {
-            presence::withdraw(store.as_ref(), settings.refresh_minutes.max(1) as u64 * 60);
-        }
+        let state = h.state::<AppState>();
+        let settings = state.settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let files = sharing::Files { interval: settings.refresh_minutes.max(1) as u64 * 60 };
+        state.sharing.exit(&sharing::Place::of(&settings), &files, sharing::WITHDRAW_LIMIT);
     });
     // A sign-in still open loses its browser and fresh profile with SlopBar (the next start deletes
     // what it had no time for).

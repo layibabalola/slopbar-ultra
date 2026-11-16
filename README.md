@@ -49,7 +49,7 @@ With in-use sharing on (Settings → Data → Other computers), SlopBar Ultra fl
 
 ### A new computer
 
-Turn on **Share account list with my other computers** (Settings → Data → Other computers) on each computer, with the same roster passphrase on each. Every SlopBar then adds its accounts' provider, id, email and plan (never sign-ins) to the sharing folder or rclone remote, encrypted. A computer that reads them shows "N accounts from your other machines are waiting to be signed in" in the flyout and Health, and **Sign in all accounts** (Settings → Accounts) queues every one, one email at a time.
+Turn on **Share account list with my other computers** (Settings → Data → Other computers) on each computer, with the same roster passphrase on each. Every SlopBar then adds its accounts' provider, id, email and plan (never sign-ins) to the sharing folder or rclone remote, encrypted. A computer that reads them shows "N accounts from your other machines are waiting to be signed in" in the flyout and Health, and **Sign in all accounts** (Settings → Accounts) queues every one, one email at a time. Moving sharing elsewhere, or turning the list off, removes this computer's list from where it was at the next refresh, or as SlopBar quits. When a folder that does not answer, or a crash, keeps that from happening, it is done later, after a restart too: the other computers would otherwise keep reading a list left there for 60 days.
 
 ### Bring up another computer
 
