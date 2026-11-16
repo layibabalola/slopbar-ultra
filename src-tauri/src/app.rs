@@ -3208,11 +3208,12 @@ async fn readiness(app: &AppHandle) -> serde_json::Value {
         if !rclone_remotes().await.remotes.iter().any(|r| r.name == name) {
             problems.push("rclone_remote_missing");
             if ready {
-                next = format!("Sharing names the rclone remote {name}, but rclone here is missing or lacks it, so no roster is written or read: install rclone and create that remote (rclone config) at this computer's screen.");
+                next = pairing::rclone_missing_next(&name);
             }
         }
     }
-    let ssh_shell = pairing::ssh_shell();
+    // A registry read and a file check: off the async threads.
+    let ssh_shell = tauri::async_runtime::spawn_blocking(pairing::ssh_shell).await.ok().flatten();
     pairing::note_ssh_shell(ssh_shell, &mut problems, &mut next);
     let snapshot = state.snapshot.lock().unwrap().clone();
     let signin_window = state.settings.lock().unwrap().signin_window;

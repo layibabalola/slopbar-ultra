@@ -321,7 +321,7 @@ fn asking(tool: &str, arguments: &Value) -> String {
 
 /// Readiness's code, and its advice, when Windows PowerShell ran SlopBar's command over SSH there.
 const NO_PWSH_OVER_SSH: &str = "no_pwsh_over_ssh";
-const NO_PWSH_ADVICE: &str = "Over SSH, PowerShell 7 did not start there, so SlopBar used Windows PowerShell: install PowerShell 7 there (winget install --id Microsoft.PowerShell).";
+const NO_PWSH_ADVICE: &str = "Over SSH, pwsh did not start there, so SlopBar used Windows PowerShell: install PowerShell 7 (winget install --id Microsoft.PowerShell).";
 
 /// Another computer's readiness over SSH, with what this side saw: which PowerShell ran SlopBar's
 /// command there (`ssh_powershell`). Where pwsh never started it, Windows PowerShell did, which is a
@@ -549,9 +549,14 @@ pub fn readiness_without_app(reason: &str) -> Value {
     })
 }
 
+/// Readiness's advice when sharing names an rclone remote that rclone here lacks.
+pub fn rclone_missing_next(name: &str) -> String {
+    format!("Sharing names the rclone remote {name}, but rclone here is missing or lacks it, so no roster is written or read: install rclone and create that remote (rclone config) at this computer's screen.")
+}
+
 /// Readiness's code, and its advice, when this computer's SSH sessions start Windows PowerShell.
 const SSH_SHELL_WINDOWS_POWERSHELL: &str = "ssh_shell_windows_powershell";
-const SSH_SHELL_ADVICE: &str = "Its SSH shell is Windows PowerShell, which can outlive SSH sessions: set OpenSSH's DefaultShell to PowerShell 7 or remove it (docs/remote-setup.md).";
+const SSH_SHELL_ADVICE: &str = "SSH starts Windows PowerShell here, which can outlive sessions: set OpenSSH's DefaultShell to pwsh or remove it.";
 
 /// Notes this computer's SSH shell in readiness: Windows PowerShell is a problem of its own, noted
 /// after whether sign-ins can start was decided, so it never stops them.
@@ -567,13 +572,13 @@ pub fn note_ssh_shell(shell: Option<&str>, problems: &mut Vec<&'static str>, nex
 /// (Win32-OpenSSH's `set_defaultshell`): the raw DefaultShell value under HKLM\SOFTWARE\OpenSSH in
 /// the 64-bit view, cmd when it is missing or empty. Only its kind is told (`shell_kind`), never
 /// the path: it can name a user, and any administrator there can write it. None without an OpenSSH
-/// server, or when it cannot be read.
+/// server, or when it cannot be read. It may touch the file system: keep it off async threads.
 pub fn ssh_shell() -> Option<&'static str> {
     #[cfg(windows)]
     {
         registry::hklm_string(r"SYSTEM\CurrentControlSet\Services\sshd", "ImagePath").ok().flatten()?;
         let value = registry::hklm_string(r"SOFTWARE\OpenSSH", "DefaultShell").ok()?;
-        Some(shell_kind(value.as_deref(), |path| std::fs::symlink_metadata(path).is_ok()))
+        Some(shell_kind(value.as_deref(), is_file_there))
     }
     #[cfg(not(windows))]
     {
@@ -581,23 +586,33 @@ pub fn ssh_shell() -> Option<&'static str> {
     }
 }
 
-/// What DefaultShell's value names: missing or empty is cmd; an absolute path to nothing starts no
-/// shell at all (`missing`); otherwise the program's file name tells pwsh, windows_powershell, cmd
-/// or other. `exists` sees a Store app's alias as there.
+/// What DefaultShell's value names, as sshd starts it: missing or empty is cmd. sshd quotes the
+/// value itself and starts it as a path, never from PATH, so a quoted, relative or `%VAR%` value,
+/// or a path to no file, starts nothing at all (`missing`); a path without an extension starts its
+/// `.exe`. Otherwise the program's file name tells pwsh, windows_powershell, cmd or other.
+/// `exists` says whether a file (not a folder) is there; it sees a Store app's alias as one.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn shell_kind(value: Option<&str>, exists: impl Fn(&str) -> bool) -> &'static str {
     let Some(value) = value.filter(|v| !v.is_empty()) else { return "cmd" };
     let bytes = value.as_bytes();
     let absolute = (bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/')) || value.starts_with(r"\\");
-    if absolute && !exists(value) {
+    let name = value.rsplit(['\\', '/']).next().unwrap_or(value).trim_end().to_ascii_lowercase();
+    let bare = !name.contains('.');
+    if !absolute || value.contains('"') || !(exists(value) || (bare && exists(&format!("{value}.exe")))) {
         return "missing";
     }
-    let name = value.rsplit(['\\', '/']).next().unwrap_or(value).trim_matches(|c: char| c == '"' || c.is_whitespace()).to_ascii_lowercase();
     match name.strip_suffix(".exe").unwrap_or(&name) {
         "pwsh" => "pwsh",
         "powershell" => "windows_powershell",
         "cmd" => "cmd",
         _ => "other",
     }
+}
+
+/// Whether a file (not a folder) is at `path`, without following it: a Store app's alias counts.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_file_there(path: &str) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| !m.is_dir())
 }
 
 #[cfg(windows)]
@@ -616,7 +631,8 @@ mod registry {
                 std::ptr::null_mut(), data.as_mut_ptr().cast(), &mut size)
         };
         match status {
-            ERROR_SUCCESS => Ok(Some(String::from_utf16_lossy(&data[..(size as usize / 2).min(data.len())]).trim_end_matches('\0').to_string())),
+            // Read as sshd reads it, a C string: up to the first NUL.
+            ERROR_SUCCESS => Ok(Some(String::from_utf16_lossy(&data[..(size as usize / 2).min(data.len())]).split('\0').next().unwrap_or_default().to_string())),
             ERROR_FILE_NOT_FOUND => Ok(None),
             error => Err(error),
         }
@@ -1427,19 +1443,35 @@ mod tests {
         let there = |_: &str| true;
         assert_eq!(shell_kind(None, there), "cmd", "OpenSSH's own default");
         assert_eq!(shell_kind(Some(""), there), "cmd");
-        for pwsh in [r"C:\Program Files\PowerShell\7\pwsh.exe", "C:/Program Files/PowerShell/7/pwsh.exe", r"C:\Users\synthetic\AppData\Local\Microsoft\WindowsApps\pwsh.exe", "pwsh"] {
-            assert_eq!(shell_kind(Some(pwsh), there), "pwsh", "{pwsh}");
+        for pwsh in [r"C:\Program Files\PowerShell\7\pwsh.exe", "C:/Program Files/PowerShell/7/pwsh.exe", r"C:\Users\synthetic\AppData\Local\Microsoft\WindowsApps\pwsh.exe", r"C:\Program Files\PowerShell\7\pwsh.exe  "] {
+            assert_eq!(shell_kind(Some(pwsh), there), "pwsh", "{pwsh:?}");
         }
         assert_eq!(shell_kind(Some(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\PowerShell.EXE"), there), "windows_powershell");
         assert_eq!(shell_kind(Some(r"C:\Windows\System32\cmd.exe"), there), "cmd");
         for other in [r"C:\Program Files\Git\bin\bash.exe", r"C:\tools\pwsh.cmd"] {
             assert_eq!(shell_kind(Some(other), there), "other", "{other}");
         }
-        // An absolute path to nothing: sshd then starts no shell at all.
-        for gone in [r"C:\Program Files\PowerShell\7\pwsh.exe", r"\\server\share\pwsh.exe"] {
+        // A path without an extension starts its .exe, as CreateProcess does.
+        let only_exe = |p: &str| p.ends_with(".exe");
+        assert_eq!(shell_kind(Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell"), only_exe), "windows_powershell");
+        // sshd starts nothing for a path to no file (or a folder), a quoted value, a relative name
+        // (it never searches PATH) or an unexpanded %VAR%.
+        for gone in [r"C:\Program Files\PowerShell\7\pwsh.exe", r"\\server\share\pwsh.exe", r"C:\Program Files\PowerShell\7"] {
             assert_eq!(shell_kind(Some(gone), |_| false), "missing", "{gone}");
         }
-        assert_eq!(shell_kind(Some("pwsh.exe"), |_| false), "pwsh", "a bare name is looked up, not checked");
+        for gone in [r#""C:\Program Files\PowerShell\7\pwsh.exe""#, "pwsh.exe", "pwsh", r"%ProgramFiles%\PowerShell\7\pwsh.exe"] {
+            assert_eq!(shell_kind(Some(gone), there), "missing", "{gone}");
+        }
+    }
+
+    #[test]
+    fn only_a_file_counts_as_a_shell_that_is_there() {
+        let dir = crate::test_support::TempDir::new();
+        let file = dir.0.join("shell.exe");
+        std::fs::write(&file, b"synthetic").unwrap();
+        assert!(is_file_there(file.to_str().unwrap()));
+        assert!(!is_file_there(dir.0.to_str().unwrap()), "a folder starts nothing");
+        assert!(!is_file_there(dir.0.join("none.exe").to_str().unwrap()));
     }
 
     #[test]
@@ -1459,10 +1491,13 @@ mod tests {
             assert_eq!(p.last(), Some(&SSH_SHELL_WINDOWS_POWERSHELL), "noted last");
             assert_eq!(p[..p.len() - 1], problems[..], "after what decides sign-ins");
             assert!(n.starts_with(&next) && n.ends_with(SSH_SHELL_ADVICE), "{n}");
-            // With the asking side's note as well, the advice still fits the door's text cap.
-            let both = format!("{n} {NO_PWSH_ADVICE}");
-            assert!(both.chars().count() <= crate::mcp::MAX_TEXT, "{} characters", both.chars().count());
         }
+        // The longest next the app gives (the rclone advice, for the longest remote name sharing
+        // takes) with both notes still fits the door's text cap, so neither advice is cut.
+        let name = "r".repeat(64);
+        assert!(crate::rclone::valid_remote(&name) && !crate::rclone::valid_remote(&"r".repeat(65)));
+        let longest = format!("{} {SSH_SHELL_ADVICE} {NO_PWSH_ADVICE}", rclone_missing_next(&name));
+        assert!(longest.chars().count() <= crate::mcp::MAX_TEXT, "{} characters", longest.chars().count());
     }
 
     #[test]
@@ -1481,11 +1516,24 @@ mod tests {
         assert!(!build.is_empty() && build.chars().all(|c| c.is_ascii_digit()), "{build:?}");
         assert_eq!(registry::hklm_string(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "SyntheticMissingValue").unwrap(), None);
         assert_eq!(registry::hklm_string(r"SOFTWARE\SyntheticMissingKey", "DefaultShell").unwrap(), None);
+        // REG_EXPAND_SZ (as sshd's own ImagePath is) reads raw, %VAR% and all, as sshd reads its shell.
+        let event_log = registry::hklm_string(r"SYSTEM\CurrentControlSet\Services\EventLog", "ImagePath").unwrap().unwrap();
+        assert!(event_log.contains('%') && !event_log.contains('\0'), "{event_log:?}");
+    }
+
+    #[test]
+    fn the_apps_readiness_notes_the_ssh_shell_off_its_async_threads() {
+        let app = include_str!("app.rs").replace("\r\n", "\n");
+        let readiness = &app[app.find("async fn readiness(app: &AppHandle)").unwrap()..];
+        let readiness = &readiness[..readiness.find("\n}\n").unwrap()];
+        for wired in ["spawn_blocking(pairing::ssh_shell)", "pairing::note_ssh_shell(ssh_shell, &mut problems, &mut next)", "\"ssh_shell\": ssh_shell", "pairing::rclone_missing_next(&name)"] {
+            assert!(readiness.contains(wired), "{wired}");
+        }
     }
 
     #[test]
     fn readiness_over_ssh_says_which_powershell_ran_it() {
-        let readiness = json!({ "ok": { "ready_for_sign_in": true, "problems": [], "next": "Ready: someone can complete sign-ins at this computer's screen." } });
+        let readiness = json!({ "ok": { "ready_for_sign_in": true, "problems": ["roster_off"], "next": "Ready: someone can complete sign-ins at this computer's screen." } });
         let printed_readiness = format!("{STARTED}\r\n{}\r\n", ascii_json(&readiness));
         // pwsh ran it: said so, nothing else changes.
         let there = scripted(vec![printed(&printed_readiness)]);
@@ -1497,7 +1545,7 @@ mod tests {
         let there = scripted(vec![printed(""), printed(&printed_readiness)]);
         let out = remote_readiness(&there, "box", &json!({ "wait_seconds": 30 })).unwrap();
         assert_eq!(out["ssh_powershell"], "windows_powershell");
-        assert_eq!(out["problems"], json!([NO_PWSH_OVER_SSH]));
+        assert_eq!(out["problems"], json!(["roster_off", NO_PWSH_OVER_SSH]), "noted last");
         assert_eq!(out["ready_for_sign_in"], true);
         let next = out["next"].as_str().unwrap();
         assert!(next.starts_with("Ready:") && next.ends_with(NO_PWSH_ADVICE), "{next}");
