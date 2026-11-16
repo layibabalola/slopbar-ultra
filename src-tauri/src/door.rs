@@ -403,7 +403,7 @@ mod imp {
     pub(super) const MAX_CONNECTIONS: usize = 16;
     /// Reading the request and writing the reply. The operation itself is not bounded here: a
     /// connection waits for it until its client gives up, and it carries on after (see `answer`).
-    const IO_TIMEOUT: Duration = Duration::from_secs(5);
+    pub(super) const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const RETRY: Duration = if cfg!(test) { Duration::from_secs(1) } else { Duration::from_secs(15) };
 
     /// What the door needs to know about a process's token.
@@ -866,25 +866,41 @@ mod tests {
         }
     }
 
+    /// Every slot, and the instance waiting for the next client, taken by clients that never send
+    /// anything: the door lets each go once its time to send a request is up (`imp::IO_TIMEOUT`),
+    /// so another client is answered, within two of those limits, long before it gives up. That
+    /// client waits as long as a starved run takes: with the I/O limit gone nobody would answer it,
+    /// and the test fails at its own limit instead.
     #[tokio::test]
     async fn silent_clients_time_out_without_blocking_others() {
-        let name = test_pipe();
-        let (_dir, file) = export_file();
-        fake_app(&name, file);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        // Every slot plus the waiting instance taken by clients that never send anything.
-        let n = name.clone();
-        let idle = tokio::task::spawn_blocking(move || (0..17).map(|_| loop {
-            match std::fs::OpenOptions::new().read(true).write(true).open(&n) {
-                Ok(pipe) => break pipe,
-                Err(_) => std::thread::sleep(Duration::from_millis(20)),
-            }
-        }).collect::<Vec<_>>()).await.unwrap();
-        let started = std::time::Instant::now();
-        let reply = blocking_call(&name, Request::GetUsage).await.unwrap();
-        assert!(reply.result.is_some());
-        assert!(started.elapsed() < Duration::from_secs(20), "idle clients are dropped after the I/O timeout");
-        drop(idle);
+        // First the limit itself: idle clients go after it, long before a client gives up, and a
+        // client that does send has time to.
+        assert!(imp::IO_TIMEOUT * 2 < CLIENT_TIMEOUT, "idle clients are let go after the I/O limit, long before a client gives up");
+        assert!(imp::IO_TIMEOUT >= Duration::from_secs(1), "a client that connects has time to send its request");
+        within_test_limit(async {
+            let over = Over::new();
+            let name = test_pipe();
+            let (_dir, file) = export_file();
+            fake_app(&name, file);
+            ask_patiently(&over, &name, Request::GetAppInfo).await.unwrap();
+            let n = name.clone();
+            let idle = tokio::task::spawn_blocking(move || {
+                let deadline = std::time::Instant::now() + PATIENT;
+                (0..imp::MAX_CONNECTIONS + 1).map(|_| loop {
+                    match std::fs::OpenOptions::new().read(true).write(true).open(&n) {
+                        Ok(pipe) => break pipe,
+                        Err(e) => {
+                            assert!(std::time::Instant::now() < deadline, "an idle client could not connect: {e}");
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    }
+                }).collect::<Vec<_>>()
+            }).await.unwrap();
+            let reply = ask_patiently(&over, &name, Request::GetUsage).await.unwrap();
+            assert_eq!(reply.result.map(|r| r["op"].clone()), Some("get_usage".into()), "{:?}", reply.error);
+            drop(idle);
+        })
+        .await
     }
 
     #[tokio::test]
@@ -912,11 +928,9 @@ mod tests {
     /// How long a test waits for what should happen at once (an answer, a door listening). The wait
     /// ends as soon as it happens, so only a starved run waits at all, and none this long.
     const PATIENT: Duration = Duration::from_secs(5 * 60);
-    /// What the tests stall on ends by itself after this. A limit in the code ends a wait far
-    /// sooner, however starved the run (tokio fires timers in deadline order); with the limit gone,
-    /// the wait ends here and the test fails, rather than hanging.
-    const SELF_ENDING: Duration = Duration::from_secs(60);
-    /// The limits the tests give the code: far inside SELF_ENDING.
+    /// The limits the tests give the code: what they stall on (a lock held, an operation stuck)
+    /// lasts until the test is over, so nothing bounds how long a starved run takes; with a limit
+    /// in the code gone, nothing answers, and the test fails at TEST_LIMIT rather than hanging.
     const SHORT: Duration = Duration::from_millis(100);
     /// A last backstop for each test.
     const TEST_LIMIT: Duration = Duration::from_secs(5 * 60);
@@ -990,22 +1004,10 @@ mod tests {
         }));
     }
 
-    /// Takes `lock` now and keeps it until SELF_ENDING, as an update's handover that never returns
-    /// keeps the refresh lock. Returns a flag set once it lets go.
-    fn hold_for_good(lock: &Arc<tokio::sync::Mutex<()>>) -> Arc<AtomicBool> {
-        let held = lock.clone().try_lock_owned().expect("a free lock");
-        let let_go = Arc::new(AtomicBool::new(false));
-        let flag = let_go.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(SELF_ENDING).await;
-            drop(held);
-            flag.store(true, SeqCst);
-        });
-        let_go
-    }
-
     /// Every slot taken by a request whose operation is stuck (a refresh on a folder that never
-    /// answers, say): each connection goes once its client has given up, so get_app_info answers.
+    /// answers, say; here, until the test is over): each connection goes once its client has given
+    /// up, so get_app_info answers. With that gone nothing would, and the test fails at its own
+    /// limit; nothing here bounds how long a starved run takes.
     #[tokio::test]
     async fn a_request_still_running_when_its_client_gives_up_frees_its_slot() {
         within_test_limit(async {
@@ -1017,7 +1019,7 @@ mod tests {
                 let (s, e) = (s.clone(), e.clone());
                 async move {
                     s.fetch_add(1, SeqCst);
-                    tokio::time::sleep(SELF_ENDING).await;
+                    std::future::pending::<()>().await;
                     e.store(true, SeqCst);
                     Ok(serde_json::json!({ "accounts": [] }))
                 }
@@ -1026,30 +1028,32 @@ mod tests {
             let stuck: Vec<_> = (0..imp::MAX_CONNECTIONS).map(|_| ask_patiently(&over, &name, Request::Refresh)).collect();
             eventually("every slot holds a stuck operation", || started.load(SeqCst) >= imp::MAX_CONNECTIONS).await;
             let info = ask_patiently(&over, &name, Request::GetAppInfo).await.unwrap();
-            assert!(!ended.load(SeqCst), "get_app_info was answered only once a stuck operation ended and gave its slot up");
             assert_eq!(info.result.unwrap()["op"], "get_app_info");
             for reply in stuck {
                 assert_eq!(reply.await.unwrap().error.as_deref(), Some("timeout"), "its client hears it is still running");
             }
+            assert!(!ended.load(SeqCst), "while every stuck operation still runs");
         })
         .await
     }
 
-    /// The refresh lock held for good (an update's handover that never returns) and more refreshes
-    /// asked for than the door has slots: each answers, saying it gave up, and get_app_info,
-    /// install_update, restart_app and quit_app answer while the lock is still held. The door's own
-    /// limit is out of reach here: the refreshes' limit alone keeps the slots free.
+    /// The refresh lock held for good (an update's handover that never returns: here, until the
+    /// test is over) and more refreshes asked for than the door has slots: each answers, saying it
+    /// gave up, and get_app_info, install_update, restart_app and quit_app answer while the lock is
+    /// still held. The door's own limit is past the test's, so the refreshes' limit alone keeps the
+    /// slots free: with it gone nothing would answer, and the test fails at its own limit. Nothing
+    /// here bounds how long a starved run takes.
     #[tokio::test]
     async fn refreshes_waiting_on_a_lock_held_for_good_answer_and_the_door_keeps_answering() {
         within_test_limit(async {
             let over = Over::new();
             let name = test_pipe();
             let lock = Arc::new(tokio::sync::Mutex::new(()));
-            let let_go = hold_for_good(&lock);
+            let held = lock.clone().try_lock_owned().expect("a free lock");
             let started = Arc::new(AtomicUsize::new(0));
             let (l, s) = (lock.clone(), started.clone());
             // The door's refresh as the app answers it (`app::door_reply`, `app::refresh_within`).
-            fake_app_within(&name, PATIENT, move || {
+            fake_app_within(&name, TEST_LIMIT * 2, move || {
                 let (l, s) = (l.clone(), s.clone());
                 async move {
                     s.fetch_add(1, SeqCst);
@@ -1065,12 +1069,13 @@ mod tests {
                 let reply = ask_patiently(&over, &name, request).await.unwrap();
                 assert_eq!(reply.result.map(|r| r["op"].clone()), Some(op));
             }
-            assert!(!let_go.load(SeqCst), "the door answered only once the lock was let go");
             for reply in refreshes {
                 let result = reply.await.unwrap().result.expect("each refresh answers");
                 assert_eq!(result[refresh_wait::WAITING], refresh_wait::WAITING_NOTE, "and says it gave up: {result}");
                 assert!(result.get("fresh").is_none(), "{result}");
             }
+            assert!(lock.try_lock().is_err(), "all of it while the lock was held");
+            drop(held);
         })
         .await
     }
@@ -1121,10 +1126,15 @@ mod tests {
     /// never less, which would answer "timeout" to a client still waiting for the answer.
     #[test]
     fn the_door_the_app_opens_waits_as_long_as_its_client() {
-        let source = include_str!("door.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap();
-        assert!(production.contains("serve_within(name, CLIENT_TIMEOUT, handle).await"), "serve passes the client's own limit");
-        assert_eq!(production.matches("serve_within(").count(), 1, "the app's door is opened that way only");
+        use crate::source_guard::{args, calls, find, function, tokens, update};
+        const TEST: &str = "door::tests::the_door_the_app_opens_waits_as_long_as_its_client (src-tauri/src/door.rs)";
+        let door = tokens(include_str!("door.rs"));
+        let production = &door[..find(&door, "#[cfg(test)]").expect("door.rs has tests")];
+        let opened = calls(production, "serve_within", TEST);
+        assert_eq!(opened.len(), 1, "the app's door is opened that way only. {}", update(TEST));
+        assert_eq!(args(opened[0]), ["name", "CLIENT_TIMEOUT", "handle"], "serve passes the client's own limit. {}", update(TEST));
+        let serve = function(production, "door.rs", "pub async fn serve<", TEST);
+        assert!(serve.ends_with(&tokens("{ serve_within(name, CLIENT_TIMEOUT, handle).await }")), "and waits for it. {}\n{serve}", update(TEST));
     }
 
     /// An operation that panics leaves its client a closed pipe, as it always has: never an answer
