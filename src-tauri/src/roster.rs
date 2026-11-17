@@ -314,9 +314,13 @@ pub struct Seen {
     /// Whether the last write of this machine's roster worked, and when one last did.
     pub wrote: Option<bool>,
     pub written_at: Option<DateTime<Utc>>,
+    /// Why the last write failed, when the network's proxy stopped it (`proxy::refusal_code`).
+    pub write_error: Option<&'static str>,
     /// Whether the last read worked, and when it was.
     pub read: Option<bool>,
     pub read_at: Option<DateTime<Utc>>,
+    /// Why the last read failed, when the network's proxy stopped it.
+    pub read_error: Option<&'static str>,
     /// This machine's roster as read back from the sharing location: how many accounts it names.
     pub own_accounts: Option<usize>,
     /// Newest first.
@@ -325,6 +329,16 @@ pub struct Seen {
     pub unreadable: usize,
     /// Rosters from a newer SlopBar.
     pub unsupported: usize,
+}
+
+impl Seen {
+    /// No sync could run (no sharing location, rclone or passphrase here, no machine identity, or
+    /// sharing moved meanwhile): the last write's and read's proxy reasons no longer say why, so
+    /// they go. The rest stays as it was.
+    pub fn unsynced(&mut self) {
+        self.write_error = None;
+        self.read_error = None;
+    }
 }
 
 /// Kept between refreshes: derived keys, and what was written last.
@@ -397,8 +411,10 @@ impl Syncer {
             if self.seal.is_none() {
                 self.seal = SealKey::new(passphrase).ok();
             }
-            let ok = self.seal.as_ref().and_then(|key| seal(&mine, key).ok()).is_some_and(|bytes| store.put(&name, &bytes).is_ok());
+            let put = self.seal.as_ref().and_then(|key| seal(&mine, key).ok()).map(|bytes| store.put(&name, &bytes));
+            let ok = matches!(put, Some(Ok(())));
             self.seen.wrote = Some(ok);
+            self.seen.write_error = put.and_then(Result::err).as_ref().and_then(crate::proxy::refusal_code);
             if ok {
                 self.written = Some((mine.accounts.clone(), now));
                 self.written_run = mine.run.clone();
@@ -437,9 +453,14 @@ impl Syncer {
     fn read_all(&mut self, store: &dyn RosterStore, passphrase: &Passphrase, own_id: &str, own_name: &str, now: DateTime<Utc>) -> Option<Run> {
         self.seen.read_at = Some(now);
         match store.list() {
-            Err(_) => { self.seen.read = Some(false); None }
+            Err(e) => {
+                self.seen.read = Some(false);
+                self.seen.read_error = crate::proxy::refusal_code(&e);
+                None
+            }
             Ok(files) => {
                 self.seen.read = Some(true);
+                self.seen.read_error = None;
                 self.read(files, passphrase, own_id, own_name, now)
             }
         }

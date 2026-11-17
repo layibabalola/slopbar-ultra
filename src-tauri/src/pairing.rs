@@ -485,9 +485,12 @@ fn redact(value: Value, secret: &str) -> Value {
 /// get_roster's result without the email list: machines, counts and what is waiting.
 fn roster_summary(roster: &Value) -> Value {
     let pick = |k: &str| roster.get(k).cloned().unwrap_or(Value::Null);
+    // The network's proxy's code, when it stopped the write or read: only a code SlopBar knows,
+    // never other text another computer sends.
+    let code = |k: &str| roster.get(k).and_then(Value::as_str).filter(|c| crate::net::PROXY_CODES.contains(c)).map_or(Value::Null, Value::from);
     json!({
         "enabled": pick("enabled"), "location": pick("location"), "passphrase_saved": pick("passphrase_saved"),
-        "wrote": pick("wrote"), "read": pick("read"), "own_accounts": pick("own_accounts"),
+        "wrote": pick("wrote"), "write_error": code("write_error"), "read": pick("read"), "read_error": code("read_error"), "own_accounts": pick("own_accounts"),
         "machines": pick("machines"), "unreadable": pick("unreadable"),
         "waiting": roster.get("waiting").and_then(Value::as_array).map_or(0, Vec::len),
     })
@@ -1344,6 +1347,15 @@ mod tests {
             assert_eq!(result["target"]["from"], "DESK-1");
             assert!(matches!(source.seen.borrow().last(), Some(Request::SyncRoster)), "the source reads the target's roster at once");
         }
+    }
+
+    #[test]
+    fn a_roster_summary_passes_on_only_a_proxy_code_it_knows() {
+        let summary = roster_summary(&json!({ "wrote": false, "write_error": "proxy_script", "read": false,
+            "read_error": "anything else another computer says", "waiting": [{}, {}] }));
+        assert_eq!((&summary["wrote"], &summary["write_error"]), (&json!(false), &json!("proxy_script")));
+        assert_eq!((&summary["read"], &summary["read_error"]), (&json!(false), &Value::Null));
+        assert_eq!(summary["waiting"], 2);
     }
 
     #[test]

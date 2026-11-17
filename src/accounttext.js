@@ -2,7 +2,7 @@
 // the plan's renewal, verdict and advice (from get_subscriptions), and the flyout's full tooltip,
 // which carries everything the full card shows for an account in the one-line layout.
 import { t, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows,
-  placesText, overlapText, seatsText, errorText, creditsText, groupResets, resetText } from "./i18n.js";
+  placesText, overlapText, seatsText, accountErrorText, creditsText, groupResets, resetText } from "./i18n.js";
 import { sparklineText } from "./sparkline.js";
 
 export const money = (v) => (v == null ? "" : `$${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`);
@@ -90,10 +90,9 @@ export function accountTipLines(a, { sub = null, trail = null, creditAdvice = ""
     trail?.length ? sparklineText(trail) : "",
   ]);
 
-  const problem = a.error || a.monitor_error;
   groups.push([
     a.fetched_at ? t("lastObserved", { t: ago(a.fetched_at, now) }) + (a.stale ? ` · ${t("lastReading")}` : "") : "",
-    problem ? errorText(provider, problem) : "",
+    accountErrorText(provider, a),
     t(a.monitor_connected ? "tipMonitorOn" : "tipMonitorOff"),
   ]);
 

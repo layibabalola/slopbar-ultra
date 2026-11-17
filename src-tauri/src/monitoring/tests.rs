@@ -56,6 +56,12 @@ fn login() -> Slot {
     slot("account:org", "monitor-access-1", "monitor-refresh-1", 0)
 }
 
+#[test]
+fn health_names_the_site_sign_ins_are_renewed_at() {
+    assert!(CLAUDE_TOKEN_URL.starts_with(&format!("https://{}/", token_host(Provider::Claude))));
+    assert!(CODEX_TOKEN_URL.starts_with(&format!("https://{}/", token_host(Provider::Codex))));
+}
+
 #[tokio::test]
 async fn diagnostic_refresh_trace_is_secret_free_and_recording_failure_cannot_break_renewal() {
     let dir = TempDir::new();
@@ -221,6 +227,8 @@ async fn rate_limit_and_network_failure_back_off_then_recover() {
     for (failure, delay, code) in [
         (Failure::RateLimited(900), 900, "rate_limited"),
         (Failure::Transient, 300, "monitor_network"),
+        // The network's proxy: the same wait as any connection failure, with its own reason.
+        (Failure::Proxy("proxy_script"), 300, "proxy_script"),
     ] {
         let dir = TempDir::new();
         let monitor = Monitor::new(dir.0.clone());
@@ -659,6 +667,7 @@ fn hinted_login() -> Slot {
 async fn hint_failures_keep_valid_access_and_backoff_but_never_return_rejected_or_expired_access() {
     for (failure, delay, code) in [
         (Failure::Transient, 300, "monitor_network"),
+        (Failure::Proxy("proxy_unsupported"), 300, "proxy_unsupported"),
         (Failure::RateLimited(900), 900, "rate_limited"),
         (Failure::Ambiguous, 300, "monitor_network"),
     ] {
@@ -1146,6 +1155,93 @@ mod http {
         let events: Vec<_> = data["events"].as_array().unwrap().iter().filter(|r| r["event"]["type"] == "http").collect();
         assert_eq!(events.len(), 3); assert_eq!(events[0]["event"]["status"], 503);
         assert_eq!(events[1]["event"]["status"], 200); assert_eq!(events[2]["event"]["network"], "timeout");
+    }
+    /// The token request through routes that refuse it: nothing leaves this computer, the failure
+    /// is the proxy's with its code (never an uncertain send), and the monitor waits as after any
+    /// connection failure, saying why meanwhile.
+    #[tokio::test]
+    async fn a_refresh_the_networks_proxy_stops_says_why_and_waits_as_any_connection_failure() {
+        use crate::proxy::Refusal;
+        struct Counted<'a>(Local<'a>, std::sync::atomic::AtomicUsize);
+        impl Refresh for Counted<'_> {
+            async fn refresh(&self, session: &Session) -> Result<Reply, Failure> {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.0.refresh(session).await
+            }
+        }
+        // Not on this computer, so it is routed; a refusal stops it before any name lookup.
+        let url = "https://token.example.test/token";
+        for (refusal, env, code) in [
+            (Some(Refusal::Script), &[][..], "proxy_script"),
+            (Some(Refusal::Unsupported), &[][..], "proxy_unsupported"),
+            (None, &[("HTTPS_PROXY", "socks5://socks.example.test:1080")][..], "proxy_environment"),
+        ] {
+            let client = crate::net::with_router(crate::net::builder().no_proxy(), crate::test_support::router(refusal, env))
+                .timeout(Duration::from_secs(30)).build().unwrap();
+            assert_eq!(Api(&client, None).refresh_at(&session(Provider::Claude), url, "test-client").await.err(), Some(Failure::Proxy(code)), "{code}");
+            let dir = TempDir::new();
+            let monitor = Monitor::new(dir.0.clone());
+            monitor.connect(&cli(), &login(), &[]).await.unwrap();
+            let transport = Counted(Local(&client, url), Default::default());
+            let calls = || transport.1.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(monitor.token_with(&cli(), &transport, None, now()).await, Err(code.into()));
+            assert_eq!(monitor.token_with(&cli(), &transport, None, now() + chrono::Duration::seconds(299)).await, Err(code.into()), "the reason stays while it waits");
+            assert_eq!(calls(), 1, "as long as after any connection failure");
+            assert_eq!(monitor.token_with(&cli(), &transport, None, now() + chrono::Duration::seconds(300)).await, Err(code.into()));
+            assert_eq!(calls(), 2);
+            // Its refresh token was never sent, so nothing is uncertain.
+            let saved: Session = serde_json::from_slice(&private_store::load_secret(&monitor.path(&cli())).unwrap()).unwrap();
+            assert_eq!((saved.uncertain_attempts, saved.reconnect, saved.refresh_token.as_str()), (0, false, "monitor-refresh-1"));
+        }
+    }
+    /// A proxy (on this computer, named by the environment) that answers the tunnel with `reply`
+    /// and hangs up, for every connection; its port.
+    fn tunnel_answering(reply: &'static str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut asked = vec![];
+                let mut buf = [0; 1024];
+                while !asked.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) { Ok(n) if n > 0 => asked.extend_from_slice(&buf[..n]), _ => break }
+                }
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        port
+    }
+
+    /// A proxy that wants a sign-in SlopBar cannot give, or refuses the tunnel: its code, retried as
+    /// a connection failure (the journal says transient); a proxy that is not there at all is a
+    /// plain connection failure, as before.
+    #[tokio::test]
+    async fn a_proxy_that_answers_the_tunnel_with_no_is_named() {
+        let url = "https://token.example.test/token";
+        let through = |port: u16| crate::net::with_router(crate::net::builder().no_proxy(),
+            crate::test_support::router(None, &[("HTTPS_PROXY", &format!("http://127.0.0.1:{port}"))])).timeout(Duration::from_secs(30)).build().unwrap();
+        for (reply, code) in [
+            ("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Negotiate\r\nContent-Length: 0\r\n\r\n", "proxy_auth"),
+            ("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n", "proxy_refused"),
+        ] {
+            let client = through(tunnel_answering(reply));
+            assert_eq!(Api(&client, None).refresh_at(&session(Provider::Codex), url, "test-client").await.err(), Some(Failure::Proxy(code)), "{reply}");
+            let dir = TempDir::new();
+            let recorder = std::sync::Arc::new(crate::diagnostics::Recorder::new(dir.0.join("journal")));
+            recorder.start();
+            let monitor = Monitor::new(dir.0.join("sessions")).with_diagnostics(recorder.clone());
+            monitor.connect(&cli(), &login(), &[]).await.unwrap();
+            assert_eq!(monitor.token_with(&cli(), &Local(&client, url), None, now()).await, Err(code.into()));
+            recorder.drain();
+            let report: Value = serde_json::from_slice(&recorder.report(&crate::model::Snapshot::default(), &crate::settings::Settings::default()).unwrap()).unwrap();
+            let outcomes: Vec<&str> = report["events"].as_array().unwrap().iter()
+                .filter(|r| r["event"]["type"] == "refresh").filter_map(|r| r["event"]["outcome"].as_str()).collect();
+            assert_eq!(outcomes, ["started", "transient"], "{code}");
+        }
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        assert_eq!(Api(&through(closed), None).refresh_at(&session(Provider::Codex), url, "test-client").await.err(), Some(Failure::Transient),
+            "no proxy listening: a connection failure, with no proxy's reason");
     }
     #[tokio::test]
     async fn real_hint_failures_allow_usage_without_repeating_refresh_during_backoff() {

@@ -1,4 +1,4 @@
-import { t, windowResetText, windowLabel, errorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, duration, resetText, groupResets, visibleResetWindows, placesText, compactPlaces, overlapText, seatsText } from "./i18n.js";
+import { t, windowResetText, windowLabel, errorText, accountErrorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, duration, resetText, groupResets, visibleResetWindows, placesText, compactPlaces, overlapText, seatsText } from "./i18n.js";
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { creditAdviceText } from "./alerts.js";
@@ -209,7 +209,7 @@ function renderDetails(snap) {
           ${seatsLine(a)}
           ${overlapLine(a)}
           <div class="acc-meta" title="${esc([meta, a.leased ? t("leasedHint") : "", a.used_outside ? t("usedOutsideHint") : ""].filter(Boolean).join("\n"))}">${esc(meta)}</div>
-          ${a.error || a.monitor_error ? `<div class="error">${esc(errorText(PROVIDER_NAME[provider], a.error ?? a.monitor_error))}</div>` : ""}
+          ${a.error || a.monitor_error ? `<div class="error">${esc(accountErrorText(PROVIDER_NAME[provider], a))}</div>` : ""}
           ${!a.monitor_connected || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account", "monitor_network", "monitor_uncertain"].includes(a.monitor_error ?? a.error)
             ? `<button class="monitor" data-provider="${provider}" data-id="${esc(a.id)}">${t(a.monitor_connected ? "monitorReconnect" : "monitorConnect")}</button>` : ""}
           ${a.monitor_connected ? `<button class="monitor" data-disconnect="true" data-provider="${provider}" data-id="${esc(a.id)}">${t("monitorDisconnect")}</button>` : ""}
@@ -231,7 +231,7 @@ function renderCompactList(snap) {
   patch($accounts, `<div class="compact-list" role="list" aria-label="${esc(t("title"))}">${list.map((a, i) => {
     const key = `${a.provider}:${a.id}`;
     const w = a.stale || a.error ? null : peak(a);
-    const problem = a.error || a.monitor_error ? errorText(PROVIDER_NAME[a.provider], a.error ?? a.monitor_error) : "";
+    const problem = accountErrorText(PROVIDER_NAME[a.provider], a);
     const used = w ? `${Math.round(w.used_percent)}%` : "—";
     const usedText = w ? `${windowLabel(w)}: ${used} ${t("used")}` : t("usageUnknown");
     const tip = accountTip(a, { sub: subs[key], trail: trails[key], creditAdvice: creditAdvice[key] });

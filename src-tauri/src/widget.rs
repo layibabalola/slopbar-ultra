@@ -255,7 +255,7 @@ pub fn account_detail(texts: &dyn Texts, a: &AccountUsage, now: chrono::DateTime
         if a.stale { line = format!("{line} · {}", texts.t("lastReading", &[])); }
         state.push(line);
     }
-    if let Some(code) = a.error.as_deref().or(a.monitor_error.as_deref()) { state.push(error_text(texts, provider, code)); }
+    if let Some(text) = account_error(texts, provider, a) { state.push(text); }
     state.push(texts.t(if a.monitor_connected { "tipMonitorOn" } else { "tipMonitorOff" }, &[]));
 
     let mut held = vec![];
@@ -273,6 +273,18 @@ pub fn account_detail(texts: &dyn Texts, a: &AccountUsage, now: chrono::DateTime
         .join("\n\n")
 }
 
+/// What an account's row says went wrong (`accountErrorText` in i18n.js): its usage's error, else
+/// its monitoring's. Usage was read when only monitoring failed, so the network's proxy stopping
+/// monitoring is said to be monitoring's.
+pub fn account_error(texts: &dyn Texts, provider: &str, a: &AccountUsage) -> Option<String> {
+    if let Some(code) = a.error.as_deref() {
+        return Some(error_text(texts, provider, code));
+    }
+    let code = a.monitor_error.as_deref()?;
+    let text = error_text(texts, provider, code);
+    Some(if crate::net::PROXY_CODES.contains(&code) { texts.t("monitorProxy", &[("reason", &text)]) } else { text })
+}
+
 /// An error code in words (`errorText` in i18n.js), for notices such as a failed monitoring
 /// sign-in.
 pub fn error_text(texts: &dyn Texts, provider: &str, code: &str) -> String {
@@ -285,7 +297,7 @@ pub fn error_text(texts: &dyn Texts, provider: &str, code: &str) -> String {
         c if c.starts_with("monitor_") => texts.t(c, &[]),
         "token_expired" | "token_invalid" | "bad_response" => texts.t(code, &vars),
         // The network's proxy stopped it, or SlopBar would not go around it.
-        "proxy_unsupported" | "proxy_script" | "proxy_auth" | "proxy_refused" => texts.t(code, &[]),
+        c if crate::net::PROXY_CODES.contains(&c) => texts.t(c, &[]),
         "idle" => texts.t("idle", &[]),
         "rate_limited" => texts.t("rateLimited", &[]),
         "active" => texts.t("activeCantRemove", &[]),
@@ -981,6 +993,23 @@ mod tests {
         assert_eq!(error_text(&En, "", "rate_limited"), en("rateLimited", &[]));
         assert_eq!(error_text(&En, "", "http_"), "http_");
         assert_eq!(error_text(&En, "", "connection reset"), "connection reset");
+    }
+
+    #[test]
+    fn a_monitoring_renewal_the_proxy_stopped_says_it_was_monitoring() {
+        let en = |k: &str, v: &[(&str, &str)]| crate::i18n::t("en", k, v);
+        let script = en("proxy_script", &[]);
+        let mut a = account(Provider::Claude, "a", true, &[40.0]);
+        assert_eq!(account_error(&En, "Claude", &a), None);
+        // Usage was read through the CLI's own sign-in; only monitoring's renewal was refused.
+        a.monitor_error = Some("proxy_script".into());
+        assert_eq!(account_error(&En, "Claude", &a), Some(en("monitorProxy", &[("reason", &script)])));
+        assert!(account_detail(&En, &a, chrono::Utc::now()).contains(&en("monitorProxy", &[("reason", &script)])));
+        // Other monitoring codes already say so; a usage error (read or renewal) is its own words.
+        a.monitor_error = Some("monitor_network".into());
+        assert_eq!(account_error(&En, "Claude", &a), Some(en("monitor_network", &[])));
+        a.error = Some("proxy_script".into());
+        assert_eq!(account_error(&En, "Claude", &a), Some(script));
     }
 
     /// No CLI found: the message names the CLI and the line that installs it, both when the
