@@ -1323,6 +1323,8 @@ fn the_wrappers_only_hand_this_machine_over() {
     let code = tokens(include_str!("../keep_running.rs"));
     let bodies = [
         ("fn check() -> i32 {", "fn check() -> i32 { check_with(&Windows, Markers::here().as_ref(), &ShellLauncher) }"),
+        ("fn launch(&self, exe: &Path, args: &[String], dir: &Path) -> Result<Launched, Refused> {",
+            "fn launch(&self, exe: &Path, args: &[String], dir: &Path) -> Result<Launched, Refused> { launch_with(|| sys::shell_execute(exe, &args.join(\" \"), dir), |flags| spawn(exe, args, dir, flags), sys::job_limits()) }"),
         ("fn running(&self) -> bool {", "fn running(&self) -> bool { crate::instance::held() }"),
         ("fn shutting_down(&self) -> bool {", "fn shutting_down(&self) -> bool { sys::shutting_down() }"),
         ("fn settings(&self) -> Settings {", "fn settings(&self) -> Settings { crate::settings::load() }"),
