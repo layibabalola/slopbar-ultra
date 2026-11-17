@@ -125,6 +125,12 @@ function Install-SlopBarUltra {
   # login counts as on only when Windows also has the startup entry, because the app ignores a
   # failure to write it.
   function Set-Defaults {
+    # The app writes its startup entry into this key but does not create the key, and some Windows
+    # images lack it. Create it only when it is missing: New-Item -Force would empty an existing key.
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    if (-not (Test-Path -Path $runKey)) {
+      try { New-Item -Path $runKey -ErrorAction Stop | Out-Null; Say 'This Windows had no per-user startup key; created it so SlopBar Ultra can start at login.' } catch { }
+    }
     $r = Invoke-Door @('--call-b64', $turnOn)
     $saved = if ($r) { $r.ok } else { $null }
     $updates = if ($saved -and $saved.auto_update -eq $true) { 'on' } else { 'not on (turn it on in Settings, Updates)' }

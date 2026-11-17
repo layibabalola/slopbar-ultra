@@ -35,6 +35,7 @@ jobs:
       - name: Install with the one-line bootstrap (Windows PowerShell 5.1)
         shell: powershell
         run: |
+          "image $env:ImageOS $env:ImageVersion; per-user startup key present before: $(Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run')"
           irm $env:BOOTSTRAP | iex
           $r = $global:SlopBarUltraInstall
           if (-not $r -or -not $r.ok -or $r.message -notmatch ' is installed and running') { throw "first run: $($r.step): $($r.message)" }
