@@ -71,9 +71,10 @@ pub struct ProxyRefused(pub Refusal);
 
 impl std::fmt::Display for ProxyRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Shown in the update check's failure, which names no app.
         f.write_str(match self.0 {
-            Refusal::Unsupported => "Windows is set to use a proxy SlopBar can't use",
-            Refusal::Script => "Windows' proxy script couldn't be fetched or run",
+            Refusal::Unsupported => "the proxy Windows is set to use can't be used here (a SOCKS proxy, say), and nothing connects around it",
+            Refusal::Script => "Windows' proxy setup script couldn't be fetched or run in time, and nothing connects around the proxy",
         })
     }
 }
