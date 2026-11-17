@@ -855,6 +855,17 @@ mod tests {
         assert_eq!(tool("read_vault", json!({}), None)["error"]["code"], -32602);
     }
 
+    /// Agents learn SlopBar Ultra's watchdog switch from update_settings' schema: keep_running, a
+    /// boolean, beside the other settings they may change.
+    #[test]
+    fn update_settings_offers_the_watchdog_switch() {
+        let tools = tools();
+        let update = tools.as_array().unwrap().iter().find(|t| t["name"] == "update_settings").expect("update_settings");
+        let patch = &update["inputSchema"]["properties"]["patch"]["properties"];
+        assert_eq!(patch["keep_running"]["type"], "boolean", "{patch}");
+        assert!(patch["keep_running"]["description"].as_str().is_some_and(|d| d.contains("watchdog")), "{patch}");
+    }
+
     #[test]
     fn every_listed_tool_maps_to_a_door_operation() {
         let listed = rpc(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).unwrap();
