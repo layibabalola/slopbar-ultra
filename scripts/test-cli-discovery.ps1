@@ -17,6 +17,10 @@
     S3 new PATH    A claude.cmd in a folder added to the user PATH in the registry after SlopBar
                    started, as an installer adds one: add_account runs it (no restart), and once that
                    sign-in is ended, so does SlopBar's logout of it.
+    S4 installer's folder
+                   Claude Code in %USERPROFILE%\.local\bin, which no PATH names (Anthropic's installer
+                   can leave it off): add_account starts `claude ... auth login` from there, ahead of
+                   the desktop app's copy.
   Each sign-in is ended unfinished (only what SlopBar started is stopped); nothing is signed in.
 
   SlopBar runs as the user would run it: when it is not running, it is started through Explorer
@@ -206,6 +210,24 @@ try {
   # Its first line is the sign-in; SlopBar's logout of the ended sign-in comes after it.
   $out = Wait-For { $all = & $lines; if ($all.Count -ge 2 -and $all[0] -match 'auth login' -and ($all | Select-Object -Skip 1) -match "$fake.*auth logout") { $all } } 40
   Check ($null -ne $out) "S3 new PATH: SlopBar's logout of the ended sign-in runs the same CLI: $((& $lines) -join ' | ')"
+
+  # S4 installer's folder: Anthropic's installer may leave %USERPROFILE%\.local\bin off PATH (it
+  # says so and stops there), as it did on a work laptop.
+  if ($null -ne $userPath) { $userKey.SetValue('Path', $userPath, $userKind) } else { $userKey.DeleteValue('Path', $false) }
+  Check ([bool](Wait-For { (Get-SignInFolders).Count -eq 0 } 60)) 'S3 new PATH: the ended sign-in is wound up'
+  $localBin = Join-Path $HOME '.local\bin'
+  $onPath = @($env:Path, [Environment]::GetEnvironmentVariable('Path', 'Machine'), [Environment]::GetEnvironmentVariable('Path', 'User')) -split ';' |
+    Where-Object { $_ -and [Environment]::ExpandEnvironmentVariables($_.Trim().Trim('"')).TrimEnd('\') -eq $localBin }
+  if ($onPath) { Stop-Run "$localBin is on PATH, so S4 would not show it is found off PATH" }
+  New-Item -ItemType Directory -Force $localBin | Out-Null
+  $installed = Join-Path $localBin 'claude.exe'
+  Copy-Item -LiteralPath $ClaudeExe $installed
+  $r = Add-Claude
+  Check ($null -ne $r.ok) "S4 installer's folder: add_account starts a sign-in: $($r | ConvertTo-Json -Compress)"
+  $signin = Wait-For { Get-Started $appId | Where-Object { $_.Name -eq 'claude.exe' -and $_.ExecutablePath -eq $installed -and $_.CommandLine -match 'auth\s+login' } | Select-Object -First 1 } 60
+  Check ($null -ne $signin) "S4 installer's folder: claude auth login runs from $installed, which no PATH names (before the desktop app's copy)"
+  Stop-Started $appId
+  Check ([bool](Wait-For { (Get-SignInFolders).Count -eq 0 } 60)) "S4 installer's folder: the ended sign-in is wound up"
 } finally {
   if ($null -ne $userPath) { $userKey.SetValue('Path', $userPath, $userKind) } else { $userKey.DeleteValue('Path', $false) }
   $userKey.Close()
