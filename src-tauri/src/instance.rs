@@ -453,6 +453,7 @@ mod tests {
     #[test]
     fn this_process_has_a_live_parent_and_is_listed() {
         assert!(parent_of(std::process::id()).is_some());
+        assert!(parent_name().is_some_and(|name| name.to_ascii_lowercase().ends_with(".exe")), "its parent is named");
         assert!(processes().is_some());
         assert!(imp::age(std::process::id()).is_some_and(|a| a < Duration::from_secs(3600)));
     }

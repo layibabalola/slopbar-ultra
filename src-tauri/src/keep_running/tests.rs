@@ -249,6 +249,10 @@ fn the_same_file_is_told_whatever_its_spelling() {
     assert!(same_file(&a, &PathBuf::from(a.to_string_lossy().to_uppercase())));
     assert!(same_file(&a, &dir.0.join(".").join("slopbar.exe")));
     assert!(!same_file(&a, &dir.0.join("other.exe")));
+    let elsewhere = dir.0.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("slopbar.exe"), "x").unwrap();
+    assert!(!same_file(&a, &elsewhere.join("slopbar.exe")), "another folder's slopbar.exe");
     assert!(!same_file(&a, &dir.0.join("missing.exe")));
 }
 
@@ -335,10 +339,16 @@ impl Machine for FakeMachine {
 struct FakeLauncher {
     refuse: Option<Refused>,
     launched: RefCell<Vec<(PathBuf, Vec<String>, PathBuf)>>,
+    /// The markers' folder: what it holds at the moment of the start.
+    markers: Option<PathBuf>,
 }
 
 impl Launcher for FakeLauncher {
     fn launch(&self, exe: &Path, args: &[String], dir: &Path) -> Result<Launched, Refused> {
+        if let (Some(folder), [flag, nonce]) = (&self.markers, args) {
+            assert_eq!(flag, STARTED_FLAG);
+            assert_eq!(Markers(folder.clone()).read(HANDSHAKE).as_deref(), Some(nonce.as_str()), "the nonce is written before the start");
+        }
         self.launched.borrow_mut().push((exe.to_path_buf(), args.to_vec(), dir.to_path_buf()));
         self.refuse.clone().map_or(Ok(Launched::Shell), Err)
     }
@@ -352,7 +362,7 @@ fn markers() -> (TempDir, Markers) {
 
 /// The check on `machine`, with these markers: its exit code, what it launched, and what it recorded.
 fn run_check(machine: &FakeMachine, markers: &Markers, refuse: Option<Refused>) -> (i32, Vec<(PathBuf, Vec<String>, PathBuf)>, Option<LastCheck>) {
-    let launcher = FakeLauncher { refuse, ..FakeLauncher::default() };
+    let launcher = FakeLauncher { refuse, markers: Some(markers.0.clone()), ..FakeLauncher::default() };
     let exit = check_with(machine, Some(markers), &launcher);
     (exit, launcher.launched.into_inner(), markers.last_check(SystemTime::now()))
 }
@@ -1359,6 +1369,8 @@ fn the_wrappers_only_hand_this_machine_over() {
         ("fn manages() -> bool {", "fn manages() -> bool { builds_task(cfg!(feature = \"ultra-updates\"), cfg!(debug_assertions), crate::settings::isolated()) }"),
         ("pub fn before_restart(exe: &Path) {", "pub fn before_restart(exe: &Path) { before_restart_with(exe, &|| remove_task(tasks(), task_name())); }"),
         ("pub fn from_args(args: &[OsString]) -> Option<i32> {", "pub fn from_args(args: &[OsString]) -> Option<i32> { std::hint::black_box(SENTINEL); (args.get(1)? == FLAG).then(check) }"),
+        ("pub fn start_kind(args: &[OsString]) -> Start {", "pub fn start_kind(args: &[OsString]) -> Start { start_kind_with(args, Markers::here().as_ref(), SystemTime::now(), || { sign_in_start(true, sys::started_from_shortcut(), crate::instance::parent_name().as_deref(), Windows.sign_in().map(|s| s.age)) }) }"),
+        ("fn here() -> Self {", "fn here() -> Self { let sid = sys::user_sid(); TaskEnv { name: sid.as_deref().map(task_name_for), sid, exe: Windows.app_exe(), uninstalling: Markers::here().is_some_and(|m| m.uninstalling(SystemTime::now())), } }"),
     ];
     for (signature, body) in bodies {
         assert_eq!(function(&code, "keep_running.rs", signature, WRAPPERS), tokens(body), "{}", update(WRAPPERS));
