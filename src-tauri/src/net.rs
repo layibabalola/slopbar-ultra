@@ -3,9 +3,10 @@
 //! Every client SlopBar makes starts from [`builder`]: it trusts what Windows trusts, through
 //! Windows' own certificate checks (rustls-platform-verifier, as the updater does), so a network
 //! that inspects HTTPS with a company certificate installed in Windows works, while a certificate
-//! Windows refuses is refused here too. It uses the proxy Windows is set to use (and the
-//! HTTPS_PROXY/NO_PROXY variables), as the updater does. Nothing here skips a check: a network that
-//! blocks a request still blocks it, and [`why`] says how.
+//! Windows refuses is refused here too. Each request goes through the proxy Windows would use for
+//! it (`proxy`: the HTTPS_PROXY/NO_PROXY variables first, then this user's proxy settings, proxy
+//! scripts and detection included). Nothing here skips a check or goes around a proxy: a network
+//! that blocks a request still blocks it, a proxy SlopBar cannot use stops it, and [`why`] says how.
 
 /// The cryptography every client uses: ring, which the updater installs the same way when it
 /// checks first. Clients cannot be built without it.
@@ -19,11 +20,26 @@ pub fn install_crypto() {
     });
 }
 
-/// A client builder that verifies certificates with Windows' own checks and uses the system's
-/// proxy. Callers add their own timeout and redirect policy.
+/// A client builder that verifies certificates with Windows' own checks and sends each request
+/// through the proxy Windows would use for it. Callers add their own timeout and redirect policy;
+/// `.no_proxy()` (only for servers on this computer or its local network) goes direct.
 pub fn builder() -> reqwest::ClientBuilder {
     install_crypto();
-    reqwest::Client::builder()
+    windows_proxy(reqwest::Client::builder())
+}
+
+/// `builder` routes each request where Windows would (`proxy::Router`), for a client built
+/// elsewhere too (the updater's). A route SlopBar cannot use fails the request with its reason
+/// (`Why::ProxyUnsupported`, `Why::ProxyScript`) before anything leaves this computer.
+pub fn windows_proxy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    with_router(builder, crate::proxy::system().clone())
+}
+
+/// `windows_proxy` with these routes.
+pub(crate) fn with_router(builder: reqwest::ClientBuilder, router: std::sync::Arc<crate::proxy::Router>) -> reqwest::ClientBuilder {
+    builder
+        .proxy(reqwest::Proxy::custom(move |url| router.proxy_for(url)))
+        .dns_resolver(crate::proxy::Resolver)
 }
 
 /// Why a request failed, in words a person can act on. Never carries a link, a header or a
@@ -51,6 +67,12 @@ pub enum Why {
     ProxyAuth,
     /// The network's proxy would not connect to the host.
     ProxyRefused,
+    /// Windows is set to use a proxy SlopBar cannot use (SOCKS, or a kind it does not know), so
+    /// SlopBar does not connect at all.
+    ProxyUnsupported,
+    /// Windows' proxy script (set, or found on the network) could not be fetched or run in time,
+    /// so SlopBar does not connect without it.
+    ProxyScript,
     /// The host's name could not be found.
     Dns,
     /// The host (or something in between) refused the connection.
@@ -136,6 +158,16 @@ pub fn why(error: &reqwest::Error) -> Why {
     }
 }
 
+/// What a usage request's failure shows: the code of a proxy SlopBar does not go around
+/// (`proxy_unsupported`, `proxy_script`: the flyout words them), else reqwest's own text, as before.
+pub fn failure_text(error: &reqwest::Error) -> String {
+    match why(error) {
+        Why::ProxyUnsupported => crate::proxy::Refusal::Unsupported.code().into(),
+        Why::ProxyScript => crate::proxy::Refusal::Script.code().into(),
+        _ => error.to_string(),
+    }
+}
+
 /// Whether `error` is an answer cut short: the other end closed before the whole body came.
 pub fn cut_short(error: &reqwest::Error) -> bool {
     fn eof(e: &(dyn std::error::Error + 'static)) -> bool {
@@ -158,6 +190,10 @@ pub fn cut_short(error: &reqwest::Error) -> bool {
 /// rustls's error sits two io::Errors down (hyper-rustls's, then tokio-rustls's). Notes in `found`
 /// the first connection failure an io::Error's kind names.
 fn inspect(error: &(dyn std::error::Error + 'static), found: &mut Option<Why>) -> Option<Why> {
+    // Refused before anything left this computer (`proxy::Resolver`): under a "dns error".
+    if let Some(refused) = error.downcast_ref::<crate::proxy::ProxyRefused>() {
+        return Some(refused.0.why());
+    }
     if let Some(tls) = error.downcast_ref::<rustls::Error>() {
         return Some(tls_why(tls));
     }
@@ -311,7 +347,8 @@ mod tests {
         ] {
             let port = plain(reply).await;
             let proxy = reqwest::Proxy::https(format!("http://127.0.0.1:{port}")).unwrap();
-            let client = builder().proxy(proxy).build().unwrap();
+            // This proxy alone, whatever this computer's own settings name.
+            let client = builder().no_proxy().proxy(proxy).build().unwrap();
             assert_eq!(failure(&client, "https://downloads.rclone.org/x").await, expected, "{reply}");
         }
     }
@@ -399,7 +436,7 @@ mod tests {
     }
 
     /// reqwest 0.13 panics building a client before any TLS cryptography is installed, so every
-    /// client is built from `builder`, which installs it: tests included.
+    /// client is built from `builder`, which installs it and Windows' proxy rules: tests included.
     #[test]
     fn every_client_is_built_here() {
         fn walk(dir: &std::path::Path, found: &mut Vec<String>) {
@@ -409,8 +446,11 @@ mod tests {
                     walk(&path, found);
                 } else if path.extension().is_some_and(|e| e == "rs") && path.file_name().is_some_and(|n| n != "net.rs") {
                     let code = crate::source_guard::tokens(&std::fs::read_to_string(&path).unwrap());
+                    // Nor may a client replace the proxy rules or the resolver that refuses a proxy
+                    // SlopBar cannot use (`windows_proxy`).
                     for needle in ["Client::new(", "Client::builder(", "ClientBuilder::new(", "Client::default(", "ClientBuilder::default(",
-                        "reqwest::get(", ".build().unwrap_or_default()", "reqwest::Client as", "ClientBuilder as", "Client as Default"] {
+                        "reqwest::get(", ".build().unwrap_or_default()", "reqwest::Client as", "ClientBuilder as", "Client as Default",
+                        ".dns_resolver(", "Proxy::custom(", "Proxy::all(", ".danger_accept_invalid"] {
                         if code.contains(needle) {
                             found.push(format!("{}: {needle}", path.display()));
                         }
@@ -421,6 +461,34 @@ mod tests {
         let mut found = Vec::new();
         walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut found);
         assert!(found.is_empty(), "build clients with net::builder(): {found:#?}");
+    }
+
+    /// Outside its tests, nothing sets a proxy of its own, looks names up its own way, or goes
+    /// direct: each would be a way around the proxy Windows names. The one exception is phone.rs,
+    /// which reaches a server on this computer or its local network directly, on purpose.
+    #[test]
+    fn nothing_goes_around_the_proxy() {
+        fn walk(dir: &std::path::Path, found: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap().map(Result::unwrap) {
+                let path = entry.path();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    walk(&path, found);
+                } else if name.ends_with(".rs") && !matches!(name.as_str(), "net.rs" | "tests.rs") {
+                    let code = crate::source_guard::tokens(&std::fs::read_to_string(&path).unwrap());
+                    // Only the code before the file's own tests.
+                    let code = code.split("#[cfg(test)]mod tests").next().unwrap_or_default();
+                    for needle in [".no_proxy(", ".proxy(", ".resolve(", ".resolve_to_addrs("] {
+                        if code.contains(needle) && !(needle == ".no_proxy(" && name == "phone.rs") {
+                            found.push(format!("{}: {needle}", path.display()));
+                        }
+                    }
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut found);
+        assert!(found.is_empty(), "{found:#?}");
     }
 
     #[test]

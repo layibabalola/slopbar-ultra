@@ -61,6 +61,22 @@ jobs:
           $null = Import-Certificate -FilePath $root -CertStoreLocation Cert:\LocalMachine\Disallowed
           Test-One 'net::tests::slopbar_trusts_what_windows_trusts' 'distrusted'
           Test-One 'sharing_setup::tests::the_github_release_downloads_through_the_apps_client' ''
+      # SlopBar's own requests, the updater's and rclone's go where this user's Windows proxy
+      # settings send them: a proxy script, a manual proxy per protocol with a bypass list, one
+      # manual proxy for all, a SOCKS proxy (refused), a script that cannot be fetched (refused, or
+      # the manual proxy beside it). Proven on this disposable runner only, since it changes this
+      # user's proxy settings; the test puts Windows' default back as it ends.
+      - name: Proxy settings come from Windows (disposable runner only)
+        shell: pwsh
+        env:
+          SLOPBAR_TEST_PROXY_SETTINGS: disposable
+        run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'This step changes this user''s proxy settings: it runs only on a disposable GitHub-hosted runner.' }
+          $name = 'proxy::tests::slopbar_follows_this_users_windows_proxy_settings'
+          $out = cargo test --locked --lib --manifest-path src-tauri/Cargo.toml -- --ignored --exact $name 2>&1 | Out-String
+          Write-Output $out
+          # A misspelt name runs nothing and still exits 0.
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch 'test result: ok\. 1 passed') { throw "$name did not pass" }
       - name: Remove the throwaway root
         if: always()
         shell: pwsh

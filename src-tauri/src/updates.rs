@@ -42,11 +42,12 @@ pub async fn check(app: &AppHandle) -> Result<UpdateInfo, String> {
 }
 
 /// The updater, with the check's request deadline and the stall limit (both through reqwest; the
-/// stall limit reaches the download too, which gets its own deadline in `install_now`).
+/// stall limit reaches the download too, which gets its own deadline in `install_now`), and the
+/// proxy Windows would use for each of its requests, as SlopBar's own (`net::windows_proxy`).
 fn updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
     app.updater_builder()
         .timeout(update_check::CHECK_TIMEOUT)
-        .configure_client(|client| client.read_timeout(update_check::STALL_TIMEOUT))
+        .configure_client(|client| crate::net::windows_proxy(client.read_timeout(update_check::STALL_TIMEOUT)))
         .build()
         .map_err(|e| describe(&e))
 }

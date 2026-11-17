@@ -74,7 +74,7 @@ pub async fn fetch(client: &reqwest::Client, token: &str, slot: &crate::accounts
         .header("anthropic-beta", "oauth-2025-04-20")
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::net::failure_text(&e))?;
     if resp.status() == 401 {
         return Err("token_invalid".into());
     }

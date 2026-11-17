@@ -814,14 +814,16 @@ mod tests {
     fn updates_rs_wires_each_deadline_to_its_own_step() {
         let code = tokens(include_str!("updates.rs"));
         let updater = function(&code, "updates.rs", "fn updater(", WIRING);
-        // The check's request deadline, on the builder, and the stall limit, whose closure is read
-        // argument by argument: rustfmt may put its body in braces.
+        // The check's request deadline, on the builder, and the stall limit with the proxy Windows
+        // names (`net::windows_proxy`), whose closure is read argument by argument: rustfmt may put
+        // its body in braces.
         let timeout = ".timeout(update_check::CHECK_TIMEOUT)";
         assert!(has(updater, timeout), "{}\n{updater}", lost("updater() in updates.rs", timeout, WIRING));
         let configured = calls(updater, ".configure_client", WIRING);
         let stall = if let [call] = configured[..] { args(call) } else { vec![] };
-        assert!(matches!(stall[..], [client] if client.starts_with("|client|") && closure_body(client) == Some("client.read_timeout(update_check::STALL_TIMEOUT)")),
-            "{}\n{updater}", lost("updater() in updates.rs", ".configure_client(|client| client.read_timeout(update_check::STALL_TIMEOUT))", WIRING));
+        let body = "crate::net::windows_proxy(client.read_timeout(update_check::STALL_TIMEOUT))";
+        assert!(matches!(stall[..], [client] if client.starts_with("|client|") && closure_body(client) == Some(body)),
+            "{}\n{updater}", lost("updater() in updates.rs", &format!(".configure_client(|client| {body})"), WIRING));
 
         let expected = [
             ("The update check", "update_check::CHECK_LIMIT", "updater(app)?.check()"),
