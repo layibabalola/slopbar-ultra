@@ -158,12 +158,16 @@ pub fn why(error: &reqwest::Error) -> Why {
     }
 }
 
-/// What a usage request's failure shows: the code of a proxy SlopBar does not go around
-/// (`proxy_unsupported`, `proxy_script`: the flyout words them), else reqwest's own text, as before.
+/// What a usage request's failure shows: the code of the network's proxy stopping it (a proxy
+/// SlopBar does not go around, `proxy_unsupported` or `proxy_script`; a proxy that wants a sign-in
+/// SlopBar cannot give, `proxy_auth`; a proxy that refuses, `proxy_refused`: the flyout words
+/// them), else reqwest's own text, as before.
 pub fn failure_text(error: &reqwest::Error) -> String {
     match why(error) {
-        Why::ProxyUnsupported => crate::proxy::Refusal::Unsupported.code().into(),
-        Why::ProxyScript => crate::proxy::Refusal::Script.code().into(),
+        Why::ProxyUnsupported => "proxy_unsupported".into(),
+        Why::ProxyScript => "proxy_script".into(),
+        Why::ProxyAuth => "proxy_auth".into(),
+        Why::ProxyRefused => "proxy_refused".into(),
         _ => error.to_string(),
     }
 }
@@ -291,8 +295,8 @@ mod tests {
     #[test]
     fn only_a_source_that_is_down_or_broken_lets_the_next_one_be_tried() {
         for why in [Why::Untrusted, Why::Distrusted, Why::Expired, Why::WrongName, Why::Certificate, Why::Tls, Why::NotSecure,
-            Why::ProxyAuth, Why::ProxyRefused, Why::Dns, Why::Refused, Why::Reset, Why::Timeout, Why::Connect, Why::Redirected,
-            Why::Page, Why::Failed] {
+            Why::ProxyAuth, Why::ProxyRefused, Why::ProxyUnsupported, Why::ProxyScript, Why::Dns, Why::Refused, Why::Reset,
+            Why::Timeout, Why::Connect, Why::Redirected, Why::Page, Why::Failed] {
             assert!(why.blocks(None), "{why:?} may be a block");
         }
         for status in [401, 403, 407, 451, 400] {

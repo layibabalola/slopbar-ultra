@@ -421,40 +421,36 @@ pub fn system() -> &'static Arc<Router> {
     ROUTER.get_or_init(|| Arc::new(Router::new(Arc::new(System))))
 }
 
-/// The proxy environment rclone (Go: HTTPS_PROXY, HTTP_PROXY, NO_PROXY) needs to go where Windows
-/// would send SlopBar's own requests to `hosts`, the cloud's hosts: each proxy variable set to the
-/// proxy, or removed for direct, and NO_PROXY removed, so that no inherited exception sends rclone
-/// around it (Go never sends this computer's own addresses through a proxy anyway). All of `hosts`
-/// must go the same way, since rclone takes one proxy per scheme; when they do not, or the proxy is
-/// refused, rclone must not run, for this reason. `known`: whether `hosts` are the remote's own; for
-/// a cloud SlopBar does not know they only stand in for it, and where a proxy script decides (which
-/// may answer each host its own way) rclone does not run either. Windows' variable names are not
-/// case-sensitive: `rclone::apply_env` removes the lower-case ones elsewhere.
+/// The proxy environment rclone (Go: HTTPS_PROXY, HTTP_PROXY, NO_PROXY; rclone 1.71 and later
+/// also RCLONE_HTTP_PROXY) needs so that it never goes around the proxy Windows names for `hosts`,
+/// the cloud's hosts (its APIs are https). rclone takes one proxy for everything: the proxy Windows
+/// names for any of the hosts, also for those Windows would send direct (through a proxy, never
+/// around one); none when Windows sends them all direct. Two different proxies, or a route that is
+/// refused, and rclone must not run, for this reason. NO_PROXY and RCLONE_HTTP_PROXY are removed so
+/// that nothing inherited overrides it (Go never sends this computer's own addresses through a
+/// proxy anyway). `known`: whether `hosts` are the remote's own; for a cloud SlopBar does not know
+/// they only stand in for it, so where a proxy script decides (which may answer each host its own
+/// way) rclone does not run either. Windows' variable names are not case-sensitive:
+/// `rclone::apply_env` removes the lower-case ones elsewhere.
 pub fn rclone_env(router: &Router, hosts: &[&str], known: bool) -> Result<Vec<(&'static str, Option<String>)>, Refusal> {
-    let mut env = Vec::new();
-    for (scheme, var) in [("https", "HTTPS_PROXY"), ("http", "HTTP_PROXY")] {
-        let mut chosen: Option<Route> = None;
-        for host in hosts {
-            let Ok(url) = Url::parse(&format!("{scheme}://{host}/")) else { return Err(Refusal::Unsupported) };
-            let (route, decided) = router.decision(&url);
-            if let Route::Refused(refusal) = route {
-                return Err(refusal);
-            }
-            if !known && decided == Decided::Script {
-                return Err(Refusal::Unsupported);
-            }
-            if chosen.as_ref().is_some_and(|c| *c != route) {
-                return Err(Refusal::Unsupported);
-            }
-            chosen = Some(route);
+    let mut chosen: Option<Url> = None;
+    for host in hosts {
+        let Ok(url) = Url::parse(&format!("https://{host}/")) else { return Err(Refusal::Unsupported) };
+        let (route, decided) = router.decision(&url);
+        if !known && decided == Decided::Script {
+            return Err(Refusal::Unsupported);
         }
-        match chosen {
-            Some(Route::Through(proxy)) => env.push((var, Some(proxy.as_str().trim_end_matches('/').to_string()))),
-            _ => env.push((var, None)),
+        match route {
+            Route::Refused(refusal) => return Err(refusal),
+            Route::Direct => {}
+            Route::Through(proxy) => match &chosen {
+                Some(other) if *other != proxy => return Err(Refusal::Unsupported),
+                _ => chosen = Some(proxy),
+            },
         }
     }
-    env.push(("NO_PROXY", None));
-    Ok(env)
+    let proxy = chosen.map(|proxy| proxy.as_str().trim_end_matches('/').to_string());
+    Ok(vec![("HTTPS_PROXY", proxy.clone()), ("HTTP_PROXY", proxy), ("NO_PROXY", None), ("RCLONE_HTTP_PROXY", None)])
 }
 
 /// This user's Windows, through WinHTTP.

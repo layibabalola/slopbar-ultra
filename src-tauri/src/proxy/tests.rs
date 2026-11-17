@@ -285,6 +285,9 @@ async fn a_refused_proxy_fails_the_request_with_its_reason_and_nothing_goes_dire
         let failed = client(Arc::new(Router::with_env(windows, env_of(&[]))), &target).get("https://api.example.test/x").send().await.unwrap_err();
         assert_eq!(crate::net::why(&failed), why, "{answer:?}");
         assert!(failed.is_connect());
+        // The flyout's usage error is the reason's code, which it words.
+        let code = if why == Why::ProxyUnsupported { "proxy_unsupported" } else { "proxy_script" };
+        assert_eq!(crate::net::failure_text(&failed), code);
     }
     assert_eq!(target.count(), 0, "nothing went direct");
 
@@ -314,12 +317,13 @@ fn rclone_gets_the_proxy_windows_names_for_its_cloud_or_does_not_run() {
     assert_eq!(env, [
         ("HTTPS_PROXY", Some("http://proxy.example.test:8080".to_string())),
         ("HTTP_PROXY", Some("http://proxy.example.test:8080".to_string())),
-        // No inherited exception sends rclone around it.
+        // Nothing inherited overrides it.
         ("NO_PROXY", None),
+        ("RCLONE_HTTP_PROXY", None),
     ]);
     // Direct: the variables are removed, whatever SlopBar's own environment had.
     let env = rclone_env(&router(Ok(vec![direct()])), &["api.dropboxapi.com"], true).unwrap();
-    assert_eq!(env, [("HTTPS_PROXY", None), ("HTTP_PROXY", None), ("NO_PROXY", None)]);
+    assert_eq!(env, [("HTTPS_PROXY", None), ("HTTP_PROXY", None), ("NO_PROXY", None), ("RCLONE_HTTP_PROXY", None)]);
 
     // On a real command: the variables rclone starts with, whatever this process's own are (on
     // Windows, where names are not case-sensitive).
@@ -338,14 +342,14 @@ fn rclone_gets_the_proxy_windows_names_for_its_cloud_or_does_not_run() {
     assert_eq!(rclone_env(&router(Ok(vec![proxy(4, "s.example.test", 1080)])), &["api.dropboxapi.com"], true), Err(Refusal::Unsupported));
     assert_eq!(rclone_env(&router(Err(Failure::Os(12167))), &["api.dropboxapi.com"], true), Err(Refusal::Script));
 
-    // Hosts Windows sends different ways: rclone takes one proxy per scheme, so it does not run.
-    struct ByHost;
+    // A script that answers each host its own way.
+    struct ByHost(Vec<(&'static str, Vec<Entry>)>);
     impl Windows for ByHost {
         fn settings(&self) -> Result<Option<Settings>, Refusal> {
             Ok(set(false, Some(SCRIPT_SET), false))
         }
         fn automatic(&self, url: &str, _: bool, _: Option<&str>, _: Instant) -> Result<Vec<Entry>, Failure> {
-            Ok(if url.contains("content.") { vec![direct()] } else { vec![proxy(1, "proxy.example.test", 8080)] })
+            Ok(self.0.iter().find(|(part, _)| url.contains(part)).map(|(_, entries)| entries.clone()).unwrap_or_else(|| vec![direct()]))
         }
         fn manual(&self, _: &str, _: Instant) -> Result<Vec<Entry>, Failure> {
             Ok(vec![])
@@ -354,36 +358,63 @@ fn rclone_gets_the_proxy_windows_names_for_its_cloud_or_does_not_run() {
             false
         }
     }
-    // A cloud SlopBar does not know: its hosts only stand in, so where a script decides (which may
-    // answer the remote's own host its own way) rclone does not run; where the manual proxy or the
-    // environment decides, it gets that proxy.
-    let hosts = crate::rclone::cloud("s3").hosts;
-    assert!(!crate::rclone::cloud("s3").known && crate::rclone::cloud("dropbox").known);
-    assert_eq!(rclone_env(&router(at("proxy.example.test", 8080)), hosts, false), Err(Refusal::Unsupported));
-    let manual = Router::with_env(Arc::new(fake(set(false, None, true), Ok(vec![]), at("proxy.example.test", 3128))), env_of(&[]));
-    assert_eq!(rclone_env(&manual, hosts, false).unwrap()[0], ("HTTPS_PROXY", Some("http://proxy.example.test:3128".to_string())));
-    let from_env = Router::with_env(Arc::new(fake(set(true, None, false), at("proxy.example.test", 1), Ok(vec![]))), env_of(&[("ALL_PROXY", "http://env.example.test:2")]));
-    assert_eq!(rclone_env(&from_env, hosts, false).unwrap()[0], ("HTTPS_PROXY", Some("http://env.example.test:2".to_string())));
+    let by_host = |answers: Vec<(&'static str, Vec<Entry>)>| Router::with_env(Arc::new(ByHost(answers)), env_of(&[]));
+    // One proxy for some hosts and direct for others: rclone takes that one proxy for all of them,
+    // through a proxy and never around one.
+    let some = by_host(vec![("//api.", vec![proxy(1, "proxy.example.test", 8080)]), ("//content.", vec![direct()])]);
+    assert_eq!(rclone_env(&some, &["api.dropboxapi.com", "content.dropboxapi.com"], true).unwrap()[0], ("HTTPS_PROXY", Some("http://proxy.example.test:8080".to_string())));
+    // Two different proxies: rclone takes only one, so it does not run.
+    let two = by_host(vec![("//api.", vec![proxy(1, "a.example.test", 8080)]), ("//content.", vec![proxy(1, "b.example.test", 8080)])]);
+    assert_eq!(rclone_env(&two, &["api.dropboxapi.com", "content.dropboxapi.com"], true), Err(Refusal::Unsupported));
 
-    let split = Router::with_env(Arc::new(ByHost), env_of(&[]));
-    assert_eq!(rclone_env(&split, &["api.dropboxapi.com", "content.dropboxapi.com"], true), Err(Refusal::Unsupported));
-    assert!(rclone_env(&split, &["api.dropboxapi.com"], true).is_ok());
+    // A cloud SlopBar does not know: the remote's own host is not known here, so where a script
+    // decides (which may answer it its own way) rclone does not run; where the manual proxy or the
+    // environment decides, it gets the proxy they give any host they do not bypass.
+    let unknown = crate::rclone::cloud("s3");
+    assert_eq!(unknown, crate::rclone::Cloud { hosts: &[crate::rclone::ANY_HOST], known: false });
+    assert!(crate::rclone::cloud("dropbox").known && crate::rclone::cloud("crypt").hosts == unknown.hosts);
+    assert_eq!(rclone_env(&router(at("proxy.example.test", 8080)), unknown.hosts, false), Err(Refusal::Unsupported));
+    let from_env = Router::with_env(Arc::new(fake(set(true, None, false), at("proxy.example.test", 1), Ok(vec![]))), env_of(&[("ALL_PROXY", "http://env.example.test:2"), ("NO_PROXY", ".dropboxapi.com,.googleapis.com")]));
+    assert_eq!(rclone_env(&from_env, unknown.hosts, false).unwrap()[0], ("HTTPS_PROXY", Some("http://env.example.test:2".to_string())));
+    // A manual proxy whose bypass list covers the well-known clouds still names its proxy for the
+    // remote: never direct because those happen to be bypassed.
+    struct Bypassing;
+    impl Windows for Bypassing {
+        fn settings(&self) -> Result<Option<Settings>, Refusal> {
+            Ok(set(true, None, true))
+        }
+        fn automatic(&self, _: &str, _: bool, _: Option<&str>, _: Instant) -> Result<Vec<Entry>, Failure> {
+            Err(Failure::Os(12180))
+        }
+        fn manual(&self, url: &str, _: Instant) -> Result<Vec<Entry>, Failure> {
+            let bypassed = ["dropboxapi.com", "googleapis.com", "microsoft.com", "box.com"].iter().any(|d| url.contains(d));
+            Ok(if bypassed { vec![direct()] } else { vec![proxy(1, "proxy.example.test", 3128)] })
+        }
+        fn detection_off(&self) -> bool {
+            false
+        }
+    }
+    let bypassing = Router::with_env(Arc::new(Bypassing), env_of(&[]));
+    assert_eq!(rclone_env(&bypassing, unknown.hosts, false).unwrap()[0], ("HTTPS_PROXY", Some("http://proxy.example.test:3128".to_string())));
+    assert_eq!(rclone_env(&bypassing, crate::rclone::cloud("dropbox").hosts, true).unwrap()[0], ("HTTPS_PROXY", None), "a known cloud bypassed: direct, as Windows");
 }
 
 /// What a child process actually starts with: Windows' variable names are not case-sensitive, and
-/// an inherited lower-case variable or NO_PROXY must not survive.
+/// an inherited lower-case variable, NO_PROXY or RCLONE_HTTP_PROXY must not survive.
 #[cfg(windows)]
 #[test]
 fn rclone_starts_with_the_proxy_whatever_this_process_has() {
     let router = Router::with_env(Arc::new(fake(set(true, None, false), Ok(vec![proxy(1, "proxy.example.test", 8080)]), Ok(vec![]))), env_of(&[]));
     let mut command = crate::sources::command("cmd");
-    command.args(["/d", "/c", "set"]).env("https_proxy", "http://inherited.example.test:1").env("no_proxy", ".dropboxapi.com");
+    command.args(["/d", "/c", "set"]).env("https_proxy", "http://inherited.example.test:1").env("no_proxy", ".dropboxapi.com")
+        .env("RCLONE_HTTP_PROXY", "http://inherited.example.test:2");
     crate::rclone::apply_env(&mut command, rclone_env(&router, &["api.dropboxapi.com"], true).unwrap());
     let out = String::from_utf8_lossy(&command.output().unwrap().stdout).to_string();
     let seen = |name: &str| out.lines().find_map(|line| line.split_once('=').filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.to_string()));
     assert_eq!(seen("HTTPS_PROXY").as_deref(), Some("http://proxy.example.test:8080"));
     assert_eq!(seen("HTTP_PROXY").as_deref(), Some("http://proxy.example.test:8080"));
     assert_eq!(seen("NO_PROXY"), None, "no inherited exception");
+    assert_eq!(seen("RCLONE_HTTP_PROXY"), None, "nor rclone's own setting");
 }
 
 // Against WinHTTP itself: a proxy script served on this computer, given to WinHTTP directly (the
@@ -496,20 +527,35 @@ async fn requests_go_through_the_proxy_a_proxy_script_names() {
     // rclone gets the same proxy for Dropbox.
     let env = rclone_env(&router, &["api.dropboxapi.com", "content.dropboxapi.com"], true).unwrap();
     let expected = Some(format!("http://127.0.0.1:{}", proxy.port));
-    assert_eq!(env, [("HTTPS_PROXY", expected.clone()), ("HTTP_PROXY", expected), ("NO_PROXY", None)]);
+    assert_eq!(env, [("HTTPS_PROXY", expected.clone()), ("HTTP_PROXY", expected), ("NO_PROXY", None), ("RCLONE_HTTP_PROXY", None)]);
 }
 
-/// rclone itself through the proxy a script names, with the environment SlopBar gives it: it asks
-/// the fake proxy for its own download site, which refuses. Needs rclone installed (SlopBar's own
-/// copy, WinGet's, or on PATH): `cargo test --lib rclone_itself -- --ignored`.
+/// rclone itself through the proxy a script names, with the environment SlopBar gives it over an
+/// inherited one that would send it elsewhere: it asks the fake proxy for its own download site,
+/// which refuses. Needs rclone: installed (SlopBar's own copy, WinGet's, or on PATH), or with
+/// SLOPBAR_TEST_RCLONE=download SlopBar's pinned one, downloaded and checked as the setup does (the
+/// Tests workflow): `cargo test --lib rclone_itself -- --ignored`.
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn rclone_itself_goes_through_the_proxy_a_script_names() {
-    let exe = crate::rclone::find().expect("rclone installed");
+    let dir = crate::test_support::TempDir::new();
+    let exe = match crate::rclone::find() {
+        Some(exe) => exe,
+        None if std::env::var("SLOPBAR_TEST_RCLONE").as_deref() == Ok("download") => {
+            let dest = dir.0.join("rclone").join("rclone.exe");
+            let mut reasons = Vec::new();
+            crate::sharing_setup::install_rclone(&dest, &std::sync::atomic::AtomicBool::new(false), &|_| {}, &mut reasons).await
+                .unwrap_or_else(|e| panic!("{e}: {reasons:?}"));
+            dest
+        }
+        None => panic!("rclone installed, or SLOPBAR_TEST_RCLONE=download"),
+    };
     let proxy = FakeProxy::start();
     let router = scripted(serve_script(format!("function FindProxyForURL(url, host) {{ return 'PROXY 127.0.0.1:{}'; }}", proxy.port)));
     let mut command = crate::sources::command(&exe.to_string_lossy());
+    // What SlopBar's own environment might hold: none of it may win.
+    command.env("NO_PROXY", "*").env("RCLONE_HTTP_PROXY", "http://127.0.0.1:1").env("https_proxy", "http://127.0.0.1:1");
     crate::rclone::apply_env(&mut command, rclone_env(&router, &["downloads.rclone.org"], true).unwrap());
     command.args(["lsjson", ":http:", "--http-url", "https://downloads.rclone.org/", "--contimeout", "5s", "--timeout", "5s", "--low-level-retries", "1", "--retries", "1"]);
     let out = tokio::task::spawn_blocking(move || command.output()).await.unwrap().unwrap();
@@ -649,11 +695,20 @@ async fn slopbar_follows_this_users_windows_proxy_settings() {
     set_user_proxy(PROXY_TYPE_DIRECT, Some(&format!("127.0.0.1:{}", plain.port)), None, None);
     assert_eq!(fresh().route(&url("https://p3off.example.test/")), Route::Direct);
 
-    // 4. A SOCKS proxy: refused, never direct.
+    // 4. A SOCKS proxy: refused, never direct; and rclone is not even started (an rclone that
+    // does not exist would say so otherwise).
     set_user_proxy(PROXY_TYPE_DIRECT | PROXY_TYPE_PROXY, Some("socks=127.0.0.1:1080"), None, None);
     assert_eq!(fresh().route(&url("https://p4.example.test/")), Route::Refused(Refusal::Unsupported));
     let failed = crate::net::builder().build().unwrap().get("https://p4-api.example.test/").send().await.unwrap_err();
     assert_eq!(crate::net::why(&failed), Why::ProxyUnsupported);
+    assert_eq!(crate::net::failure_text(&failed), "proxy_unsupported");
+    let missing = std::path::Path::new(r"C:\nonexistent-slopbar-test\rclone.exe");
+    let connected = crate::sharing_setup::connect_dropbox(missing, "dropbox", crate::sharing_setup::Connect::Create, &|_| {},
+        &std::sync::atomic::AtomicBool::new(false), Duration::from_secs(5));
+    assert_eq!(connected, Err("proxy_unsupported"));
+    let store = crate::rclone::Rclone::with("dropbox", crate::rclone::Cli::for_remote(missing.to_path_buf(), "dropbox"));
+    let listed = crate::presence::PresenceStore::list(&store).unwrap_err();
+    assert_eq!(refusal_in(&listed), Some(Refusal::Unsupported), "{listed}");
 
     // 5. A script that cannot be fetched: refused; with a manual proxy beside it, that proxy.
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();

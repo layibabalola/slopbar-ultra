@@ -52,7 +52,9 @@ sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 tauri-plugin-autostart = { version = "2", optional = true }
 tauri-plugin-single-instance = { version = "2", optional = true }
-tauri-plugin-updater = { version = "2", optional = true }
+# configure_client hands SlopBar the plugin's reqwest builder (net::windows_proxy): its docs ask to pin
+# the minor version when using it.
+tauri-plugin-updater = { version = "~2.12", optional = true }
 # rt-multi-thread: proxy.rs waits for Windows' proxy answer with block_in_place on the app's runtime.
 tokio = { version = "1", features = ["time", "sync", "rt", "rt-multi-thread", "macros", "net", "io-util"] }
 tauri-plugin-notification = { version = "2", optional = true }
