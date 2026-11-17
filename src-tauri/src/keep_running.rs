@@ -74,9 +74,6 @@ pub const SIGN_IN_GRACE: Duration = Duration::from_secs(5 * 60);
 pub const UNINSTALL_GRACE: Duration = Duration::from_secs(60 * 60);
 /// How long the nonce of a start the check made counts: the app reads it within seconds.
 pub const HANDSHAKE_GRACE: Duration = Duration::from_secs(2 * 60);
-/// A start with no arguments, from Explorer and no shortcut, this soon after the sign-in, is the
-/// startup entry's (`sign_in_start`): Explorer runs the entries once, as it starts.
-pub const SIGN_IN_START_WINDOW: Duration = Duration::from_secs(30 * 60);
 /// How long Task Scheduler gets to answer a call: the door's get_app_info and the tray's Quit wait.
 pub const SCHEDULER_LIMIT: Duration = Duration::from_secs(10);
 /// How long the shell gets to start the app. A hung Explorer would otherwise hold the check, and
@@ -90,7 +87,7 @@ pub const START_BOUNDARY: &str = "2026-01-01T00:00:00";
 /// A marker this far ahead of the clock still counts as just written (a clock set back a little).
 const CLOCK_SLACK_SECONDS: i64 = 60;
 /// In every build that handles `--keep-running`: restart_app looks for it in the executable it
-/// restarts into (`handles_watchdog`), and removes the task before starting one without it.
+/// restarts into (`handles_watchdog`), and removes the task once it has started one without it.
 pub const SENTINEL: &str = "slopbar-ultra:keep-running:handles:v1";
 
 const QUIT: &str = "quit";
@@ -403,13 +400,15 @@ impl Markers {
 
     /// A start of SlopBar (this process won the instance lock): the markers it ends, and the sign-in
     /// it started in. Only a start that is not the watchdog's ends a person's Quit; no start ends an
-    /// uninstall's hold (the installer does).
+    /// uninstall's hold (the installer does). Every start ends the last check's record: a start that
+    /// failed is over once SlopBar runs.
     fn record_start(&self, sign_in: Option<&str>, by_watchdog: bool) {
         if !by_watchdog {
             self.remove(QUIT);
         }
         self.remove(INSTALLING);
         self.remove(AGENT_QUIT);
+        self.remove(LAST_CHECK);
         match sign_in {
             Some(id) => {
                 let _ = self.write(STARTED, id);
@@ -420,6 +419,8 @@ impl Markers {
 
     /// A person's Quit, naming this sign-in (an empty marker, which holds, when it cannot be told).
     fn record_quit(&self, sign_in: Option<&str>) -> std::io::Result<()> {
+        #[cfg(test)]
+        tests::quit_write_made_to_fail()?;
         self.write(QUIT, sign_in.unwrap_or_default())
     }
 
@@ -700,6 +701,10 @@ fn check() -> i32 {
 pub enum Start {
     /// By the watchdog (its handshake checked out).
     Watchdog,
+    /// With the watchdog's flag but not its handshake: a nonce spent (the updater restarts an app
+    /// with its old arguments), too old (a shell that started it late) or unknown. An ordinary
+    /// start, but a quiet one.
+    Flagged,
     /// By the startup entry at sign-in (`sign_in_start`).
     SignIn,
     /// Any other way: the Start menu, a restart, an installer, a person, an agent.
@@ -717,11 +722,12 @@ impl Start {
 /// The startup entry's start at sign-in: no arguments (the entry has none; the watchdog, a restart
 /// and the installer's restart pass some), no shortcut (the Start menu, the taskbar and the desktop
 /// start a shortcut, which Windows says in the start-up information), Explorer as the parent (it
-/// runs the user's startup entries), and a sign-in that began less than SIGN_IN_START_WINDOW ago.
-/// Only a person who starts slopbar.exe itself from a folder this soon after signing in looks the
-/// same: if SlopBar already runs, that start ends quietly instead of opening Settings.
+/// runs the user's startup entries), and a sign-in Windows can tell, however long ago it began:
+/// Explorer may hold the entries back for an hour and more (behind Windows' "Let's finish setting
+/// up your device" after an update). Only a person who starts slopbar.exe itself from a folder looks
+/// the same: if SlopBar already runs, that start ends quietly instead of opening Settings.
 pub fn sign_in_start(no_args: bool, from_shortcut: bool, parent: Option<&str>, sign_in_age: Option<Duration>) -> bool {
-    no_args && !from_shortcut && parent.is_some_and(|p| p.eq_ignore_ascii_case("explorer.exe")) && sign_in_age.is_some_and(|a| a < SIGN_IN_START_WINDOW)
+    no_args && !from_shortcut && parent.is_some_and(|p| p.eq_ignore_ascii_case("explorer.exe")) && sign_in_age.is_some()
 }
 
 /// The nonce a `--watchdog-start` start presents.
@@ -733,12 +739,13 @@ fn handshake_arg(args: &[OsString]) -> Option<String> {
 /// from how Explorer started it.
 pub fn start_kind_with(args: &[OsString], markers: Option<&Markers>, now: SystemTime, sign_in_start: impl FnOnce() -> bool) -> Start {
     match handshake_arg(args) {
-        // The updater restarts an app with its old arguments: their nonce is spent by then.
+        // The nonce only tells whether the start is the watchdog's; every start with the flag is
+        // quiet. The updater restarts an app with its old arguments: their nonce is spent by then.
         Some(nonce) => {
             if markers.is_some_and(|m| m.take_handshake(&nonce, now)) {
                 Start::Watchdog
             } else {
-                Start::Other
+                Start::Flagged
             }
         }
         None if args.len() == 1 && sign_in_start() => Start::SignIn,
@@ -1686,9 +1693,10 @@ fn contains(path: &Path, needle: &[u8]) -> std::io::Result<bool> {
     }
 }
 
-/// app.rs (`restart`), before it restarts into `exe`: an executable without the watchdog would take
-/// the task's runs for plain second launches (Settings opening every 5 minutes), so the task goes
-/// first. The next build with the watchdog registers it again.
+/// app.rs (`restart`), once the restart has started `exe` and before this app exits: an executable
+/// without the watchdog would take the task's runs for plain second launches (Settings opening
+/// every 5 minutes), so the task goes. A restart that failed to start leaves this app its task. The
+/// next build with the watchdog registers it again.
 pub fn before_restart(exe: &Path) {
     before_restart_with(exe, &|| remove_task(tasks(), task_name()));
 }
@@ -1834,10 +1842,12 @@ mod sys {
         Some(String::from_utf16_lossy(&wide))
     }
 
+    /// The key of the user's startup entries, which Explorer runs at sign-in.
+    pub(super) const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
     /// The startup entry, as Windows will treat it at sign-in (`super::run_entry_from`).
     pub fn run_entry(app: &Path) -> RunEntry {
         use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD};
-        const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
         const APPROVED: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
         const POLICY: &str = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
         let blocked = [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE].into_iter().any(|root| {

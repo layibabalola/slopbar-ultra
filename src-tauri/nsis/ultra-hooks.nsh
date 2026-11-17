@@ -54,9 +54,10 @@
 
 ; Before anything else is removed, and never on an update: the watchdog's `uninstalling` marker holds
 ; every check, and keeps a SlopBar that a check started meanwhile from registering the task again;
-; then the task goes. Its name ends with the user's SID, read here from the uninstaller's own token,
-; and schtasks deletes it through nsExec, which shows no console window. No slopbar.exe runs: a
-; foreign one at this path would take any argument for a second launch.
+; then the task goes. Its name ends with the user's SID, read here from the uninstaller's own token
+; (copied up to its end), and schtasks deletes it through nsExec, which shows no console window and
+; waits at most 10 seconds. No slopbar.exe runs: a foreign one at this path would take any argument
+; for a second launch.
 !macro NSIS_HOOK_PREUNINSTALL
   ${If} $UpdateMode <> 1
     Push $R0
@@ -86,7 +87,7 @@
         System::Call '*$R3(p .R5)'
         System::Call 'advapi32::ConvertSidToStringSidW(p R5, *p .R6) i .R2'
         ${If} $R2 <> 0
-          System::Call '*$R6(&w256 .R4)'
+          System::Call 'kernel32::lstrcpynW(w .R4, p R6, i ${NSIS_MAX_STRLEN})'
           System::Call 'kernel32::LocalFree(p R6)'
         ${EndIf}
       ${EndIf}
@@ -94,7 +95,7 @@
       System::Call 'kernel32::CloseHandle(p R1)'
     ${EndIf}
     ${If} $R4 != ""
-      nsExec::Exec '"$SYSDIR\schtasks.exe" /Delete /TN "${KEEP_RUNNING_TASK} $R4" /F'
+      nsExec::Exec /TIMEOUT=10000 '"$SYSDIR\schtasks.exe" /Delete /TN "${KEEP_RUNNING_TASK} $R4" /F'
       Pop $R7
     ${EndIf}
     ClearErrors

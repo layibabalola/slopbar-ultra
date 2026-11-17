@@ -270,12 +270,13 @@ fn restart(app: &AppHandle) -> Result<(), String> {
     // A duplicate of an older build ignores the instance lock and would take the door over once
     // this one exits; it renews the same monitoring sessions, so it is ended rather than kept.
     crate::instance::end_duplicates();
-    // A build without SlopBar Ultra's watchdog takes its task's runs for second launches.
-    crate::keep_running::before_restart(&exe);
     if let Err(e) = std::process::Command::new(&exe).arg("--after").arg(std::process::id().to_string()).spawn() {
         RESTARTING.store(false, std::sync::atomic::Ordering::Release);
         return Err(format!("restart failed: {e}"));
     }
+    // A build without SlopBar Ultra's watchdog takes its task's runs for second launches; a restart
+    // that failed has returned above, keeping this app's task.
+    crate::keep_running::before_restart(&exe);
     let h = app.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(500)).await;

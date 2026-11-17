@@ -160,12 +160,13 @@ fn the_limits_are_pinned() {
     assert_eq!(AGENT_QUIT_GRACE, Duration::from_secs(15 * 60));
     assert_eq!(UNINSTALL_GRACE, Duration::from_secs(60 * 60));
     assert_eq!(HANDSHAKE_GRACE, Duration::from_secs(2 * 60));
-    assert_eq!(SIGN_IN_START_WINDOW, Duration::from_secs(30 * 60));
     assert_eq!(SCHEDULER_LIMIT, Duration::from_secs(10));
     assert_eq!(SHELL_LIMIT, Duration::from_secs(30));
     assert_eq!(RETRIES, [Duration::from_secs(60), Duration::from_secs(5 * 60), Duration::from_secs(15 * 60)]);
     assert_eq!(PRIORITY, 5);
     assert_eq!(START_BOUNDARY, "2026-01-01T00:00:00");
+    #[cfg(windows)]
+    assert_eq!(sys::RUN, r"Software\Microsoft\Windows\CurrentVersion\Run", "the startup entries' key");
     assert!(INSTALL_GRACE > crate::update_check::HANDOFF_LIMIT + Duration::from_secs(5 * 60), "the handover, then the installer");
     assert!(SCHEDULER_LIMIT < crate::door::CLIENT_TIMEOUT, "get_app_info answers before its client gives up");
 }
@@ -553,8 +554,8 @@ fn a_job_that_could_end_or_bound_the_app_ties_it() {
 // ------------------------------------------------------------------------------------------------
 // How a start counts.
 
-/// The startup entry's start at sign-in: no arguments, no shortcut, Explorer as the parent, within
-/// SIGN_IN_START_WINDOW of the sign-in. Anything else is not.
+/// The startup entry's start at sign-in: no arguments, no shortcut, Explorer as the parent, however
+/// long after the sign-in. Anything else is not.
 #[test]
 fn the_startup_entry_s_start_is_told_from_others() {
     let young = Some(Duration::from_secs(8 * 60));
@@ -564,10 +565,25 @@ fn the_startup_entry_s_start_is_told_from_others() {
     assert!(!sign_in_start(true, true, Some("explorer.exe"), young), "a shortcut: the Start menu, the taskbar, the desktop");
     assert!(!sign_in_start(true, false, Some("pwsh.exe"), young), "a script");
     assert!(!sign_in_start(true, false, None, young), "a parent that is gone");
-    assert!(!sign_in_start(true, false, Some("explorer.exe"), Some(SIGN_IN_START_WINDOW)), "long after the sign-in");
     assert!(!sign_in_start(true, false, Some("explorer.exe"), None), "no sign-in");
-    for (start, quiet) in [(Start::Watchdog, true), (Start::SignIn, true), (Start::Other, false)] {
+    for (start, quiet) in [(Start::Watchdog, true), (Start::Flagged, true), (Start::SignIn, true), (Start::Other, false)] {
         assert_eq!(start.is_quiet(), quiet, "{start:?}");
+    }
+}
+
+/// Explorer may run the startup entry long after the sign-in: measured 70.7 minutes, behind Windows'
+/// "Let's finish setting up your device" after an update. That start is still the entry's, and
+/// claims quietly, so it never opens Settings over a SlopBar the watchdog started meanwhile.
+#[test]
+fn a_startup_entry_run_long_after_the_sign_in_is_still_the_entry_s() {
+    let (_dir, m) = markers();
+    let now = SystemTime::now();
+    for minutes in [70, 6 * 60] {
+        let age = Some(Duration::from_secs(minutes * 60));
+        assert!(sign_in_start(true, false, Some("explorer.exe"), age), "{minutes} minutes after the sign-in");
+        let start = start_kind_with(&args(&["slopbar.exe"]), Some(&m), now, || sign_in_start(true, false, Some("explorer.exe"), age));
+        assert_eq!(start, Start::SignIn, "{minutes} minutes after the sign-in");
+        assert!(start.is_quiet(), "{minutes} minutes after the sign-in");
     }
 }
 
@@ -576,7 +592,8 @@ fn args(a: &[&str]) -> Vec<OsString> {
 }
 
 /// Only a start that presents the nonce the check wrote, within HANDSHAKE_GRACE, is the watchdog's,
-/// and only once: the updater restarts an app with its old arguments, whose nonce is spent.
+/// and only once: the updater restarts an app with its old arguments, whose nonce is spent. Every
+/// start with the watchdog's flag claims quietly all the same (a shell may start one late).
 #[test]
 fn only_the_watchdog_s_own_start_counts_as_its() {
     let (_dir, m) = markers();
@@ -585,12 +602,16 @@ fn only_the_watchdog_s_own_start_counts_as_its() {
     m.write_handshake("0123456789abcdef0123456789abcdef").unwrap();
     let watchdog = args(&["slopbar.exe", STARTED_FLAG, "0123456789abcdef0123456789abcdef"]);
     assert_eq!(start_kind_with(&watchdog, Some(&m), now, never), Start::Watchdog);
-    assert_eq!(start_kind_with(&watchdog, Some(&m), now, never), Start::Other, "spent: the updater's restart with the old arguments");
+    assert_eq!(start_kind_with(&watchdog, Some(&m), now, never), Start::Flagged, "spent: the updater's restart with the old arguments");
     m.write_handshake("0123456789abcdef0123456789abcdef").unwrap();
-    assert_eq!(start_kind_with(&args(&["slopbar.exe", STARTED_FLAG, "fedcba9876543210fedcba9876543210"]), Some(&m), now, never), Start::Other, "another nonce");
-    assert_eq!(start_kind_with(&args(&["slopbar.exe", STARTED_FLAG]), Some(&m), now, never), Start::Other, "none");
-    assert_eq!(start_kind_with(&watchdog, Some(&m), now + HANDSHAKE_GRACE + Duration::from_secs(2), never), Start::Other, "too old");
-    assert_eq!(start_kind_with(&watchdog, None, now, never), Start::Other, "no markers");
+    assert_eq!(start_kind_with(&args(&["slopbar.exe", STARTED_FLAG, "fedcba9876543210fedcba9876543210"]), Some(&m), now, never), Start::Flagged, "another nonce");
+    assert_eq!(start_kind_with(&args(&["slopbar.exe", STARTED_FLAG]), Some(&m), now, never), Start::Flagged, "none");
+    assert_eq!(start_kind_with(&watchdog, Some(&m), now + HANDSHAKE_GRACE + Duration::from_secs(2), never), Start::Flagged, "too old: a shell that started it late");
+    assert_eq!(start_kind_with(&watchdog, None, now, never), Start::Flagged, "no markers");
+    let (_late, late) = markers();
+    late.write(QUIT, SIGN_IN).unwrap();
+    assert!(!started_in(Some(&late), Some(SIGN_IN), Start::Flagged), "a flagged start is not the watchdog's");
+    assert_eq!(late.read(QUIT), None, "an ordinary start: it ends a person's Quit");
     assert_eq!(start_kind_with(&args(&["slopbar.exe"]), Some(&m), now, || true), Start::SignIn);
     assert_eq!(start_kind_with(&args(&["slopbar.exe"]), Some(&m), now, || false), Start::Other);
     assert_eq!(start_kind_with(&args(&["slopbar.exe", "--after", "42"]), Some(&m), now, never), Start::Other);
@@ -636,6 +657,13 @@ fn starts_and_quits_leave_what_the_check_reads() {
     started_in(Some(&m), Some(SIGN_IN), Start::Watchdog);
     assert_eq!((m.read(INSTALLING), m.read(AGENT_QUIT)), (None, None), "a start ends both");
     assert!(m.read(UNINSTALLING).is_some(), "but not an uninstall's hold");
+    // A check's record, a failed start among it, ends with every start that wins the instance lock.
+    for start in [Start::Watchdog, Start::Flagged, Start::SignIn, Start::Other] {
+        m.record_check(Verdict::Start, 1);
+        assert!(m.last_check(SystemTime::now()).is_some_and(|c| c.exit == 1));
+        started_in(Some(&m), Some(SIGN_IN), start);
+        assert_eq!(m.last_check(SystemTime::now()), None, "{start:?}");
+    }
     assert!(!m.path(&format!("{QUIT}.part")).exists() && !m.path(&format!("{STARTED}.part")).exists(), "written whole");
     // Without markers nothing is written, and nothing breaks.
     assert!(!started_in(None, Some(SIGN_IN), Start::Other));
@@ -662,6 +690,38 @@ fn a_quit_that_cannot_be_written_removes_the_task() {
     assert_eq!(quit_by_person_in(None, Some(SIGN_IN), &remove), Ok(QuitHeld::NoTask), "no markers' folder at all");
     let fails = || -> Result<bool, String> { Err("synthetic".into()) };
     assert_eq!(quit_by_person_in(Some(&m), Some(SIGN_IN), &fails), Err("synthetic".into()));
+}
+
+thread_local! {
+    /// How many of this thread's next Quit writes fail (`Markers::record_quit`).
+    static QUIT_WRITES_TO_FAIL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `Markers::record_quit`'s test hook: fails the write while QUIT_WRITES_TO_FAIL says so.
+pub(super) fn quit_write_made_to_fail() -> std::io::Result<()> {
+    QUIT_WRITES_TO_FAIL.with(|left| match left.get() {
+        0 => Ok(()),
+        n => {
+            left.set(n - 1);
+            Err(std::io::Error::other("a write made to fail"))
+        }
+    })
+}
+
+/// A Quit whose first write fails is written again: the marker holds it, and the task stays.
+#[test]
+fn a_quit_written_at_the_second_try_keeps_the_task() {
+    let (_dir, m) = markers();
+    let removed = AtomicUsize::new(0);
+    let remove = || -> Result<bool, String> {
+        removed.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    };
+    QUIT_WRITES_TO_FAIL.with(|left| left.set(1));
+    assert_eq!(quit_by_person_in(Some(&m), Some(SIGN_IN), &remove), Ok(QuitHeld::Marker));
+    assert_eq!(QUIT_WRITES_TO_FAIL.with(|left| left.get()), 0, "the first write failed");
+    assert_eq!(m.read(QUIT).as_deref(), Some(SIGN_IN), "the second wrote the Quit");
+    assert_eq!(removed.load(Ordering::SeqCst), 0, "and the task stays");
 }
 
 /// The markers are the machine's own (the local data folder), never the roaming one.
@@ -1309,7 +1369,7 @@ fn a_build_without_the_watchdog_is_told_by_its_sentinel() {
     assert_eq!(before_restart_with(&with, &remove), None);
     assert_eq!(removed.load(Ordering::SeqCst), 0, "a build with the watchdog keeps the task");
     assert_eq!(before_restart_with(&without, &remove), Some(Ok(true)));
-    assert_eq!(removed.load(Ordering::SeqCst), 1, "the task goes before a build without it starts");
+    assert_eq!(removed.load(Ordering::SeqCst), 1, "the task goes once a build without it is starting");
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1414,7 +1474,7 @@ fn the_update_handover_writes_the_install_marker_before_it_hands_over() {
 }
 
 /// Every settings change, and startup, reach the task (`apply`); get_app_info reports it, with the
-/// launch-at-login setting; restart_app looks at the build it restarts into before starting it.
+/// launch-at-login setting; restart_app looks at the build it restarts into once it has started it.
 #[test]
 fn the_app_keeps_the_task_and_reports_it() {
     let app = tokens(include_str!("../app.rs"));
@@ -1429,13 +1489,20 @@ fn the_app_keeps_the_task_and_reports_it() {
     }
     let restart = function(&app, "app.rs", "fn restart(app: &AppHandle) -> Result<(), String> {", WIRED);
     let at = |needle: &str| find(restart, needle).unwrap_or_else(|| panic!("{}\n{restart}", lost("restart in app.rs", needle, WIRED)));
-    assert!(at("crate::keep_running::before_restart(&exe);") < at("std::process::Command::new(&exe)"), "before the new build starts. {}", update(WIRED));
+    let (spawn, failed, guard, exit) = (
+        at("std::process::Command::new(&exe)"),
+        at("return Err(format!(\"restart failed: {e}\"));"),
+        at("crate::keep_running::before_restart(&exe);"),
+        at("h.exit(0);"),
+    );
+    assert!(spawn < failed && failed < guard && guard < exit, "once the new build has started, before this app exits: a restart that failed keeps the task. {}", update(WIRED));
+    assert_eq!(words(restart, "before_restart"), 1, "{}", update(WIRED));
 }
 
 /// The uninstaller, never on an update, first writes the marker that holds every check and the
-/// task's registration, then deletes the task by its name (the user's SID read from its own token)
-/// through nsExec and schtasks, which show no console; it never runs a slopbar.exe. Every install
-/// removes the marker.
+/// task's registration, then deletes the task by its name (the user's SID read from its own token,
+/// up to the string's end) through nsExec and schtasks, which show no console and are waited for at
+/// most 10 seconds; it never runs a slopbar.exe. Every install removes the marker.
 #[test]
 fn the_uninstaller_holds_the_watchdog_and_removes_its_task() {
     let hooks = include_str!("../../nsis/ultra-hooks.nsh").replace("\r\n", "\n");
@@ -1446,15 +1513,18 @@ fn the_uninstaller_holds_the_watchdog_and_removes_its_task() {
     };
     let un = macro_lines("NSIS_HOOK_PREUNINSTALL");
     let at = |needle: &str| un.iter().position(|l| l == needle).unwrap_or_else(|| panic!("NSIS_HOOK_PREUNINSTALL has no `{needle}`. {}\n{un:#?}", update(UNINSTALL)));
-    let (update_mode, marker, write, token, sid, delete) = (
+    let (update_mode, marker, write, token, sid, copy, delete) = (
         at("${If} $UpdateMode <> 1"),
         at("!insertmacro KEEP_RUNNING_MARKERS_TO_R0"),
         at("FileOpen $R1 \"$R0\\uninstalling\" w"),
         at("System::Call 'advapi32::OpenProcessToken(p -1, i 8, *p .R1) i .R2'"),
         at("System::Call 'advapi32::ConvertSidToStringSidW(p R5, *p .R6) i .R2'"),
-        at("nsExec::Exec '\"$SYSDIR\\schtasks.exe\" /Delete /TN \"${KEEP_RUNNING_TASK} $R4\" /F'"),
+        at("System::Call 'kernel32::lstrcpynW(w .R4, p R6, i ${NSIS_MAX_STRLEN})'"),
+        at("nsExec::Exec /TIMEOUT=10000 '\"$SYSDIR\\schtasks.exe\" /Delete /TN \"${KEEP_RUNNING_TASK} $R4\" /F'"),
     );
-    assert!(update_mode == 1 && update_mode < marker && marker < write && write < token && token < sid && sid < delete, "{}\n{un:#?}", update(UNINSTALL));
+    assert!(update_mode == 1 && update_mode < marker && marker < write && write < token && token < sid && sid < copy && copy < delete, "{}\n{un:#?}", update(UNINSTALL));
+    assert!(!un.iter().any(|l| l.contains("&w")), "the SID's string is copied up to its end, never read as a fixed block past it. {}", update(UNINSTALL));
+    assert_eq!(Duration::from_millis(10_000), SCHEDULER_LIMIT, "schtasks gets what the app's own Task Scheduler calls get");
     assert!(!un.iter().any(|l| l.to_ascii_lowercase().contains("slopbar.exe") || l.contains("ExecWait")), "no slopbar.exe runs. {}", update(UNINSTALL));
     let preinstall = macro_lines("NSIS_HOOK_PREINSTALL");
     let marker = preinstall.iter().position(|l| l == "!insertmacro KEEP_RUNNING_MARKERS_TO_R0");

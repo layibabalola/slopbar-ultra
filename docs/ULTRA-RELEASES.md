@@ -395,7 +395,9 @@ passed. Nobody has to set it up; each machine gets it with the release that brin
     the first 5 minutes of a sign-in to the startup entry.
 
   `restart_app` is no Quit: it starts the app itself, and if that start fails, the next run starts it.
-  Each run records what it decided and its exit code (`last-check`), except while SlopBar runs.
+  Each run records what it decided and its exit code (`last-check`), except while SlopBar runs, and
+  every start of SlopBar that wins its instance lock clears the record: a start that failed is over
+  once SlopBar runs again.
 - **How it starts SlopBar.** The way the shell does: through Explorer's own Shell.Application (the
   desktop's ShellWindows), so the app is Explorer's child, at normal CPU, I/O and memory priority, and
   in none of Task Scheduler's jobs. Only when the shell cannot be reached does the run start the app
@@ -405,15 +407,17 @@ passed. Nobody has to set it up; each machine gets it with the release that brin
   so does a shell that has not answered within 30 seconds (it may still start the app, so the run
   starts nothing more and the next run tries again; a hung Explorer never holds the task). The
   app gets `--watchdog-start <nonce>`, a nonce the run writes beside its markers just before: the
-  start that presents it (once, within 2 minutes) is the watchdog's, and claims the instance lock as
-  a restart does, quietly second to an instance that won it. A start with a spent nonce (the
-  installer restarts an app with its old arguments) is an ordinary start.
+  start that presents it (once, within 2 minutes) is the watchdog's. Every start with the flag
+  claims the instance lock as a restart does, quietly second to an instance that won it, so a shell
+  that starts the app late opens nothing. A start with a spent or too old nonce (the installer
+  restarts an app with its old arguments) is otherwise an ordinary start.
 - **The startup entry's start.** Explorer runs the startup entry (`SlopBar`, in HKCU Run, with no
-  arguments) once, as it starts. A start with no arguments, from Explorer, not from a shortcut (the
-  Start menu, the taskbar and the desktop start shortcuts, which Windows tells the app) and within 30
-  minutes of the sign-in is taken as that entry's: if SlopBar already runs (the watchdog started it
-  after a slow sign-in), it ends quietly instead of opening Settings. A person who starts slopbar.exe
-  itself from a folder within those 30 minutes, while SlopBar runs, gets nothing rather than Settings.
+  arguments) once per sign-in, but not always soon: after an update it can wait behind Windows' "Let's
+  finish setting up your device" (measured: 70 minutes after the sign-in). A start with no arguments,
+  from Explorer and not from a shortcut (the Start menu, the taskbar and the desktop start shortcuts,
+  which Windows tells the app) is taken as that entry's whenever it comes: if SlopBar already runs
+  (the watchdog started it meanwhile), it ends quietly instead of opening Settings. A person who
+  starts slopbar.exe itself from a folder while SlopBar runs gets nothing rather than Settings.
 - **A person's Quit lasts for the rest of the sign-in.** The Quit writes a marker naming the sign-in:
   the Windows session's id and the time its user signed in. Every process of that sign-in reads the
   same pair, elevated or not (a token's logon id differs between an admin's two linked tokens);
@@ -436,21 +440,22 @@ passed. Nobody has to set it up; each machine gets it with the release that brin
   (`src-tauri/nsis/ultra-hooks.nsh`): it writes the `uninstalling` marker, which holds every run and
   keeps a SlopBar that a run started meanwhile from registering the task again (for an hour, or until
   the next install removes it), and deletes the task through `schtasks` under nsExec, which shows no
-  console, by the name it builds from its own user's SID. It never runs a slopbar.exe. Updates keep
-  the task.
+  console and is waited for at most 10 seconds, by the name it builds from its own user's SID. It
+  never runs a slopbar.exe. Updates keep the task.
 - **What shows it.** `get_app_info`'s `keep_running`: `enabled` (the setting), `managed` (this build
   keeps the task), `task` (`ok`; `pending` while the app is still making it; `missing`; `disabled`, by
   hand; `wrong` with its `problems`; or `unknown` with its `error`), the task's `last_run` and
-  `last_result`, `last_check` (when the watchdog last decided anything but "running", what, and its
-  exit code), `launch_at_login` (the setting, and the startup entry as Windows will treat it: `ok`,
+  `last_result`, `last_check` (when the watchdog last decided anything but "running" since SlopBar
+  last started, what, and its exit code), `launch_at_login` (the setting, and the startup entry as Windows will treat it: `ok`,
   `missing`, `elsewhere`, `disabled` or `blocked`), and `started_by_watchdog`. The fleet report has a
   Watchdog column (below).
 - **A build without the watchdog at the same place** (an upstream SlopBar, or a local build of
   `claude/subscription-value`) takes the task's `--keep-running` for a plain second launch: while it
   runs, Settings opens every 5 minutes, and after a person quits it, it is started again within 5
   minutes (it writes no Quit marker). `restart_app`, which `scripts/install-local-build.ps1` goes
-  through, removes the task before it restarts into an executable without the watchdog (it looks for
-  the watchdog's sentinel in the file). In any other case, delete the task first, in PowerShell:
+  through, removes the task once it has started an executable without the watchdog (it looks for the
+  watchdog's sentinel in the file); a restart that fails to start leaves the task. In any other case,
+  delete the task first, in PowerShell:
 
   ```powershell
   schtasks /Delete /F /TN "SlopBar Ultra keep running $([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)"
