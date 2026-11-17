@@ -2,6 +2,7 @@
 #![recursion_limit = "256"]
 #![cfg_attr(not(feature = "desktop"), allow(dead_code))]
 mod accounts;
+mod cli;
 mod login;
 mod balancer;
 mod model;

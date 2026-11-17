@@ -287,12 +287,26 @@ pub fn error_text(texts: &dyn Texts, provider: &str, code: &str) -> String {
         "idle" => texts.t("idle", &[]),
         "rate_limited" => texts.t("rateLimited", &[]),
         "active" => texts.t("activeCantRemove", &[]),
-        "CLI not found" => texts.t("cliMissing", &[]),
+        "CLI not found" => cli_missing(texts, provider),
         c => match c.strip_prefix("http_").filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
             Some(n) => texts.t("http", &[("code", n)]),
             None => c.to_string(),
         },
     }
+}
+
+/// `cliMissing` for the provider named (any case), or for both when it is not known
+/// (`cliMissingText` in i18n.js).
+fn cli_missing(texts: &dyn Texts, provider: &str) -> String {
+    let all = crate::accounts::Provider::ALL.map(crate::cli::install_hint);
+    let (cli, install) = match crate::accounts::Provider::ALL.into_iter().find(|p| p.name().eq_ignore_ascii_case(provider)) {
+        Some(p) => {
+            let (cli, install) = crate::cli::install_hint(p);
+            (cli.to_string(), install.to_string())
+        }
+        None => (all.map(|(name, _)| name).join(" / "), all.map(|(name, line)| format!("{name}: {line}")).join("\n")),
+    };
+    texts.t("cliMissing", &[("cli", &cli), ("install", &install)])
 }
 
 /// The health dot's tooltip.
@@ -965,6 +979,23 @@ mod tests {
         assert_eq!(error_text(&En, "", "rate_limited"), en("rateLimited", &[]));
         assert_eq!(error_text(&En, "", "http_"), "http_");
         assert_eq!(error_text(&En, "", "connection reset"), "connection reset");
+    }
+
+    /// No CLI found: the message names the CLI and the line that installs it, both when the
+    /// provider is known (any spelling) and when it is not.
+    #[test]
+    fn a_missing_cli_reads_with_how_to_install_it() {
+        let claude = error_text(&En, "Claude", "CLI not found");
+        assert!(claude.contains("Claude Code") && claude.contains("irm https://claude.ai/install.ps1 | iex") && !claude.contains("chatgpt.com"), "{claude}");
+        assert_eq!(error_text(&En, "claude", "CLI not found"), claude);
+        let codex = error_text(&En, "Codex", "CLI not found");
+        assert!(codex.contains("Codex CLI") && codex.contains("irm https://chatgpt.com/codex/install.ps1 | iex") && !codex.contains("claude.ai"), "{codex}");
+        let either = error_text(&En, "", "CLI not found");
+        assert!(either.contains("irm https://claude.ai/install.ps1 | iex") && either.contains("irm https://chatgpt.com/codex/install.ps1 | iex"), "{either}");
+        for lang in crate::i18n::languages() {
+            let text = crate::i18n::t(lang, "cliMissing", &[("cli", "X"), ("install", "Y")]);
+            assert!(text.contains('X') && text.contains('Y') && !text.contains('{'), "{lang}: {text}");
+        }
     }
 
     #[test]

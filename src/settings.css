@@ -125,6 +125,8 @@ h2 { font-size: 14px; font-weight: 600; margin: 28px 0 8px 1px; }
   color: var(--text); font-size: 14px; line-height: 20px; padding: 14px 16px; margin-top: 12px;
   background: var(--card); border: 1px solid var(--card-stroke); border-radius: 4px;
 }
+/* A failed Add account says how to install the CLI: the line stays on its own and can be copied. */
+#add-hint { white-space: pre-line; user-select: text; cursor: text; }
 .bulk-retry { margin: 8px 1px 0; }
 /* "Signing in on <machine>": another computer's Sign in all accounts, followed through the roster. */
 .hint.notice.peer-run { margin: 0 0 12px; }

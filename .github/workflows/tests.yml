@@ -21,6 +21,9 @@ jobs:
       # The windows load src/*.js as modules: one unparseable file stops every script importing it.
       - name: UI scripts parse
         run: node scripts/check-ui-syntax.cjs
+      # Every language has every English text, with the same {placeholders}.
+      - name: Translations complete
+        run: node scripts/check-i18n.cjs
       - name: Unit tests (desktop build)
         run: cargo test --locked --lib --manifest-path src-tauri/Cargo.toml
       # Releases turn on upstream-updates, which changes defaults such as auto_update: a test can
