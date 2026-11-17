@@ -173,6 +173,10 @@ try {
     Check ($null -ne (Get-Process -Id $signin.ProcessId -ErrorAction SilentlyContinue)) 'S2 desktop: the sign-in still waits 15 s later'
   }
   Stop-Started $appId
+  # SlopBar winds the ended sign-in up (its logout, then its folder) before the next scene changes
+  # what it would find.
+  $wound = Wait-For { (Get-SignInFolders).Count -eq 0 } 60
+  Check ([bool]$wound) 'S2 desktop: the ended sign-in is wound up (its folder removed)'
 
   # S3 new PATH
   $newDir = Join-Path $Work 'installed-later'
@@ -182,11 +186,15 @@ try {
   $userKey.SetValue('Path', (@("$userPath".TrimEnd(';'), $newDir) | Where-Object { $_ }) -join ';', [Microsoft.Win32.RegistryValueKind]::ExpandString)
   $r = Add-Claude
   Check ($null -ne $r.ok) "S3 new PATH: add_account starts a sign-in: $($r | ConvertTo-Json -Compress)"
-  $ran = Wait-For { if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Raw } } 60
-  Check ("$ran" -match [regex]::Escape((Join-Path $newDir 'claude.cmd')) -and "$ran" -match 'auth login') "S3 new PATH: the claude.cmd added to the user PATH after SlopBar started runs the sign-in: $("$ran".Trim())"
+  # The folder's own name (cmd may log the long spelling of an 8.3 TEMP).
+  $fake = [regex]::Escape('\installed-later\claude.cmd ')
+  $lines = { @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue) }
+  $ran = Wait-For { & $lines | Where-Object { $_ -match "$fake.*auth login" } } 60
+  Check ($null -ne $ran) "S3 new PATH: the claude.cmd added to the user PATH after SlopBar started runs the sign-in: $((& $lines) -join ' | ')"
   Stop-Started $appId
-  $out = Wait-For { $text = Get-Content -LiteralPath $log -Raw -ErrorAction SilentlyContinue; if ($text -match 'auth logout') { $text } } 30
-  Check ($null -ne $out) "S3 new PATH: SlopBar's logout of the ended sign-in runs the same CLI: $("$out".Trim() -replace "`r?`n", ' | ')"
+  # Its first line is the sign-in; SlopBar's logout of the ended sign-in comes after it.
+  $out = Wait-For { $all = & $lines; if ($all.Count -ge 2 -and $all[0] -match 'auth login' -and ($all | Select-Object -Skip 1) -match "$fake.*auth logout") { $all } } 40
+  Check ($null -ne $out) "S3 new PATH: SlopBar's logout of the ended sign-in runs the same CLI: $((& $lines) -join ' | ')"
 } finally {
   if ($null -ne $userPath) { $userKey.SetValue('Path', $userPath, $userKind) } else { $userKey.DeleteValue('Path', $false) }
   $userKey.Close()
