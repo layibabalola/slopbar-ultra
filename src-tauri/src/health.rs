@@ -88,6 +88,24 @@ pub struct SharingResult {
     pub at: DateTime<Utc>,
     pub wrote: bool,
     pub read: bool,
+    /// Why the write, and the read, failed when the network's proxy stopped it
+    /// (`proxy::refusal_code`: rclone was not started).
+    pub write_error: Option<&'static str>,
+    pub read_error: Option<&'static str>,
+}
+
+impl SharingResult {
+    /// A refresh's exchange: whether this computer's record was written and the records read, and
+    /// for each, the code of the network's proxy when it stopped it.
+    pub fn of<W, R>(at: DateTime<Utc>, wrote: &std::io::Result<W>, read: &std::io::Result<R>) -> SharingResult {
+        let code = |failed: Option<&std::io::Error>| failed.and_then(crate::proxy::refusal_code);
+        SharingResult { at, wrote: wrote.is_ok(), read: read.is_ok(), write_error: code(wrote.as_ref().err()), read_error: code(read.as_ref().err()) }
+    }
+
+    /// Nothing written or read, for no known reason.
+    pub fn failed(at: DateTime<Utc>) -> SharingResult {
+        SharingResult { at, wrote: false, read: false, write_error: None, read_error: None }
+    }
 }
 
 /// The account roster (see `roster`) and how its last sync went.
@@ -97,6 +115,9 @@ pub struct Roster {
     pub passphrase_saved: bool,
     pub wrote: Option<bool>,
     pub read: Option<bool>,
+    /// Why the last write or read failed, when the network's proxy stopped it.
+    pub write_error: Option<&'static str>,
+    pub read_error: Option<&'static str>,
     /// Other machines' rosters that did not open with this machine's passphrase.
     pub unreadable: usize,
     /// Accounts those rosters name that are not signed in here.
@@ -152,6 +173,23 @@ fn place_set(sharing: &Sharing) -> bool {
     sharing.remote.is_some() || sharing.folder.is_some()
 }
 
+/// For a reason to end with when the network's proxy stopped it: a space and the English sentence
+/// i18n.js has for the code (what `errorText` shows), so Health and the rest of SlopBar say the
+/// same. Empty for anything else.
+fn proxy_reason(code: Option<&str>) -> String {
+    code.filter(|c| crate::net::PROXY_CODES.contains(c)).map(|c| format!(" {}", crate::i18n::t("en", c, &[]))).unwrap_or_default()
+}
+
+/// `proxy_reason` for a write and a read that both failed: once when the proxy stopped both for
+/// the same reason, else each said of what it stopped.
+fn proxy_reasons(write: Option<&str>, read: Option<&str>) -> String {
+    if write == read {
+        return proxy_reason(write);
+    }
+    let of = |what: &str, code: Option<&str>| Some(proxy_reason(code)).filter(|r| !r.is_empty()).map(|r| format!(" {what}:{r}")).unwrap_or_default();
+    format!("{}{}", of("Writing", write), of("Reading", read))
+}
+
 /// The account roster, while it is on: whether it can be shared, and the accounts it found that
 /// wait to be signed in here.
 fn roster_checks(r: &Roster, place: bool) -> Vec<Check> {
@@ -166,8 +204,10 @@ fn roster_checks(r: &Roster, place: bool) -> Vec<Check> {
         check("roster", Status::Warning, title, "On, but no roster passphrase is set: set the same one on each computer under Other computers.", data)
     } else {
         match (r.wrote, r.read) {
-            (Some(false), _) => check("roster", Status::Problem, title, "Could not write this computer's roster, so your other computers do not learn its accounts.", data),
-            (_, Some(false)) => check("roster", Status::Problem, title, "Could not read the rosters, so this computer does not learn the others' accounts.", data),
+            (Some(false), _) => check("roster", Status::Problem, title,
+                format!("Could not write this computer's roster, so your other computers do not learn its accounts.{}", proxy_reason(r.write_error)), data),
+            (_, Some(false)) => check("roster", Status::Problem, title,
+                format!("Could not read the rosters, so this computer does not learn the others' accounts.{}", proxy_reason(r.read_error)), data),
             _ if r.unreadable > 0 => check("roster", Status::Warning, title, format!("{} roster(s) did not open with this computer's passphrase: set the same passphrase on every computer.", r.unreadable), data),
             (None, None) => check("roster", Status::Ok, title, "Shared at the next refresh.", None),
             _ => check("roster", Status::Ok, title, "Shared with your other computers, encrypted.", None),
@@ -316,7 +356,13 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
             monitoring.push(check(id, Status::Problem, format!("{who}: monitoring sign-in unreadable"),
                 "The saved monitoring sign-in could not be read or saved. Check disk space and file access, then reconnect.", connect));
         } else if let Some(e) = error {
-            let why = if e == "monitor_network" { "The monitoring service could not be reached; it is retried at each refresh.".to_string() }
+            // The wait (`Monitor::token_with`), during which the same reason is kept without asking
+            // again; for the proxy, also the site, since a proxy may let usage through but not it.
+            let why = if e == "monitor_network" { "The monitoring service could not be reached; SlopBar tries again at the first refresh at least 5 minutes after it failed.".to_string() }
+                else if crate::net::PROXY_CODES.contains(&e) {
+                    format!("Monitoring could not renew its sign-in at {}.{} SlopBar tries the renewal again at the first refresh at least 5 minutes after it failed, or when it starts again.",
+                        crate::monitoring::token_host(a.provider), proxy_reason(Some(e)))
+                }
                 else if e.starts_with("rate_limited") { "The provider is rate-limiting monitoring; it is retried later.".to_string() }
                 else { format!("Monitoring failed ({}); it is retried at each refresh.", e.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(32).collect::<String>()) };
             monitoring.push(check(id, Status::Warning, format!("{who}: monitoring failing"), why, Some(Fix::Refresh)));
@@ -356,6 +402,8 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
             Some(t) => format!("Last confirmed {}, more than two refresh intervals ago.", ago(now, t)),
             None => "No usage has been read for it yet.".into(),
         };
+        // The network's proxy, when it stopped the read or monitoring's renewal before it.
+        let reason = format!("{reason}{}", proxy_reason(a.error.as_deref()));
         stale.push(check(format!("freshness:{}:{}", a.provider.key(), a.id), Status::Warning, format!("{who}: usage is out of date"), reason, Some(Fix::Refresh)));
     }
     if stale.is_empty() {
@@ -363,10 +411,14 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
     }
     checks.extend(stale);
 
+    // When the network's proxy stops every account's read for the same reason (from the start,
+    // say), that is why nothing was read: the rows above have nothing to say before a first read.
+    let blocked = inputs.accounts.first().and_then(|a| a.error.as_deref())
+        .filter(|code| inputs.accounts.iter().all(|a| a.error.as_deref() == Some(*code)));
     checks.push(match inputs.last_success {
-        None => check("refresh", Status::Warning, "Last refresh", "No refresh has read any account yet.", Some(Fix::Refresh)),
+        None => check("refresh", Status::Warning, "Last refresh", format!("No refresh has read any account yet.{}", proxy_reason(blocked)), Some(Fix::Refresh)),
         Some(t) if now - t > max_age => check("refresh", Status::Problem, "Last refresh",
-            format!("The last refresh that read usage was {}; refreshes run every {} minutes.", ago(now, t), interval.num_minutes()), Some(Fix::Refresh)),
+            format!("The last refresh that read usage was {}; refreshes run every {} minutes.{}", ago(now, t), interval.num_minutes(), proxy_reason(blocked)), Some(Fix::Refresh)),
         Some(t) => check("refresh", Status::Ok, "Last refresh", format!("Usage was read {}.", ago(now, t)), None),
     });
 
@@ -426,9 +478,12 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         (Some(p), None) => check("sharing", Status::Ok, "In-use sharing", format!("Shares through {p}; checked at the next refresh."), None),
         (Some(p), Some(r)) => match (r.wrote, r.read) {
             (true, true) => check("sharing", Status::Ok, "In-use sharing", format!("Shared through {p} {}.", ago(now, r.at)), None),
-            (false, true) => check("sharing", Status::Problem, "In-use sharing", format!("Could not write to {p}, so other computers do not see this one."), data),
-            (true, false) => check("sharing", Status::Problem, "In-use sharing", format!("Could not read {p}, so this computer does not see the others."), data),
-            (false, false) => check("sharing", Status::Problem, "In-use sharing", format!("Could not write to or read {p}."), data),
+            (false, true) => check("sharing", Status::Problem, "In-use sharing",
+                format!("Could not write to {p}, so other computers do not see this one.{}", proxy_reason(r.write_error)), data),
+            (true, false) => check("sharing", Status::Problem, "In-use sharing",
+                format!("Could not read {p}, so this computer does not see the others.{}", proxy_reason(r.read_error)), data),
+            (false, false) => check("sharing", Status::Problem, "In-use sharing",
+                format!("Could not write to or read {p}.{}", proxy_reasons(r.write_error, r.read_error)), data),
         },
     });
 
@@ -777,7 +832,7 @@ mod tests {
         assert_eq!(find(&case.run(), "sharing").status, Status::Ok, "not yet tried");
         assert!(case.run().checks.iter().all(|c| c.id != "rclone"), "rclone only matters for a remote");
         for (wrote, read, status) in [(true, true, Status::Ok), (false, true, Status::Problem), (true, false, Status::Problem), (false, false, Status::Problem)] {
-            case.sharing.last = Some(SharingResult { at: now() - Duration::minutes(2), wrote, read });
+            case.sharing.last = Some(SharingResult { at: now() - Duration::minutes(2), wrote, read, write_error: None, read_error: None });
             let r = case.run();
             let c = find(&r, "sharing");
             assert_eq!(c.status, status, "wrote {wrote} read {read}");
@@ -785,6 +840,93 @@ mod tests {
                 assert_eq!(c.fix, Some(Fix::OpenSettings { page: "data" }));
             }
         }
+    }
+
+    #[test]
+    fn a_sharing_result_keeps_only_the_proxys_code() {
+        use crate::proxy::{ProxyRefused, Refusal};
+        let refused = || -> std::io::Result<()> { Err(std::io::Error::other(ProxyRefused(Refusal::Script))) };
+        let failed = || -> std::io::Result<()> { Err(std::io::Error::other("rclone rcat failed (Some(1))")) };
+        let r = SharingResult::of(now(), &refused(), &Ok::<_, std::io::Error>(vec![1]));
+        assert_eq!((r.wrote, r.read, r.write_error, r.read_error), (false, true, Some("proxy_script"), None));
+        let r = SharingResult::of(now(), &failed(), &refused());
+        assert_eq!((r.wrote, r.read, r.write_error, r.read_error), (false, false, None, Some("proxy_script")), "each failure keeps its own reason");
+        let r = SharingResult::of(now(), &failed(), &failed());
+        assert_eq!((r.write_error, r.read_error), (None, None), "any other failure has no code");
+        let ok = Ok::<_, std::io::Error>(());
+        assert_eq!(SharingResult::of(now(), &ok, &ok), SharingResult { at: now(), wrote: true, read: true, write_error: None, read_error: None });
+        assert_eq!(SharingResult::failed(now()), SharingResult { at: now(), wrote: false, read: false, write_error: None, read_error: None });
+    }
+
+    #[test]
+    fn sharing_the_roster_and_monitoring_say_when_the_networks_proxy_stopped_them() {
+        // The English text Settings, the flyout and the widget show for the code (i18n.js).
+        let script = crate::i18n::t("en", "proxy_script", &[]);
+        let unsupported = crate::i18n::t("en", "proxy_unsupported", &[]);
+        assert!(script.contains("proxy") && unsupported.contains("proxy"), "{script} / {unsupported}");
+        let mut case = Case::healthy();
+        case.sharing = Sharing { folder: None, remote: Some("dropbox".into()), rclone_installed: true, last: None };
+        let script_where = |wrote: bool, read: bool| (if wrote { None } else { Some("proxy_script") }, if read { None } else { Some("proxy_script") });
+        for (wrote, read, words) in [
+            (false, true, "Could not write to the rclone remote dropbox, so other computers do not see this one."),
+            (true, false, "Could not read the rclone remote dropbox, so this computer does not see the others."),
+            (false, false, "Could not write to or read the rclone remote dropbox."),
+        ] {
+            let (write_error, read_error) = script_where(wrote, read);
+            case.sharing.last = Some(SharingResult { at: now(), wrote, read, write_error, read_error });
+            let c = find(&case.run(), "sharing").clone();
+            assert_eq!(c.reason, format!("{words} {script}"));
+            assert_eq!((c.status, c.fix), (Status::Problem, Some(Fix::OpenSettings { page: "data" })));
+            // Any other failure keeps its own words.
+            case.sharing.last = Some(SharingResult { at: now(), wrote, read, write_error: None, read_error: None });
+            assert_eq!(find(&case.run(), "sharing").reason, words);
+        }
+        // Both failed, only one for the proxy (the route changed between them): said of that one.
+        case.sharing.last = Some(SharingResult { at: now(), wrote: false, read: false, write_error: None, read_error: Some("proxy_script") });
+        assert_eq!(find(&case.run(), "sharing").reason, format!("Could not write to or read the rclone remote dropbox. Reading: {script}"));
+        case.sharing.last = Some(SharingResult { at: now(), wrote: false, read: false, write_error: Some("proxy_unsupported"), read_error: Some("proxy_script") });
+        assert_eq!(find(&case.run(), "sharing").reason, format!("Could not write to or read the rclone remote dropbox. Writing: {unsupported} Reading: {script}"));
+
+        case.roster = Roster { enabled: true, passphrase_saved: true, wrote: Some(false), read: Some(false),
+            write_error: Some("proxy_unsupported"), read_error: Some("proxy_script"), ..Default::default() };
+        let c = find(&case.run(), "roster").clone();
+        assert_eq!(c.reason, format!("Could not write this computer's roster, so your other computers do not learn its accounts. {unsupported}"));
+        assert_eq!(c.status, Status::Problem);
+        case.roster.wrote = Some(true);
+        assert_eq!(find(&case.run(), "roster").reason, format!("Could not read the rosters, so this computer does not learn the others' accounts. {script}"));
+        case.roster.read_error = None;
+        assert_eq!(find(&case.run(), "roster").reason, "Could not read the rosters, so this computer does not learn the others' accounts.");
+
+        // Monitoring's renewal, retried as after any connection failure.
+        case.accounts[0].monitor_error = Some("proxy_script".into());
+        let c = find(&case.run(), "monitoring:claude:a").clone();
+        assert_eq!((c.status, c.fix.clone()), (Status::Warning, Some(Fix::Refresh)));
+        assert_eq!(c.reason, format!("Monitoring could not renew its sign-in at platform.claude.com. {script} \
+            SlopBar tries the renewal again at the first refresh at least 5 minutes after it failed, or when it starts again."));
+
+        // An account the proxy keeps from being read at all (its usage, or monitoring's renewal
+        // with no CLI to fall back on): its out-of-date row says why.
+        case.accounts[1].fetched_at = Some(now() - Duration::minutes(30));
+        case.accounts[1].stale = true;
+        case.accounts[1].error = Some("proxy_unsupported".into());
+        assert_eq!(find(&case.run(), "freshness:claude:b").reason, format!("Last confirmed 30 minutes ago, more than two refresh intervals ago. {unsupported}"));
+        case.accounts[1].error = Some("monitor_network".into());
+        assert_eq!(find(&case.run(), "freshness:claude:b").reason, "Last confirmed 30 minutes ago, more than two refresh intervals ago.");
+
+        // Every account stopped by the proxy from the start: before a first read nothing else has
+        // anything to say, so the last refresh says why.
+        let environment = crate::i18n::t("en", "proxy_environment", &[]);
+        let mut start = Case::healthy();
+        start.last_success = None;
+        for a in &mut start.accounts {
+            a.error = Some("proxy_environment".into());
+        }
+        assert_eq!(find(&start.run(), "refresh").reason, format!("No refresh has read any account yet. {environment}"));
+        start.last_success = Some(now() - Duration::minutes(45));
+        assert!(find(&start.run(), "refresh").reason.ends_with(&format!("refreshes run every 5 minutes. {environment}")));
+        // Not all of them: the accounts' own rows say which.
+        start.accounts[0].error = None;
+        assert_eq!(find(&start.run(), "refresh").reason, "The last refresh that read usage was 45 minutes ago; refreshes run every 5 minutes.");
     }
 
     #[test]

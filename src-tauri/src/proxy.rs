@@ -23,24 +23,39 @@ pub enum Route {
     /// Through this proxy: `http://host:port`, or `https://host:port` (a secure connection to the
     /// proxy itself).
     Through(Url),
-    /// Not at all: the proxy Windows names cannot be used, for this reason.
+    /// Not at all: the proxy SlopBar is told to use cannot be used, for this reason.
     Refused(Refusal),
 }
 
-/// Why the proxy Windows names cannot be used.
+/// Why the proxy SlopBar is told to use cannot be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     /// Windows names a proxy SlopBar cannot use: SOCKS, or a kind WinHTTP does not know.
     Unsupported,
     /// Windows' proxy script (set, or found on the network) could not be fetched or run in time.
     Script,
+    /// The proxy environment variable SlopBar reads (HTTPS_PROXY, else ALL_PROXY: SlopBar's own
+    /// requests are https) names a proxy it cannot use: SOCKS, or anything but an http(s) proxy.
+    Environment,
+    /// Only for rclone (`rclone_env`), which takes one proxy for a whole cloud: Windows' proxy
+    /// script picks a proxy per site and gives the cloud's sites different ones, or the remote is
+    /// of a kind whose sites SlopBar does not know, so it cannot tell which proxy is right.
+    Rclone,
 }
 
 impl Refusal {
+    /// Every refusal: each has a stand-in name the resolver answers with it (`refusal_named`). A
+    /// refusal added to the enum belongs here too: `proxy::tests::listed` does not compile until it
+    /// names the new one, and its test then fails until it is here. One missing would still never
+    /// be looked up (`stand_in_refusal`), only worded as `Unsupported`.
+    pub const ALL: [Refusal; 4] = [Refusal::Unsupported, Refusal::Script, Refusal::Environment, Refusal::Rclone];
+
     pub fn why(self) -> crate::net::Why {
         match self {
             Refusal::Unsupported => crate::net::Why::ProxyUnsupported,
             Refusal::Script => crate::net::Why::ProxyScript,
+            Refusal::Environment => crate::net::Why::ProxyEnvironment,
+            Refusal::Rclone => crate::net::Why::ProxyRclone,
         }
     }
 
@@ -49,6 +64,8 @@ impl Refusal {
         match self {
             Refusal::Unsupported => "proxy_unsupported",
             Refusal::Script => "proxy_script",
+            Refusal::Environment => "proxy_environment",
+            Refusal::Rclone => "proxy_rclone",
         }
     }
 
@@ -56,6 +73,8 @@ impl Refusal {
         match self {
             Refusal::Unsupported => "proxy-unsupported",
             Refusal::Script => "proxy-script",
+            Refusal::Environment => "proxy-environment",
+            Refusal::Rclone => "proxy-rclone",
         }
     }
 }
@@ -63,6 +82,28 @@ impl Refusal {
 /// The refusal an rclone run was stopped for (`rclone::proxy_env`), if that is why.
 pub fn refusal_in(error: &std::io::Error) -> Option<Refusal> {
     error.get_ref().and_then(|inner| inner.downcast_ref::<ProxyRefused>()).map(|refused| refused.0)
+}
+
+/// `refusal_in`'s code (`Refusal::code`): what Settings and Health word when sharing through rclone
+/// stopped for it.
+pub fn refusal_code(error: &std::io::Error) -> Option<&'static str> {
+    refusal_in(error).map(Refusal::code)
+}
+
+/// The refusal that stopped `error`, if one did: it or any of its causes, also inside the
+/// io::Errors they wrap (whose own `source` skips the error they carry).
+pub fn refusal_among(error: &(dyn std::error::Error + 'static)) -> Option<ProxyRefused> {
+    let mut cause = Some(error);
+    while let Some(e) = cause {
+        if let Some(refused) = e.downcast_ref::<ProxyRefused>() {
+            return Some(*refused);
+        }
+        if let Some(refused) = e.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()).and_then(|inner| refusal_among(inner)) {
+            return Some(refused);
+        }
+        cause = e.source();
+    }
+    None
 }
 
 /// A request refused before it left this computer: what `net::why` finds in its error.
@@ -75,6 +116,8 @@ impl std::fmt::Display for ProxyRefused {
         f.write_str(match self.0 {
             Refusal::Unsupported => "the proxy Windows is set to use can't be used here (a SOCKS proxy, say), and nothing connects around it",
             Refusal::Script => "Windows' proxy setup script couldn't be fetched or run in time, and nothing connects around the proxy",
+            Refusal::Environment => "the HTTPS_PROXY or ALL_PROXY environment variable names a proxy that can't be used here (only an http:// or https:// proxy can), and nothing connects around it",
+            Refusal::Rclone => "Windows' proxy script picks a proxy per site, and rclone can't be given the one proxy it would need, so it doesn't run",
         })
     }
 }
@@ -254,7 +297,7 @@ fn env_var(env: &Env, names: &[&str]) -> Option<String> {
 
 /// The route the environment sets for `url`, when it sets one: HTTPS_PROXY (https) or HTTP_PROXY
 /// (http), upper case first, else ALL_PROXY; NO_PROXY as reqwest and curl read it. A value that is
-/// no http(s) proxy is refused, not ignored.
+/// no http(s) proxy is refused, not ignored, with a reason that names the environment.
 fn from_env(env: &Env, url: &Url) -> Option<Route> {
     let own = match url.scheme() {
         "https" => env_var(env, &["HTTPS_PROXY", "https_proxy"]),
@@ -270,7 +313,7 @@ fn from_env(env: &Env, url: &Url) -> Option<Route> {
     if rules.intercept(&uri).is_none() {
         return Some(Route::Direct);
     }
-    Some(env_proxy(&value).map_or(Route::Refused(Refusal::Unsupported), Route::Through))
+    Some(env_proxy(&value).map_or(Route::Refused(Refusal::Environment), Route::Through))
 }
 
 /// An environment variable's proxy: `http://` or `https://`, or `host:port` (http), as curl and
@@ -385,12 +428,17 @@ fn stand_in(refusal: Refusal) -> Url {
     Url::parse(&format!("http://{}{STAND_IN}:1", refusal.label())).expect("a valid stand-in")
 }
 
+/// The refusal whose stand-in `host` is: every refusal's own label (`Refusal::ALL`).
 fn refusal_named(host: &str) -> Option<Refusal> {
-    match host.strip_suffix(STAND_IN)? {
-        "proxy-unsupported" => Some(Refusal::Unsupported),
-        "proxy-script" => Some(Refusal::Script),
-        _ => None,
-    }
+    let label = host.strip_suffix(STAND_IN)?;
+    Refusal::ALL.into_iter().find(|refusal| refusal.label() == label)
+}
+
+/// What the resolver answers for a name under the stand-ins' own domain: its refusal, or for a
+/// name that is no refusal's (which nothing asks for), `Unsupported`. None for any other name. So
+/// no such name is ever looked up, whatever a resolver would answer for `.invalid`.
+fn stand_in_refusal(host: &str) -> Option<Refusal> {
+    host.to_ascii_lowercase().ends_with(STAND_IN).then(|| refusal_named(&host.to_ascii_lowercase()).unwrap_or(Refusal::Unsupported))
 }
 
 /// SlopBar's name lookups: a stand-in for a refusal fails with it, without a lookup; every other
@@ -400,7 +448,7 @@ pub struct Resolver;
 impl reqwest::dns::Resolve for Resolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         type Failed = Box<dyn std::error::Error + Send + Sync>;
-        if let Some(refusal) = refusal_named(name.as_str()) {
+        if let Some(refusal) = stand_in_refusal(name.as_str()) {
             return Box::pin(std::future::ready(Err(Box::new(ProxyRefused(refusal)) as Failed)));
         }
         let host = name.as_str().to_string();
@@ -426,28 +474,29 @@ pub fn system() -> &'static Arc<Router> {
 /// also RCLONE_HTTP_PROXY) needs so that it never goes around the proxy Windows names for `hosts`,
 /// the cloud's hosts (its APIs are https). rclone takes one proxy for everything: the proxy Windows
 /// names for any of the hosts, also for those Windows would send direct (through a proxy, never
-/// around one); none when Windows sends them all direct. Two different proxies, or a route that is
-/// refused, and rclone must not run, for this reason. NO_PROXY and RCLONE_HTTP_PROXY are removed so
-/// that nothing inherited overrides it (Go never sends this computer's own addresses through a
-/// proxy anyway). `known`: whether `hosts` are the remote's own; for a cloud SlopBar does not know
-/// they only stand in for it, so where a proxy script decides (which may answer each host its own
-/// way) rclone does not run either. Windows' variable names are not case-sensitive:
-/// `rclone::apply_env` removes the lower-case ones elsewhere.
+/// around one); none when Windows sends them all direct. A route that is refused, and rclone must
+/// not run, for that reason; two different proxies, and it must not run either (`Refusal::Rclone`).
+/// NO_PROXY and RCLONE_HTTP_PROXY are removed so that nothing inherited overrides it (Go never
+/// sends this computer's own addresses through a proxy anyway). `known`: whether `hosts` are the
+/// remote's own; for a cloud SlopBar does not know they only stand in for it, so where a proxy
+/// script decides (which may answer each host its own way) rclone does not run either
+/// (`Refusal::Rclone`). Windows' variable names are not case-sensitive: `rclone::apply_env`
+/// removes the lower-case ones elsewhere.
 pub fn rclone_env(router: &Router, hosts: &[&str], known: bool) -> Result<Vec<(&'static str, Option<String>)>, Refusal> {
     let mut chosen: Option<Url> = None;
     for host in hosts {
         let Ok(url) = Url::parse(&format!("https://{host}/")) else { return Err(Refusal::Unsupported) };
         let (route, decided) = router.decision(&url);
-        if !known && decided == Decided::Script {
-            return Err(Refusal::Unsupported);
-        }
-        match route {
+        let proxy = match route {
+            // Refused for its own reason first: a script that failed did, whatever the cloud.
             Route::Refused(refusal) => return Err(refusal),
-            Route::Direct => {}
-            Route::Through(proxy) => match &chosen {
-                Some(other) if *other != proxy => return Err(Refusal::Unsupported),
-                _ => chosen = Some(proxy),
-            },
+            _ if !known && decided == Decided::Script => return Err(Refusal::Rclone),
+            Route::Direct => continue,
+            Route::Through(proxy) => proxy,
+        };
+        match &chosen {
+            Some(other) if *other != proxy => return Err(Refusal::Rclone),
+            _ => chosen = Some(proxy),
         }
     }
     let proxy = chosen.map(|proxy| proxy.as_str().trim_end_matches('/').to_string());

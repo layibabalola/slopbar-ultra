@@ -21,6 +21,14 @@ pub fn key(slot: &Slot) -> String {
     format!("{}:{}", slot.provider.name(), slot.id)
 }
 
+/// The site monitoring renews `provider`'s sign-ins at, for Health to name when that fails.
+pub fn token_host(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "platform.claude.com",
+        Provider::Codex => "auth.openai.com",
+    }
+}
+
 /// Held by every open monitoring sign-in (the user's, a bulk queue's or an automatic one), so
 /// only one sign-in terminal is ever open at a time.
 pub const SIGN_IN: &str = "monitoring-sign-in";
@@ -583,7 +591,7 @@ impl Monitor {
             let started = std::time::Instant::now();
             let result = transport.refresh(&state.session).await;
             let outcome = match &result { Ok(_) => RefreshOutcome::Success, Err(Failure::Revoked) => RefreshOutcome::Revoked,
-                Err(Failure::RotatedUnreadable) => RefreshOutcome::RotatedUnreadable, Err(Failure::Transient) => RefreshOutcome::Transient,
+                Err(Failure::RotatedUnreadable) => RefreshOutcome::RotatedUnreadable, Err(Failure::Transient | Failure::Proxy(_)) => RefreshOutcome::Transient,
                 Err(Failure::RateLimited(_)) => RefreshOutcome::RateLimited, Err(Failure::Ambiguous) => RefreshOutcome::Ambiguous };
             self.record(slot, Event::Refresh { outcome, reason, elapsed_ms: diagnostics::millis(started) });
             match result {
@@ -655,6 +663,8 @@ impl Monitor {
                                 .into()
                             });
                         }
+                        // Retried as any connection failure is, saying it was the network's proxy.
+                        Failure::Proxy(code) => (code, 300),
                         _ => ("monitor_network", 300),
                     };
                     state.retry_at = Some(now + chrono::Duration::seconds(delay));
@@ -719,6 +729,9 @@ enum Failure {
     Revoked,
     RateLimited(i64),
     Transient,
+    /// A connection failure the network's proxy caused, with its code (`net::proxy_code`):
+    /// handled exactly as `Transient`, and shown as the proxy's reason, not `monitor_network`.
+    Proxy(&'static str),
     Ambiguous,
     RotatedUnreadable,
 }
@@ -776,7 +789,8 @@ impl Api<'_> {
         let response = request.send().await.map_err(|e| {
             self.http_event(session, diagnostics::Endpoint::Token, None, Some(network_kind(&e)), started);
             if e.is_connect() {
-                Failure::Transient
+                // Nothing reached the token endpoint. When the network's proxy is why, say so.
+                crate::net::proxy_code(&e).map_or(Failure::Transient, Failure::Proxy)
             } else {
                 Failure::Ambiguous
             }

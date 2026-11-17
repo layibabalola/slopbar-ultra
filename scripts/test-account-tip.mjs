@@ -236,4 +236,14 @@ test("errors are worded with their fix, and stale readings say so", () => {
   assert.ok(!lines.some((l) => l.startsWith(t("runsOut", { at: "" }).trim())), "no forecast from a stale reading");
 });
 
+test("a monitoring renewal the network's proxy stopped says it was monitoring", () => {
+  const script = t("proxy_script");
+  // Usage was read through the CLI's own sign-in; only monitoring's renewal was refused.
+  const renewal = accountTipLines({ ...account, monitor_error: "proxy_script" }, { now }).flat();
+  assert.ok(renewal.includes(t("monitorProxy", { reason: script })), renewal.join("\n"));
+  // A usage error (a read, or a renewal with nothing to fall back on) is the proxy's words alone.
+  const usage = accountTipLines({ ...account, error: "proxy_script", monitor_error: "proxy_script", stale: true }, { now }).flat();
+  assert.ok(usage.includes(script) && !usage.includes(t("monitorProxy", { reason: script })), usage.join("\n"));
+});
+
 console.log(`${passed} account tooltip and sparkline checks passed`);

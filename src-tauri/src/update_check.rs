@@ -370,6 +370,11 @@ pub fn wait_at_most(limit: Duration, part: impl FnOnce() + Send + 'static) -> bo
 /// An error with its causes, which carry the useful part (a request's "operation timed out"),
 /// made fit to show (see `clean`).
 pub fn describe(error: &(dyn std::error::Error + 'static)) -> String {
+    // A proxy SlopBar would not go around: its own words, whole. reqwest's text before them would
+    // leave them no room under MAX_TEXT.
+    if let Some(refused) = crate::proxy::refusal_among(error) {
+        return clean(&refused.to_string());
+    }
     let mut text = error.to_string();
     let mut cause = error.source();
     while let Some(e) = cause {
@@ -1064,6 +1069,23 @@ mod tests {
         assert_eq!(without_profile(r"C:\Users\Synthetic Name\AppData and C:\Users\Synthetic Names", Some(Path::new(r"C:\Users\Synthetic Name"))),
             r"%USERPROFILE%\AppData and %USERPROFILE% Names", "the user's own folder, spaces and all; another one by its first word");
         assert_eq!(without_profile("/home/synthetic/.cache and /home/synthetic2", Some(Path::new("/home/synthetic"))), "%USERPROFILE%/.cache and /home/synthetic2");
+    }
+
+    /// A proxy SlopBar would not go around is the update check's whole failure, in its own words.
+    #[tokio::test]
+    async fn a_refused_proxy_is_the_update_checks_whole_failure() {
+        use crate::proxy::{ProxyRefused, Refusal};
+        // The longest channel link either build checks, so reqwest's own text is as long as it gets.
+        let url = "https://github.com/layibabalola/slopbar-ultra/releases/download/ultra-channel/latest.json";
+        for (refusal, windows, env) in [
+            (Refusal::Unsupported, Some(Refusal::Unsupported), &[][..]),
+            (Refusal::Script, Some(Refusal::Script), &[][..]),
+            (Refusal::Environment, None, &[("HTTPS_PROXY", "socks5://socks.example.test:1080")][..]),
+        ] {
+            let client = crate::net::with_router(crate::net::builder().no_proxy(), crate::test_support::router(windows, env)).build().unwrap();
+            let failed = client.get(url).send().await.unwrap_err();
+            assert_eq!(describe(&failed), ProxyRefused(refusal).to_string(), "{refusal:?}");
+        }
     }
 
     #[test]

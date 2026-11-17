@@ -86,7 +86,8 @@ the getting-started guide), or the `setup_sharing` agent tool, connects a comput
      file hosts. Like all of SlopBar's own requests (`src-tauri/src/net.rs`), it trusts what
      Windows trusts, through Windows' own certificate checks, so a network that inspects HTTPS works
      once its certificate is installed in Windows, and a certificate Windows distrusts is refused.
-     It uses the proxy Windows is set to (not a proxy script) and HTTPS_PROXY.
+     It uses the proxy Windows would use, proxy scripts included, with HTTPS_PROXY first, and never
+     goes around one it can't use (`proxy_unsupported`, `proxy_script`, `proxy_environment`).
    - A failed download says why, for each site tried (Settings and `get_sharing_setup`'s
      `reasons`): the host and a code such as `untrusted`, `distrusted`, `page` (a web page in the
      zip's place, as a web filter answers), `redirected` (with the host it led to), `status`,

@@ -224,7 +224,7 @@ pub(crate) async fn health_report(app: &AppHandle) -> health::Report {
         roster: {
             let seen = state.roster_seen.lock().unwrap().clone();
             health::Roster { enabled: settings.account_roster, passphrase_saved: roster_passphrase_saved(), wrote: seen.wrote, read: seen.read,
-                unreadable: seen.unreadable, waiting: roster_waiting(&state, &snapshot).len() }
+                write_error: seen.write_error, read_error: seen.read_error, unreadable: seen.unreadable, waiting: roster_waiting(&state, &snapshot).len() }
         },
         journal: state.diagnostics.health(),
         notifications: health::Notifications { registered: seen.notifications_registered, app_enabled, system_enabled,
@@ -2649,25 +2649,26 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
         let (place, h) = (sharing::Place::of(&settings), app.clone());
         let read_from = place.clone();
         let exchanged = tauri::async_runtime::spawn_blocking(move || {
-            let Some((id, name)) = presence::identity() else { return Some((vec![], false, false)) };
+            let Some((id, name)) = presence::identity() else { return Some((vec![], health::SharingResult::failed(now))) };
             // A save that moved sharing since this refresh read the settings: nothing is written to
             // the place it left, which the next refresh withdraws from (see `sharing`).
             if !sharing::still(&place, &sharing::Place::of(&h.state::<AppState>().settings.lock().unwrap())) {
                 return None;
             }
-            let wrote = store.write(&presence::own(id, name, interval, &mine, now)).is_ok();
+            let wrote = store.write(&presence::own(id, name, interval, &mine, now));
             let listed = store.list();
-            let read = listed.is_ok();
-            Some((listed.unwrap_or_default(), wrote, read))
-        }).await.unwrap_or(Some((vec![], false, false)));
-        if let Some((files, wrote, read)) = exchanged {
+            // With the network's proxy's code for whichever it stopped, which Health words.
+            let result = health::SharingResult::of(now, &wrote, &listed);
+            Some((listed.unwrap_or_default(), result))
+        }).await.unwrap_or(Some((vec![], health::SharingResult::failed(now))));
+        if let Some((files, result)) = exchanged {
             let (own, me) = presence::identity().map_or(("", ""), |(id, name)| (id.as_str(), name.as_str()));
             // What the read found raises alarms; what accounts show also keeps a record the read
             // missed, while that record is live (`presence::Recall`).
             let found = presence::peers(files.iter().cloned(), own, now);
-            let every = presence::peers(state.presence_recall.lock().unwrap().fill(&read_from, read.then_some(files.as_slice()), own, now), own, now);
-            shared = Some(health::SharingResult { at: now, wrote, read });
-            covered = wrote || found.iter().any(|p| p.live);
+            let every = presence::peers(state.presence_recall.lock().unwrap().fill(&read_from, result.read.then_some(files.as_slice()), own, now), own, now);
+            shared = Some(result);
+            covered = result.wrote || found.iter().any(|p| p.live);
             presence::apply(&mut list, &found, &every, me, now);
         }
     }
@@ -3261,8 +3262,11 @@ fn sharing_setup_state(app: AppHandle) -> sharing_setup::Setup {
 /// without a sharing location or a passphrase, or once a save moved sharing elsewhere or turned
 /// the roster off since `settings` were read (see `sharing::Sharing::sync_roster`).
 async fn sync_roster(app: &AppHandle, settings: &settings::Settings, accounts: Vec<model::AccountUsage>, force: bool, soon: bool) {
-    let (Some(store), Some(passphrase)) = (roster::store(settings), settings::app_dir().and_then(|d| roster::load_passphrase(&d))) else { return };
     let state = app.state::<AppState>();
+    let (Some(store), Some(passphrase)) = (roster::store(settings), settings::app_dir().and_then(|d| roster::load_passphrase(&d))) else {
+        state.roster_seen.lock().unwrap().unsynced();
+        return;
+    };
     let (sharing, place, h) = (state.sharing.clone(), sharing::Place::of(settings), app.clone());
     let run = state.roster_run.lock().unwrap().clone();
     let now = chrono::Utc::now();
@@ -3277,8 +3281,9 @@ async fn sync_roster(app: &AppHandle, settings: &settings::Settings, accounts: V
             sync.seen.clone()
         })
     }).await.ok().flatten();
-    if let Some(seen) = seen {
-        *state.roster_seen.lock().unwrap() = seen;
+    match seen {
+        Some(seen) => *state.roster_seen.lock().unwrap() = seen,
+        None => state.roster_seen.lock().unwrap().unsynced(),
     }
 }
 
@@ -3347,7 +3352,7 @@ async fn roster_status(app: &AppHandle, sync: bool) -> serde_json::Value {
         "enabled": settings.account_roster,
         "location": settings.presence_remote.is_some() || settings.presence_folder.is_some(),
         "passphrase_saved": roster_passphrase_saved(),
-        "wrote": seen.wrote, "written_at": seen.written_at, "read": seen.read, "read_at": seen.read_at,
+        "wrote": seen.wrote, "written_at": seen.written_at, "write_error": seen.write_error, "read": seen.read, "read_at": seen.read_at, "read_error": seen.read_error,
         "own_accounts": seen.own_accounts, "unreadable": seen.unreadable, "unsupported": seen.unsupported,
         "machines": seen.peers.iter().map(|p| serde_json::json!({ "machine": p.machine, "written_at": p.written_at, "accounts": p.accounts.len() })).collect::<Vec<_>>(),
         "waiting": waiting,

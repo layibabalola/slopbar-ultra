@@ -546,8 +546,9 @@ pub fn connect_args(remote: &str, how: Connect) -> Vec<&str> {
 /// (Dropbox's consent page behind it) and, when the user allows access, writes the token into its
 /// own config. `on_link` gets that link as soon as rclone prints it, for SlopBar to open in a
 /// browser; `cancel` stops rclone, which then writes nothing. Error codes: `cancelled`,
-/// `timed_out`, `proxy_unsupported` and `proxy_script` (the proxy Windows names for Dropbox cannot
-/// be used), and what `failure` reads from rclone's notices.
+/// `timed_out`, `proxy_unsupported`, `proxy_script`, `proxy_environment` and `proxy_rclone` (the
+/// proxy SlopBar would give rclone for Dropbox cannot be used: `proxy::Refusal`), and what
+/// `failure` reads from rclone's notices.
 pub fn connect_dropbox(rclone: &std::path::Path, remote: &str, how: Connect, on_link: &dyn Fn(String), cancel: &std::sync::atomic::AtomicBool, timeout: std::time::Duration) -> Result<(), &'static str> {
     use std::io::BufRead;
     use std::process::Stdio;
@@ -556,7 +557,7 @@ pub fn connect_dropbox(rclone: &std::path::Path, remote: &str, how: Connect, on_
     }
     let mut command = crate::sources::command(&rclone.to_string_lossy());
     // rclone takes the token from Dropbox through the proxy Windows names for Dropbox, or does not
-    // run (`proxy_unsupported`, `proxy_script`). Its own sign-in server is on this computer, which
+    // run (`proxy::Refusal::code`). Its own sign-in server is on this computer, which
     // rclone never reaches through a proxy.
     crate::rclone::proxy_env(&mut command, crate::rclone::cloud("dropbox"))
         .map_err(|e| crate::proxy::refusal_in(&e).map_or("rclone_failed", crate::proxy::Refusal::code))?;

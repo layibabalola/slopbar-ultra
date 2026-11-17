@@ -204,10 +204,13 @@ fn the_environment_comes_first_with_no_proxy() {
     // Upper case first, and an empty variable is unset.
     let router = Router::with_env(windows.clone(), env_of(&[("HTTPS_PROXY", " "), ("https_proxy", "http://lower.example.test:2")]));
     assert_eq!(router.route(&url("https://a.example.test/")), through("http://lower.example.test:2"));
-    // A value that is no http(s) proxy is refused, not ignored.
+    // A value that is no http(s) proxy is refused, not ignored, and the reason names the
+    // environment, not Windows.
     for value in ["socks5://s.example.test:1080", "ftp://f.example.test", "http://"] {
         let router = Router::with_env(windows.clone(), env_of(&[("HTTPS_PROXY", value)]));
-        assert_eq!(router.route(&url("https://a.example.test/")), Route::Refused(Refusal::Unsupported), "{value}");
+        assert_eq!(router.decision(&url("https://a.example.test/")), (Route::Refused(Refusal::Environment), Decided::Environment), "{value}");
+        let router = Router::with_env(windows.clone(), env_of(&[("ALL_PROXY", value)]));
+        assert_eq!(router.route(&url("https://a.example.test/")), Route::Refused(Refusal::Environment), "{value}");
     }
 }
 
@@ -289,6 +292,19 @@ async fn a_refused_proxy_fails_the_request_with_its_reason_and_nothing_goes_dire
         let code = if why == Why::ProxyUnsupported { "proxy_unsupported" } else { "proxy_script" };
         assert_eq!(crate::net::failure_text(&failed), code);
     }
+    // An environment variable SlopBar cannot use, whatever Windows would say: its own reason.
+    let windows = Arc::new(fake(set(false, None, true), Ok(vec![direct()]), Ok(vec![direct()])));
+    let env = env_of(&[("HTTPS_PROXY", "socks5://socks.example.test:1080")]);
+    let failed = client(Arc::new(Router::with_env(windows, env)), &target).get("https://api.example.test/x").send().await.unwrap_err();
+    assert_eq!((crate::net::why(&failed), crate::net::failure_text(&failed)), (Why::ProxyEnvironment, "proxy_environment".to_string()));
+    assert!(failed.is_connect(), "nothing was sent, so monitoring retries it as a connection failure");
+    // Every refusal's stand-in, through the client: its own reason and code.
+    for refusal in Refusal::ALL {
+        let windows = Arc::new(Fake { settings: Err(refusal), ..fake(None, Ok(vec![]), Ok(vec![])) });
+        let failed = client(Arc::new(Router::with_env(windows, env_of(&[]))), &target).get("https://api.example.test/x").send().await.unwrap_err();
+        assert_eq!((crate::net::why(&failed), crate::net::proxy_code(&failed)), (refusal.why(), Some(refusal.code())), "{refusal:?}");
+        assert!(failed.is_connect(), "{refusal:?}");
+    }
     assert_eq!(target.count(), 0, "nothing went direct");
 
     // The control: a direct answer does reach the target.
@@ -297,15 +313,67 @@ async fn a_refused_proxy_fails_the_request_with_its_reason_and_nothing_goes_dire
     assert_eq!(target.count(), 1);
 }
 
+/// `Refusal::ALL` is every refusal: a refusal added to the enum does not compile here until it is
+/// matched, and then this fails until it is in ALL too, where `refusal_named` finds it.
+fn listed(refusal: Refusal) -> bool {
+    match refusal {
+        Refusal::Unsupported | Refusal::Script | Refusal::Environment | Refusal::Rclone => Refusal::ALL.contains(&refusal),
+    }
+}
+
 #[test]
 fn a_stand_in_names_only_its_refusal() {
-    for refusal in [Refusal::Unsupported, Refusal::Script] {
+    for refusal in [Refusal::Unsupported, Refusal::Script, Refusal::Environment, Refusal::Rclone] {
+        assert!(listed(refusal), "{refusal:?} is missing from Refusal::ALL");
+    }
+    for refusal in Refusal::ALL {
         let name = stand_in(refusal).host_str().unwrap().to_string();
         assert!(name.ends_with(".invalid"), "{name}");
         assert_eq!(refusal_named(&name), Some(refusal));
     }
     for other in ["slopbar.invalid", "x.slopbar.invalid", "proxy-script.slopbar.invalid.example", "api.example.test"] {
         assert_eq!(refusal_named(other), None, "{other}");
+    }
+    // The resolver looks up no name under the stand-ins' domain: one that is no refusal's (a
+    // refusal left out of ALL, say) is refused too.
+    for refusal in Refusal::ALL {
+        let name = stand_in(refusal).host_str().unwrap().to_ascii_uppercase();
+        assert_eq!(stand_in_refusal(&name), Some(refusal), "{name}");
+    }
+    for unknown in ["x.slopbar.invalid", crate::rclone::ANY_HOST, "proxy-new.SLOPBAR.invalid"] {
+        assert_eq!(stand_in_refusal(unknown), Some(Refusal::Unsupported), "{unknown}");
+    }
+    for other in ["slopbar.invalid", "proxy-script.slopbar.invalid.example", "api.example.test", "example.invalid"] {
+        assert_eq!(stand_in_refusal(other), None, "{other}");
+    }
+}
+
+/// Each refusal's code is the one its `Why` gives, and is a code everything that words the
+/// network's proxy knows: diagnostics, Health, the native widget, i18n.js's `errorText` and its
+/// English text, and the rclone download reasons Settings words (`sharingWhy_…`).
+#[test]
+fn every_proxy_code_is_known_wherever_one_is_worded() {
+    let i18n = include_str!("../../../src/i18n.js");
+    // The list errorText and accountErrorText use.
+    let listed = i18n.split("const PROXY_CODES = [").nth(1).and_then(|l| l.split("];").next()).expect("i18n.js's PROXY_CODES");
+    assert!(i18n.contains("if (PROXY_CODES.includes(code)) return t(code);"), "errorText words them");
+    let mut codes: Vec<&str> = Refusal::ALL.iter().map(|r| r.code()).collect();
+    codes.extend([Why::ProxyAuth, Why::ProxyRefused].map(|w| w.proxy_code().unwrap()));
+    for refusal in Refusal::ALL {
+        assert_eq!(refusal.why().proxy_code(), Some(refusal.code()), "{refusal:?}");
+    }
+    assert_eq!(codes.len(), crate::net::PROXY_CODES.len(), "every code SlopBar gives, and no other: {codes:?}");
+    for code in codes {
+        assert!(crate::net::PROXY_CODES.contains(&code), "{code}");
+        assert_eq!(crate::diagnostics::Code::from_error(Some(code)), crate::diagnostics::Code::Proxy, "{code}");
+        let english = crate::i18n::t("en", code, &[]);
+        assert!(english != code && english.contains("proxy"), "{code}: {english}");
+        assert!(listed.contains(&format!("\"{code}\"")), "errorText (i18n.js) words {code}");
+        assert_eq!(crate::widget::error_text(&crate::widget::Lang("en".into(), None), "", code), english, "the widget words {code}");
+        // rclone's own refusal is never a download's.
+        if code != "proxy_rclone" {
+            assert!(crate::i18n::t("en", &format!("sharingWhy_{code}"), &[("host", "x")]).starts_with("x: "), "sharingWhy_{code}");
+        }
     }
 }
 
@@ -363,9 +431,9 @@ fn rclone_gets_the_proxy_windows_names_for_its_cloud_or_does_not_run() {
     // through a proxy and never around one.
     let some = by_host(vec![("//api.", vec![proxy(1, "proxy.example.test", 8080)]), ("//content.", vec![direct()])]);
     assert_eq!(rclone_env(&some, &["api.dropboxapi.com", "content.dropboxapi.com"], true).unwrap()[0], ("HTTPS_PROXY", Some("http://proxy.example.test:8080".to_string())));
-    // Two different proxies: rclone takes only one, so it does not run.
+    // Two different proxies: rclone takes only one, so it does not run, and says that is why.
     let two = by_host(vec![("//api.", vec![proxy(1, "a.example.test", 8080)]), ("//content.", vec![proxy(1, "b.example.test", 8080)])]);
-    assert_eq!(rclone_env(&two, &["api.dropboxapi.com", "content.dropboxapi.com"], true), Err(Refusal::Unsupported));
+    assert_eq!(rclone_env(&two, &["api.dropboxapi.com", "content.dropboxapi.com"], true), Err(Refusal::Rclone));
 
     // A cloud SlopBar does not know: the remote's own host is not known here, so where a script
     // decides (which may answer it its own way) rclone does not run; where the manual proxy or the
@@ -373,7 +441,10 @@ fn rclone_gets_the_proxy_windows_names_for_its_cloud_or_does_not_run() {
     let unknown = crate::rclone::cloud("s3");
     assert_eq!(unknown, crate::rclone::Cloud { hosts: &[crate::rclone::ANY_HOST], known: false });
     assert!(crate::rclone::cloud("dropbox").known && crate::rclone::cloud("crypt").hosts == unknown.hosts);
-    assert_eq!(rclone_env(&router(at("proxy.example.test", 8080)), unknown.hosts, false), Err(Refusal::Unsupported));
+    assert_eq!(rclone_env(&router(at("proxy.example.test", 8080)), unknown.hosts, false), Err(Refusal::Rclone));
+    assert_eq!(rclone_env(&router(Ok(vec![direct()])), unknown.hosts, false), Err(Refusal::Rclone), "even where the script says direct");
+    // A script that failed is the reason, whatever the cloud.
+    assert_eq!(rclone_env(&router(Err(Failure::Os(12167))), unknown.hosts, false), Err(Refusal::Script));
     let from_env = Router::with_env(Arc::new(fake(set(true, None, false), at("proxy.example.test", 1), Ok(vec![]))), env_of(&[("ALL_PROXY", "http://env.example.test:2"), ("NO_PROXY", ".dropboxapi.com,.googleapis.com")]));
     assert_eq!(rclone_env(&from_env, unknown.hosts, false).unwrap()[0], ("HTTPS_PROXY", Some("http://env.example.test:2".to_string())));
     // A manual proxy whose bypass list covers the well-known clouds still names its proxy for the

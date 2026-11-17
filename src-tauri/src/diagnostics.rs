@@ -57,7 +57,7 @@ impl Code {
             Some("token_invalid") => Self::TokenInvalid,
             Some("token_expired") => Self::TokenExpired,
             Some("bad_response") => Self::BadResponse,
-            Some("proxy_unsupported" | "proxy_script" | "proxy_auth" | "proxy_refused") => Self::Proxy,
+            Some(e) if crate::net::PROXY_CODES.contains(&e) => Self::Proxy,
             Some(e)
                 if e.strip_prefix("rate_limited:")
                     .is_some_and(|n| n.parse::<i64>().is_ok()) =>

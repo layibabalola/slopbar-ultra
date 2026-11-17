@@ -47,6 +47,30 @@ pub fn require_short_names(path: &str) {
     eprintln!("skipped: no 8.3 short spelling for {path}");
 }
 
+/// Routes for a test: the proxy environment `env` first, as always; then Windows' proxy settings,
+/// which refuse every link with `refusal` (as settings that cannot be read, or a proxy script
+/// that fails, do), or are not set at all for None. A link on this computer stays direct.
+pub fn router(refusal: Option<crate::proxy::Refusal>, env: &[(&str, &str)]) -> std::sync::Arc<crate::proxy::Router> {
+    use crate::proxy::{Entry, Failure, Refusal, Settings};
+    struct Windows(Option<Refusal>);
+    impl crate::proxy::Windows for Windows {
+        fn settings(&self) -> Result<Option<Settings>, Refusal> {
+            self.0.map_or(Ok(None), Err)
+        }
+        fn automatic(&self, _: &str, _: bool, _: Option<&str>, _: std::time::Instant) -> Result<Vec<Entry>, Failure> {
+            unreachable!("no settings, so nothing automatic")
+        }
+        fn manual(&self, _: &str, _: std::time::Instant) -> Result<Vec<Entry>, Failure> {
+            unreachable!("no settings, so no manual proxy")
+        }
+        fn detection_off(&self) -> bool {
+            false
+        }
+    }
+    let env: std::collections::HashMap<String, String> = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    std::sync::Arc::new(crate::proxy::Router::with_env(std::sync::Arc::new(Windows(refusal)), Box::new(move |name| env.get(name).cloned())))
+}
+
 pub fn slot(id: &str, access: &str, refresh: &str, expires_ms: i64) -> crate::accounts::Slot {
     crate::accounts::Slot {
         id: id.into(),

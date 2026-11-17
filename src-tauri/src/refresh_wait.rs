@@ -550,16 +550,23 @@ mod tests {
         assert!(place == "&place" && read == "live" && closure_body(run) == Some(tokens("{ if let Some(run) = run { sync.offer_run(run); } \
             sync.sync(store.as_ref(), &passphrase, (id, name), &accounts, now, force, soon); sync.seen.clone() }").as_str()) && run.starts_with("|sync|"),
             "a roster sync only where the settings still share. {}\n{sync}", update(HANDS));
+        // A sync that could not run leaves no proxy reason from an earlier one (`Seen::unsynced`).
+        assert!(has(sync, "else { state.roster_seen.lock().unwrap().unsynced(); return; };")
+            && has(sync, "match seen { Some(seen) => *state.roster_seen.lock().unwrap() = seen, None => state.roster_seen.lock().unwrap().unsynced(), }"),
+            "{}\n{sync}", update(HANDS));
         let locked = function(&app, "app.rs", "async fn refresh_locked(", HANDS);
         let identity = "let Some((id, name)) = presence::identity() else {";
         let unknown = statement(locked, identity).unwrap_or_else(|| panic!("{}", lost("refresh_locked in app.rs", identity, HANDS)));
         // rustfmt ends the `return` with a semicolon.
-        assert!([tokens("let Some((id, name)) = presence::identity() else { return Some((vec![], false, false)) };"),
-            tokens("let Some((id, name)) = presence::identity() else { return Some((vec![], false, false)); };")].iter().any(|s| s == unknown),
+        assert!([tokens("let Some((id, name)) = presence::identity() else { return Some((vec![], health::SharingResult::failed(now))) };"),
+            tokens("let Some((id, name)) = presence::identity() else { return Some((vec![], health::SharingResult::failed(now))); };")].iter().any(|s| s == unknown),
             "{}\n{locked}", lost("refresh_locked in app.rs", identity, HANDS));
         let next = &locked[unknown.as_ptr() as usize - locked.as_ptr() as usize + unknown.len()..];
         assert!(next.starts_with(&tokens("if !sharing::still(&place, &sharing::Place::of(&h.state::<AppState>().settings.lock().unwrap())) { return None; } let wrote = store.write(")),
             "a refresh's presence record only where the settings still share. {}\n{locked}", update(HANDS));
+        // What Health shows of it is worked out by the helper health's tests cover.
+        assert!(has(next, "let wrote = store.write(&presence::own(id, name, interval, &mine, now)); let listed = store.list(); \
+            let result = health::SharingResult::of(now, &wrote, &listed);"), "{}\n{locked}", update(HANDS));
         assert!(!has(&app, "presence::withdraw(") && !has(&app, "roster::withdraw("),
             "this machine's files are withdrawn through sharing (sharing::Files): by the refresh and on exit, never by a save. {}", update(HANDS));
         let exit = function(&app, "app.rs", "pub(crate) fn on_exit(", HANDS);
