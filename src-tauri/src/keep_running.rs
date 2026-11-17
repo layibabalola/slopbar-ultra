@@ -12,9 +12,10 @@
 //! The check starts SlopBar with `--watchdog-start <its own pid>`, which claims the instance lock as
 //! a restart does: it waits for the check to end, and leaves quietly to an instance that won the lock.
 //! Task Scheduler runs each task in a job object; the app the check starts breaks away from it when
-//! the job allows that, and otherwise stays in it only when it has no limit that could end or bound
-//! the app (`spawn_flags`): such a job is never closed on the app, which then outlives the check, a
-//! new run, the task's repair and its removal.
+//! the job allows that, and otherwise stays in it only when the job has no limit that could end or
+//! bound the app (`spawn_flags`). Task Scheduler's allows no breakaway and has no limits: letting go
+//! of it ends nothing, and the app outlives the check, the task's next runs, its repair and its
+//! removal.
 //!
 //! Ultra release builds create or repair the task at startup and remove it while `keep_running` is
 //! off (`apply`); the uninstaller removes it (`--remove-keep-running`, src-tauri/nsis/ultra-hooks.nsh).
