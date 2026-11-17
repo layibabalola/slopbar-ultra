@@ -1,0 +1,132 @@
+name: Ultra install smoke test
+
+# A clean Windows runner installs SlopBar Ultra the way a computer outside the fleet does: with the
+# one-line bootstrap scripts/install-ultra.ps1 (docs/ULTRA-RELEASES.md, "Installing on another
+# machine"), fetched from this commit and run under Windows PowerShell 5.1.
+# - fresh: the bootstrap must report OK. The app's door must answer with the channel's version, and
+#   Update automatically and Launch at login must be on. A second run must find the install and
+#   change nothing.
+# - update: the release before the channel's is installed first, with Update automatically off from
+#   its first start. The bootstrap must bring it to the channel's version through the app's own
+#   install_update, then turn Update automatically back on.
+#
+# It runs when the bootstrap or this workflow changes. Re-running its newest run tests the release
+# the channel holds now. It needs no secrets and publishes nothing.
+
+on:
+  push:
+    branches: [ultra]
+    paths:
+      - scripts/install-ultra.ps1
+      - .github/workflows/ultra-install-smoke.yml
+
+permissions:
+  contents: read
+
+env:
+  BOOTSTRAP: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/scripts/install-ultra.ps1
+  CHANNEL: https://github.com/${{ github.repository }}/releases/download/ultra-latest/latest.json
+
+jobs:
+  fresh:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install with the one-line bootstrap (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          "image $env:ImageOS $env:ImageVersion; per-user startup key present before: $(Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run')"
+          irm $env:BOOTSTRAP | iex
+          $r = $global:SlopBarUltraInstall
+          if (-not $r -or -not $r.ok -or $r.message -notmatch ' is installed and running') { throw "first run: $($r.step): $($r.message)" }
+          if ($r.message -notmatch 'Launch at login: on\.') { throw "first run: Launch at login did not read as on: $($r.message)" }
+
+      - name: Run it again; it must find the install and change nothing
+        shell: powershell
+        run: |
+          irm $env:BOOTSTRAP | iex
+          $r = $global:SlopBarUltraInstall
+          if (-not $r -or -not $r.ok -or $r.message -notmatch 'already installed and running') { throw "second run: $($r.step): $($r.message)" }
+
+      - name: Check the running app through its door
+        if: always()
+        shell: pwsh
+        run: |
+          $door = Join-Path $env:LOCALAPPDATA 'SlopBar\slopbar-mcp.exe'
+          $info = (& $door --call get_app_info | Select-Object -Last 1 | ConvertFrom-Json).ok
+          $settings = (& $door --call get_settings | Select-Object -Last 1 | ConvertFrom-Json).ok
+          Invoke-WebRequest $env:CHANNEL -OutFile latest.json
+          $channel = (Get-Content -Raw latest.json | ConvertFrom-Json).version
+          "runs $($info.version), channel $channel, build has updates $($info.updates_enabled), auto_update $($settings.auto_update), launch_at_login $($settings.launch_at_login)"
+          "LOCALAPPDATA $env:LOCALAPPDATA; TEMP $env:TEMP"
+          Get-Process slopbar | ForEach-Object { "process $($_.Id) session $($_.SessionId): $($_.Path)" }
+          $run = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue
+          $entries = @($run.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' })
+          $entries | ForEach-Object { "Run entry $($_.Name) = $($_.Value)" }
+          if ($info.version -ne $channel) { throw "runs $($info.version), not the channel's $channel" }
+          if (-not $info.updates_enabled -or $settings.auto_update -ne $true) { throw 'Update automatically is not on' }
+          if ($settings.launch_at_login -ne $true) { throw 'Launch at login is not on' }
+          if (-not ($entries | Where-Object { "$($_.Value)" -match 'slopbar\.exe' })) { throw 'Windows has no startup entry for SlopBar' }
+
+  update:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install the release before the channel's, with Update automatically off from its first start
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Invoke-WebRequest $env:CHANNEL -OutFile latest.json
+          $channel = (Get-Content -Raw latest.json | ConvertFrom-Json).version
+          $key = { param($v) if ($v -match '^(\d+)\.(\d+)\.(\d+)-ultra\.(\d+)$') { '{0:D6}.{1:D6}.{2:D6}.{3:D9}' -f [int]$Matches[1], [int]$Matches[2], [int]$Matches[3], [int]$Matches[4] } }
+          $older = gh release list -R $env:GITHUB_REPOSITORY --limit 30 --json tagName --jq '.[].tagName' |
+            Where-Object { $_ -like 'ultra-v*' } | ForEach-Object { $_.Substring(7) } |
+            Where-Object { (& $key $_) -and (& $key $_) -lt (& $key $channel) } |
+            Sort-Object { & $key $_ } | Select-Object -Last 1
+          if (-not $older) { throw "no release before $channel" }
+          gh release download "ultra-v$older" -R $env:GITHUB_REPOSITORY -p '*-setup.exe' -D old
+          $setup = Get-ChildItem old -Filter '*-setup.exe' | Select-Object -First 1
+          # Settings are read with defaults for anything missing, so this file turns off only the
+          # automatic update, before the app's first check (about 20 s after it starts) can run.
+          $data = Join-Path $env:APPDATA 'dev.thelio.slopbar'
+          New-Item -ItemType Directory -Path $data -Force | Out-Null
+          Set-Content -LiteralPath (Join-Path $data 'settings.json') -Value '{"auto_update":false}' -Encoding ascii
+          $p = Start-Process $setup.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installer exit $($p.ExitCode)" }
+          $dir = Join-Path $env:LOCALAPPDATA 'SlopBar'
+          if (-not (Get-Process slopbar -ErrorAction SilentlyContinue)) { Start-Process (Join-Path $dir 'slopbar.exe') }
+          $door = Join-Path $dir 'slopbar-mcp.exe'
+          $deadline = (Get-Date).AddSeconds(90)
+          do { Start-Sleep 2; $info = (& $door --call get_app_info | Select-Object -Last 1 | ConvertFrom-Json).ok } until ($info.version -or (Get-Date) -gt $deadline)
+          if (-not $info.version) { throw 'the older release did not answer' }
+          $settings = (& $door --call get_settings | Select-Object -Last 1 | ConvertFrom-Json).ok
+          "installed $($info.version) (channel $channel); auto_update $($settings.auto_update)"
+          if ($info.version -ne $older) { throw "runs $($info.version), not $older" }
+          if ($settings.auto_update -ne $false) { throw 'Update automatically is on; the test would not reach the bootstrap''s update path' }
+
+      - name: The bootstrap updates it (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          irm $env:BOOTSTRAP | iex
+          $r = $global:SlopBarUltraInstall
+          if (-not $r -or -not $r.ok -or $r.message -notmatch ' is installed and running') { throw "update run: $($r.step): $($r.message)" }
+
+      - name: Check the version and settings through the door
+        if: always()
+        shell: pwsh
+        run: |
+          $door = Join-Path $env:LOCALAPPDATA 'SlopBar\slopbar-mcp.exe'
+          $info = (& $door --call get_app_info | Select-Object -Last 1 | ConvertFrom-Json).ok
+          $settings = (& $door --call get_settings | Select-Object -Last 1 | ConvertFrom-Json).ok
+          Invoke-WebRequest $env:CHANNEL -OutFile latest.json
+          $channel = (Get-Content -Raw latest.json | ConvertFrom-Json).version
+          "runs $($info.version), channel $channel, auto_update $($settings.auto_update), launch_at_login $($settings.launch_at_login)"
+          Get-Process slopbar | ForEach-Object { "process $($_.Id) session $($_.SessionId): $($_.Path)" }
+          $run = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue
+          $entries = @($run.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' })
+          $entries | ForEach-Object { "Run entry $($_.Name) = $($_.Value)" }
+          if ($info.version -ne $channel) { throw "runs $($info.version), not the channel's $channel" }
+          if ($settings.auto_update -ne $true) { throw 'Update automatically was not turned back on' }
+          if ($settings.launch_at_login -ne $true) { throw 'Launch at login is not on' }
+          if (-not ($entries | Where-Object { "$($_.Value)" -match 'slopbar\.exe' })) { throw 'Windows has no startup entry for SlopBar' }

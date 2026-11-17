@@ -39,7 +39,9 @@ Installed build and health on this PC, through the app's door (the slopbar MCP s
 
 Other machines: by their ssh aliases over the fleet key mesh (key auth; memory
 `reference-other-machines-ssh` lists them and what breaks over ssh). Update and visually check them
-with `~/.claude/ops/remote-slopbar/README.md`.
+with `~/.claude/ops/remote-slopbar/README.md`. A computer the mesh can't reach, such as a work
+laptop, installs with one line that Layi runs there: `docs/ULTRA-RELEASES.md`, "Installing on another
+machine".
 
 ## Standing procedure
 

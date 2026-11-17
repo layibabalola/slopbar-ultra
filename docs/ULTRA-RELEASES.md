@@ -302,9 +302,46 @@ The names matter:
 
 ## Installing on another machine
 
-1. Download `SlopBar_<version>_x64-setup.exe` from the newest `ultra-v…` release:
-   `gh release download ultra-v0.1.0-ultra.1 -R layibabalola/slopbar-ultra -p "*-setup.exe"`,
-   or use the release page.
+A machine in the fleet is set up from another machine over SSH ("The fleet", below). On any other
+Windows computer, such as a work laptop, paste this line into a normal PowerShell window, not one
+run as administrator:
+
+```powershell
+irm https://raw.githubusercontent.com/layibabalola/slopbar-ultra/ultra/scripts/install-ultra.ps1 | iex
+```
+
+It installs the release the channel holds, for that user only, with no admin rights. It checks the
+download's size and SHA-256 against GitHub's digest, starts SlopBar Ultra, and turns on "Update
+automatically" and Launch at login. Where an older Ultra release runs, it asks the app to update
+itself instead. Where a local build or upstream SlopBar runs, it changes nothing and says so. Its
+last line is `RESULT: OK`, or `RESULT: FAILED at <step>` with the reason. Then sign in to your
+accounts in SlopBar Ultra.
+
+The fleet report can't see such a computer, so that last line is its check. From then on the app
+updates itself from the channel, like every other install.
+
+The script never works around a block. Where it stops:
+- A proxy that asks for a sign-in (error 407) stops the first download. This line signs in to it as
+  you, the way the browser does:
+  `[Net.WebRequest]::DefaultWebProxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials; irm https://raw.githubusercontent.com/layibabalola/slopbar-ultra/ultra/scripts/install-ultra.ps1 | iex`
+- The network has to let through raw.githubusercontent.com, github.com, api.github.com and
+  release-assets.githubusercontent.com, and go.microsoft.com where the WebView2 Runtime is missing.
+- Where a policy blocks scripts or the installer, install by hand (below), or ask the computer's
+  administrator.
+
+The line trusts this repository, as updates do. It checks GitHub's digest of the installer, not the
+fork's signature; the app checks that signature on every update after this one. Its download carries
+no Mark of the Web, so SmartScreen does not ask about it. The computer's policy and antivirus still
+apply.
+
+`.github/workflows/ultra-install-smoke.yml` runs the line on a clean Windows runner whenever the
+script changes: a fresh install, and an update from the release before. Re-run its newest run to
+test the release the channel holds now.
+
+By hand:
+
+1. Download `SlopBar_<version>_x64-setup.exe` from the newest `ultra-v…` release on the
+   [release page](https://github.com/layibabalola/slopbar-ultra/releases).
 2. Run it. The installer is per-user and needs no admin rights. It's unsigned (see below), so
    SmartScreen may say "Windows protected your PC": choose **More info → Run anyway**.
 3. Sign in to accounts in SlopBar Ultra as usual. On a fresh install, "Update automatically" is
@@ -390,7 +427,8 @@ pwsh scripts/fleet-slopbar.ps1 -UpdateNow
 
 - **Machines:** this one, plus each stanza with a `HostName` in the managed block of `~/.ssh/config`
   (between `# >>> fleet-ssh managed block` and `# <<< fleet-ssh managed block <<<`). No host names
-  or addresses are in the repository.
+  or addresses are in the repository. A computer outside that block, such as a work laptop
+  installed with the one line above, is not in the report.
 - **How it asks:** each machine's own `slopbar-mcp.exe --call` (`get_app_info`, `get_settings`,
   `install_update`), all machines at once. Over ssh the command is
   `cmd /d /c if exist <door> <door> --call <tool>`, which works under a PowerShell or cmd remote
