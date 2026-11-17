@@ -500,9 +500,9 @@ mod tests {
 
     /// Outside its tests, nothing sets a proxy of its own, looks names up its own way, goes
     /// direct, or routes by routes of its own (only proxy.rs makes a `Router`: this user's): each
-    /// would be a way around the proxy Windows names. The one exception is phone.rs, which reaches a
-    /// server on this computer or its local network directly, on purpose. test_support.rs is
-    /// compiled for tests only.
+    /// would be a way around the proxy Windows names. The exceptions: phone.rs reaches a server on
+    /// this computer or its local network directly, on purpose; test_support.rs, which only tests
+    /// compile, makes tests' own routes.
     #[test]
     fn nothing_goes_around_the_proxy() {
         fn walk(dir: &std::path::Path, found: &mut Vec<String>) {
@@ -511,12 +511,14 @@ mod tests {
                 let name = path.file_name().unwrap().to_string_lossy().into_owned();
                 if path.is_dir() {
                     walk(&path, found);
-                } else if name.ends_with(".rs") && !matches!(name.as_str(), "net.rs" | "tests.rs" | "test_support.rs") {
+                } else if name.ends_with(".rs") && !matches!(name.as_str(), "net.rs" | "tests.rs") {
                     let code = crate::source_guard::tokens(&std::fs::read_to_string(&path).unwrap());
                     // Only the code before the file's own tests.
                     let code = code.split("#[cfg(test)]mod tests").next().unwrap_or_default();
                     for needle in [".no_proxy(", ".proxy(", ".resolve(", ".resolve_to_addrs(", "with_router(", "Router::with_env(", "Router::new("] {
-                        let allowed = (needle == ".no_proxy(" && name == "phone.rs") || (needle.starts_with("Router::") && name == "proxy.rs");
+                        let allowed = (needle == ".no_proxy(" && name == "phone.rs")
+                            || (needle.starts_with("Router::") && name == "proxy.rs")
+                            || (needle == "Router::with_env(" && name == "test_support.rs");
                         if code.contains(needle) && !allowed {
                             found.push(format!("{}: {needle}", path.display()));
                         }
@@ -527,6 +529,9 @@ mod tests {
         let mut found = Vec::new();
         walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut found);
         assert!(found.is_empty(), "{found:#?}");
+        // test_support.rs's own routes reach no build people run.
+        let lib = crate::source_guard::tokens(include_str!("lib.rs"));
+        assert!(lib.contains("#[cfg(test)]mod test_support;"), "test_support is compiled for tests only");
     }
 
     #[test]
