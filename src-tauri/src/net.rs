@@ -30,7 +30,8 @@ pub fn builder() -> reqwest::ClientBuilder {
 
 /// `builder` routes each request where Windows would (`proxy::Router`), for a client built
 /// elsewhere too (the updater's). A route SlopBar cannot use fails the request with its reason
-/// (`Why::ProxyUnsupported`, `Why::ProxyScript`) before anything leaves this computer.
+/// (`Why::ProxyUnsupported`, `Why::ProxyScript`, `Why::ProxyEnvironment`) before anything leaves
+/// this computer.
 pub fn windows_proxy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     with_router(builder, crate::proxy::system().clone())
 }
@@ -73,6 +74,13 @@ pub enum Why {
     /// Windows' proxy script (set, or found on the network) could not be fetched or run in time,
     /// so SlopBar does not connect without it.
     ProxyScript,
+    /// The HTTPS_PROXY or ALL_PROXY environment variable names a proxy SlopBar cannot use (only an
+    /// http or https proxy works), so SlopBar does not connect at all.
+    ProxyEnvironment,
+    /// Windows' proxy script picks a proxy per site, and rclone, which takes one for a whole
+    /// cloud, cannot be given one SlopBar is sure of: rclone does not run (`proxy::rclone_env`).
+    /// Never a request's own failure.
+    ProxyRclone,
     /// The host's name could not be found.
     Dns,
     /// The host (or something in between) refused the connection.
@@ -110,7 +118,28 @@ impl Why {
             _ => true,
         }
     }
+
+    /// The code shown when the network's proxy stopped the request (`Why`'s own name), which
+    /// `errorText` (i18n.js) and `widget::error_text` word: a proxy SlopBar does not go around
+    /// (`proxy_unsupported`, `proxy_script`, `proxy_environment`, and for rclone `proxy_rclone`),
+    /// one that wants a sign-in SlopBar cannot give (`proxy_auth`), one that refuses
+    /// (`proxy_refused`). None for any other failure.
+    pub fn proxy_code(self) -> Option<&'static str> {
+        match self {
+            Why::ProxyUnsupported => Some("proxy_unsupported"),
+            Why::ProxyScript => Some("proxy_script"),
+            Why::ProxyEnvironment => Some("proxy_environment"),
+            Why::ProxyRclone => Some("proxy_rclone"),
+            Why::ProxyAuth => Some("proxy_auth"),
+            Why::ProxyRefused => Some("proxy_refused"),
+            _ => None,
+        }
+    }
 }
+
+/// Every code `Why::proxy_code` gives: what Settings, the flyout, the widget, Health and
+/// diagnostics treat as the network's proxy stopping SlopBar.
+pub const PROXY_CODES: &[&str] = &["proxy_unsupported", "proxy_script", "proxy_environment", "proxy_rclone", "proxy_auth", "proxy_refused"];
 
 /// Windows' errors that the verifier passes on as its OS error text (the text is translated, the
 /// number is not): CERT_E_CHAINING, no chain to a trusted root (a missing intermediate, say);
@@ -158,18 +187,15 @@ pub fn why(error: &reqwest::Error) -> Why {
     }
 }
 
-/// What a usage request's failure shows: the code of the network's proxy stopping it (a proxy
-/// SlopBar does not go around, `proxy_unsupported` or `proxy_script`; a proxy that wants a sign-in
-/// SlopBar cannot give, `proxy_auth`; a proxy that refuses, `proxy_refused`: the flyout words
-/// them), else reqwest's own text, as before.
+/// The code of the network's proxy stopping `error`'s request (`Why::proxy_code`), if it did.
+pub fn proxy_code(error: &reqwest::Error) -> Option<&'static str> {
+    why(error).proxy_code()
+}
+
+/// What a usage request's failure shows: the code of the network's proxy stopping it
+/// (`proxy_code`: the flyout words it), else reqwest's own text, as before.
 pub fn failure_text(error: &reqwest::Error) -> String {
-    match why(error) {
-        Why::ProxyUnsupported => "proxy_unsupported".into(),
-        Why::ProxyScript => "proxy_script".into(),
-        Why::ProxyAuth => "proxy_auth".into(),
-        Why::ProxyRefused => "proxy_refused".into(),
-        _ => error.to_string(),
-    }
+    proxy_code(error).map_or_else(|| error.to_string(), str::to_string)
 }
 
 /// Whether `error` is an answer cut short: the other end closed before the whole body came.
@@ -295,8 +321,8 @@ mod tests {
     #[test]
     fn only_a_source_that_is_down_or_broken_lets_the_next_one_be_tried() {
         for why in [Why::Untrusted, Why::Distrusted, Why::Expired, Why::WrongName, Why::Certificate, Why::Tls, Why::NotSecure,
-            Why::ProxyAuth, Why::ProxyRefused, Why::ProxyUnsupported, Why::ProxyScript, Why::Dns, Why::Refused, Why::Reset,
-            Why::Timeout, Why::Connect, Why::Redirected, Why::Page, Why::Failed] {
+            Why::ProxyAuth, Why::ProxyRefused, Why::ProxyUnsupported, Why::ProxyScript, Why::ProxyEnvironment, Why::ProxyRclone,
+            Why::Dns, Why::Refused, Why::Reset, Why::Timeout, Why::Connect, Why::Redirected, Why::Page, Why::Failed] {
             assert!(why.blocks(None), "{why:?} may be a block");
         }
         for status in [401, 403, 407, 451, 400] {
@@ -353,7 +379,12 @@ mod tests {
             let proxy = reqwest::Proxy::https(format!("http://127.0.0.1:{port}")).unwrap();
             // This proxy alone, whatever this computer's own settings name.
             let client = builder().no_proxy().proxy(proxy).build().unwrap();
-            assert_eq!(failure(&client, "https://downloads.rclone.org/x").await, expected, "{reply}");
+            let failed = client.get("https://downloads.rclone.org/x").send().await.expect_err("the request fails");
+            assert_eq!(why(&failed), expected, "{reply}");
+            // The tunnel failed, so nothing reached the host: what monitoring retries as a
+            // connection failure, never as an uncertain send.
+            assert!(failed.is_connect(), "{reply}");
+            assert_eq!(proxy_code(&failed), expected.proxy_code(), "{reply}");
         }
     }
 
@@ -467,9 +498,11 @@ mod tests {
         assert!(found.is_empty(), "build clients with net::builder(): {found:#?}");
     }
 
-    /// Outside its tests, nothing sets a proxy of its own, looks names up its own way, or goes
-    /// direct: each would be a way around the proxy Windows names. The one exception is phone.rs,
-    /// which reaches a server on this computer or its local network directly, on purpose.
+    /// Outside its tests, nothing sets a proxy of its own, looks names up its own way, goes
+    /// direct, or routes by routes of its own (only proxy.rs makes a `Router`: this user's): each
+    /// would be a way around the proxy Windows names. The exceptions: phone.rs reaches a server on
+    /// this computer or its local network directly, on purpose; test_support.rs, which only tests
+    /// compile, makes tests' own routes.
     #[test]
     fn nothing_goes_around_the_proxy() {
         fn walk(dir: &std::path::Path, found: &mut Vec<String>) {
@@ -482,8 +515,11 @@ mod tests {
                     let code = crate::source_guard::tokens(&std::fs::read_to_string(&path).unwrap());
                     // Only the code before the file's own tests.
                     let code = code.split("#[cfg(test)]mod tests").next().unwrap_or_default();
-                    for needle in [".no_proxy(", ".proxy(", ".resolve(", ".resolve_to_addrs("] {
-                        if code.contains(needle) && !(needle == ".no_proxy(" && name == "phone.rs") {
+                    for needle in [".no_proxy(", ".proxy(", ".resolve(", ".resolve_to_addrs(", "with_router(", "Router::with_env(", "Router::new("] {
+                        let allowed = (needle == ".no_proxy(" && name == "phone.rs")
+                            || (needle.starts_with("Router::") && name == "proxy.rs")
+                            || (needle == "Router::with_env(" && name == "test_support.rs");
+                        if code.contains(needle) && !allowed {
                             found.push(format!("{}: {needle}", path.display()));
                         }
                     }
@@ -493,6 +529,9 @@ mod tests {
         let mut found = Vec::new();
         walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut found);
         assert!(found.is_empty(), "{found:#?}");
+        // test_support.rs's own routes reach no build people run.
+        let lib = crate::source_guard::tokens(include_str!("lib.rs"));
+        assert!(lib.contains("#[cfg(test)]mod test_support;"), "test_support is compiled for tests only");
     }
 
     #[test]

@@ -2,7 +2,7 @@ import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { sparkline } from "./sparkline.js";
 import { money, pct, amount, renewalText, adviceText, creditsLine, extraUsageLine } from "./accounttext.js";
-import { t, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, LANGUAGES, resetText, errorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText, overlapText, seatsText } from "./i18n.js";
+import { t, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, LANGUAGES, resetText, errorText, accountErrorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText, overlapText, seatsText } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -115,7 +115,7 @@ function accountRow(p, a) {
       <div class="monitor-state">
         ${windowResets}
         ${a.stale && a.fetched_at ? `<small>${esc(t("lastObserved", { t: duration(Math.max(1, Math.round((Date.now() - new Date(a.fetched_at)) / 60000))) }))}</small>` : ""}
-        ${a.error || a.monitor_error ? `<small>${esc(errorText(p, a.error ?? a.monitor_error))}</small>` : ""}
+        ${a.error || a.monitor_error ? `<small>${esc(accountErrorText(p, a))}</small>` : ""}
         ${!a.monitor_connected || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account", "monitor_network", "monitor_uncertain"].includes(a.monitor_error ?? a.error)
           ? `<button class="btn" data-monitor="${p}" data-id="${esc(a.id)}">${t(a.monitor_connected ? "monitorReconnect" : "monitorConnect")}</button>`
           : ""}
@@ -915,8 +915,9 @@ async function renderRoster() {
   if (!text && settings.account_roster) {
     if (!placed) text = t("rosterNeedsSharing");
     else if (!r?.passphrase_saved) text = t("rosterNeedsPassphrase");
-    else if (r.wrote === false) text = t("rosterWriteFailed");
-    else if (r.read === false) text = t("rosterReadFailed");
+    // With the network's proxy's reason, when it stopped the write or read.
+    else if (r.wrote === false) text = [t("rosterWriteFailed"), r.write_error ? errorText("", r.write_error) : ""].filter(Boolean).join(" ");
+    else if (r.read === false) text = [t("rosterReadFailed"), r.read_error ? errorText("", r.read_error) : ""].filter(Boolean).join(" ");
     else if (r.read) {
       text = [t("rosterShared", { n: r.machines.length }), r.unreadable ? t("rosterUnreadable", { n: r.unreadable }) : "",
         r.waiting.length ? `${t("rosterWaiting", { n: r.waiting.length })}.` : ""].filter(Boolean).join(" ");

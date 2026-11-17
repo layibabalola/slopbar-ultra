@@ -42,19 +42,28 @@ pub trait Runner: Send + Sync {
 pub struct Cli {
     exe: PathBuf,
     remote: Option<String>,
+    /// The routes rclone's proxy comes from: this user's (`proxy::system`), unless a test gives
+    /// its own.
+    router: Option<std::sync::Arc<crate::proxy::Router>>,
 }
 
 impl Cli {
     /// For commands that reach no cloud.
     pub fn local(exe: PathBuf) -> Cli {
-        Cli { exe, remote: None }
+        Cli { exe, remote: None, router: None }
     }
 
     /// For commands on `remote`: each runs through the proxy Windows would use for its cloud
     /// (`proxy::rclone_env`), whose kind is looked up when the first command runs, on the thread
     /// that runs rclone anyway.
     pub fn for_remote(exe: PathBuf, remote: &str) -> Cli {
-        Cli { exe, remote: Some(remote.to_string()) }
+        Cli { exe, remote: Some(remote.to_string()), router: None }
+    }
+
+    /// `for_remote` with these routes in place of this user's.
+    #[cfg(test)]
+    pub fn routed(exe: PathBuf, remote: &str, router: std::sync::Arc<crate::proxy::Router>) -> Cli {
+        Cli { exe, remote: Some(remote.to_string()), router: Some(router) }
     }
 }
 
@@ -90,7 +99,12 @@ pub fn cloud(kind: &str) -> Cloud {
 /// Sets `cmd`'s proxy variables to what rclone needs to reach `cloud` where Windows would send
 /// SlopBar's own requests; an error (`proxy::ProxyRefused`) when it must not run at all.
 pub fn proxy_env(cmd: &mut std::process::Command, cloud: Cloud) -> std::io::Result<()> {
-    let env = crate::proxy::rclone_env(crate::proxy::system(), cloud.hosts, cloud.known)
+    proxy_env_with(cmd, cloud, crate::proxy::system())
+}
+
+/// `proxy_env` with these routes.
+fn proxy_env_with(cmd: &mut std::process::Command, cloud: Cloud, router: &crate::proxy::Router) -> std::io::Result<()> {
+    let env = crate::proxy::rclone_env(router, cloud.hosts, cloud.known)
         .map_err(|refusal| std::io::Error::other(crate::proxy::ProxyRefused(refusal)))?;
     apply_env(cmd, env);
     Ok(())
@@ -117,7 +131,11 @@ impl Runner for Cli {
         let mut cmd = crate::sources::command(&self.exe.to_string_lossy());
         // Through the proxy Windows names for the remote's cloud, or not at all.
         if let Some(remote) = &self.remote {
-            proxy_env(&mut cmd, cloud(&kind_of(&self.exe, remote).unwrap_or_default()))?;
+            let router: &crate::proxy::Router = match &self.router {
+                Some(router) => router,
+                None => crate::proxy::system(),
+            };
+            proxy_env_with(&mut cmd, cloud(&kind_of(&self.exe, remote).unwrap_or_default()), router)?;
         }
         // Never wait on a prompt for an encrypted config's password, and give up on dead networks
         // well inside the timeout.
@@ -500,6 +518,51 @@ mod tests {
         assert!(store.list().is_err());
         assert!(store.write(&own("11111111-1111-4111-8111-111111111111", "B", 300, &[], Utc::now())).is_err());
         assert!(read(&store, "me", Utc::now()).is_empty());
+    }
+
+    /// Where the network's proxy cannot be used, rclone is not started, and what Health and Settings
+    /// show says so: the presence exchange's and the roster's writes and reads, each with the
+    /// proxy's code. A later failure for another reason, or a success, takes the code away.
+    #[test]
+    fn sharing_stopped_by_the_networks_proxy_says_why() {
+        use crate::proxy::Refusal;
+        use crate::roster::Syncer;
+        const MACHINE: &str = "11111111-1111-4111-8111-111111111111";
+        // An rclone that does not exist: one started would fail, and say nothing of a proxy.
+        let dir = crate::test_support::TempDir::new();
+        let missing = dir.0.join("no-such-folder").join(if cfg!(windows) { "rclone.exe" } else { "rclone" });
+        let passphrase = crate::backup::Passphrase("synthetic roster passphrase".into());
+        let accounts = [account("synthetic-a:org")];
+        for (refusal, env, code) in [
+            (Some(Refusal::Script), &[][..], "proxy_script"),
+            (Some(Refusal::Unsupported), &[][..], "proxy_unsupported"),
+            (None, &[("HTTPS_PROXY", "socks5://socks.example.test:1080")][..], "proxy_environment"),
+        ] {
+            let store = Rclone::with("dropbox", Cli::routed(missing.clone(), "dropbox", crate::test_support::router(refusal, env)));
+            let now = Utc::now();
+            let wrote = store.write(&own(MACHINE, "DESK-1", 300, &accounts, now));
+            let listed = PresenceStore::list(&store);
+            let shared = crate::health::SharingResult::of(now, &wrote, &listed);
+            assert_eq!((shared.wrote, shared.read, shared.write_error, shared.read_error), (false, false, Some(code), Some(code)));
+            let mut sync = Syncer::default();
+            sync.sync(&store, &passphrase, (MACHINE, "DESK-1"), &accounts, now, false, false);
+            let seen = &sync.seen;
+            assert_eq!((seen.wrote, seen.write_error, seen.read, seen.read_error), (Some(false), Some(code), Some(false), Some(code)));
+
+            // Routes that work again: rclone starts (and, missing, fails for another reason).
+            let direct = Rclone::with("dropbox", Cli::routed(missing.clone(), "dropbox", crate::test_support::router(None, &[])));
+            let wrote = direct.write(&own(MACHINE, "DESK-1", 300, &accounts, now));
+            assert!(wrote.is_err() && crate::proxy::refusal_code(wrote.as_ref().unwrap_err()).is_none(), "{wrote:?}");
+            let shared = crate::health::SharingResult::of(now, &wrote, &PresenceStore::list(&direct));
+            assert_eq!((shared.write_error, shared.read_error), (None, None));
+            sync.sync(&direct, &passphrase, (MACHINE, "DESK-1"), &accounts, now, true, false);
+            let seen = &sync.seen;
+            assert_eq!((seen.wrote, seen.write_error, seen.read, seen.read_error), (Some(false), None, Some(false), None));
+            // And a sharing location that works clears it.
+            sync.sync(&Rclone::with("dropbox", Fake::default()), &passphrase, (MACHINE, "DESK-1"), &accounts, now, true, false);
+            let seen = &sync.seen;
+            assert_eq!((seen.wrote, seen.write_error, seen.read, seen.read_error), (Some(true), None, Some(true), None));
+        }
     }
 
     #[test]
