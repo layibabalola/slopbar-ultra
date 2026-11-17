@@ -61,6 +61,8 @@ pub struct AppState {
     pub(crate) sources: Mutex<Vec<sources::Source>>,
     /// Recent readings of unclaimed accounts, to notice use outside this PC.
     presence_tracks: Mutex<presence::Tracks>,
+    /// The other machines' last records, for a read that misses one (see `presence::Recall`).
+    presence_recall: Mutex<presence::Recall>,
     /// Where in-use status is shared: what settings saves left for the next refresh to withdraw,
     /// and the account roster's sync, its keys and last write, which share one lock (see `sharing`).
     sharing: std::sync::Arc<sharing::Sharing>,
@@ -2645,6 +2647,7 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
     if let Some(store) = presence::store(&settings) {
         let mine = list.clone();
         let (place, h) = (sharing::Place::of(&settings), app.clone());
+        let read_from = place.clone();
         let exchanged = tauri::async_runtime::spawn_blocking(move || {
             let Some((id, name)) = presence::identity() else { return Some((vec![], false, false)) };
             // A save that moved sharing since this refresh read the settings: nothing is written to
@@ -2655,13 +2658,17 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
             let wrote = store.write(&presence::own(id, name, interval, &mine, now)).is_ok();
             let listed = store.list();
             let read = listed.is_ok();
-            Some((presence::peers(listed.unwrap_or_default(), id, now), wrote, read))
+            Some((listed.unwrap_or_default(), wrote, read))
         }).await.unwrap_or(Some((vec![], false, false)));
-        if let Some((peers, wrote, read)) = exchanged {
+        if let Some((files, wrote, read)) = exchanged {
+            let (own, me) = presence::identity().map_or(("", ""), |(id, name)| (id.as_str(), name.as_str()));
+            // What the read found raises alarms; what accounts show also keeps a record the read
+            // missed, while that record is live (`presence::Recall`).
+            let found = presence::peers(files.iter().cloned(), own, now);
+            let every = presence::peers(state.presence_recall.lock().unwrap().fill(&read_from, read.then_some(files.as_slice()), own, now), own, now);
             shared = Some(health::SharingResult { at: now, wrote, read });
-            covered = wrote || peers.iter().any(|p| p.live);
-            presence::attach(&mut list, &peers, now);
-            presence::overlap(&mut list, presence::identity().map_or("", |(_, name)| name.as_str()));
+            covered = wrote || found.iter().any(|p| p.live);
+            presence::apply(&mut list, &found, &every, me, now);
         }
     }
     // Two refresh intervals without a rise (readings are at least a minute apart), plus slack.
@@ -3629,6 +3636,7 @@ pub fn run() {
         recent: Mutex::default(),
         sources: Mutex::default(),
         presence_tracks: Mutex::default(),
+        presence_recall: Mutex::default(),
         // What saves left for the next refresh to withdraw, kept between runs (see `sharing`).
         sharing: std::sync::Arc::new(sharing::Sharing::kept_in(settings::app_dir().expect("config directory").join(sharing::DUE_FILE))),
         roster_seen: Mutex::default(),

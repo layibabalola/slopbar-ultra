@@ -340,13 +340,14 @@ impl<R: Runner> Rclone<R> {
             .collect())
     }
 
-    /// Uploads under a temporary name, then renames over `<dir>/<name>`, so a reader never sees
-    /// half of a file.
+    /// Uploads straight over `<dir>/<name>`, which rclone replaces in one step: a cloud storage
+    /// swaps in the finished upload, and a local, SFTP or FTP remote gets a partial file renamed
+    /// into place (rclone v1.63 and later). A reader finds the old file or the new one. Uploading
+    /// under a temporary name and moving it over the old file left a moment with no file at all,
+    /// because rclone deletes an existing file before it moves another onto its name (about a
+    /// second on Dropbox), and a reader then skipped this machine for a refresh.
     pub fn put(&self, dir: &str, name: &str, bytes: &[u8]) -> std::io::Result<()> {
-        let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
-        let tmp = self.path_in(dir, &format!("{stem}.tmp"));
-        self.run(&["rcat", &tmp], Some(bytes))?;
-        self.run(&["moveto", &tmp, &self.path_in(dir, name)], None).map(|_| ())
+        self.run(&["rcat", &self.path_in(dir, name)], Some(bytes)).map(|_| ())
     }
 
     /// Deletes `<dir>/<name>`; one already gone is fine.
@@ -435,11 +436,6 @@ mod tests {
                     files.insert(path.to_string(), input.unwrap_or_default().to_vec());
                     ok(vec![])
                 }
-                ["moveto", from, to] => {
-                    let bytes = files.remove(*from).ok_or_else(|| std::io::Error::other("missing"))?;
-                    files.insert(to.to_string(), bytes);
-                    ok(vec![])
-                }
                 other => panic!("unexpected rclone call: {other:?}"),
             }
         }
@@ -455,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_atomically_and_reads_back_through_the_remote() {
+    fn writes_in_one_step_and_reads_back_through_the_remote() {
         let store = Rclone::with("cloud", Fake::default());
         let now = Utc::now();
         assert!(store.list().unwrap().is_empty(), "a missing folder is an empty one");
@@ -463,9 +459,13 @@ mod tests {
         let other = own("22222222-2222-4222-8222-222222222222", "LAPTOP-2", 300, &[account("synthetic-a:org")], now);
         store.write(&mine).unwrap();
         store.write(&other).unwrap();
+        store.write(&other).unwrap();
         let calls = store.runner.calls.lock().unwrap().clone();
-        assert!(calls.contains(&"rcat cloud:SlopBar/presence/22222222-2222-4222-8222-222222222222.tmp".to_string()));
-        assert!(calls.contains(&"moveto cloud:SlopBar/presence/22222222-2222-4222-8222-222222222222.tmp cloud:SlopBar/presence/22222222-2222-4222-8222-222222222222.json".to_string()));
+        // Replacing a record is one upload over it: a `moveto` onto an existing file deletes that
+        // file first, and a reader listing in between would miss this machine.
+        assert_eq!(calls.iter().filter(|c| *c == "rcat cloud:SlopBar/presence/22222222-2222-4222-8222-222222222222.json").count(), 2, "{calls:?}");
+        let writes: Vec<_> = calls.iter().filter(|c| !c.starts_with("lsjson ")).collect();
+        assert!(writes.len() == 3 && writes.iter().all(|c| c.starts_with("rcat ") && c.ends_with(".json")), "nothing but uploads to the records themselves: {calls:?}");
         assert!(calls.iter().all(|c| c.contains("cloud:SlopBar/presence") || c.starts_with("listremotes")), "only the presence folder: {calls:?}");
         for bytes in store.runner.files.lock().unwrap().values() {
             let text = String::from_utf8_lossy(bytes);
