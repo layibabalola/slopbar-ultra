@@ -456,7 +456,7 @@ fn explain(error: &str) -> String {
         "signin_no_page" => "The sign-in page never opened (the CLI did not start its sign-in, or no browser window could open there). Check get_machine_readiness, then retry with sign_in_all.".into(),
         "CLI not found" => {
             let [claude, codex] = crate::accounts::Provider::ALL.map(crate::cli::install_hint);
-            format!("That provider's CLI is not on this computer: not on PATH (as Windows has it now), not in its installers' usual folders, and for Claude Code not in the Claude desktop app's own copy either. Ask the user to install it from PowerShell ({}: `{}`; {}: `{}`), then try again; SlopBar needs no restart for it.",
+            format!("That provider's CLI is not on this computer: not on PATH (as Windows has it now), not in its installers' usual folders, and for Claude Code not in the Claude desktop app's own copy either. Ask the user to install it from PowerShell ({}: `{}`; {}: `{}`), then try again; SlopBar needs no restart for it. If the installer says its folder is not on PATH, SlopBar still finds it there; the folder belongs on the user PATH only to run the CLI in a terminal (slopbar-run included).",
                 claude.0, claude.1, codex.0, codex.1)
         }
         "desktop_locked" => "Nothing was started: this computer's desktop is locked, so nobody would see the sign-in windows. Ask the user to unlock it at the screen, then try again.".into(),
