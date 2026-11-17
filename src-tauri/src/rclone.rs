@@ -2,7 +2,9 @@
 //! connects their cloud once, with `rclone config` or with SlopBar's guided Dropbox setup
 //! (`sharing_setup`, which runs rclone's own sign-in), and rclone keeps its own config and tokens.
 //! SlopBar only runs rclone (no window, a hard timeout per call) on `<remote>:SlopBar/presence`,
-//! never passes or reads credentials, and never prints rclone's output.
+//! never passes or reads credentials, and never prints rclone's output. rclone reads only proxy
+//! environment variables, so SlopBar sets them to the proxy Windows names for the cloud
+//! (`proxy::rclone_env`), and does not run rclone where that proxy cannot be used.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -35,13 +37,88 @@ pub trait Runner: Send + Sync {
     fn run(&self, args: &[&str], input: Option<&[u8]>) -> std::io::Result<Ran>;
 }
 
-/// The real rclone executable.
-pub struct Cli(pub PathBuf);
+/// The real rclone executable, and the remote its commands reach (none for commands that stay on
+/// this computer: `version`, `listremotes`).
+pub struct Cli {
+    exe: PathBuf,
+    remote: Option<String>,
+}
+
+impl Cli {
+    /// For commands that reach no cloud.
+    pub fn local(exe: PathBuf) -> Cli {
+        Cli { exe, remote: None }
+    }
+
+    /// For commands on `remote`: each runs through the proxy Windows would use for its cloud
+    /// (`proxy::rclone_env`), whose kind is looked up when the first command runs, on the thread
+    /// that runs rclone anyway.
+    pub fn for_remote(exe: PathBuf, remote: &str) -> Cli {
+        Cli { exe, remote: Some(remote.to_string()) }
+    }
+}
+
+/// The hosts rclone reaches for a cloud (its sign-in, API, uploads and downloads), whose proxy it
+/// gets, and whether they are the cloud's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cloud {
+    pub hosts: &'static [&'static str],
+    /// False for a kind SlopBar does not know (S3, WebDAV, a crypt or alias wrapping another
+    /// remote, or a remote whose kind could not be read): rclone then runs only where no proxy
+    /// script decides, since a script may answer the remote's own host its own way.
+    pub known: bool,
+}
+
+/// What an unknown kind's route is asked for: no bypass list names it (only `*` would), so a manual
+/// proxy and the environment answer for it as for any host they do not bypass, never direct
+/// because some well-known host happens to be bypassed.
+pub const ANY_HOST: &str = "remote.rclone.slopbar.invalid";
+
+/// The cloud of a remote of this kind.
+pub fn cloud(kind: &str) -> Cloud {
+    let known = |hosts| Cloud { hosts, known: true };
+    match kind {
+        "dropbox" => known(&["api.dropboxapi.com", "content.dropboxapi.com"]),
+        "drive" => known(&["www.googleapis.com", "oauth2.googleapis.com"]),
+        // OneDrive's files come from SharePoint and 1drv.com hosts.
+        "onedrive" => known(&["graph.microsoft.com", "login.microsoftonline.com", "onedrive.sharepoint.com", "public.files.1drv.com"]),
+        "box" => known(&["api.box.com", "upload.box.com", "dl.boxcloud.com"]),
+        _ => Cloud { hosts: &[ANY_HOST], known: false },
+    }
+}
+
+/// Sets `cmd`'s proxy variables to what rclone needs to reach `cloud` where Windows would send
+/// SlopBar's own requests; an error (`proxy::ProxyRefused`) when it must not run at all.
+pub fn proxy_env(cmd: &mut std::process::Command, cloud: Cloud) -> std::io::Result<()> {
+    let env = crate::proxy::rclone_env(crate::proxy::system(), cloud.hosts, cloud.known)
+        .map_err(|refusal| std::io::Error::other(crate::proxy::ProxyRefused(refusal)))?;
+    apply_env(cmd, env);
+    Ok(())
+}
+
+/// Sets or removes each variable. Windows' variable names are not case-sensitive, so removing
+/// `https_proxy` there would remove the `HTTPS_PROXY` just set; elsewhere the lower-case ones go
+/// first, since Go reads them too.
+pub fn apply_env(cmd: &mut std::process::Command, env: Vec<(&'static str, Option<String>)>) {
+    for (var, value) in env {
+        if cfg!(not(windows)) {
+            cmd.env_remove(var.to_ascii_lowercase());
+        }
+        match value {
+            Some(value) => cmd.env(var, value),
+            None => cmd.env_remove(var),
+        };
+    }
+}
 
 impl Runner for Cli {
     fn run(&self, args: &[&str], input: Option<&[u8]>) -> std::io::Result<Ran> {
         use std::process::Stdio;
-        let mut cmd = crate::sources::command(&self.0.to_string_lossy());
+        let mut cmd = crate::sources::command(&self.exe.to_string_lossy());
+        // Through the proxy Windows names for the remote's cloud, or not at all.
+        if let Some(remote) = &self.remote {
+            proxy_env(&mut cmd, cloud(&kind_of(&self.exe, remote).unwrap_or_default()))?;
+        }
         // Never wait on a prompt for an encrypted config's password, and give up on dead networks
         // well inside the timeout.
         cmd.args(args).args(["--ask-password=false", "--contimeout", "10s", "--timeout", "15s"]);
@@ -193,8 +270,28 @@ impl Rclone<Cli> {
         if !valid_remote(remote) {
             return None;
         }
-        Some(Rclone { remote: remote.into(), runner: Cli(find()?) })
+        Some(Rclone { remote: remote.into(), runner: Cli::for_remote(find()?, remote) })
     }
+}
+
+/// How long a remote's kind is kept before `listremotes` is asked again: long enough for one sync
+/// (presence, then rosters), short enough that a remote pointed at another cloud is seen soon.
+const KIND_KEPT: Duration = Duration::from_secs(60);
+
+/// `remote`'s kind ("dropbox"…), from `listremotes --long` (names and kinds only), kept a while.
+fn kind_of(exe: &std::path::Path, remote: &str) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static KINDS: OnceLock<Mutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
+    let kinds = KINDS.get_or_init(Default::default);
+    if let Some((kind, at)) = kinds.lock().unwrap_or_else(|e| e.into_inner()).get(remote) {
+        if at.elapsed() < KIND_KEPT {
+            return Some(kind.clone());
+        }
+    }
+    let kind = listed(&Cli::local(exe.to_path_buf()))?.into_iter().find(|r| r.name == remote)?.kind;
+    kinds.lock().unwrap_or_else(|e| e.into_inner()).insert(remote.to_string(), (kind.clone(), Instant::now()));
+    Some(kind)
 }
 
 impl<R: Runner> Rclone<R> {

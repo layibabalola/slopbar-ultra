@@ -36,6 +36,10 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # SlopBar's own requests (net.rs): Windows' own certificate checks (rustls-platform-verifier) and the
 # system's proxy, as the updater's reqwest does; one reqwest in the build.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "system-proxy"] }
+# The proxy environment variables' rules as reqwest applies them (NO_PROXY), for proxy.rs; both are
+# already in the build through reqwest.
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
+http = "1"
 # reqwest's TLS cryptography (ring, as the updater installs it), and its errors, to say why a
 # request failed.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -48,8 +52,11 @@ sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 tauri-plugin-autostart = { version = "2", optional = true }
 tauri-plugin-single-instance = { version = "2", optional = true }
-tauri-plugin-updater = { version = "2", optional = true }
-tokio = { version = "1", features = ["time", "sync", "rt", "macros", "net", "io-util"] }
+# configure_client hands SlopBar the plugin's reqwest builder (net::windows_proxy): its docs ask to pin
+# the minor version when using it.
+tauri-plugin-updater = { version = "~2.12", optional = true }
+# rt-multi-thread: proxy.rs waits for Windows' proxy answer with block_in_place on the app's runtime.
+tokio = { version = "1", features = ["time", "sync", "rt", "rt-multi-thread", "macros", "net", "io-util"] }
 tauri-plugin-notification = { version = "2", optional = true }
 # The quick switcher's system-wide hotkey.
 # 2.4 needs a newer tauri than the one locked here.
@@ -66,7 +73,7 @@ argon2 = "0.5"
 url = "2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_RemoteDesktop", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader", "Win32_System_SystemInformation", "Win32_System_Environment"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_RemoteDesktop", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader", "Win32_System_SystemInformation", "Win32_System_Environment", "Win32_Networking_WinHttp", "Win32_Networking_WinInet"] }
 # UI Automation, to find taskbar items that have no window of their own (the Widgets button).
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_UI_Accessibility", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi_Common"] }
 # The native taskbar widget's Direct2D points and transforms.
