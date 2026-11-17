@@ -133,13 +133,13 @@ The agent should:
 `{"error": "…"}`):
 
 ```powershell
-& "$env:LOCALAPPDATA\SlopBar\slopbar-mcp.exe" --call get_machine_readiness ssh_host=newpc
-& "$env:LOCALAPPDATA\SlopBar\slopbar-mcp.exe" --call pair_machine ssh_host=newpc
-& "$env:LOCALAPPDATA\SlopBar\slopbar-mcp.exe" --call run_on_machine ssh_host=newpc tool=get_roster
+& "$env:LOCALAPPDATA\SlopBar\slopbar-mcp.exe" --call get_machine_readiness ssh_host=newpc | Out-String
+& "$env:LOCALAPPDATA\SlopBar\slopbar-mcp.exe" --call pair_machine ssh_host=newpc | Out-String
+& "$env:LOCALAPPDATA\SlopBar\slopbar-mcp.exe" --call run_on_machine ssh_host=newpc tool=get_roster | Out-String
 ```
 
-PowerShell does not wait for this windowless program unless its output is captured, so pipe it,
-for example `| Out-String`.
+Keep the pipe: PowerShell neither waits for this windowless program nor shows what it prints
+unless its output is captured, so without one each line returns at once and shows nothing.
 
 ## Troubleshooting
 
