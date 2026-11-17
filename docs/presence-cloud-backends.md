@@ -47,8 +47,15 @@ MEGA, S3, WebDAV, SFTP and the other rclone backends. rclone keeps its own confi
 - **Calls.** SlopBar runs only these, and only on `<remote>:SlopBar/presence`:
   - `lsjson --files-only --no-mimetype` to list records;
   - `cat <file>` to read each one;
-  - `rcat <id>.tmp`, then `moveto <id>.tmp <id>.json`, to write this machine's record
-    atomically.
+  - `rcat <id>.json` to write this machine's record in one step: rclone replaces the file whole
+    (a cloud swaps in the finished upload; local, SFTP and FTP remotes get a partial file renamed
+    into place, rclone v1.63 and later). Uploading `<id>.tmp` and then `moveto <id>.json`, as
+    earlier versions did, left about a second with no file at all, because rclone deletes an
+    existing file before it moves another onto its name; another machine reading then skipped
+    this one for a refresh.
+
+  A read that still misses a record (an older SlopBar writing the old way, a failed listing)
+  keeps that machine's last record while it is live by its own time (`presence::Recall`).
 
   A clean quit rewrites this machine's record with no accounts.
 - **Each call.** rclone runs with no window, `--ask-password=false` (it never waits on an
