@@ -57,7 +57,7 @@ function Stop-Run([string]$why) { Write-Host "CANNOT RUN: $why"; exit 2 }
 function Get-CliAnywhere {
   $dirs = @($env:Path -split ';') + @([Environment]::GetEnvironmentVariable('Path', 'Machine') -split ';') +
     @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';') +
-    @((Join-Path $HOME '.local\bin'), (Join-Path $env:APPDATA 'npm'), (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links'))
+    @((Join-Path $HOME '.local\bin'), (Join-Path $env:LOCALAPPDATA 'Programs\OpenAI\Codex\bin'), (Join-Path $env:APPDATA 'npm'), (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links'))
   $hits = @(foreach ($d in $dirs | Where-Object { $_ } | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_.Trim().Trim('"')) }) {
     foreach ($name in 'claude', 'codex') {
       foreach ($ext in '.exe', '.cmd', '.bat', '.com') {
@@ -107,14 +107,25 @@ function Get-Started([int]$appId) {
   }
   $tree
 }
+# Ends SlopBar's sign-ins: the cmd.exe it started for each (a sign-in's console, a logout) and
+# what runs under it. Its own WebView2 processes are left alone.
 function Stop-Started([int]$appId) {
-  Get-Started $appId | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  $consoles = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$appId" | Where-Object Name -eq 'cmd.exe')
+  foreach ($console in $consoles) {
+    Get-Started $console.ProcessId | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Stop-Process -Id $console.ProcessId -Force -ErrorAction SilentlyContinue
+  }
 }
 function Get-SignInFolders { @(Get-ChildItem -LiteralPath $HOME -Directory -Force -Filter '.slopbar-login-*' -ErrorAction SilentlyContinue) }
 
 $before = @(Get-CliAnywhere)
 if ($before) { Stop-Run "a CLI is already where SlopBar looks: $($before -join ', ')" }
-$distros = if (Get-Command wsl.exe -ErrorAction SilentlyContinue) { ("$(& wsl.exe --list --quiet 2>$null)" -replace "`0", '').Trim() } else { '' }
+# wsl.exe lists distros (in UTF-16) with exit code 0, and fails when there are none.
+$distros = ''
+if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
+  $listed = "$(& wsl.exe --list --quiet 2>$null)" -replace "`0", ''
+  if ($LASTEXITCODE -eq 0) { $distros = $listed.Trim() }
+}
 if ($distros) { Stop-Run "a WSL distro is installed, where a CLI could be: $distros" }
 New-Item -ItemType Directory -Force $Work | Out-Null
 $userKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)

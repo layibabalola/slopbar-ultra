@@ -1,5 +1,5 @@
 //! Where a provider's CLI is on Windows, and how to start it, for the sign-ins SlopBar runs
-//! (`accounts::has_cli`, `login::command`).
+//! (`accounts::cli_at`, `login::command`).
 //!
 //! `where.exe` searched SlopBar's own PATH, the one Windows gave it when it started. A CLI installed
 //! since stayed invisible until the next Windows sign-in, and a computer whose only Claude Code was
@@ -185,7 +185,7 @@ fn launch_in(provider: Provider, places: &Places, extra_ca: bool) -> Launch {
     // when cmd would otherwise run another file for the bare name (a stale npm shim, say), so the
     // CLI's own lookups keep the order they had.
     let plain = fit(None, &places.child);
-    let runs = plain.iter().filter(|d| d.is_absolute()).find_map(|d| first_match(d, name(provider), &places.pathext));
+    let runs = plain.iter().filter(|d| d.is_absolute() && d.is_dir()).find_map(|d| first_match(d, name(provider), &places.pathext));
     let path = if runs.as_deref() == Some(found.exe.as_path()) { plain } else { fit(found.exe.parent(), &places.child) };
     let env = match found.kind {
         Kind::DesktopApp if extra_ca => vec![("DISABLE_AUTOUPDATER", "1")],

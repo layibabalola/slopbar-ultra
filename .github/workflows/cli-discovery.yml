@@ -14,6 +14,13 @@ on:
       - src-tauri/src/cli/**
       - src-tauri/src/login.rs
       - src-tauri/src/accounts.rs
+      - src-tauri/src/sources.rs
+      - src-tauri/src/signin.rs
+      - src-tauri/src/app.rs
+      - src-tauri/src/mcp.rs
+      - src-tauri/Cargo.toml
+      - src-tauri/Cargo.lock
+      - src/i18n.js
       - scripts/test-cli-discovery.ps1
       - .github/workflows/cli-discovery.yml
   workflow_dispatch:

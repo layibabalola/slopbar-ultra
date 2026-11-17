@@ -12,6 +12,8 @@ document.documentElement.dataset.loading = "1";
 
 const REFRESH_OPTIONS = [1, 5, 15, 30];
 const PROVIDERS = [["claude", "Claude"], ["codex", "Codex"]];
+/** A provider's name ("Claude") from its key ("claude"), as errorText takes it; "" when unknown. */
+const providerName = (key) => PROVIDERS.find(([p]) => p === key)?.[1] ?? "";
 const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`);
 const color = (p) => (p >= 90 ? "var(--bad)" : p >= 70 ? "var(--warn)" : "var(--ok)");
@@ -257,7 +259,7 @@ $("accounts").addEventListener("click", async (e) => {
     try {
       await invoke("connect_monitoring", { provider: monitor.dataset.monitor, id: monitor.dataset.id });
       $("add-hint").textContent = t("monitorPending"); $("add-hint").hidden = false;
-    } catch (err) { alert(errorText(monitor.dataset.monitor, String(err))); }
+    } catch (err) { alert(errorText(providerName(monitor.dataset.monitor), String(err))); }
     finally { monitor.disabled = false; }
     return;
   }
@@ -274,7 +276,7 @@ $("accounts").addEventListener("click", async (e) => {
       snapshot = await invoke("switch_account", { provider, id });
     } catch (err) {
       snapshot = before;
-      alert(errorText(PROVIDERS.find(([p]) => p === provider)?.[1] ?? provider, String(err)));
+      alert(errorText(providerName(provider), String(err)));
     }
     renderAccounts();
   } else if (add) {
@@ -282,7 +284,7 @@ $("accounts").addEventListener("click", async (e) => {
       await invoke("add_account", { provider: add.dataset.add });
       $("add-hint").textContent = t("addHint"); $("add-hint").hidden = false;
     } catch (err) {
-      const text = errorText(PROVIDERS.find(([p]) => p === add.dataset.add)?.[1] ?? add.dataset.add, String(err));
+      const text = errorText(providerName(add.dataset.add), String(err));
       // Also on the page, where its install line can be selected and copied.
       $("add-hint").textContent = text; $("add-hint").hidden = false;
       alert(text);
@@ -1481,7 +1483,7 @@ function renderBulk() {
   } else if (running && c.current) status.textContent = t("bulkConnecting", { i: c.done + 1, n: c.total, account: who(c.current) });
   else if (c?.finished && c.error) {
     const failed = c.steps?.find((s) => s.state === "failed");
-    status.textContent = t("bulkConnectStopped", { done: c.done, n: c.total, error: errorText(failed?.provider ?? "", c.error) });
+    status.textContent = t("bulkConnectStopped", { done: c.done, n: c.total, error: errorText(providerName(failed?.provider), c.error) });
   }
   else if (c?.finished && c.total) status.textContent = t(c.emails ? "signInAllDone" : "bulkConnectDone", { n: c.total });
   status.hidden = !(running || (c?.finished && c.total)) || !status.textContent;

@@ -926,7 +926,7 @@ async fn start_add_account(app: AppHandle, provider: Provider, pending: Option<m
     // A fresh profile of its own (who signs in is not known yet), held until the sign-in ends.
     let session = signin_session(&app);
     let options = signin_options(&app, None, session.as_deref());
-    // Probing for the CLI runs wsl.exe / where.exe; keep it off the async runtime.
+    // Looking for the CLI runs wsl.exe and reads the registry and disk; keep it off the async runtime.
     let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, None, options))
         .await
         .map_err(|e| e.to_string())??;
