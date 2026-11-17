@@ -30,7 +30,7 @@ Your Claude Code and Codex plan limits, right in the Windows taskbar, next to th
 
 ## Multiple accounts
 
-Add accounts in **Settings → Accounts**: SlopBar opens the CLI's own sign-in (`claude auth login` / `codex login`) in an isolated folder, so your current login is untouched. Switching rewrites the CLI's login files in place; the official CLI keeps doing all the work. Switch from the flyout with **Use**, or turn on **Switch automatically** to move to the account with the most headroom when the active one reaches your threshold.
+Add accounts in **Settings → Accounts**: SlopBar opens the CLI's own sign-in (`claude auth login` / `codex login`) in an isolated folder, so your current login is untouched. It uses the CLI on PATH as Windows has it now (one installed while SlopBar runs counts, with no restart), in its installer's usual folder (even one the installer left off PATH; a terminal, and `slopbar-run`, need that folder on your user PATH), in a WSL distro, or, for Claude Code, the copy the Claude desktop app keeps for itself. Without one, install it from PowerShell and add the account again: Claude Code with `irm https://claude.ai/install.ps1 | iex` (or `winget install Anthropic.ClaudeCode`), the Codex CLI with `powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"` (or `npm install -g @openai/codex`). Switching rewrites the CLI's login files in place; the official CLI keeps doing all the work. Switch from the flyout with **Use**, or turn on **Switch automatically** to move to the account with the most headroom when the active one reaches your threshold.
 
 > [!NOTE]
 > A running Codex session keeps its account until you restart it.

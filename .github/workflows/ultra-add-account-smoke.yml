@@ -1,0 +1,62 @@
+name: Ultra add-account smoke test
+
+# The release the channel holds, installed on a clean Windows runner with the one-line bootstrap
+# (scripts/install-ultra.ps1), then driven through its door by scripts/test-cli-discovery.ps1: with
+# no Claude Code anywhere, Add account says how to install it; with only the copy the Claude desktop
+# app keeps for itself, it starts the sign-in from that copy; and it finds a CLI added to the user
+# PATH after SlopBar started. It runs when this workflow or the test script changes; re-run its
+# newest run to test the release the channel holds now (a push publishes its release while this
+# runs, so a change is proven here one release late). It needs no secrets and publishes nothing.
+
+on:
+  push:
+    branches: [ultra]
+    paths:
+      - scripts/test-cli-discovery.ps1
+      - .github/workflows/ultra-add-account-smoke.yml
+
+permissions:
+  contents: read
+
+env:
+  BOOTSTRAP: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/scripts/install-ultra.ps1
+  CHANNEL: https://github.com/${{ github.repository }}/releases/download/ultra-latest/latest.json
+
+jobs:
+  add-account:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install the channel's release with the one-line bootstrap (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          irm $env:BOOTSTRAP | iex
+          $r = $global:SlopBarUltraInstall
+          if (-not $r -or -not $r.ok) { throw "install: $($r.step): $($r.message)" }
+      - name: Download Claude Code where SlopBar does not look
+        shell: pwsh
+        run: |
+          "image $env:ImageOS $env:ImageVersion"
+          # As https://claude.ai/install.ps1 downloads it: the latest version, checked against its manifest.
+          $base = 'https://downloads.claude.ai/claude-code-releases'
+          $version = "$(Invoke-RestMethod "$base/latest")".Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+') { throw "unexpected version: $version" }
+          $checksum = (Invoke-RestMethod "$base/$version/manifest.json").platforms.'win32-x64'.checksum
+          $held = Join-Path $env:RUNNER_TEMP 'held'
+          New-Item -ItemType Directory -Force $held | Out-Null
+          $exe = Join-Path $held 'claude.exe'
+          Invoke-WebRequest "$base/$version/win32-x64/claude.exe" -OutFile $exe
+          if ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant() -ne $checksum) { throw 'checksum mismatch' }
+          $signature = Get-AuthenticodeSignature -LiteralPath $exe
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O="?Anthropic, PBC') { throw "not signed by Anthropic: $($signature.Status) $($signature.SignerCertificate.Subject)" }
+          "Claude Code $version, signed by Anthropic: $(& $exe --version)"
+      - name: Add account, step by step, on the channel's release
+        shell: pwsh
+        run: |
+          Invoke-WebRequest $env:CHANNEL -OutFile latest.json
+          $channel = (Get-Content -Raw latest.json | ConvertFrom-Json).version
+          $dir = Join-Path $env:LOCALAPPDATA 'SlopBar'
+          ./scripts/test-cli-discovery.ps1 -App (Join-Path $dir 'slopbar.exe') -Door (Join-Path $dir 'slopbar-mcp.exe') -ClaudeExe "$env:RUNNER_TEMP/held/claude.exe" -Version $channel
