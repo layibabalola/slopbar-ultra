@@ -190,7 +190,7 @@ function Install-SlopBarUltra {
     } elseif ($Message -match 'trust relationship|SSL|TLS|could not be resolved|Unable to connect|timed out|connection was closed|proxy|\((403|502|503)\)') {
       $hint = 'The network blocked or intercepted the connection to GitHub.'
     } elseif ($step -match 'installer|start' -and $Message -match 'Access is denied') {
-      $hint = 'Security software or a policy on this computer refused to run it.'
+      $hint = "Security software or this computer's policy refused to start it. Admin rights are not what is missing: the installer needs none. To see that software's own prompt, if it has one, download the installer from https://github.com/$repo/releases and run it from Explorer; otherwise ask the computer's administrator."
     }
     if ($hint) { return "$Message ($hint)" }
     return $Message
