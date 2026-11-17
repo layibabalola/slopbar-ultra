@@ -119,13 +119,14 @@ pub fn compose(phone: &Phone, kind: Kind, named: (&str, &str), generic: (&str, &
     Some(Message { kind, title: clip(title), body: clip(body) })
 }
 
+/// SlopBar's own client (`net::builder`: Windows' certificate checks, the system's proxy).
 pub fn client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::net::builder()
         .timeout(TIMEOUT)
         // A redirect could carry the token to another host.
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_default()
+        .expect("phone client")
 }
 
 /// Publishes one message. Errors are codes for the Settings window, never response bodies.
@@ -211,7 +212,8 @@ mod tests {
         Phone { enabled: true, url: Some(url.into()), include_names: false, kinds: PhoneKinds::default() }
     }
 
-    fn local() -> reqwest::Client { reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().unwrap() }
+    // A local server is reached directly, whatever proxy this machine is set to use.
+    fn local() -> reqwest::Client { crate::net::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().unwrap() }
 
     #[test]
     fn off_by_default_and_generic_unless_names_are_chosen() {

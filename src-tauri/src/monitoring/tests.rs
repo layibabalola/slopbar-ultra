@@ -1102,7 +1102,7 @@ mod http {
         }
     }
     fn client(timeout_ms: u64) -> reqwest::Client {
-        reqwest::Client::builder()
+        crate::net::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_millis(timeout_ms))

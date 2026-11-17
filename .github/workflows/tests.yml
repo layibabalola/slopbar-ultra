@@ -29,3 +29,41 @@ jobs:
         run: cargo test --locked --features upstream-updates --lib --manifest-path src-tauri/Cargo.toml
       - name: Agent tool (slopbar-mcp) builds without the desktop app
         run: cargo build --locked --bin slopbar-mcp --no-default-features --manifest-path src-tauri/Cargo.toml
+      - name: Unit tests without the desktop app
+        run: cargo test --locked --no-default-features --lib --manifest-path src-tauri/Cargo.toml
+      # SlopBar's own HTTPS trusts what Windows trusts, and nothing else. Proven on this disposable
+      # runner only, since it changes the machine's trusted roots: a throwaway authority's root is in
+      # no store (untrusted), then in the machine's Root store (trusted), then in its Disallowed store
+      # too (distrusted), and every client the app makes must agree each time. Then rclone's GitHub
+      # release, which answers with a redirect, through the app's download client.
+      - name: HTTPS trusts what Windows trusts (disposable runner only)
+        shell: pwsh
+        env:
+          SLOPBAR_TEST_OS_STORE: ${{ runner.temp }}\os-store
+        run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'This step changes the machine''s trusted roots: it runs only on a disposable GitHub-hosted runner.' }
+          function Test-One([string]$name, [string]$expect) {
+            $env:SLOPBAR_TEST_OS_STORE_EXPECT = $expect
+            $out = cargo test --locked --lib --manifest-path src-tauri/Cargo.toml -- --ignored --exact $name 2>&1 | Out-String
+            Write-Output $out
+            # A misspelt name runs nothing and still exits 0.
+            if ($LASTEXITCODE -ne 0 -or $out -notmatch 'test result: ok\. 1 passed') { throw "$name ($expect) did not pass" }
+          }
+          Test-One 'test_tls::tests::write_os_store_files' ''
+          Test-One 'net::tests::slopbar_trusts_what_windows_trusts' 'untrusted'
+          $root = Join-Path $env:SLOPBAR_TEST_OS_STORE 'root.cer'
+          $thumb = (Import-Certificate -FilePath $root -CertStoreLocation Cert:\LocalMachine\Root).Thumbprint
+          if (-not (Test-Path "Cert:\LocalMachine\Root\$thumb")) { throw 'The root is not in the machine''s Root store.' }
+          Test-One 'net::tests::slopbar_trusts_what_windows_trusts' 'trusted'
+          $null = Import-Certificate -FilePath $root -CertStoreLocation Cert:\LocalMachine\Disallowed
+          Test-One 'net::tests::slopbar_trusts_what_windows_trusts' 'distrusted'
+          Test-One 'sharing_setup::tests::the_github_release_downloads_through_the_apps_client' ''
+      - name: Remove the throwaway root
+        if: always()
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'os-store\root.cer'
+          if (Test-Path $root) {
+            $thumb = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($root).Thumbprint
+            foreach ($store in 'Root', 'Disallowed') { Remove-Item "Cert:\LocalMachine\$store\$thumb" -ErrorAction SilentlyContinue }
+          }

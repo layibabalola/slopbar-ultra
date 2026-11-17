@@ -67,13 +67,28 @@ MEGA, S3, WebDAV, SFTP and the other rclone backends. rclone keeps its own confi
 the getting-started guide), or the `setup_sharing` agent tool, connects a computer in one go:
 
 1. **rclone.** An installed rclone of v1.60 or later is used as it is. Otherwise SlopBar downloads
-   one fixed release (v1.76.0) from downloads.rclone.org, or its GitHub release if that fails, and
-   takes it only when the zip's SHA-256 matches the one pinned in the code (as rclone's
-   `SHA256SUMS` and winget's reviewed manifest publish it). It unpacks only `rclone.exe` with
-   Windows' `tar.exe` (PowerShell's `Expand-Archive` where tar is missing), checks that it runs and
-   reports that version, then moves it into SlopBar's folder. The download shows its progress, fails
-   after 30 seconds without data or 10 minutes in all, and Cancel stops it; unpacking and the version
-   check are killed after 3 minutes and 20 seconds.
+   one fixed release (v1.76.0) from downloads.rclone.org, or its GitHub release if that site is
+   down or broken, and takes it only when the zip's SHA-256 matches the one pinned in the code (as
+   rclone's `SHA256SUMS` and winget's reviewed manifest publish it). It unpacks only `rclone.exe`
+   with Windows' `tar.exe` (PowerShell's `Expand-Archive` where tar is missing), checks that it runs
+   and reports that version, then moves it into SlopBar's folder. The download shows its progress,
+   fails after 30 seconds without data or 10 minutes in all, and Cancel stops it; unpacking and the
+   version check are killed after 3 minutes and 20 seconds.
+   - The download follows redirects (GitHub's release links always redirect) only over HTTPS, at
+     most five, and only to downloads.rclone.org, github.com and GitHub's `*.githubusercontent.com`
+     file hosts. Like all of SlopBar's own requests (`src-tauri/src/net.rs`), it trusts what
+     Windows trusts, through Windows' own certificate checks, so a network that inspects HTTPS works
+     once its certificate is installed in Windows, and a certificate Windows distrusts is refused.
+     It uses the proxy Windows is set to (not a proxy script) and HTTPS_PROXY.
+   - A failed download says why, for each site tried (Settings and `get_sharing_setup`'s
+     `reasons`): the host and a code such as `untrusted`, `page` (a web page in the zip's place, as
+     a web filter answers), `redirected` (with the host it led to), `status`, `proxy_auth` or
+     `reset`, never a link. The GitHub release is tried only after the first site was down or
+     broken (404, 410, 429, 5xx, a broken or wrong zip): after a refusal that may be on purpose,
+     the download ends there, so a company that blocks rclone is not worked around.
+   - When Windows or security software refuses to run the unpacked rclone (an AppLocker or
+     Application Control policy, or antivirus taking the file), the setup stops with
+     `rclone_blocked` and tries no other way to run it.
 2. **Dropbox.** A remote of that name (the one sharing already uses, else `dropbox`) that reaches
    its storage is used as it is. Otherwise rclone signs in with its own flow:
    `rclone config create <remote> dropbox` for a new remote, `rclone config update <remote>

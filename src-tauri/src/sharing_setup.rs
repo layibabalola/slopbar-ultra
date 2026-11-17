@@ -38,6 +38,57 @@ pub fn urls(asset: &Asset) -> [String; 2] {
     ]
 }
 
+/// Whether the download may go to `host`: rclone's own site, GitHub, whose release links answer
+/// with a redirect, and GitHub's hosts for release files (`release-assets.githubusercontent.com`,
+/// `objects.githubusercontent.com` before it). The zip's SHA-256 is checked whichever serves it.
+pub fn download_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    host == "downloads.rclone.org" || host == "github.com" || host.ends_with(".githubusercontent.com")
+}
+
+/// Whether a redirect may take the download to `url`: HTTPS on its standard port, no user name or
+/// password, and a host `download_host` names (never an address).
+pub fn download_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https" && url.username().is_empty() && url.password().is_none() && url.port().is_none()
+        && url.host_str().is_some_and(download_host)
+}
+
+/// The most redirects one source's download follows (GitHub's takes one).
+const MAX_REDIRECTS: usize = 5;
+
+/// The client that downloads rclone: SlopBar's own (`net::builder`, which trusts what Windows
+/// trusts), following a redirect only over HTTPS to a link `allowed` accepts, and at most
+/// MAX_REDIRECTS. Any other redirect is not followed: its answer comes back as it is, for `fetch`
+/// to say where it led. No Referer goes along. SlopBar's other requests follow no redirect at all.
+pub fn download_client_with(builder: reqwest::ClientBuilder, allowed: fn(&reqwest::Url) -> bool) -> reqwest::Client {
+    let policy = reqwest::redirect::Policy::custom(move |attempt| {
+        let next = attempt.url();
+        if attempt.previous().len() <= MAX_REDIRECTS && next.scheme() == "https" && allowed(next) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    });
+    builder.redirect(policy).referer(false).build().expect("download client")
+}
+
+/// The one client rclone's download uses (`install_rclone` makes it itself).
+pub fn download_client() -> reqwest::Client {
+    download_client_with(crate::net::builder(), download_url)
+}
+
+/// Why one source's download failed, as Settings and agents see it: the source's host (always one
+/// `download_host` allows) and never a link, whose query may carry a signature.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Reason {
+    pub host: String,
+    pub why: crate::net::Why,
+    /// The HTTP status, when an answer came.
+    pub status: Option<u16>,
+    /// Where a redirect that was not followed led: a host (with `http://` when it was not HTTPS).
+    pub to: Option<String>,
+}
+
 /// The zip is about 25 MB; anything far larger is not it.
 const MAX_ZIP: u64 = 128 * 1024 * 1024;
 
@@ -53,13 +104,27 @@ const DOWNLOAD_LIMIT: std::time::Duration = std::time::Duration::from_secs(10 * 
 const UNPACK_LIMIT: std::time::Duration = std::time::Duration::from_secs(3 * 60);
 const VERSION_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Whether a program could not start because Windows or security software refused it: an
+/// AppLocker or software restriction policy (1260), Application Control (4551), antivirus that
+/// found it infected or removed it (225, 226), access denied, or the file gone the moment after it
+/// was unpacked. SlopBar then stops and says so; it never tries another way to run it.
+pub fn refused_to_start(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(225 | 226 | 1260 | 4551))
+        || matches!(error.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound)
+}
+
 /// Runs a helper to its end within `limit`, its standard output collected, and kills it after: a
 /// helper that hangs must not keep the setup (and the automatic update waiting on it) forever.
-fn run_within(mut command: std::process::Command, limit: std::time::Duration) -> Option<std::process::Output> {
+/// None when it could not start (with why) or was stopped at its limit.
+fn run_within(mut command: std::process::Command, limit: std::time::Duration) -> Result<std::process::Output, Option<std::io::Error>> {
     use std::io::Read;
     use std::process::Stdio;
-    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
-    let mut stdout = child.stdout.take()?;
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(Some)?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(None);
+    };
     let (send, read) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut out = Vec::new();
@@ -72,13 +137,13 @@ fn run_within(mut command: std::process::Command, limit: std::time::Duration) ->
             // Its output ends with it; one still held open elsewhere is not waited for.
             Ok(Some(status)) => {
                 let stdout = read.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or_default();
-                return Some(std::process::Output { status, stdout, stderr: Vec::new() });
+                return Ok(std::process::Output { status, stdout, stderr: Vec::new() });
             }
             Ok(None) if started.elapsed() < limit => std::thread::sleep(std::time::Duration::from_millis(100)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return Err(None);
             }
         }
     }
@@ -148,6 +213,8 @@ pub struct Setup {
     pub error: Option<String>,
     /// The step it stopped at.
     pub failed_at: Option<Phase>,
+    /// When rclone's download failed: why, for each source tried (`Reason`: hosts, never links).
+    pub reasons: Vec<Reason>,
     /// The other computers sharing there, by name, once sharing is on.
     pub found: Vec<String>,
     /// Bumped on every change.
@@ -217,51 +284,116 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Downloads the pinned rclone zip (its own site, then its GitHub release), takes it only when
-/// its SHA-256 matches, and puts its `rclone.exe` at `dest`. `progress` hears each new percent;
-/// `cancel` ends the download. Error codes: `rclone_unsupported`, `download_failed`,
-/// `hash_mismatch`, `extract_failed`, `cancelled`.
-pub async fn install_rclone(client: &reqwest::Client, dest: &std::path::Path, cancel: &std::sync::atomic::AtomicBool, progress: &(dyn Fn(u8) + Send + Sync)) -> Result<(), &'static str> {
+/// Downloads the pinned rclone zip (its own site, then its GitHub release) with `download_client`,
+/// takes it only when its SHA-256 matches, and puts its `rclone.exe` at `dest`. `progress` hears
+/// each new percent; `cancel` ends the download. Each source that fails adds its reason to
+/// `reasons`. Error codes: `rclone_unsupported`, `download_failed`, `hash_mismatch`,
+/// `extract_failed`, `rclone_blocked` (Windows or security software would not let it run),
+/// `cancelled`.
+pub async fn install_rclone(dest: &std::path::Path, cancel: &std::sync::atomic::AtomicBool, progress: &(dyn Fn(u8) + Send + Sync), reasons: &mut Vec<Reason>) -> Result<(), &'static str> {
     let asset = asset(std::env::consts::ARCH).ok_or("rclone_unsupported")?;
+    // Its own client, never one passed in: a client that followed no redirect once made GitHub's
+    // link fail every time.
+    let bytes = download(&download_client(), &urls(&asset), asset.sha256, cancel, progress, reasons).await?;
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || extract(&bytes, &asset, &dest)).await.unwrap_or(Err("extract_failed"))
+}
+
+/// The first of `urls` whose answer has the SHA-256 `sha256`; each that fails adds its reason. The
+/// next source is tried only after one that was down or broken (`Why::blocks`): after a refusal
+/// that may be on purpose, such as a filter's page, an untrusted certificate or a cut connection,
+/// the download ends, so a company that blocks it from one site is not worked around through
+/// another. Error codes: `hash_mismatch` when a zip came but none matched, `download_failed`,
+/// `cancelled`.
+async fn download(client: &reqwest::Client, urls: &[String], sha256: &str, cancel: &std::sync::atomic::AtomicBool, progress: &(dyn Fn(u8) + Send + Sync), reasons: &mut Vec<Reason>) -> Result<Vec<u8>, &'static str> {
+    use crate::net::Why;
     let mut failure = "download_failed";
-    for url in urls(&asset) {
-        let bytes = match fetch(client, &url, cancel, progress).await {
-            Ok(bytes) => bytes,
-            Err("cancelled") => return Err("cancelled"),
-            Err(_) => continue,
+    for url in urls {
+        let reason = match fetch(client, url, cancel, progress).await {
+            Ok(bytes) if sha256_hex(&bytes) == sha256 => return Ok(bytes),
+            // Not even a zip: a page or a message in its place, which is what a filter that
+            // blocks the download may send with a 200.
+            Ok(bytes) if !bytes.starts_with(b"PK\x03\x04") => Reason { host: host_of(url), why: Why::Page, status: Some(200), to: None },
+            Ok(_) => {
+                failure = "hash_mismatch";
+                Reason { host: host_of(url), why: Why::Mismatch, status: Some(200), to: None }
+            }
+            Err(Fetch::Cancelled) => return Err("cancelled"),
+            Err(Fetch::Failed(reason)) => reason,
         };
-        if sha256_hex(&bytes) != asset.sha256 {
-            failure = "hash_mismatch";
-            continue;
+        let stop = reason.why.blocks(reason.status);
+        reasons.push(reason);
+        if stop {
+            return Err("download_failed");
         }
-        let dest = dest.to_path_buf();
-        return tokio::task::spawn_blocking(move || extract(&bytes, &asset, &dest)).await.unwrap_or(Err("extract_failed"));
     }
     Err(failure)
 }
 
-async fn fetch(client: &reqwest::Client, url: &str, cancel: &std::sync::atomic::AtomicBool, progress: &(dyn Fn(u8) + Send + Sync)) -> Result<Vec<u8>, &'static str> {
-    fn failed<E>(_: E) -> &'static str {
-        "download_failed"
-    }
+enum Fetch {
+    Cancelled,
+    Failed(Reason),
+}
+
+fn host_of(url: &str) -> String {
+    reqwest::Url::parse(url).map(|u| crate::net::shown_host(&u)).unwrap_or_default()
+}
+
+async fn fetch(client: &reqwest::Client, url: &str, cancel: &std::sync::atomic::AtomicBool, progress: &(dyn Fn(u8) + Send + Sync)) -> Result<Vec<u8>, Fetch> {
+    use crate::net::Why;
+    // A failure names the source asked (its host), whichever hop of its redirects failed: an
+    // error after a redirect carries the first link, not the hop's.
+    let host = host_of(url);
+    let failed = |why: Why, status: Option<u16>| Fetch::Failed(Reason { host: host.clone(), why, status, to: None });
     // The client's own limit is for small requests: this one may take minutes on a slow link, but
     // never more than DOWNLOAD_LIMIT in all (reqwest's limit covers the body too), and never STALL
     // without a byte.
     let send = client.get(url).timeout(DOWNLOAD_LIMIT).send();
-    let mut response = tokio::time::timeout(STALL, send).await.map_err(failed)?.map_err(failed)?;
-    if !response.status().is_success() || response.content_length().is_some_and(|n| n > MAX_ZIP) {
-        return Err("download_failed");
+    let mut response = match tokio::time::timeout(STALL, send).await {
+        Err(_) => return Err(failed(Why::Timeout, None)),
+        Ok(Err(e)) => return Err(failed(crate::net::why(&e), None)),
+        Ok(Ok(response)) => response,
+    };
+    let status = response.status();
+    if status.is_redirection() {
+        // A redirect `download_client` does not follow: say where it led, never the link.
+        let to = response.headers().get(reqwest::header::LOCATION).and_then(|l| l.to_str().ok())
+            .and_then(|l| response.url().join(l).ok()).map(|u| crate::net::shown_host(&u));
+        return Err(Fetch::Failed(Reason { host: host.clone(), why: Why::Redirected, status: Some(status.as_u16()), to }));
+    }
+    if status == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        return Err(failed(Why::ProxyAuth, Some(407)));
+    }
+    let html = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|t| t.to_str().ok())
+        .is_some_and(|t| { let t = t.trim_start().to_ascii_lowercase(); t.starts_with("text/html") || t.starts_with("application/xhtml") });
+    if html {
+        // A page where the zip should be, whatever its status: a filter's block page, typically.
+        return Err(failed(Why::Page, Some(status.as_u16())));
+    }
+    if !status.is_success() {
+        return Err(failed(Why::Status, Some(status.as_u16())));
+    }
+    if response.content_length().is_some_and(|n| n > MAX_ZIP) {
+        return Err(failed(Why::TooLarge, Some(status.as_u16())));
     }
     let total = response.content_length().filter(|n| *n > 0);
     let (mut bytes, mut shown) = (Vec::new(), None);
     loop {
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err("cancelled");
+            return Err(Fetch::Cancelled);
         }
-        let Some(chunk) = tokio::time::timeout(STALL, response.chunk()).await.map_err(failed)?.map_err(failed)? else { break };
+        let chunk = match tokio::time::timeout(STALL, response.chunk()).await {
+            Err(_) => return Err(failed(Why::Timeout, Some(status.as_u16()))),
+            Ok(Err(e)) => {
+                let why = match crate::net::why(&e) { Why::Failed => Why::Interrupted, why => why };
+                return Err(failed(why, Some(status.as_u16())));
+            }
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(chunk))) => chunk,
+        };
         bytes.extend_from_slice(&chunk);
         if bytes.len() as u64 > MAX_ZIP {
-            return Err("download_failed");
+            return Err(failed(Why::TooLarge, Some(status.as_u16())));
         }
         if let Some(total) = total {
             let percent = (bytes.len() as u64 * 100 / total).min(100) as u8;
@@ -298,14 +430,22 @@ fn extract(zip: &[u8], asset: &Asset, dest: &std::path::Path) -> Result<(), &'st
                 .arg(&archive).arg(&work);
             ps
         };
-        let unpacked = run_within(unpack, UNPACK_LIMIT).is_some_and(|out| out.status.success());
+        let unpacked = run_within(unpack, UNPACK_LIMIT).is_ok_and(|out| out.status.success());
         let exe = work.join(&inner);
-        if !unpacked || !exe.is_file() {
+        if !unpacked {
             return Err("extract_failed");
+        }
+        // Unpacked, then gone: antivirus took it.
+        if !exe.is_file() {
+            return Err("rclone_blocked");
         }
         let mut check = crate::sources::command(&exe.to_string_lossy());
         check.arg("version");
-        let version = run_within(check, VERSION_LIMIT).ok_or("extract_failed")?;
+        let version = match run_within(check, VERSION_LIMIT) {
+            Ok(version) => version,
+            Err(Some(e)) if refused_to_start(&e) => return Err("rclone_blocked"),
+            Err(_) => return Err("extract_failed"),
+        };
         if !String::from_utf8_lossy(&version.stdout).starts_with(&format!("rclone {RCLONE_VERSION}")) {
             return Err("extract_failed");
         }
@@ -349,7 +489,7 @@ pub fn connect_dropbox(rclone: &std::path::Path, remote: &str, how: Connect, on_
     let mut child = crate::sources::command(&rclone.to_string_lossy())
         .args(connect_args(remote, how))
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped())
-        .spawn().map_err(|_| "rclone_failed")?;
+        .spawn().map_err(|e| if refused_to_start(&e) { "rclone_blocked" } else { "rclone_failed" })?;
     // Ends with the app (an updater restart, a crash): a sign-in never outlives it.
     #[cfg(windows)]
     let _tree = crate::login::ProcessTree::attach(&child).ok();
@@ -458,7 +598,8 @@ mod tests {
         assert!(own.starts_with("https://downloads.rclone.org/v1.76.0/") && github.starts_with("https://github.com/rclone/rclone/releases/download/v1.76.0/"));
     }
 
-    /// Downloads the real zip (about 25 MB): `cargo test -- --ignored downloads_and_unpacks`.
+    /// Downloads the real zip (about 25 MB) with the client the app uses:
+    /// `cargo test -- --ignored downloads_and_unpacks`.
     #[tokio::test(flavor = "current_thread")]
     #[ignore]
     async fn downloads_and_unpacks_the_pinned_rclone() {
@@ -466,7 +607,9 @@ mod tests {
         let dest = dir.0.join("rclone").join("rclone.exe");
         let seen = std::sync::Mutex::new(Vec::new());
         let progress = |p: u8| seen.lock().unwrap().push(p);
-        install_rclone(&reqwest::Client::new(), &dest, &std::sync::atomic::AtomicBool::new(false), &progress).await.unwrap();
+        let mut reasons = Vec::new();
+        install_rclone(&dest, &std::sync::atomic::AtomicBool::new(false), &progress, &mut reasons).await.unwrap();
+        assert!(reasons.is_empty(), "{reasons:?}");
         let out = std::process::Command::new(&dest).arg("version").output().unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).starts_with("rclone v1.76.0"));
         assert!(!dest.parent().unwrap().join(".unpack").exists(), "the unpacking folder is removed");
@@ -476,8 +619,216 @@ mod tests {
         // Cancelled, it stops before anything is put in place.
         let other = dir.0.join("cancelled").join("rclone.exe");
         let cancel = std::sync::atomic::AtomicBool::new(true);
-        assert_eq!(install_rclone(&reqwest::Client::new(), &other, &cancel, &|_| {}).await, Err("cancelled"));
+        assert_eq!(install_rclone(&other, &cancel, &|_| {}, &mut reasons).await, Err("cancelled"));
         assert!(!other.exists());
+    }
+
+    /// The second source alone, rclone's GitHub release, with the client the app uses: GitHub
+    /// answers with a redirect to its file host, which the client follows (the zip, about 25 MB):
+    /// `cargo test -- --ignored the_github_release`.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn the_github_release_downloads_through_the_apps_client() {
+        let asset = asset(std::env::consts::ARCH).unwrap();
+        let github = urls(&asset)[1].clone();
+        assert!(github.starts_with("https://github.com/"));
+        // GitHub answers with a redirect, which the client follows to GitHub's file host.
+        let answer = download_client().get(&github).send().await.unwrap();
+        assert!(answer.status().is_success(), "{}", answer.status());
+        assert!(answer.url().host_str().is_some_and(|h| h.ends_with(".githubusercontent.com")), "{}", crate::net::shown_host(answer.url()));
+        drop(answer);
+        let mut reasons = Vec::new();
+        let zip = download(&download_client(), &[github], asset.sha256, &std::sync::atomic::AtomicBool::new(false), &|_| {}, &mut reasons).await;
+        assert!(zip.is_ok_and(|zip| sha256_hex(&zip) == asset.sha256), "{reasons:?}");
+        assert!(reasons.is_empty(), "{reasons:?}");
+    }
+
+    #[test]
+    fn redirects_are_followed_only_over_https_to_rclones_and_githubs_hosts() {
+        let url = |s: &str| reqwest::Url::parse(s).unwrap();
+        for ok in [
+            "https://downloads.rclone.org/v1.76.0/rclone-v1.76.0-windows-amd64.zip",
+            "https://github.com/rclone/rclone/releases/download/v1.76.0/x.zip",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1/2?sig=SYNTHETIC",
+            "https://objects.githubusercontent.com/x",
+            "https://GITHUB.com/x",
+        ] {
+            assert!(download_url(&url(ok)), "{ok}");
+        }
+        for bad in [
+            "http://github.com/x",
+            "https://github.com:8443/x",
+            "https://user:pass@github.com/x",
+            "https://evilgithubusercontent.com/x",
+            "https://githubusercontent.com.evil.example/x",
+            "https://gateway.example.invalid/blocked",
+            "https://140.82.112.3/x",
+            "https://[::1]/x",
+            "ftp://github.com/x",
+        ] {
+            assert!(!download_url(&url(bad)), "{bad}");
+        }
+    }
+
+    // The tests below use the app's download client (`download_client_with`) against an HTTPS
+    // server on this machine, made by a throwaway authority (`test_tls`). The client trusts that
+    // authority and may follow redirects to `localhost` only; everything else is the app's.
+    fn localhost(url: &reqwest::Url) -> bool {
+        url.host_str() == Some("localhost")
+    }
+
+    struct Site {
+        authority: crate::test_tls::Authority,
+        server: crate::test_tls::Server,
+    }
+
+    impl Site {
+        fn new(answer: impl Fn(&str, u16) -> crate::test_tls::Answer + Send + Sync + 'static) -> Site {
+            let authority = crate::test_tls::Authority::new();
+            let (cert, key) = authority.issue();
+            let server = crate::test_tls::Server::start(cert, key, answer);
+            Site { authority, server }
+        }
+
+        /// The app's download client, trusting this site's authority, allowing `localhost`, and
+        /// reaching it directly whatever proxy this machine is set to use.
+        fn client(&self) -> reqwest::Client {
+            download_client_with(crate::net::builder().no_proxy().tls_certs_merge([self.authority.reqwest_root()]), localhost)
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.server.asked.lock().unwrap().clone()
+        }
+    }
+
+    const ZIP: &[u8] = b"PK\x03\x04 synthetic rclone zip";
+
+    fn zip() -> crate::test_tls::Answer {
+        crate::test_tls::Answer::Body { status: 200, content_type: "application/octet-stream", body: ZIP.to_vec() }
+    }
+
+    fn redirect(location: String) -> crate::test_tls::Answer {
+        crate::test_tls::Answer::Redirect { status: 302, location }
+    }
+
+    async fn get(client: &reqwest::Client, urls: &[String]) -> (Result<Vec<u8>, &'static str>, Vec<Reason>) {
+        let mut reasons = Vec::new();
+        let got = download(client, urls, &sha256_hex(ZIP), &std::sync::atomic::AtomicBool::new(false), &|_| {}, &mut reasons).await;
+        (got, reasons)
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_an_allowed_host_is_followed() {
+        let site = Site::new(|path, port| match path {
+            "/release.zip" => redirect(format!("https://localhost:{port}/asset/1?sig=SYNTHETIC")),
+            _ => zip(),
+        });
+        let (got, reasons) = get(&site.client(), &[site.server.url("/release.zip")]).await;
+        assert_eq!(got, Ok(ZIP.to_vec()), "{reasons:?}");
+        assert!(reasons.is_empty());
+        assert_eq!(site.asked(), ["/release.zip", "/asset/1?sig=SYNTHETIC"]);
+    }
+
+    /// What app::http_client did: no redirect followed, so GitHub's link could never work.
+    #[tokio::test]
+    async fn a_client_that_follows_no_redirect_cannot_get_githubs_file() {
+        let site = Site::new(|path, port| match path {
+            "/release.zip" => redirect(format!("https://localhost:{port}/asset/1")),
+            _ => zip(),
+        });
+        let none = crate::net::builder().no_proxy().tls_certs_merge([site.authority.reqwest_root()]).redirect(reqwest::redirect::Policy::none()).build().unwrap();
+        let (got, reasons) = get(&none, &[site.server.url("/release.zip")]).await;
+        assert_eq!(got, Err("download_failed"));
+        assert_eq!(reasons, [Reason { host: "localhost".into(), why: crate::net::Why::Redirected, status: Some(302), to: Some("localhost".into()) }]);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_elsewhere_is_not_followed_ends_the_download_and_names_only_the_host() {
+        let site = Site::new(|path, port| match path {
+            "/blocked.zip" => redirect("https://gateway.example.invalid/block?user=someone@example.invalid&sig=SECRET".into()),
+            "/plain.zip" => redirect(format!("http://localhost:{port}/asset")),
+            _ => zip(),
+        });
+        let (got, reasons) = get(&site.client(), &[site.server.url("/blocked.zip"), site.server.url("/next.zip")]).await;
+        assert_eq!(got, Err("download_failed"));
+        assert_eq!(reasons, [Reason { host: "localhost".into(), why: crate::net::Why::Redirected, status: Some(302), to: Some("gateway.example.invalid".into()) }]);
+        assert_eq!(site.asked(), ["/blocked.zip"], "a redirect elsewhere may be a block: the next source is not tried");
+        let shown = serde_json::to_string(&reasons).unwrap();
+        assert!(!shown.contains('?') && !shown.contains('@') && !shown.contains("sig") && !shown.contains("SECRET") && !shown.contains("/block"), "{shown}");
+
+        // Not over HTTPS: not followed either, and said so.
+        let (_, reasons) = get(&site.client(), &[site.server.url("/plain.zip")]).await;
+        assert_eq!(reasons[0].to.as_deref(), Some("http://localhost"));
+    }
+
+    #[tokio::test]
+    async fn redirects_end_after_five() {
+        let site = Site::new(|path, port| {
+            let n: u32 = path.trim_start_matches("/hop").parse().unwrap_or(0);
+            redirect(format!("https://localhost:{port}/hop{}", n + 1))
+        });
+        let (got, reasons) = get(&site.client(), &[site.server.url("/hop0")]).await;
+        assert_eq!(got, Err("download_failed"));
+        assert_eq!((reasons[0].why, reasons[0].status), (crate::net::Why::Redirected, Some(302)));
+        assert_eq!(site.asked().len(), 1 + MAX_REDIRECTS, "{:?}", site.asked());
+    }
+
+    #[tokio::test]
+    async fn a_page_where_the_zip_should_be_is_named_and_ends_the_download() {
+        use crate::test_tls::Answer;
+        let site = Site::new(|path, _| match path {
+            "/html.zip" => Answer::Body { status: 200, content_type: "text/html; charset=utf-8", body: b"<html><title>Blocked by policy</title></html>".to_vec() },
+            "/forbidden.zip" => Answer::Body { status: 403, content_type: "text/html", body: b"<html>Access denied</html>".to_vec() },
+            "/text.zip" => Answer::Body { status: 200, content_type: "application/octet-stream", body: b"This download is blocked.".to_vec() },
+            _ => zip(),
+        });
+        for (path, status) in [("/html.zip", 200), ("/forbidden.zip", 403), ("/text.zip", 200)] {
+            let (got, reasons) = get(&site.client(), &[site.server.url(path), site.server.url("/next.zip")]).await;
+            assert_eq!(got, Err("download_failed"), "{path}");
+            assert_eq!(reasons, [Reason { host: "localhost".into(), why: crate::net::Why::Page, status: Some(status), to: None }], "{path}");
+        }
+        assert!(!site.asked().contains(&"/next.zip".to_string()), "a page may be a block: {:?}", site.asked());
+    }
+
+    #[tokio::test]
+    async fn a_source_that_is_down_or_broken_lets_the_next_one_serve_the_zip() {
+        use crate::test_tls::Answer;
+        let site = Site::new(|path, _| match path {
+            "/gone.zip" => Answer::Body { status: 404, content_type: "text/plain", body: b"not found".to_vec() },
+            "/down.zip" => Answer::Body { status: 503, content_type: "text/plain", body: Vec::new() },
+            "/corrupt.zip" => Answer::Body { status: 200, content_type: "application/zip", body: b"PK\x03\x04 another zip".to_vec() },
+            _ => zip(),
+        });
+        let urls = ["/gone.zip", "/down.zip", "/corrupt.zip", "/good.zip"].map(|p| site.server.url(p));
+        let (got, reasons) = get(&site.client(), &urls).await;
+        assert_eq!(got, Ok(ZIP.to_vec()));
+        use crate::net::Why;
+        assert_eq!(reasons.iter().map(|r| (r.why, r.status)).collect::<Vec<_>>(), [(Why::Status, Some(404)), (Why::Status, Some(503)), (Why::Mismatch, Some(200))]);
+
+        // None left: the checksum's code when a zip came but did not match.
+        let (got, _) = get(&site.client(), &urls[..3]).await;
+        assert_eq!(got, Err("hash_mismatch"));
+    }
+
+    #[tokio::test]
+    async fn a_certificate_for_another_name_is_named() {
+        let site = Site::new(|_, _| zip());
+        // The certificate is for `localhost`; the address is asked for instead.
+        let (got, reasons) = get(&site.client(), &[format!("https://127.0.0.1:{}/a.zip", site.server.port)]).await;
+        assert_eq!(got, Err("download_failed"));
+        assert_eq!(reasons, [Reason { host: "127.0.0.1".into(), why: crate::net::Why::WrongName, status: None, to: None }]);
+    }
+
+    #[tokio::test]
+    async fn a_certificate_this_computer_does_not_trust_is_named_and_ends_the_download() {
+        let site = Site::new(|_, _| zip());
+        // The app's own client (reaching this machine directly): the throwaway authority is in no
+        // store here.
+        let client = download_client_with(crate::net::builder().no_proxy(), download_url);
+        let (got, reasons) = get(&client, &[site.server.url("/a.zip"), site.server.url("/b.zip")]).await;
+        assert_eq!(got, Err("download_failed"));
+        assert_eq!(reasons, [Reason { host: "localhost".into(), why: crate::net::Why::Untrusted, status: None, to: None }]);
+        assert!(site.asked().is_empty(), "the request never got past the certificate");
     }
 
     #[cfg(windows)]
@@ -486,7 +837,7 @@ mod tests {
         let started = std::time::Instant::now();
         let mut hang = crate::sources::command("ping");
         hang.args(["-n", "30", "127.0.0.1"]);
-        assert!(run_within(hang, std::time::Duration::from_secs(1)).is_none(), "killed, not waited for");
+        assert!(matches!(run_within(hang, std::time::Duration::from_secs(1)), Err(None)), "killed, not waited for");
         assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
         let mut echo = crate::sources::command("cmd");
         echo.args(["/c", "echo", "rclone", "v1.76.0"]);
