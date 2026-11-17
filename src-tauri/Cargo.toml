@@ -35,7 +35,12 @@ tauri-build = { version = "2", features = [], optional = true }
 tauri = { version = "2", features = [], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# SlopBar's own requests (net.rs): Windows' own certificate checks (rustls-platform-verifier) and the
+# system's proxy, as the updater's reqwest does; one reqwest in the build.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "system-proxy"] }
+# reqwest's TLS cryptography (ring, as the updater installs it), and its errors, to say why a
+# request failed.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 futures = "0.3"
@@ -74,6 +79,10 @@ png = "0.17"
 webview2-com = { version = "0.38", optional = true }
 # The toast the notification plugin shows, used directly where a click must open Settings.
 tauri-winrt-notification = { version = "0.8", optional = true }
+
+[dev-dependencies]
+# Throwaway certificates for HTTPS tests, made afresh in every run (test_tls.rs).
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 
 # Argon2 is unusably slow unoptimised; backup tests use the real parameters.
 [profile.dev.package.argon2]
