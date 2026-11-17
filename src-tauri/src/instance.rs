@@ -117,6 +117,18 @@ pub fn processes() -> Option<Processes> {
     Some(count(&named, session))
 }
 
+/// Whether another process holds this user's instance lock: SlopBar Ultra's watchdog asks
+/// (`keep_running`). It never waits for the lock, never keeps it, and never signals the app, as a
+/// second launch's hand-over would by opening Settings.
+pub fn held() -> bool {
+    imp::held(&lock_name())
+}
+
+/// The executable name of every process on this machine, in every session, if they can be listed.
+pub fn names() -> Option<Vec<String>> {
+    imp::list().map(|(list, _)| list.into_iter().map(|p| p.name).collect())
+}
+
 /// Ends every other SlopBar app process in this session (duplicates of an older build, which
 /// ignore the instance lock) that have run for at least `DUPLICATE_AGE`, so a moment-long
 /// `--build-info-to` or a restart still deciding is left alone. Returns how many were ended.
@@ -180,6 +192,31 @@ mod imp {
             }
             let waited = WaitForSingleObject(mutex, limit.as_millis().min(u32::MAX as u128 - 1) as u32);
             waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED
+        }
+    }
+
+    /// Whether another thread or process owns the named mutex now. One that does not exist, or is
+    /// free (or abandoned: its owner died), is taken for a moment and let go at once. One that
+    /// cannot be opened counts as owned.
+    pub fn held(name: &str) -> bool {
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_FILE_NOT_FOUND};
+        use windows_sys::Win32::System::Threading::{OpenMutexW, ReleaseMutex, MUTEX_MODIFY_STATE, SYNCHRONIZATION_SYNCHRONIZE};
+        let name = wide(name);
+        // SAFETY: `name` is NUL-terminated; the handle, if any, is released (when owned) and closed once.
+        unsafe {
+            let mutex = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE | MUTEX_MODIFY_STATE, 0, name.as_ptr());
+            if mutex.is_null() {
+                return GetLastError() != ERROR_FILE_NOT_FOUND;
+            }
+            let held = match WaitForSingleObject(mutex, 0) {
+                WAIT_OBJECT_0 | WAIT_ABANDONED => {
+                    ReleaseMutex(mutex);
+                    false
+                }
+                _ => true,
+            };
+            CloseHandle(mutex);
+            held
         }
     }
 
@@ -284,6 +321,9 @@ mod imp {
     pub fn lock(_name: &str, _limit: Duration) -> bool {
         true
     }
+    pub fn held(_name: &str) -> bool {
+        false
+    }
     pub(super) fn list() -> Option<(Vec<Entry>, u32)> {
         None
     }
@@ -367,6 +407,38 @@ mod tests {
         release.0.send(()).unwrap();
         first.join().unwrap();
         assert!(imp::lock(&name, Duration::from_secs(5)));
+    }
+
+    /// The watchdog's look at the lock: held while another thread owns it; not held when it was
+    /// never taken, once it is let go, or once its owner ended without letting go. Looking never
+    /// keeps it: the next start takes it at once.
+    #[cfg(windows)]
+    #[test]
+    fn the_watchdog_sees_the_lock_without_keeping_it() {
+        let name = format!(r"Local\slopbar-test-instance-{}-{}", std::process::id(), line!());
+        assert!(!imp::held(&name), "never taken");
+        let (taken, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+        let owner = {
+            let name = name.clone();
+            std::thread::spawn(move || {
+                taken.0.send(imp::lock(&name, Duration::ZERO)).unwrap();
+                release.1.recv().unwrap();
+                // The thread ends owning it: abandoned.
+            })
+        };
+        assert!(taken.1.recv().unwrap());
+        assert!(imp::held(&name), "owned by another thread");
+        assert!(imp::held(&name), "and still, after a look");
+        release.0.send(()).unwrap();
+        owner.join().unwrap();
+        assert!(!imp::held(&name), "abandoned by its owner");
+        assert!(!imp::held(&name), "and the look let it go");
+        // A start takes it at once after a look (it waits not at all here).
+        let started = {
+            let name = name.clone();
+            std::thread::spawn(move || imp::lock(&name, Duration::ZERO)).join().unwrap()
+        };
+        assert!(started, "the next start takes it");
     }
 
     #[cfg(windows)]

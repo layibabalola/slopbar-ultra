@@ -138,6 +138,8 @@ async fn install_now(app: &AppHandle, by: Trigger, steps: &Steps) -> Result<Outc
     }
     record(app, by, Outcome::Installing(update.version.clone()));
     let _ = app.emit("update-installing", &update.version);
+    // SlopBar Ultra's watchdog starts nothing while the installer replaces this executable.
+    crate::keep_running::installing(&update.version);
     // On a thread of its own, holding the turn and the refresh lock until that thread ends, so no
     // refresh starts while the installer may still end this process (see `hand_over`).
     update_check::hand_over(steps, update_check::HANDOFF_LIMIT, (turn, refresh), move || update.install(bytes).map_err(|e| describe(&e))).await?;

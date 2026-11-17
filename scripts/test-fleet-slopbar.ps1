@@ -31,10 +31,17 @@ function Record([hashtable]$fields = @{}) {
   foreach ($key in $fields.Keys) { $record[$key] = $fields[$key] }
   return $record
 }
-function Info($record, [string]$version = '0.1.0-ultra.13', [bool]$updates = $true) {
+function Info($record, [string]$version = '0.1.0-ultra.13', [bool]$updates = $true, $keep = $null) {
   $value = [ordered]@{ version = $version; updates_enabled = $updates; pid = 4242 }
   if ($null -ne $record) { $value.update_check = $record }
+  if ($null -ne $keep) { $value.keep_running = $keep }
   return [pscustomobject]@{ State = 'ok'; Value = ($value | ConvertTo-Json -Depth 5 | ConvertFrom-Json) }
+}
+# SlopBar Ultra's watchdog as get_app_info reports it (keep_running): healthy unless told otherwise.
+function Keep([hashtable]$fields = @{}) {
+  $keep = [ordered]@{ enabled = $true; managed = $true; task = 'ok'; problems = @(); error = $null; last_run = $null; last_result = 0; started_by_watchdog = $false }
+  foreach ($key in $fields.Keys) { $keep[$key] = $fields[$key] }
+  return $keep
 }
 $on = [pscustomobject]@{ State = 'ok'; Value = ('{"auto_update":true}' | ConvertFrom-Json) }
 $off = [pscustomobject]@{ State = 'ok'; Value = ('{"auto_update":false}' | ConvertFrom-Json) }
@@ -78,6 +85,28 @@ foreach ($state in 'unreachable', 'timeout', 'failed', 'error') {
 }
 $r = Row ([pscustomobject]@{ State = 'missing' })
 Check 'a machine without SlopBar is not installed, which is no problem' (-not $r.Problem -and $r.Status -eq 'not installed')
+
+# SlopBar Ultra's watchdog (keep_running): a build from before it shows n/a; a build that keeps the task
+# with the setting on must have it as the app registers it; the setting off, or a build that does not
+# keep the task, is no problem.
+$r = Row (Info $healthy)
+Check 'a build from before the watchdog shows n/a and no problem' ($r.Watchdog -eq 'n/a' -and -not $r.Problem -and $r.Status -eq 'current')
+$r = Row (Info $healthy -keep (Keep))
+Check 'a watchdog task as it should be is ok and no problem' ($r.Watchdog -eq 'ok' -and -not $r.Problem -and $r.Status -eq 'current')
+$r = Row (Info $healthy -keep (Keep @{ task = 'missing' }))
+Check 'a missing watchdog task is a problem' ($r.Watchdog -eq 'missing' -and $r.Problem -and $r.Status -eq 'current; watchdog task missing')
+$r = Row (Info $healthy -keep (Keep @{ task = 'wrong'; problems = @('logon type Password, not InteractiveToken', 'disabled') }))
+Check 'a wrong watchdog task is a problem that says what differs' ($r.Watchdog -eq 'wrong' -and $r.Problem -and
+  $r.Status -eq 'current; watchdog task wrong: logon type Password, not InteractiveToken; disabled')
+$r = Row (Info $healthy -keep (Keep @{ task = 'unknown'; error = 'Task Scheduler did not answer within 10 s' }))
+Check 'a watchdog task that cannot be read is a problem that says why' ($r.Watchdog -eq 'unknown' -and $r.Problem -and
+  $r.Status -eq 'current; watchdog task unknown: Task Scheduler did not answer within 10 s')
+$r = Row (Info $healthy -keep (Keep @{ enabled = $false; task = 'missing' }))
+Check 'the watchdog turned off (keep_running) is no problem' ($r.Watchdog -eq 'off' -and -not $r.Problem -and $r.Status -eq 'current')
+$r = Row (Info $healthy -keep (Keep @{ managed = $false; task = 'missing' }))
+Check 'a build that does not keep the task is no problem for its absence' ($r.Watchdog -eq 'missing' -and -not $r.Problem -and $r.Status -eq 'current')
+$r = Row (Info (Record @{ at = (Ago 1); result = 'error'; error = 'synthetic' ; next_at = (Ago -14) }) -keep (Keep @{ task = 'missing' }))
+Check 'a watchdog problem comes after the update check''s' ($r.Problem -and $r.Status -eq 'current; last update check failed; watchdog task missing')
 
 # A failed check: a problem; the table cuts it to 40 characters and the full text follows it.
 $failure = 'The download failed: error decoding response body: operation timed out'
@@ -240,9 +269,10 @@ Check 'short text is left alone' ((Get-Short 'up to date') -eq 'up to date')
 $reportDir = Join-Path ([IO.Path]::GetTempPath()) "slopbar-fleet-test-$PID"
 $null = New-Item -ItemType Directory -Force $reportDir
 function RealAgo([double]$minutes) { [datetime]::UtcNow.AddMinutes(-$minutes).ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture) }
-# A door that answers: this version, with this update record (healthy by default) and the setting.
-function Door([string]$version = '0.1.0-ultra.13', [bool]$auto = $true) {
-  @{ version = $version; auto = $auto; record = (Record @{ at = (RealAgo 5); result = 'up_to_date'; by = 'auto'; next_at = (RealAgo -10) }) }
+# A door that answers: this version, with this update record (healthy by default), the setting and the
+# watchdog (healthy by default).
+function Door([string]$version = '0.1.0-ultra.13', [bool]$auto = $true, $keep = (Keep)) {
+  @{ version = $version; auto = $auto; keep = $keep; record = (Record @{ at = (RealAgo 5); result = 'up_to_date'; by = 'auto'; next_at = (RealAgo -10) }) }
 }
 # $doors: 'here' and the ssh aliases of the other machines, each a Door, or a hashtable with only a
 # state: missing (no SlopBar: nothing printed, exit 0) or unreachable (ssh's exit 255).
@@ -260,7 +290,7 @@ function Invoke-Report([string]$latestJson, [hashtable]$doors) {
     if ($door.state -eq 'unreachable') { $code = 255; $message = 'Connection timed out' }
     elseif ($door.state -ne 'missing') {
       $answer = switch ($words[-1]) {
-        'get_app_info' { [ordered]@{ version = $door.version; updates_enabled = $true; pid = 4242; update_check = $door.record } }
+        'get_app_info' { [ordered]@{ version = $door.version; updates_enabled = $true; pid = 4242; update_check = $door.record; keep_running = $door.keep } }
         'get_settings' { [ordered]@{ auto_update = $door.auto } }
       }
       $text = @{ ok = $answer } | ConvertTo-Json -Depth 6 -Compress
@@ -299,7 +329,8 @@ try {
   $report = Invoke-Report (Latest (RealAgo 120)) @{ here = (Door); 'box-1' = (Door); 'lap-1' = (Door) }
   Check 'a fleet that is all current says its channel and machines, summarises them, and exits 0' ($report.Exit -eq 0 -and
     (Matching $report '^Channel: 0\.1\.0-ultra\.13\. Machines: 3 \(this one and the ssh managed block\)\.$') -eq 1 -and (Summary $report) -eq 'Summary: 3 current, 0 behind, 0 not installed, 0 with problems.')
-  Check '...lists each machine, this one by its name' ((Matching $report '^(desk-1 \(here\)|box-1|lap-1)\s+0\.1\.0-ultra\.13\s+on\s+5 min ago: up to date\s+current\s*$') -eq 3)
+  Check '...lists each machine, this one by its name' ((Matching $report '^(desk-1 \(here\)|box-1|lap-1)\s+0\.1\.0-ultra\.13\s+on\s+5 min ago: up to date\s+ok\s+current\s*$') -eq 3)
+  Check '...under a Watchdog column' ((Matching $report '^Machine\s+Version\s+AutoUpdate\s+LastCheck\s+Watchdog\s+Status\s*$') -eq 1)
   Check '...and has no line about the release time while it is known' ((Matching $report '^Release time unknown') -eq 0)
 
   $report = Invoke-Report (Latest) @{ here = (Door); 'box-1' = (Door) }
@@ -326,6 +357,10 @@ try {
     (Matching $report '^box-1\s+not installed\s*$') -eq 1)
   $report = Invoke-Report (Latest (RealAgo 120)) @{ here = (Door '0.1.0-ultra.13' $false); 'box-1' = (Door) }
   Check 'a machine with "Update automatically" off is a problem: exit 1' ($report.Exit -eq 1 -and (Summary $report) -eq 'Summary: 2 current, 0 behind, 0 not installed, 1 with problems.')
+  $report = Invoke-Report (Latest (RealAgo 120)) @{ here = (Door); 'box-1' = (Door -keep (Keep @{ task = 'missing' })); 'lap-1' = (Door -keep $null) }
+  Check 'a machine whose watchdog task is missing is a problem: its row and exit 1' ($report.Exit -eq 1 -and (Summary $report) -eq 'Summary: 3 current, 0 behind, 0 not installed, 1 with problems.' -and
+    (Matching $report '^box-1\s+0\.1\.0-ultra\.13\s+on\s+5 min ago: up to date\s+missing\s+current; watchdog task missing\s*$') -eq 1 -and
+    (Matching $report '^lap-1\s+0\.1\.0-ultra\.13\s+on\s+5 min ago: up to date\s+n/a\s+current\s*$') -eq 1)
 } finally {
   # The report folder goes when the scenarios are done. Another process (a scanner) may hold a new file
   # for a moment; Windows then finishes the delete.

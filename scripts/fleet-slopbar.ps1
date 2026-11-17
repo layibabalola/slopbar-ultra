@@ -42,6 +42,10 @@ machine that is current is not affected), and, from the record:
 A machine that has just woken from a long sleep shows both of the last two until its next pass, and
 cannot be told from a dead loop: ask again after an interval (docs/ULTRA-RELEASES.md says how long a
 sleep it takes).
+Watchdog is SlopBar Ultra's watchdog task (get_app_info's keep_running): ok, off (the keep_running
+setting), missing, wrong or unknown; a build from before it shows n/a, which is no problem. A build
+that keeps the task (an Ultra release build) with keep_running on and a task that is not ok is a
+problem: missing, wrong (with what differs) or unknown (with why it could not be read).
 A machine without SlopBar is reported as not installed, which is no problem.
 
 The functions are tested offline by scripts/test-fleet-slopbar.ps1, which dot-sources this file.
@@ -184,6 +188,22 @@ function Get-LastCheck($check, $auto, [datetime]$now = [datetime]::UtcNow) {
   return [pscustomobject]@{ Text = "$minutes min ago: $result"; Problems = $problems.ToArray(); Interval = $interval; PassLimit = $passLimit }
 }
 
+# SlopBar Ultra's watchdog (get_app_info's keep_running): its text, and the problem it shows, if any.
+# A build from before it has no keep_running: n/a, no problem. A build that keeps the task (managed: an
+# Ultra release build) with the setting on must have it as the app would register it.
+function Get-Watchdog($keep) {
+  if ($null -eq $keep) { return [pscustomobject]@{ Text = 'n/a'; Problem = $null } }
+  if ($keep.enabled -eq $false) { return [pscustomobject]@{ Text = 'off'; Problem = $null } }
+  $task = "$($keep.task)"
+  if (-not $keep.managed -or $task -eq 'ok') { return [pscustomobject]@{ Text = $task; Problem = $null } }
+  $problem = switch ($task) {
+    'missing' { 'watchdog task missing' }
+    'wrong' { "watchdog task wrong: $(@($keep.problems) -join '; ')" }
+    default { "watchdog task unknown: $($keep.error)" }
+  }
+  return [pscustomobject]@{ Text = $task; Problem = $problem }
+}
+
 # Starts one door call on a machine; Complete-Call collects it.
 function Start-Call([string]$machine, [string]$tool) {
   $id = [guid]::NewGuid().ToString('N')
@@ -234,7 +254,7 @@ function Invoke-Everywhere([string[]]$machines, [string]$tool, [int]$seconds = $
 # pub_date, as ConvertFrom-Json read it: see Get-ReleaseTime).
 function Get-Row([string]$machine, $info, $settings, [string]$channel, $published, [datetime]$now = [datetime]::UtcNow) {
   $row = [pscustomobject]@{ Machine = $(if ($machine -eq $here) { "$($machine.ToLowerInvariant()) (here)" } else { $machine })
-    Version = ''; AutoUpdate = ''; LastCheck = ''; Status = ''; Behind = $false; Problem = $false; Key = $machine; CheckText = '' }
+    Version = ''; AutoUpdate = ''; LastCheck = ''; Watchdog = ''; Status = ''; Behind = $false; Problem = $false; Key = $machine; CheckText = '' }
   switch ($info.State) {
     'missing' { $row.Status = 'not installed' }
     'ok' {
@@ -254,6 +274,9 @@ function Get-Row([string]$machine, $info, $settings, [string]$channel, $publishe
       $row.CheckText = $last.Text
       $row.LastCheck = Get-Short $last.Text
       foreach ($problem in $last.Problems) { $notes.Add($problem); $row.Problem = $true }
+      $watchdog = Get-Watchdog $info.Value.keep_running
+      $row.Watchdog = $watchdog.Text
+      if ($watchdog.Problem) { $notes.Add($watchdog.Problem); $row.Problem = $true }
       # Still behind long after the release: its update loop should have installed it by now. A build
       # from before the record, whose old updater could stall, gets Ultra's interval and the new pass
       # limit, so a machine stuck on it shows during a rollout. Without a usable release time (none, not
@@ -285,7 +308,7 @@ function Get-Report([string[]]$machines, [string]$channel, $published) {
 
 # The table, each last check cut to fit, then those that were cut, in full.
 function Write-Report($rows) {
-  $rows | Format-Table Machine, Version, AutoUpdate, LastCheck, Status -AutoSize | Out-String -Width 200 | Write-Output
+  $rows | Format-Table Machine, Version, AutoUpdate, LastCheck, Watchdog, Status -AutoSize | Out-String -Width 220 | Write-Output
   $cut = @($rows | Where-Object { $_.CheckText -ne $_.LastCheck })
   if ($cut) {
     Write-Output 'Last checks in full:'

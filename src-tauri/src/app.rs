@@ -527,6 +527,12 @@ async fn door_reply(app: AppHandle, request: door::Request) -> Result<serde_json
     refresh_wait::noted(door_call(app, request)).await
 }
 
+/// get_app_info's `keep_running` (`keep_running::report`), read off the async threads.
+async fn keep_running_report(app: &AppHandle) -> serde_json::Value {
+    let enabled = app.state::<AppState>().settings.lock().unwrap().keep_running;
+    tauri::async_runtime::spawn_blocking(move || crate::keep_running::report(enabled)).await.unwrap_or_default()
+}
+
 /// One operation for an agent, through the door (see `door` and `mcp`). Each runs the same code as
 /// the matching Settings action, so the windows and journal see it the same way.
 async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json::Value, String> {
@@ -768,6 +774,8 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             "pid": std::process::id(),
             // Agents' server beside it: its hash, and old copies still running agents' servers.
             "mcp": tauri::async_runtime::spawn_blocking(crate::mcp_update::status).await.unwrap_or_default(),
+            // SlopBar Ultra's watchdog: the setting, and its scheduled task as it is.
+            "keep_running": keep_running_report(&app).await,
         })),
         R::InspectWindow { window, page, screenshot } => {
             let target = match window {
@@ -823,6 +831,9 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             if restart {
                 self::restart(&app)?;
             } else {
+                // No person's Quit: SlopBar Ultra's watchdog starts it again once quit_app's grace has
+                // passed (the manual install route quits here, installs and starts SlopBar within it).
+                crate::keep_running::quit_by_agent();
                 let h = app.clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2434,7 +2445,11 @@ pub(crate) fn menu_event(app: &AppHandle, id: &str) {
         }
         "settings" => show_settings(app),
         MENU_COMPACT => toggle_compact_flyout(app, true),
-        "quit" => app.exit(0),
+        "quit" => {
+            // A person's Quit: SlopBar Ultra's watchdog leaves it stopped for the rest of this sign-in.
+            crate::keep_running::quit_by_person();
+            app.exit(0)
+        }
         _ => {}
     }
 }
@@ -2446,6 +2461,8 @@ pub(crate) fn apply_settings(app: &AppHandle) {
     if !settings::isolated() && autolaunch.is_enabled().unwrap_or(false) != settings.launch_at_login {
         let _ = if settings.launch_at_login { autolaunch.enable() } else { autolaunch.disable() };
     }
+    // SlopBar Ultra's watchdog task, created or repaired at startup and removed while it is off.
+    crate::keep_running::apply(settings.keep_running);
     dock::apply_mode(app, settings.native_widget);
     sources::set_wsl_mode(settings.wsl_accounts);
     if let Some(item) = app.state::<AppState>().compact_item.lock().unwrap().as_ref() {

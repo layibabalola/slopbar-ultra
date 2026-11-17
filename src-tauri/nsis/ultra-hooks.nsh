@@ -32,6 +32,17 @@
   Pop $R0
 !macroend
 
+; SlopBar Ultra's watchdog (src-tauri/src/keep_running.rs) is a scheduled task of the user's, named
+; with their SID, which the app knows: the uninstaller asks the app to remove it before anything
+; else, so it cannot start SlopBar while the files go. slopbar.exe is a window app (no console), and
+; it waits at most 10 s for Task Scheduler. An update keeps the task.
+!macro NSIS_HOOK_PREUNINSTALL
+  ${If} $UpdateMode <> 1
+    ExecWait '"$INSTDIR\slopbar.exe" --remove-keep-running'
+    ClearErrors
+  ${EndIf}
+!macroend
+
 ; The uninstaller removes slopbar-mcp.exe itself; copies set aside are not in its list. One an
 ; agent still runs is left, and so is the folder then. Updates never uninstall.
 !macro NSIS_HOOK_POSTUNINSTALL

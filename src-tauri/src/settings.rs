@@ -201,6 +201,9 @@ pub struct Settings {
     /// A sharing setup (here, or one this computer finishes for another) opens Dropbox's page in
     /// the default browser by itself. Off: it waits for the notification or the setup's button.
     pub sharing_open_browser: bool,
+    /// SlopBar Ultra's watchdog: a scheduled task starts SlopBar again within 5 minutes when it
+    /// stopped for any reason but a Quit from its menu (see `keep_running`). Off removes the task.
+    pub keep_running: bool,
 }
 
 /// Phone alerts through a push service (ntfy). The access token is not here: it is kept with
@@ -313,6 +316,7 @@ impl Default for Settings {
             account_roster: false,
             switch_desktop: false,
             sharing_open_browser: true,
+            keep_running: true,
         }
     }
 }
@@ -375,7 +379,7 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
 /// `project_pins` has its own operations (see `pins`).
-const PATCHABLE: [&str; 31] = ["rotate_at", "rotate_grace_minutes", "refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "compact_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed", "native_widget", "wsl_accounts", "account_roster", "switch_desktop", "sharing_open_browser"];
+const PATCHABLE: [&str; 32] = ["rotate_at", "rotate_grace_minutes", "refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "compact_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed", "native_widget", "wsl_accounts", "account_roster", "switch_desktop", "sharing_open_browser", "keep_running"];
 
 /// Modifier names a shortcut may use, as the Settings window writes them.
 const HOTKEY_MODIFIERS: [&str; 4] = ["Ctrl", "Alt", "Shift", "Win"];
