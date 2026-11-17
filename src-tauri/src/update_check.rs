@@ -636,7 +636,7 @@ mod tests {
                 let first = passes.fetch_add(1, SeqCst) == 0;
                 let url = url.clone();
                 async move {
-                    let client = if first { reqwest::Client::builder().timeout(Duration::from_millis(300)) } else { reqwest::Client::builder() };
+                    let client = if first { crate::net::builder().timeout(Duration::from_millis(300)) } else { crate::net::builder() };
                     let client = client.no_proxy().build().unwrap();
                     let limit = if first { Duration::from_secs(10) } else { Duration::from_millis(400) };
                     steps.run("The update check", limit, fetch(client, url)).await

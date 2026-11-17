@@ -9,6 +9,7 @@ mod model;
 mod settings;
 mod sources;
 mod providers;
+mod net;
 mod monitoring;
 mod private_store;
 mod diagnostics;
@@ -95,5 +96,7 @@ pub(crate) use app::AppState;
 
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod test_tls;
 #[cfg(test)]
 mod source_guard;

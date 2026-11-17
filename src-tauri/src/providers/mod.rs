@@ -331,7 +331,7 @@ mod tests {
         let login = slot("active:org", "monitor-access", "monitor-refresh", i64::MAX);
         monitor.connect(&account, &login, &[]).await.unwrap();
         let usage = Observed(std::sync::Mutex::new(vec![]));
-        let client = reqwest::Client::new();
+        let client = crate::net::builder().build().unwrap();
         let original = serde_json::to_vec(&account).unwrap();
         for _ in 0..60 {
             let result = fetch_one_with(&client, &account, &monitor, true, &usage).await.unwrap();
@@ -372,11 +372,11 @@ mod tests {
             monitor.connect(&account, &login, &[]).await.unwrap();
             // Persist a rejected monitor, so any attempted automatic renewal fails
             // the test rather than hitting a real provider.
-            monitor.token(&account, &reqwest::Client::new(), None).await.unwrap();
+            monitor.token(&account, &crate::net::builder().build().unwrap(), None).await.unwrap();
             monitor.reject(&account, "monitor-access").await.unwrap();
             let usage = Observed(std::sync::Mutex::new(vec![]));
             let original = serde_json::to_vec(&account).unwrap();
-            let result = fetch_one_with(&reqwest::Client::new(), &account, &monitor, active, &usage).await;
+            let result = fetch_one_with(&crate::net::builder().build().unwrap(), &account, &monitor, active, &usage).await;
             if active {
                 let fetched = result.unwrap();
                 assert_eq!(fetched.windows[0].used_percent, 24.0);
@@ -408,7 +408,7 @@ mod tests {
         let monitor = Monitor::new(dir.0.clone());
         let account = slot("inactive:org", "expired", "cli-owned-refresh", 0);
         let mut cache = Cache::new();
-        let results = fetch_all(&reqwest::Client::new(), &[account], &Active::new(), &mut cache, &Settings::default(), &monitor).await;
+        let results = fetch_all(&crate::net::builder().build().unwrap(), &[account], &Active::new(), &mut cache, &Settings::default(), &monitor).await;
         assert_eq!(results[0].error.as_deref(), Some("monitor_setup"));
         assert!(results[0].stale);
         assert!(results[0].windows.is_empty());
@@ -430,7 +430,7 @@ mod tests {
         assert!(!String::from_utf8_lossy(&bytes).contains("refresh"));
         let mut restarted: Cache = serde_json::from_slice(&bytes).unwrap();
         assert!(!restarted[&monitoring::key(&account)].verified);
-        let results = fetch_all(&reqwest::Client::new(), &[account], &Active::new(), &mut restarted, &Settings::default(), &monitor).await;
+        let results = fetch_all(&crate::net::builder().build().unwrap(), &[account], &Active::new(), &mut restarted, &Settings::default(), &monitor).await;
         assert!(results[0].stale);
         assert_eq!(results[0].windows[0].used_percent, 87.0);
         assert_eq!(results[0].windows[0].resets_at, original_reset);
@@ -451,7 +451,7 @@ mod tests {
             entry.blocked_until = Some(Utc::now() + chrono::Duration::hours(1));
             cache.insert(monitoring::key(account), entry);
         }
-        let results = fetch_all(&reqwest::Client::new(), &[claude, codex], &Active::new(), &mut cache, &Settings::default(), &monitor).await;
+        let results = fetch_all(&crate::net::builder().build().unwrap(), &[claude, codex], &Active::new(), &mut cache, &Settings::default(), &monitor).await;
         assert_eq!(results[0].windows[0].used_percent, 87.0);
         assert_eq!(results[1].windows[0].used_percent, 12.0);
         assert!(results.iter().all(|a| a.stale && a.error.as_deref() == Some("rate_limited")));
