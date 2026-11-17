@@ -79,6 +79,9 @@ pub const HANDSHAKE_GRACE: Duration = Duration::from_secs(2 * 60);
 pub const SIGN_IN_START_WINDOW: Duration = Duration::from_secs(30 * 60);
 /// How long Task Scheduler gets to answer a call: the door's get_app_info and the tray's Quit wait.
 pub const SCHEDULER_LIMIT: Duration = Duration::from_secs(10);
+/// How long the shell gets to start the app. A hung Explorer would otherwise hold the check, and
+/// the task with it (it never runs twice at once), for as long as it hangs.
+pub const SHELL_LIMIT: Duration = Duration::from_secs(30);
 /// How long a failed registration waits before each retry: three more tries, then none until the
 /// next start or settings change.
 pub const RETRIES: [Duration; 3] = [Duration::from_secs(60), Duration::from_secs(5 * 60), Duration::from_secs(15 * 60)];
@@ -547,7 +550,33 @@ pub struct ShellLauncher;
 
 impl Launcher for ShellLauncher {
     fn launch(&self, exe: &Path, args: &[String], dir: &Path) -> Result<Launched, Refused> {
-        launch_with(|| sys::shell_execute(exe, &args.join(" "), dir), |flags| spawn(exe, args, dir, flags), sys::job_limits())
+        let (e, a, d) = (exe.to_path_buf(), args.join(" "), dir.to_path_buf());
+        launch_with(|| bounded(SHELL_LIMIT, move || sys::shell_execute(&e, &a, &d)), |flags| spawn(exe, args, dir, flags), sys::job_limits())
+    }
+}
+
+/// Why the shell did not start the app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellError {
+    /// It cannot be reached (no Explorer, or another shell): the check starts the app itself.
+    Unavailable(String),
+    /// It did not answer in time. It may still start the app, so the check starts nothing more.
+    NoAnswer,
+}
+
+/// `call` on a thread of its own, waited for at most `limit` (a call still running then ends with
+/// the process).
+pub fn bounded(limit: Duration, call: impl FnOnce() -> Result<(), String> + Send + 'static) -> Result<(), ShellError> {
+    let (done, answer) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("keep-running-shell".into())
+        .spawn(move || {
+            let _ = done.send(call());
+        })
+        .map_err(|e| ShellError::Unavailable(e.to_string()))?;
+    match answer.recv_timeout(limit) {
+        Ok(result) => result.map_err(ShellError::Unavailable),
+        Err(_) => Err(ShellError::NoAnswer),
     }
 }
 
@@ -573,12 +602,15 @@ const JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK: u32 = 0x0000_1000;
 /// job and process time, job and process memory, and the number of processes.
 const TYING: u32 = 0x0000_2000 | 0x0000_0004 | 0x0000_0002 | 0x0000_0200 | 0x0000_0100 | 0x0000_0008;
 
-/// Starts the app through the shell; where that fails, by itself at normal priority, breaking away
-/// from the check's job (`job`, its limit flags; None outside a job) where the job allows it, and
-/// staying in one only when that job can neither end nor bound it.
-pub fn launch_with(shell: impl FnOnce() -> Result<(), String>, spawn: impl Fn(u32) -> std::io::Result<()>, job: Option<u32>) -> Result<Launched, Refused> {
-    if shell().is_ok() {
-        return Ok(Launched::Shell);
+/// Starts the app through the shell; where the shell cannot be reached, by itself at normal
+/// priority, breaking away from the check's job (`job`, its limit flags; None outside a job) where
+/// the job allows it, and staying in one only when that job can neither end nor bound it. A shell
+/// that did not answer may still start it, so then nothing more is started.
+pub fn launch_with(shell: impl FnOnce() -> Result<(), ShellError>, spawn: impl Fn(u32) -> std::io::Result<()>, job: Option<u32>) -> Result<Launched, Refused> {
+    match shell() {
+        Ok(()) => return Ok(Launched::Shell),
+        Err(ShellError::NoAnswer) => return Err(Refused::Failed("the shell did not answer".into())),
+        Err(ShellError::Unavailable(_)) => {}
     }
     let flags = spawn_flags(job).map_err(|()| Refused::Tied)?;
     spawn(flags | NORMAL_PRIORITY_CLASS)

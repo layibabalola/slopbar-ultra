@@ -398,7 +398,9 @@ passed. Nobody has to set it up; each machine gets it with the release that brin
   in none of Task Scheduler's jobs. Only when the shell cannot be reached does the run start the app
   itself, at normal priority, breaking away from the task's job where the job allows it, staying in a
   job that can neither end nor bound it, and never starting it into one that could (closing kills it,
-  or it limits time, memory or processes): that run ends with 2. A start that fails ends with 1. The
+  or it limits time, memory or processes): that run ends with 2. A start that fails ends with 1, and
+  so does a shell that has not answered within 30 seconds (it may still start the app, so the run
+  starts nothing more and the next run tries again; a hung Explorer never holds the task). The
   app gets `--watchdog-start <nonce>`, a nonce the run writes beside its markers just before: the
   start that presents it (once, within 2 minutes) is the watchdog's, and claims the instance lock as
   a restart does, quietly second to an instance that won it. A start with a spent nonce (the

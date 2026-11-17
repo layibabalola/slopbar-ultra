@@ -162,6 +162,7 @@ fn the_limits_are_pinned() {
     assert_eq!(HANDSHAKE_GRACE, Duration::from_secs(2 * 60));
     assert_eq!(SIGN_IN_START_WINDOW, Duration::from_secs(30 * 60));
     assert_eq!(SCHEDULER_LIMIT, Duration::from_secs(10));
+    assert_eq!(SHELL_LIMIT, Duration::from_secs(30));
     assert_eq!(RETRIES, [Duration::from_secs(60), Duration::from_secs(5 * 60), Duration::from_secs(15 * 60)]);
     assert_eq!(PRIORITY, 5);
     assert_eq!(START_BOUNDARY, "2026-01-01T00:00:00");
@@ -476,7 +477,7 @@ fn the_app_is_started_through_the_shell_first() {
     };
     assert_eq!(launch_with(|| Ok(()), spawn, Some(0x2000)), Ok(Launched::Shell));
     assert!(spawned.borrow().is_empty(), "the shell started it");
-    let no_shell = || Err::<(), String>("synthetic".into());
+    let no_shell = || Err::<(), ShellError>(ShellError::Unavailable("synthetic".into()));
     assert_eq!(launch_with(no_shell, spawn, None), Ok(Launched::Spawned));
     assert_eq!(spawned.take(), [NORMAL_PRIORITY_CLASS], "normal priority, whatever the check runs at");
     assert_eq!(launch_with(no_shell, spawn, Some(0)), Ok(Launched::Spawned), "Task Scheduler's job");
@@ -496,6 +497,24 @@ fn the_app_is_started_through_the_shell_first() {
     assert_eq!(spawned.take(), [CREATE_BREAKAWAY_FROM_JOB | NORMAL_PRIORITY_CLASS]);
     let fails = |_flags: u32| -> std::io::Result<()> { Err(std::io::Error::from_raw_os_error(2)) };
     assert!(matches!(launch_with(no_shell, fails, None), Err(Refused::Failed(_))));
+    // A shell that did not answer may still start it: nothing more is started.
+    assert_eq!(launch_with(|| Err(ShellError::NoAnswer), spawn, None), Err(Refused::Failed("the shell did not answer".into())));
+    assert!(spawned.take().is_empty());
+}
+
+/// The shell's call is waited for at most its limit, so a hung Explorer cannot hold the check.
+#[test]
+fn the_shell_is_waited_for_within_a_limit() {
+    assert_eq!(bounded(Duration::from_secs(60), || Ok(())), Ok(()));
+    assert_eq!(bounded(Duration::from_secs(60), || Err("no desktop".into())), Err(ShellError::Unavailable("no desktop".into())));
+    let started = std::time::Instant::now();
+    let (release, hung) = mpsc::channel::<()>();
+    assert_eq!(bounded(Duration::from_millis(100), move || {
+        let _ = hung.recv_timeout(Duration::from_secs(60));
+        Ok(())
+    }), Err(ShellError::NoAnswer));
+    assert!(started.elapsed() < Duration::from_secs(30), "not held by the hung call");
+    drop(release);
 }
 
 #[test]
@@ -1324,7 +1343,7 @@ fn the_wrappers_only_hand_this_machine_over() {
     let bodies = [
         ("fn check() -> i32 {", "fn check() -> i32 { check_with(&Windows, Markers::here().as_ref(), &ShellLauncher) }"),
         ("fn launch(&self, exe: &Path, args: &[String], dir: &Path) -> Result<Launched, Refused> {",
-            "fn launch(&self, exe: &Path, args: &[String], dir: &Path) -> Result<Launched, Refused> { launch_with(|| sys::shell_execute(exe, &args.join(\" \"), dir), |flags| spawn(exe, args, dir, flags), sys::job_limits()) }"),
+            "fn launch(&self, exe: &Path, args: &[String], dir: &Path) -> Result<Launched, Refused> { let (e, a, d) = (exe.to_path_buf(), args.join(\" \"), dir.to_path_buf()); launch_with(|| bounded(SHELL_LIMIT, move || sys::shell_execute(&e, &a, &d)), |flags| spawn(exe, args, dir, flags), sys::job_limits()) }"),
         ("fn running(&self) -> bool {", "fn running(&self) -> bool { crate::instance::held() }"),
         ("fn shutting_down(&self) -> bool {", "fn shutting_down(&self) -> bool { sys::shutting_down() }"),
         ("fn settings(&self) -> Settings {", "fn settings(&self) -> Settings { crate::settings::load() }"),
