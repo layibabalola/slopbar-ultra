@@ -509,6 +509,19 @@ pub fn switch(sources: &[Source], provider: Provider, id: &str) -> Result<(), St
         written += 1;
     }
     if written == 0 {
+        // A CLI installed on Windows but not run yet has no folder of its own: it gets one, signed
+        // in to this account (never for the Claude desktop app's own copy: the app makes its folder).
+        let installed_cli = crate::cli::find(provider).is_some_and(|f| f.kind != crate::cli::Kind::DesktopApp);
+        if let Some(source) = sources.iter().find(|s| s.distro.is_none()).filter(|_| installed_cli) {
+            let dir = match provider {
+                Provider::Claude => source.claude_dir(),
+                Provider::Codex => source.codex_dir(),
+            };
+            std::fs::create_dir_all(&dir).and_then(|_| write_login(&target, source)).map_err(|e| format!("{}: {e}", source.label))?;
+            written += 1;
+        }
+    }
+    if written == 0 {
         return Err("CLI not found".into());
     }
     Ok(())
@@ -730,34 +743,33 @@ fn sync_profiles_in(vault: &Path, root: &Path, wanted: &[(Provider, String)], ac
 // ---------------------------------------------------------------------------------------------
 // Adding an account
 
-fn executable(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Claude => "claude",
-        Provider::Codex => "codex",
+/// Whether the CLI can actually be run at `source`: `Some(true)` on PATH (in WSL, its login
+/// shell's), `Some(false)` only in an installer's folder or as the Claude desktop app's own copy,
+/// None not at all. A config dir alone isn't enough: editor extensions and desktop apps create
+/// `~/.codex` or `~/.claude` without installing the CLI. On Windows this is `cli::find` (the
+/// sign-in runs the one it finds, see `login::command`).
+fn cli_at(provider: Provider, source: &Source) -> Option<bool> {
+    match &source.distro {
+        // A login shell, so ~/.local/bin and version managers are on PATH.
+        // With a deadline, so a hung WSL cannot hold up adding an account.
+        Some(distro) => sources::wsl(&["-d", distro, "--", "bash", "-lc", &format!("command -v {}", crate::cli::name(provider))], std::time::Duration::from_secs(15))
+            .is_some_and(|o| o.status.success())
+            .then_some(true),
+        None => crate::cli::find(provider).map(|f| f.kind == crate::cli::Kind::Path),
     }
 }
 
-/// Whether the CLI can actually be run at `source`. A config dir alone isn't enough: editor
-/// extensions and desktop apps create `~/.codex` or `~/.claude` without installing the CLI.
-fn has_cli(provider: Provider, source: &Source) -> bool {
-    let exe = executable(provider);
-    let status = match &source.distro {
-        // A login shell, so ~/.local/bin and version managers are on PATH.
-        // With a deadline, so a hung WSL cannot hold up adding an account.
-        Some(distro) => sources::wsl(&["-d", distro, "--", "bash", "-lc", &format!("command -v {exe}")], std::time::Duration::from_secs(15)),
-        None => sources::command("where.exe").arg(exe).output().ok(),
-    };
-    status.is_some_and(|o| o.status.success())
-}
-
-/// Where to run a sign-in: a source that has the CLI, preferring one where it's signed in.
+/// Where to run a sign-in: a source that has the CLI, preferring one where it's signed in, then one
+/// where it is on PATH over an installer's folder or the Claude desktop app's own copy (so a WSL
+/// user signs in there as before).
 fn login_source(provider: Provider, sources: &[Source]) -> Option<&Source> {
-    let with_cli: Vec<&Source> = sources.iter().filter(|s| has_cli(provider, s)).collect();
+    let with_cli: Vec<(&Source, bool)> = sources.iter().filter_map(|s| Some((s, cli_at(provider, s)?))).collect();
     with_cli
         .iter()
-        .find(|s| read_login(provider, s, &[]).is_some())
+        .find(|(s, _)| read_login(provider, s, &[]).is_some())
+        .or_else(|| with_cli.iter().find(|(_, installed)| *installed))
         .or_else(|| with_cli.first())
-        .copied()
+        .map(|(s, _)| *s)
 }
 
 /// Where a sign-in's page opens and what it prefills (see `signin`). Both apply to sign-ins run on

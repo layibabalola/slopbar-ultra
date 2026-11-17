@@ -454,7 +454,11 @@ fn explain(error: &str) -> String {
         "monitor_login_failed" => "The monitoring sign-in could not be started.".into(),
         "monitor_wrong_workspace" => "The Codex sign-in used the right email but chose another ChatGPT workspace than this account's. Ask the user to retry and pick this account's workspace on the page.".into(),
         "signin_no_page" => "The sign-in page never opened (the CLI did not start its sign-in, or no browser window could open there). Check get_machine_readiness, then retry with sign_in_all.".into(),
-        "CLI not found" => "That provider's CLI is not installed or not found on PATH.".into(),
+        "CLI not found" => {
+            let [claude, codex] = crate::accounts::Provider::ALL.map(crate::cli::install_hint);
+            format!("That provider's CLI is not on this computer: not on PATH (as Windows has it now), not in its installers' usual folders, and for Claude Code not in the Claude desktop app's own copy either. Ask the user to install it from PowerShell ({}: `{}`; {}: `{}`), then try again; SlopBar needs no restart for it.",
+                claude.0, claude.1, codex.0, codex.1)
+        }
         "desktop_locked" => "Nothing was started: this computer's desktop is locked, so nobody would see the sign-in windows. Ask the user to unlock it at the screen, then try again.".into(),
         "desktop_not_shown" => "Nothing was started: the desktop SlopBar runs on is not shown on any screen (a closed Remote Desktop, or another Windows user switched in). Ask the user to go back to it, then try again.".into(),
         "no_sharing_location" => "This computer has no sharing location: choose one with update_settings (presence_remote from list_sharing_locations, or presence_folder) first.".into(),

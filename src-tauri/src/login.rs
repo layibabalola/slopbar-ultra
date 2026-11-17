@@ -91,6 +91,21 @@ pub fn command(
     action: &str,
     visible: bool,
 ) -> Command {
+    // In WSL the distro's own login shell finds the CLI (see `shell_script`).
+    let launch = if source.distro.is_none() { crate::cli::launch(provider) } else { Default::default() };
+    command_with(provider, source, dir, native, action, visible, launch)
+}
+
+/// `command`, with how the CLI starts on Windows given (`cli::launch`).
+pub fn command_with(
+    provider: Provider,
+    source: &Source,
+    dir: &Path,
+    native: &str,
+    action: &str,
+    visible: bool,
+    launch: crate::cli::Launch,
+) -> Command {
     #[allow(unused_mut)]
     let mut command = match &source.distro {
         Some(distro) => {
@@ -106,7 +121,8 @@ pub fn command(
             c
         }
         None => {
-            let mut c = crate::sources::command("cmd.exe");
+            // By its full path: PATH is set below, and Rust looks for a bare name there first.
+            let mut c = crate::sources::command(&crate::cli::cmd_exe().to_string_lossy());
             // /d disables cmd AutoRun, which can restore authentication overrides.
             c.arg("/d").arg("/c");
             if visible {
@@ -125,6 +141,14 @@ pub fn command(
                     c.env_remove(name);
                 }
             }
+            // The CLI as `cli::find` finds it, run by the bare name in `action` (the script never
+            // holds a path): PATH as Windows has it now, so a CLI or Node.js installed since
+            // SlopBar started is there, with the CLI's folder first when cmd would otherwise run
+            // another file; and for the Claude desktop app's copy, what the app sets to run it.
+            if let Some(path) = launch.path {
+                c.env("PATH", path);
+            }
+            c.envs(launch.env);
             match provider {
                 Provider::Claude => {
                     c.env("CLAUDE_CONFIG_DIR", dir)
@@ -190,6 +214,11 @@ pub fn handoff(dir: &Path, provider: Provider) -> std::io::Result<()> {
 /// A hidden logout is needed if the CLI wrote to its isolated OS credential store.
 /// Always use the same sanitized environment and config directory as the login.
 pub fn logout(provider: Provider, source: &Source, dir: &Path, native: &str) {
+    // Where the CLI is gone, nothing runs (the folder is still removed): the bare name could
+    // reach a program `cli::find` never takes, such as the Claude desktop app itself.
+    if source.distro.is_none() && crate::cli::find(provider).is_none() {
+        return;
+    }
     let Ok((mut child, _tree)) = ProcessTree::spawn(
         command(provider, source, dir, native, action(provider, true), false)
             .stdout(std::process::Stdio::null())
