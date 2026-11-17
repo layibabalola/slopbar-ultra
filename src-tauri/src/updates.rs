@@ -49,15 +49,16 @@ pub async fn check(app: &AppHandle) -> Result<UpdateInfo, String> {
 }
 
 /// The updater, with the check's request deadline and the stall limit (both through reqwest; the
-/// stall limit reaches the download too, which gets its own deadline in `install_now`). Ultra
-/// release builds pin the fork's channel and key in code, so a merged config change cannot point
-/// them back at upstream, and accept only newer Ultra versions.
+/// stall limit reaches the download too, which gets its own deadline in `install_now`), and the
+/// proxy Windows would use for each of its requests, as SlopBar Ultra's own (`net::windows_proxy`).
+/// Ultra release builds pin the fork's channel and key in code, so a merged config change cannot
+/// point them back at upstream, and accept only newer Ultra versions.
 fn updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
     let h = app.clone();
     let builder = app
         .updater_builder()
         .timeout(update_check::CHECK_TIMEOUT)
-        .configure_client(|client| client.read_timeout(update_check::STALL_TIMEOUT))
+        .configure_client(|client| crate::net::windows_proxy(client.read_timeout(update_check::STALL_TIMEOUT)))
         .on_before_exit(move || crate::app::on_exit(&h));
     #[cfg(feature = "ultra-updates")]
     let builder = builder

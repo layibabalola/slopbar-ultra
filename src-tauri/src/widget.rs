@@ -284,6 +284,8 @@ pub fn error_text(texts: &dyn Texts, provider: &str, code: &str) -> String {
     match code {
         c if c.starts_with("monitor_") => texts.t(c, &[]),
         "token_expired" | "token_invalid" | "bad_response" => texts.t(code, &vars),
+        // The network's proxy stopped it, or SlopBar would not go around it.
+        "proxy_unsupported" | "proxy_script" | "proxy_auth" | "proxy_refused" => texts.t(code, &[]),
         "idle" => texts.t("idle", &[]),
         "rate_limited" => texts.t("rateLimited", &[]),
         "active" => texts.t("activeCantRemove", &[]),

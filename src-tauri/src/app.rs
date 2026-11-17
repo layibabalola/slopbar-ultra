@@ -2278,7 +2278,7 @@ struct RcloneRemotes { installed: bool, remotes: Vec<crate::rclone::Remote> }
 #[tauri::command]
 async fn rclone_remotes() -> RcloneRemotes {
     tauri::async_runtime::spawn_blocking(|| match crate::rclone::find() {
-        Some(exe) => RcloneRemotes { installed: true, remotes: crate::rclone::remotes(&crate::rclone::Cli(exe)) },
+        Some(exe) => RcloneRemotes { installed: true, remotes: crate::rclone::remotes(&crate::rclone::Cli::local(exe)) },
         None => RcloneRemotes { installed: false, remotes: vec![] },
     }).await.unwrap_or(RcloneRemotes { installed: false, remotes: vec![] })
 }
@@ -3077,7 +3077,7 @@ async fn run_sharing_setup(app: &AppHandle, remote: String, via_tunnel: bool, re
     // The rclone found here, and whether it does: one that Windows or security software will not
     // run ends the setup, never replaced by a download of SlopBar's own (`rclone_step`).
     let found = tauri::async_runtime::spawn_blocking(|| rclone::find().map(|path| {
-        let checked = rclone::check(&rclone::Cli(path.clone()));
+        let checked = rclone::check(&rclone::Cli::local(path.clone()));
         (path, checked)
     // A check that panicked found nothing out: it stops the setup, never leads to a download.
     })).await.map_err(|_| "setup_failed")?;
@@ -3115,7 +3115,7 @@ async fn run_sharing_setup(app: &AppHandle, remote: String, via_tunnel: bool, re
     let (rclone_path, name) = (path.clone(), remote.clone());
     let how = tauri::async_runtime::spawn_blocking(move || -> Result<Option<Connect>, &'static str> {
         // A listing that failed is not an empty one: creating would overwrite a remote of that name.
-        let listed = rclone::listed(&rclone::Cli(rclone_path)).ok_or("rclone_failed")?;
+        let listed = rclone::listed(&rclone::Cli::local(rclone_path)).ok_or("rclone_failed")?;
         match listed.iter().find(|r| r.name == name) {
             None => Ok(Some(Connect::Create)),
             Some(r) if r.kind != "dropbox" => Err("remote_taken"),

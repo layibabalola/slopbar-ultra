@@ -3915,6 +3915,8 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "futures",
+ "http",
+ "hyper-util",
  "memchr",
  "png 0.17.16",
  "rcgen",

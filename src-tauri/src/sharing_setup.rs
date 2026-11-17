@@ -546,14 +546,21 @@ pub fn connect_args(remote: &str, how: Connect) -> Vec<&str> {
 /// (Dropbox's consent page behind it) and, when the user allows access, writes the token into its
 /// own config. `on_link` gets that link as soon as rclone prints it, for SlopBar to open in a
 /// browser; `cancel` stops rclone, which then writes nothing. Error codes: `cancelled`,
-/// `timed_out`, and what `failure` reads from rclone's notices.
+/// `timed_out`, `proxy_unsupported` and `proxy_script` (the proxy Windows names for Dropbox cannot
+/// be used), and what `failure` reads from rclone's notices.
 pub fn connect_dropbox(rclone: &std::path::Path, remote: &str, how: Connect, on_link: &dyn Fn(String), cancel: &std::sync::atomic::AtomicBool, timeout: std::time::Duration) -> Result<(), &'static str> {
     use std::io::BufRead;
     use std::process::Stdio;
     if !crate::rclone::valid_remote(remote) {
         return Err("rclone_failed");
     }
-    let mut child = crate::sources::command(&rclone.to_string_lossy())
+    let mut command = crate::sources::command(&rclone.to_string_lossy());
+    // rclone takes the token from Dropbox through the proxy Windows names for Dropbox, or does not
+    // run (`proxy_unsupported`, `proxy_script`). Its own sign-in server is on this computer, which
+    // rclone never reaches through a proxy.
+    crate::rclone::proxy_env(&mut command, crate::rclone::cloud("dropbox"))
+        .map_err(|e| crate::proxy::refusal_in(&e).map_or("rclone_failed", crate::proxy::Refusal::code))?;
+    let mut child = command
         .args(connect_args(remote, how))
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped())
         .spawn().map_err(|e| if refused_to_start(&e) { "rclone_blocked" } else { "rclone_failed" })?;
@@ -610,7 +617,8 @@ pub fn connect_dropbox(rclone: &std::path::Path, remote: &str, how: Connect, on_
 /// Why rclone's sign-in failed, from its own (English, never translated) notices: `denied` (the
 /// user did not allow access on Dropbox's page), `stale_page` (Allow was clicked on a page from an
 /// earlier try), `port_busy` or `port_reserved` (its port 53682 is held by another program, or
-/// reserved by Windows), else `rclone_failed`.
+/// reserved by Windows), `proxy_auth` or `proxy_refused` (the network's proxy, which rclone goes
+/// through as SlopBar does, wants a sign-in rclone cannot give, or refused), else `rclone_failed`.
 pub fn failure(notices: &[String]) -> &'static str {
     let said = |text: &str| notices.iter().any(|line| line.contains(text));
     if said("No code returned by remote server") {
@@ -620,6 +628,11 @@ pub fn failure(notices: &[String]) -> &'static str {
     } else if said("failed to start auth webserver") {
         // Windows' own words come after rclone's, in English where Windows has it (Go asks for it).
         if said("forbidden by its access permissions") { "port_reserved" } else { "port_busy" }
+    } else if said("proxyconnect tcp: Proxy Authentication Required") {
+        // Go's words for a proxy's answer to its tunnel: the status text after "proxyconnect tcp".
+        "proxy_auth"
+    } else if said("proxyconnect tcp: Forbidden") {
+        "proxy_refused"
     } else {
         "rclone_failed"
     }
@@ -1042,6 +1055,11 @@ mod tests {
         assert_eq!(failure(&lines("Error: config failed to refresh token: failed to start auth webserver: listen tcp 127.0.0.1:53682: bind: Normalerweise darf jede Socketadresse nur jeweils einmal verwendet werden.")), "port_busy");
         assert_eq!(failure(&lines(&format!("{waiting}Error: failed to get token: Post \"https://api.dropbox.com/oauth2/token\": dial tcp: lookup api.dropbox.com: no such host"))), "rclone_failed");
         assert_eq!(failure(&[]), "rclone_failed");
+        // The network's proxy (Go's words for its answer to a tunnel).
+        let token = "Error: failed to get token: Post \"https://api.dropboxapi.com/oauth2/token\"";
+        assert_eq!(failure(&lines(&format!("{waiting}{token}: proxyconnect tcp: Proxy Authentication Required"))), "proxy_auth");
+        assert_eq!(failure(&lines(&format!("{waiting}{token}: proxyconnect tcp: Forbidden"))), "proxy_refused");
+        assert_eq!(failure(&lines(&format!("{waiting}{token}: proxyconnect tcp: dial tcp 127.0.0.1:1: connectex: No connection could be made"))), "rclone_failed");
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod settings;
 mod sources;
 mod providers;
 mod net;
+mod proxy;
 mod monitoring;
 mod private_store;
 mod diagnostics;
