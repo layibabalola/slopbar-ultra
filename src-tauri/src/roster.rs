@@ -181,7 +181,8 @@ pub fn open(bytes: &[u8], passphrase: &Passphrase, keys: &mut HashMap<String, [u
 pub trait RosterStore: Send + Sync {
     /// Every roster file there: its name, bytes and modification time (when known).
     fn list(&self) -> std::io::Result<Vec<(String, Vec<u8>, Option<DateTime<Utc>>)>>;
-    /// Replaces the file `name`, atomically.
+    /// Replaces the file `name` in one step where the storage can: a folder renames a finished
+    /// temporary file over it, and an rclone remote uploads straight over it (`Rclone::put`).
     fn put(&self, name: &str, bytes: &[u8]) -> std::io::Result<()>;
     /// Deletes the file `name`; one already gone is fine.
     fn remove(&self, name: &str) -> std::io::Result<()>;
