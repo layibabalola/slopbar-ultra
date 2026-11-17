@@ -326,8 +326,11 @@ The script never works around a block. Where it stops:
   `[Net.WebRequest]::DefaultWebProxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials; irm https://raw.githubusercontent.com/layibabalola/slopbar-ultra/ultra/scripts/install-ultra.ps1 | iex`
 - The network has to let through raw.githubusercontent.com, github.com, api.github.com and
   release-assets.githubusercontent.com, and go.microsoft.com where the WebView2 Runtime is missing.
-- Where a policy blocks scripts or the installer, install by hand (below), or ask the computer's
-  administrator.
+- "Access is denied" as the installer starts means security software or the computer's policy
+  refused to start it. Admin rights are not what is missing: the installer needs none, and a normal
+  window is right. Installing by hand (below) runs it from Explorer, where that software shows its
+  own prompt if it has one (some offer a request to IT). Otherwise ask the computer's administrator.
+- Where a policy blocks scripts, install by hand (below), or ask the computer's administrator.
 
 The line trusts this repository, as updates do. It checks GitHub's digest of the installer, not the
 fork's signature; the app checks that signature on every update after this one. Its download carries
