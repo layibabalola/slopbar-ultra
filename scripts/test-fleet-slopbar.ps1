@@ -39,7 +39,8 @@ function Info($record, [string]$version = '0.1.0-ultra.13', [bool]$updates = $tr
 }
 # SlopBar Ultra's watchdog as get_app_info reports it (keep_running): healthy unless told otherwise.
 function Keep([hashtable]$fields = @{}) {
-  $keep = [ordered]@{ enabled = $true; managed = $true; task = 'ok'; problems = @(); error = $null; last_run = $null; last_result = 0; started_by_watchdog = $false }
+  $keep = [ordered]@{ enabled = $true; managed = $true; task = 'ok'; problems = @(); error = $null; last_run = $null; last_result = 0
+    last_check = $null; launch_at_login = [ordered]@{ setting = $true; entry = 'ok' }; started_by_watchdog = $false }
   foreach ($key in $fields.Keys) { $keep[$key] = $fields[$key] }
   return $keep
 }
@@ -103,10 +104,34 @@ Check 'a watchdog task that cannot be read is a problem that says why' ($r.Watch
   $r.Status -eq 'current; watchdog task unknown: Task Scheduler did not answer within 10 s')
 $r = Row (Info $healthy -keep (Keep @{ enabled = $false; task = 'missing' }))
 Check 'the watchdog turned off (keep_running) is no problem' ($r.Watchdog -eq 'off' -and -not $r.Problem -and $r.Status -eq 'current')
-$r = Row (Info $healthy -keep (Keep @{ managed = $false; task = 'missing' }))
+$r = Row (Info $healthy -keep (Keep @{ task = 'disabled' }))
+Check 'a watchdog task turned off in Task Scheduler is a person''s choice, shown and no problem' ($r.Watchdog -eq 'disabled by hand' -and -not $r.Problem -and $r.Status -eq 'current')
+$r = Row (Info $healthy -keep (Keep @{ task = 'pending' }))
+Check 'a watchdog task the app is still making is no problem' ($r.Watchdog -eq 'pending' -and -not $r.Problem -and $r.Status -eq 'current')
+$r = Row (Info $healthy -keep (Keep @{ managed = $false; task = 'missing'; launch_at_login = [ordered]@{ setting = $false; entry = 'missing' } }))
 Check 'a build that does not keep the task is no problem for its absence' ($r.Watchdog -eq 'missing' -and -not $r.Problem -and $r.Status -eq 'current')
 $r = Row (Info (Record @{ at = (Ago 1); result = 'error'; error = 'synthetic' ; next_at = (Ago -14) }) -keep (Keep @{ task = 'missing' }))
 Check 'a watchdog problem comes after the update check''s' ($r.Problem -and $r.Status -eq 'current; last update check failed; watchdog task missing')
+# The watchdog's own last start: a failure (exit 1) and a refusal (exit 2) are problems, with when.
+$r = Row (Info $healthy -keep (Keep @{ last_check = [ordered]@{ at = '2026-11-15T11:00:00Z'; decision = 'start'; exit = 1 } }))
+Check 'a watchdog start that failed is a problem, with when' ($r.Problem -and $r.Status -eq 'current; watchdog could not start SlopBar (exit 1 at 2026-11-15T11:00:00Z)')
+$r = Row (Info $healthy -keep (Keep @{ last_check = [ordered]@{ at = '2026-11-15T11:00:00Z'; decision = 'start'; exit = 2 } }))
+Check 'a watchdog start refused for a job that could end SlopBar is a problem' ($r.Problem -and $r.Status -eq 'current; watchdog would not start SlopBar in a job that could end it (exit 2 at 2026-11-15T11:00:00Z)')
+$r = Row (Info $healthy -keep (Keep @{ last_check = [ordered]@{ at = '2026-11-15T11:00:00Z'; decision = 'quit_by_person'; exit = 0 } }))
+Check 'a watchdog decision that went as it should is no problem' (-not $r.Problem -and $r.Status -eq 'current')
+# Windows must start SlopBar at sign-in on a build that keeps the task, whatever the setting: each of
+# these leaves it down after a restart.
+foreach ($case in @(
+    @{ login = [ordered]@{ setting = $false; entry = 'missing' }; said = 'launch at login off' },
+    @{ login = [ordered]@{ setting = $true; entry = 'missing' }; said = 'startup entry missing' },
+    @{ login = [ordered]@{ setting = $true; entry = 'elsewhere' }; said = 'startup entry starts another program' },
+    @{ login = [ordered]@{ setting = $true; entry = 'disabled' }; said = 'startup entry disabled in Task Manager' },
+    @{ login = [ordered]@{ setting = $true; entry = 'blocked' }; said = 'startup entries blocked by policy' })) {
+  $r = Row (Info $healthy -keep (Keep @{ launch_at_login = $case.login }))
+  Check "$($case.said) is a problem" ($r.Problem -and $r.Watchdog -eq 'ok' -and $r.Status -eq "current; $($case.said)")
+  $r = Row (Info $healthy -keep (Keep @{ enabled = $false; task = 'missing'; launch_at_login = $case.login }))
+  Check "...with the watchdog off too" ($r.Problem -and $r.Watchdog -eq 'off' -and $r.Status -eq "current; $($case.said)")
+}
 
 # A failed check: a problem; the table cuts it to 40 characters and the full text follows it.
 $failure = 'The download failed: error decoding response body: operation timed out'

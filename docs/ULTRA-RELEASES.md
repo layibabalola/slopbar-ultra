@@ -355,64 +355,101 @@ back a manual build.
 
 ## Keeping SlopBar Ultra running (the watchdog)
 
-If SlopBar Ultra stops for any reason other than a person choosing Quit, it starts again within
-about 5 minutes: after a crash, a kill, an agent's `quit_app` (once its grace has passed), a restart
-that failed or an update that failed. Nobody has to set it up; each machine gets it with the release
-that brings it (`src-tauri/src/keep_running.rs`).
+If SlopBar Ultra stops for any reason other than a person choosing Quit, it starts again by itself:
+within about 5 minutes after a crash, a kill or a restart that failed; 15 to 20 minutes after an
+agent's `quit_app`; and 10 to 15 minutes after an update that failed, once the installer's hold has
+passed. Nobody has to set it up; each machine gets it with the release that brings it
+(`src-tauri/src/keep_running.rs`).
 
 - **The task.** Every Ultra release build creates, at startup, a scheduled task of the signed-in
   user's own, named `SlopBar Ultra keep running <the user's SID>` (task names are the machine's; the
-  task is the user's). If the task differs from what the app would register (another executable, a
-  changed trigger or setting, disabled by hand), the app registers it again. It runs every 5 minutes
-  for ever, only while the user is signed in (an interactive token, as `schtasks /IT`; no password is
-  stored), never twice at once, with no execution time limit, on batteries too. Its action is the
-  installed `slopbar.exe --keep-running`, a window app: no window or console shows. The app never
-  registers a console app, debug builds (which are console apps) never register the task, and neither
-  does a build running on `SLOPBAR_DATA_DIR`.
+  task is the user's). It runs every 5 minutes for ever from a start in the past, only while the user
+  is signed in (an interactive token, as `schtasks /IT`; no password is stored), never twice at once,
+  with no execution time limit, at priority 5 (normal CPU, I/O and memory priority; Task Scheduler's
+  default, 7, is below normal), on batteries too, never waking the computer. Its action is the
+  installed `slopbar.exe --keep-running`, a window app: no window or console shows. The app compares
+  the registered task with that whole definition, priority included; one that differs (another
+  executable, an older build's priority 7, a changed trigger or setting, a corrupt or foreign task
+  with the name) is removed and registered anew, and a registration that fails is retried after 1, 5
+  and 15 minutes. A task a person disabled in Task Scheduler (the task or its trigger) is left
+  disabled: get_app_info says `disabled`, and no check runs. The app never registers a console app;
+  debug builds (console apps) never register the task, and neither does a build on
+  `SLOPBAR_DATA_DIR`.
 - **What a run does.** If SlopBar runs (another process holds its instance lock), the run ends at
   once. It never asks the running app anything: a plain second launch would hand over to it, which
   opens Settings. Otherwise it starts SlopBar, unless one of these holds:
+  - Windows is signing out or shutting down;
+  - `keep_running` is off;
+  - SlopBar is being uninstalled (below);
   - a person chose Quit in SlopBar's menu (the tray's or the widget's) during this Windows sign-in;
   - an update is being installed: the update's handover writes a marker right before it starts the
     installer, honoured for 10 minutes, and a running `SlopBar*installer.exe` or `SlopBar*setup.exe`
     (in any session) holds it too, for as long as it runs;
   - an agent called `quit_app` less than 15 minutes ago (see "Installing a release by hand");
-  - SlopBar has not run during this sign-in and does not launch at login (nothing stopped), or it
-    launches at login and the sign-in began less than 5 minutes ago (both starting it at once would
-    open Settings);
-  - `keep_running` is off.
+  - SlopBar has not run during this sign-in and Windows does not start it at sign-in (nothing
+    stopped): launch at login is off, or its startup entry is missing, starts another program, is
+    disabled in Task Manager or is blocked by a policy. Where Windows does start it, the run leaves
+    the first 5 minutes of a sign-in to the startup entry.
 
   `restart_app` is no Quit: it starts the app itself, and if that start fails, the next run starts it.
+  Each run records what it decided and its exit code (`last-check`), except while SlopBar runs.
+- **How it starts SlopBar.** The way the shell does: through Explorer's own Shell.Application (the
+  desktop's ShellWindows), so the app is Explorer's child, at normal CPU, I/O and memory priority, and
+  in none of Task Scheduler's jobs. Only when the shell cannot be reached does the run start the app
+  itself, at normal priority, breaking away from the task's job where the job allows it, staying in a
+  job that can neither end nor bound it, and never starting it into one that could (closing kills it,
+  or it limits time, memory or processes): that run ends with 2. A start that fails ends with 1. The
+  app gets `--watchdog-start <nonce>`, a nonce the run writes beside its markers just before: the
+  start that presents it (once, within 2 minutes) is the watchdog's, and claims the instance lock as
+  a restart does, quietly second to an instance that won it. A start with a spent nonce (the
+  installer restarts an app with its old arguments) is an ordinary start.
+- **The startup entry's start.** Explorer runs the startup entry (`SlopBar`, in HKCU Run, with no
+  arguments) once, as it starts. A start with no arguments, from Explorer, not from a shortcut (the
+  Start menu, the taskbar and the desktop start shortcuts, which Windows tells the app) and within 30
+  minutes of the sign-in is taken as that entry's: if SlopBar already runs (the watchdog started it
+  after a slow sign-in), it ends quietly instead of opening Settings. A person who starts slopbar.exe
+  itself from a folder within those 30 minutes, while SlopBar runs, gets nothing rather than Settings.
 - **A person's Quit lasts for the rest of the sign-in.** The Quit writes a marker naming the sign-in:
   the Windows session's id and the time its user signed in. Every process of that sign-in reads the
   same pair, elevated or not (a token's logon id differs between an admin's two linked tokens);
   locking, unlocking or reconnecting keeps it; and the next sign-in has a new logon time even where
-  Windows reuses the session id. So the marker lapses by itself at the next sign-in. Any start that
-  is not the watchdog's (launch at login, the Start menu, the installer's restart) removes it. A
-  marker that cannot be read holds the Quit, and so does a sign-in that cannot be read.
-- **How it starts SlopBar.** As `slopbar.exe --watchdog-start <the run's process id>`, which claims the
-  instance lock the way a restart does: after the run that started it has ended, and quietly second
-  to an instance that won the lock. Task Scheduler runs each task's process in a job object. The run
-  breaks the app away from it when the job allows that; Task Scheduler's does not, but it has no
-  limits, so the app stays in it and outlives the run, the task's next runs, its repair and its
-  removal (checked on Windows 10 22H2). A job that would end or bound the app (closing kills it, or
-  it limits time or memory) is never used: the run then starts nothing and ends with 2, which shows
-  as the task's last result.
+  Windows reuses the session id. So the marker lapses by itself at the next sign-in. Every start but
+  the watchdog's own removes it: launch at login, the Start menu, `restart_app`, and the installer's
+  restart, even one that repeats the watchdog's flag with its spent nonce. A marker that cannot be
+  read holds the Quit, and so does a sign-in that cannot be read. A marker that cannot be written
+  (tried twice) is replaced by removing the task, so no run happens at all until a start that is not
+  the watchdog's registers it again.
 - **Where the markers are:** `%LOCALAPPDATA%\dev.thelio.slopbar\keep-running\` (`quit`, `started`,
-  `installing`, `agent-quit`). The machine's own, never roaming with the profile.
-- **Turning it off.** The `keep_running` setting, through the door:
-  `update_settings` with `{"keep_running": false}` removes the task at once, and a run that is still
-  left ends without starting anything; `true` brings it back. There is no switch in the Settings
-  window.
-- **Uninstalling** removes the task first (`src-tauri/nsis/ultra-hooks.nsh` runs
-  `slopbar.exe --remove-keep-running` before anything is deleted). Updates keep it.
+  `installing`, `agent-quit`, `uninstalling`, `watchdog-start`, `last-check`). The machine's own,
+  never roaming with the profile.
+- **Turning it off.** The `keep_running` setting, through the door: `update_settings` with
+  `{"keep_running": false}`. Any run still left then ends without starting anything, and on an Ultra
+  release build, which keeps the task, the app removes the task at once; `true` brings it back (a task
+  a person disabled stays disabled until it goes off and on again). There is no switch in the
+  Settings window.
+- **Uninstalling** holds the watchdog, then removes its task, before anything is deleted
+  (`src-tauri/nsis/ultra-hooks.nsh`): it writes the `uninstalling` marker, which holds every run and
+  keeps a SlopBar that a run started meanwhile from registering the task again (for an hour, or until
+  the next install removes it), and deletes the task through `schtasks` under nsExec, which shows no
+  console, by the name it builds from its own user's SID. It never runs a slopbar.exe. Updates keep
+  the task.
 - **What shows it.** `get_app_info`'s `keep_running`: `enabled` (the setting), `managed` (this build
-  keeps the task), `task` (`ok`, `missing`, `wrong` with its `problems`, or `unknown` with its
-  `error`), the task's `last_run` and `last_result`, and `started_by_watchdog`. The fleet report has
-  a Watchdog column (below).
-- **Before installing a build without the watchdog at the same place** (an upstream SlopBar, or a
-  local build of `claude/subscription-value`), set `keep_running` to false: such a build takes
-  `--keep-running` for a plain second launch, and would open Settings every 5 minutes.
+  keeps the task), `task` (`ok`; `pending` while the app is still making it; `missing`; `disabled`, by
+  hand; `wrong` with its `problems`; or `unknown` with its `error`), the task's `last_run` and
+  `last_result`, `last_check` (when the watchdog last decided anything but "running", what, and its
+  exit code), `launch_at_login` (the setting, and the startup entry as Windows will treat it: `ok`,
+  `missing`, `elsewhere`, `disabled` or `blocked`), and `started_by_watchdog`. The fleet report has a
+  Watchdog column (below).
+- **A build without the watchdog at the same place** (an upstream SlopBar, or a local build of
+  `claude/subscription-value`) takes the task's `--keep-running` for a plain second launch: while it
+  runs, Settings opens every 5 minutes, and after a person quits it, it is started again within 5
+  minutes (it writes no Quit marker). `restart_app`, which `scripts/install-local-build.ps1` goes
+  through, removes the task before it restarts into an executable without the watchdog (it looks for
+  the watchdog's sentinel in the file). In any other case, delete the task first, in PowerShell:
+
+  ```powershell
+  schtasks /Delete /F /TN "SlopBar Ultra keep running $([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)"
+  ```
 
 ## The fleet
 
@@ -437,8 +474,9 @@ pwsh scripts/fleet-slopbar.ps1 -UpdateNow
   never exits.
 - **What it reports:** version, "Update automatically", the last update check (`LastCheck`: how
   long ago, and what it found, why it was deferred, or its error, cut to 40 characters; each one cut
-  follows the table in full), the watchdog's task (`Watchdog`: `ok`, `off`, `missing`, `wrong` or
-  `unknown`), and current, behind or not installed. A machine without SlopBar is
+  follows the table in full), the watchdog's task (`Watchdog`: `ok`, `pending`, `off`,
+  `disabled by hand`, `missing`, `wrong` or `unknown`), and current, behind or not installed. A
+  machine without SlopBar is
   "not installed", not an error. A build from before the update-check record, or from before the
   watchdog, shows n/a there, which is no problem in itself, because machines update one by one.
 - **Updating:** `install_update` replies at once and installs in the background. The app records how
@@ -450,8 +488,13 @@ pwsh scripts/fleet-slopbar.ps1 -UpdateNow
   - a build without updates,
   - "Update automatically" off,
   - a machine that does not answer,
-  - a build that keeps the watchdog's task, with `keep_running` on, whose task is missing, wrong
-    (the problems follow) or cannot be read (why follows),
+  - on a build that keeps the watchdog's task, with `keep_running` on: the task missing, wrong (the
+    problems follow) or unreadable (why follows), or the watchdog's last start failed (exit 1) or
+    refused for a job that could end SlopBar (exit 2). Pending (the app is still making the task)
+    and disabled by hand (a person's choice, like the setting off) are no problems,
+  - on such a build, whatever `keep_running` says: launch at login off, or the startup entry missing,
+    starting another program, disabled in Task Manager or blocked by a policy. Each leaves SlopBar
+    down after the computer restarts,
   - an update that does not arrive within 5 minutes,
   - a machine still behind the channel longer than its interval plus its pass limit after the
     channel's release was published (`pub_date` in `latest.json`). A build from before the record,
@@ -594,9 +637,12 @@ without spaces.
    presence, sign-ins and the journal before SlopBar exits. Like Quit in the tray, it does not wait
    for a refresh, so a token being rotated at that moment is cut off. A silent install would end the
    app without closing anything, because Tauri's installer kills a running app in silent mode.
-   `quit_app` also holds the watchdog off for 15 minutes ("Keeping SlopBar Ultra running"), and
-   so does the installer while it runs: finish steps 4 and 5 within them. If step 5 never happens,
-   the watchdog starts SlopBar once the 15 minutes have passed.
+   Where the running build already has the watchdog (its `get_app_info` reports `keep_running`),
+   `quit_app` holds the watchdog off for 15 minutes ("Keeping SlopBar Ultra running"), and so does
+   the installer while it runs: finish steps 4 and 5 within them. If step 5 never happens there, the
+   watchdog starts SlopBar once the 15 minutes have passed. The install that first brings the
+   watchdog has neither: the old build's `quit_app` writes no marker and there is no task yet, so
+   only step 5 starts SlopBar.
 4. Run the installer silently, in update mode: `ssh <alias> "cmd /d /c %USERPROFILE%\<name> /S /UPDATE"`.
    `/UPDATE` is the flag the updater itself passes. With it, Tauri's installer (tauri-cli 2.11.5)
    skips uninstalling the old version and installing WebView2, and does not recreate the desktop and

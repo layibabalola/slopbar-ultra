@@ -129,6 +129,14 @@ pub fn names() -> Option<Vec<String>> {
     imp::list().map(|(list, _)| list.into_iter().map(|p| p.name).collect())
 }
 
+/// The executable name of this process's parent, while that parent still runs (SlopBar Ultra's
+/// watchdog tells the startup entry's start at sign-in, which Explorer makes, from others).
+pub fn parent_name() -> Option<String> {
+    let parent = imp::parent_of(std::process::id())?;
+    let (list, _) = imp::list()?;
+    list.into_iter().find(|p| p.pid == parent).map(|p| p.name)
+}
+
 /// Ends every other SlopBar app process in this session (duplicates of an older build, which
 /// ignore the instance lock) that have run for at least `DUPLICATE_AGE`, so a moment-long
 /// `--build-info-to` or a restart still deciding is left alone. Returns how many were ended.

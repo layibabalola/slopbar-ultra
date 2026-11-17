@@ -270,6 +270,8 @@ fn restart(app: &AppHandle) -> Result<(), String> {
     // A duplicate of an older build ignores the instance lock and would take the door over once
     // this one exits; it renews the same monitoring sessions, so it is ended rather than kept.
     crate::instance::end_duplicates();
+    // A build without SlopBar Ultra's watchdog takes its task's runs for second launches.
+    crate::keep_running::before_restart(&exe);
     if let Err(e) = std::process::Command::new(&exe).arg("--after").arg(std::process::id().to_string()).spawn() {
         RESTARTING.store(false, std::sync::atomic::Ordering::Release);
         return Err(format!("restart failed: {e}"));
@@ -529,8 +531,12 @@ async fn door_reply(app: AppHandle, request: door::Request) -> Result<serde_json
 
 /// get_app_info's `keep_running` (`keep_running::report`), read off the async threads.
 async fn keep_running_report(app: &AppHandle) -> serde_json::Value {
-    let enabled = app.state::<AppState>().settings.lock().unwrap().keep_running;
-    tauri::async_runtime::spawn_blocking(move || crate::keep_running::report(enabled)).await.unwrap_or_default()
+    let (enabled, at_login) = {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap();
+        (settings.keep_running, settings.launch_at_login)
+    };
+    tauri::async_runtime::spawn_blocking(move || crate::keep_running::report(enabled, at_login)).await.unwrap_or_default()
 }
 
 /// One operation for an agent, through the door (see `door` and `mcp`). Each runs the same code as

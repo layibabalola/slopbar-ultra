@@ -69,7 +69,7 @@ mod instance;
 mod mcp_update;
 pub use instance::claim as claim_instance;
 mod keep_running;
-pub use keep_running::{from_args as keep_running, started as keep_running_started, started_by as watchdog_start};
+pub use keep_running::{from_args as keep_running, start_kind as keep_running_start, started as keep_running_started, Start as KeepRunningStart};
 mod mcp;
 pub use mcp::serve_stdio as serve_mcp;
 pub use mcp::{call_cli, pair_receive, sharing_state};

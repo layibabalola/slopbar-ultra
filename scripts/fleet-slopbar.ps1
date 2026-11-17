@@ -42,10 +42,13 @@ machine that is current is not affected), and, from the record:
 A machine that has just woken from a long sleep shows both of the last two until its next pass, and
 cannot be told from a dead loop: ask again after an interval (docs/ULTRA-RELEASES.md says how long a
 sleep it takes).
-Watchdog is SlopBar Ultra's watchdog task (get_app_info's keep_running): ok, off (the keep_running
-setting), missing, wrong or unknown; a build from before it shows n/a, which is no problem. A build
-that keeps the task (an Ultra release build) with keep_running on and a task that is not ok is a
-problem: missing, wrong (with what differs) or unknown (with why it could not be read).
+Watchdog is SlopBar Ultra's watchdog task (get_app_info's keep_running): ok, pending, off (the
+keep_running setting), disabled by hand (in Task Scheduler), missing, wrong or unknown; a build from
+before it shows n/a, which is no problem. On a build that keeps the task (an Ultra release build), with
+keep_running on, these are problems: the task missing, wrong (with what differs) or unknown (with why it
+could not be read), and the watchdog's last start failed (exit 1) or refused (exit 2). Whatever the
+setting, so are launch at login off and a startup entry that is missing, starts another program, is
+disabled in Task Manager or is blocked by a policy: each leaves SlopBar down after a restart.
 A machine without SlopBar is reported as not installed, which is no problem.
 
 The functions are tested offline by scripts/test-fleet-slopbar.ps1, which dot-sources this file.
@@ -188,20 +191,49 @@ function Get-LastCheck($check, $auto, [datetime]$now = [datetime]::UtcNow) {
   return [pscustomobject]@{ Text = "$minutes min ago: $result"; Problems = $problems.ToArray(); Interval = $interval; PassLimit = $passLimit }
 }
 
-# SlopBar Ultra's watchdog (get_app_info's keep_running): its text, and the problem it shows, if any.
-# A build from before it has no keep_running: n/a, no problem. A build that keeps the task (managed: an
-# Ultra release build) with the setting on must have it as the app would register it.
+# SlopBar Ultra's watchdog (get_app_info's keep_running): its text, and the problems it shows. A build
+# from before it has no keep_running: n/a, no problem. A build that keeps the task (managed: an Ultra
+# release build), with the setting on, must have it as the app registers it (pending while the app
+# makes it; a task a person turned off in Task Scheduler is theirs, as the setting off is), and the
+# check's last start must not have failed (exit 1) or been refused for a job that could end SlopBar
+# (exit 2). Whatever the setting, Windows must start SlopBar at sign-in on such a build: launch at login
+# on, and its startup entry there, starting this app, neither disabled in Task Manager nor blocked by
+# a policy. Otherwise a restart of the computer leaves SlopBar down.
 function Get-Watchdog($keep) {
-  if ($null -eq $keep) { return [pscustomobject]@{ Text = 'n/a'; Problem = $null } }
-  if ($keep.enabled -eq $false) { return [pscustomobject]@{ Text = 'off'; Problem = $null } }
+  if ($null -eq $keep) { return [pscustomobject]@{ Text = 'n/a'; Problems = @() } }
   $task = "$($keep.task)"
-  if (-not $keep.managed -or $task -eq 'ok') { return [pscustomobject]@{ Text = $task; Problem = $null } }
-  $problem = switch ($task) {
-    'missing' { 'watchdog task missing' }
-    'wrong' { "watchdog task wrong: $(@($keep.problems) -join '; ')" }
-    default { "watchdog task unknown: $($keep.error)" }
+  $text = if ($keep.enabled -eq $false) { 'off' } elseif ($task -eq 'disabled') { 'disabled by hand' } else { $task }
+  $problems = [Collections.Generic.List[string]]::new()
+  if ($keep.managed) {
+    if ($keep.enabled -ne $false) {
+      switch ($task) {
+        { $_ -in 'ok', 'pending', 'disabled' } { }
+        'missing' { $problems.Add('watchdog task missing') }
+        'wrong' { $problems.Add("watchdog task wrong: $(@($keep.problems) -join '; ')") }
+        default { $problems.Add("watchdog task unknown: $($keep.error)") }
+      }
+      $check = $keep.last_check
+      if ($null -ne $check -and $check.exit -in 1, 2) {
+        $at = (ConvertTo-UtcTime $check.at).ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
+        $problems.Add($(if ($check.exit -eq 1) { "watchdog could not start SlopBar (exit 1 at $at)" } else { "watchdog would not start SlopBar in a job that could end it (exit 2 at $at)" }))
+      }
+    }
+    $login = $keep.launch_at_login
+    if ($null -ne $login) {
+      if ($login.setting -eq $false) { $problems.Add('launch at login off') }
+      else {
+        switch ("$($login.entry)") {
+          'ok' { }
+          'missing' { $problems.Add('startup entry missing') }
+          'elsewhere' { $problems.Add('startup entry starts another program') }
+          'disabled' { $problems.Add('startup entry disabled in Task Manager') }
+          'blocked' { $problems.Add('startup entries blocked by policy') }
+          default { $problems.Add("startup entry unknown: $($login.entry)") }
+        }
+      }
+    }
   }
-  return [pscustomobject]@{ Text = $task; Problem = $problem }
+  return [pscustomobject]@{ Text = $text; Problems = $problems.ToArray() }
 }
 
 # Starts one door call on a machine; Complete-Call collects it.
@@ -276,7 +308,7 @@ function Get-Row([string]$machine, $info, $settings, [string]$channel, $publishe
       foreach ($problem in $last.Problems) { $notes.Add($problem); $row.Problem = $true }
       $watchdog = Get-Watchdog $info.Value.keep_running
       $row.Watchdog = $watchdog.Text
-      if ($watchdog.Problem) { $notes.Add($watchdog.Problem); $row.Problem = $true }
+      foreach ($problem in $watchdog.Problems) { $notes.Add($problem); $row.Problem = $true }
       # Still behind long after the release: its update loop should have installed it by now. A build
       # from before the record, whose old updater could stall, gets Ultra's interval and the new pass
       # limit, so a machine stuck on it shows during a rollout. Without a usable release time (none, not
