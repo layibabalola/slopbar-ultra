@@ -1326,11 +1326,21 @@ function renderSharingSetup() {
       : stopped && reached === i ? "failed" : at === i ? "busy" : "todo";
     return `<li class="${state}"><span>${esc(title)}</span>${state === "busy" && busy ? `<small>${esc(busy)}</small>${more}` : ""}</li>`;
   };
+  // Why rclone's download failed, for each site tried: hosts and codes from the app, never links.
+  const reasons = stopped && Array.isArray(s.reasons) ? s.reasons : [];
   const key = `sharingErr_${s.error}`;
-  const why = t(key, { remote: s.remote ?? "" }) === key ? errorText("", s.error ?? "") : t(key, { remote: s.remote ?? "" });
+  const known = t(key, { remote: s.remote ?? "" });
+  const why = reasons.length && s.error === "download_failed" ? t("sharingDownloadStopped")
+    : known === key ? errorText("", s.error ?? "") : known;
+  const reason = (r) => {
+    const name = r.why === "redirected" && !r.to ? "sharingWhy_redirected_nowhere" : `sharingWhy_${r.why}`;
+    const vars = { host: r.host ?? "", status: r.status ?? "", to: r.to ?? "" };
+    return t(name, vars) === name ? t("sharingWhy_failed", vars) : t(name, vars);
+  };
   const result = s.phase === "done"
     ? `<li class="result">${esc(s.found?.length ? t("sharingFound", { list: s.found.join(", ") }) : t("sharingFoundNone"))}</li>`
-    : stopped ? `<li class="result">${esc(t("sharingFailed", { error: why }))}</li>` : "";
+    : stopped ? `<li class="result">${esc(t("sharingFailed", { error: why }))}</li>`
+      + reasons.map((r) => `<li class="result reason">${esc(reason(r))}</li>`).join("") : "";
   // The download's progress, once rclone says how big it is.
   const bar = Number.isInteger(s.progress) ? `<progress max="100" value="${s.progress}"></progress>` : "";
   $("sharing-setup-list").innerHTML = step(0, t("sharingStepRclone"), s.downloaded ? t("sharingStepRcloneBusy") : "", bar)

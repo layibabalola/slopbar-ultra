@@ -73,13 +73,8 @@ pub fn normalize_url(text: &str) -> Result<String, String> {
     let text = text.trim();
     if text.len() > 512 || text.chars().any(char::is_control) { return Err(refuse()); }
     let url = Url::parse(text).map_err(|_| refuse())?;
-    let local = match url.host() {
-        Some(url::Host::Domain(d)) => d == "localhost" || d.ends_with(".local") || d.ends_with(".lan") || d.ends_with(".home.arpa"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => return Err(refuse()),
-    };
-    let scheme_ok = url.scheme() == "https" || (url.scheme() == "http" && local);
+    if url.host().is_none() { return Err(refuse()); }
+    let scheme_ok = url.scheme() == "https" || (url.scheme() == "http" && local(&url));
     if !scheme_ok || !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
         return Err(refuse());
     }
@@ -88,6 +83,16 @@ pub fn normalize_url(text: &str) -> Result<String, String> {
         return Err(refuse());
     }
     Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// Whether `url`'s server is on this machine or the local network.
+fn local(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(d)) => d == "localhost" || d.ends_with(".local") || d.ends_with(".lan") || d.ends_with(".home.arpa"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 /// Where to publish and the topic: ntfy takes JSON at the server root (its path, for a server
@@ -119,18 +124,23 @@ pub fn compose(phone: &Phone, kind: Kind, named: (&str, &str), generic: (&str, &
     Some(Message { kind, title: clip(title), body: clip(body) })
 }
 
-pub fn client() -> reqwest::Client {
-    reqwest::Client::builder()
+/// The client for a topic at `base`: SlopBar's own (`net::builder`: Windows' certificate checks,
+/// the system's proxy), except that a server on this machine or the local network is reached
+/// directly. Plain http is allowed only there, and a proxy, perhaps one on the internet, must
+/// never see the token unencrypted.
+pub fn client_for(base: &Url) -> reqwest::Client {
+    let builder = crate::net::builder()
         .timeout(TIMEOUT)
         // A redirect could carry the token to another host.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap_or_default()
+        .redirect(reqwest::redirect::Policy::none());
+    let builder = if local(base) { builder.no_proxy() } else { builder };
+    builder.build().expect("phone client")
 }
 
 /// Publishes one message. Errors are codes for the Settings window, never response bodies.
-pub async fn send(client: &reqwest::Client, url: &str, token: Option<&str>, message: &Message) -> Result<(), String> {
+pub async fn send(url: &str, token: Option<&str>, message: &Message) -> Result<(), String> {
     let (base, topic) = endpoint(url)?;
+    let client = client_for(&base);
     let mut body = serde_json::json!({
         "topic": topic,
         "title": message.title,
@@ -211,7 +221,6 @@ mod tests {
         Phone { enabled: true, url: Some(url.into()), include_names: false, kinds: PhoneKinds::default() }
     }
 
-    fn local() -> reqwest::Client { reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().unwrap() }
 
     #[test]
     fn off_by_default_and_generic_unless_names_are_chosen() {
@@ -233,6 +242,18 @@ mod tests {
     }
 
     #[test]
+    fn a_server_on_this_machine_or_the_local_network_is_reached_without_a_proxy() {
+        let local = |u: &str| local(&Url::parse(u).unwrap());
+        for direct in ["http://localhost:8080/t", "http://127.0.0.1/t", "http://192.168.1.20:8080/t", "http://10.0.0.5/t",
+            "https://ntfy.local/t", "http://box.lan/t", "http://hub.home.arpa/t", "http://[::1]/t"] {
+            assert!(local(direct), "{direct}");
+        }
+        for proxied in ["https://ntfy.sh/t", "https://8.8.8.8/t", "https://push.example.invalid/ntfy/t"] {
+            assert!(!local(proxied), "{proxied}");
+        }
+    }
+
+    #[test]
     fn topic_urls_are_checked() {
         assert_eq!(normalize_url(" https://ntfy.sh/my-topic/ ").unwrap(), "https://ntfy.sh/my-topic");
         assert_eq!(normalize_url("http://192.168.1.20:8080/alerts").unwrap(), "http://192.168.1.20:8080/alerts");
@@ -249,7 +270,7 @@ mod tests {
         let (server, served) = mock(200).await;
         let url = format!("{server}/synthetic-topic");
         let m = compose(&phone(&url), Kind::UnexpectedUse, ("x", "y"), ("Claude used outside your computers", "A Claude account is being used where none of your computers is signed in.")).unwrap();
-        send(&local(), &url, Some(TOKEN), &m).await.unwrap();
+        send(&url, Some(TOKEN), &m).await.unwrap();
         let got = served.await.unwrap();
         assert!(got.starts_with("POST / HTTP/1.1"), "{got}");
         assert!(got.to_ascii_lowercase().contains(&format!("authorization: bearer {}", TOKEN.to_ascii_lowercase())));
@@ -264,14 +285,14 @@ mod tests {
         let (server, served) = mock(403).await;
         let url = format!("{server}/t");
         let m = Message { kind: Kind::Test, title: "SlopBar test".into(), body: String::new() };
-        assert_eq!(send(&local(), &url, None, &m).await.unwrap_err(), "phone_unauthorized");
+        assert_eq!(send(&url, None, &m).await.unwrap_err(), "phone_unauthorized");
         let got = served.await.unwrap();
         assert!(!got.to_ascii_lowercase().contains("authorization"), "no token, no header");
         assert!(got.contains("\"message\":\"SlopBar test\""), "an empty body repeats the title");
         let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = closed.local_addr().unwrap().port();
         drop(closed);
-        assert_eq!(send(&local(), &format!("http://127.0.0.1:{port}/t"), None, &m).await.unwrap_err(), "phone_unreachable");
+        assert_eq!(send(&format!("http://127.0.0.1:{port}/t"), None, &m).await.unwrap_err(), "phone_unreachable");
     }
 
     #[test]

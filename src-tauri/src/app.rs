@@ -2468,8 +2468,10 @@ pub(crate) fn apply_settings(app: &AppHandle) {
     let _ = app.emit("settings-changed", &settings);
 }
 
-fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+/// The client for the providers' usage and sign-in APIs: SlopBar's own (`net::builder`: Windows'
+/// certificate checks, the system's proxy), following no redirect.
+pub(crate) fn http_client() -> reqwest::Client {
+    crate::net::builder()
         .timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -3047,11 +3049,19 @@ async fn run_sharing_setup(app: &AppHandle, remote: String, via_tunnel: bool, re
     use sharing_setup::{Connect, Phase};
     use std::sync::atomic::Ordering::SeqCst;
     let state = app.state::<AppState>();
-    let installed = tauri::async_runtime::spawn_blocking(|| rclone::find().filter(|path| rclone::usable(path))).await.unwrap_or(None);
-    let path = match installed {
-        Some(path) => path,
-        None => {
-            let own = sharing_setup::own_rclone().ok_or("extract_failed")?;
+    // The rclone found here, and whether it does: one that Windows or security software will not
+    // run ends the setup, never replaced by a download of SlopBar's own (`rclone_step`).
+    let found = tauri::async_runtime::spawn_blocking(|| rclone::find().map(|path| {
+        let checked = rclone::check(&rclone::Cli(path.clone()));
+        (path, checked)
+    // A check that panicked found nothing out: it stops the setup, never leads to a download.
+    })).await.map_err(|_| "setup_failed")?;
+    let own = sharing_setup::own_rclone();
+    let path = match sharing_setup::rclone_step(found, own.as_deref()) {
+        sharing_setup::RcloneStep::Use(path) => path,
+        sharing_setup::RcloneStep::Stop(code) => return Err(code),
+        sharing_setup::RcloneStep::Download => {
+            let own = own.ok_or("extract_failed")?;
             publish_sharing(app, |s| {
                 s.downloaded = true;
                 s.progress = Some(0);
@@ -3060,8 +3070,16 @@ async fn run_sharing_setup(app: &AppHandle, remote: String, via_tunnel: bool, re
             let progress = move |percent: u8| {
                 publish_sharing(&signal, |s| s.progress = Some(percent));
             };
-            let result = sharing_setup::install_rclone(&http_client(), &own, &state.sharing_cancel, &progress).await;
-            publish_sharing(app, |s| s.progress = None);
+            let mut reasons = Vec::new();
+            let result = sharing_setup::install_rclone(&own, &state.sharing_cancel, &progress, &mut reasons).await;
+            publish_sharing(app, |s| {
+                s.progress = None;
+                // Why the download failed, shown with that failure only: a site that failed before
+                // another served the zip is no failure, and unpacking or Cancel has its own.
+                if matches!(result, Err("download_failed" | "hash_mismatch")) {
+                    s.reasons = reasons;
+                }
+            });
             result?;
             own
         }
@@ -3381,7 +3399,7 @@ async fn send_phone_test(app: AppHandle, title: String, body: String) -> Result<
     let url = phone_settings.url.clone().ok_or("phone_url_missing")?;
     let message = phone::compose(&phone_settings, phone::Kind::Test, (&title, &body), (&title, &body)).ok_or("phone_url_missing")?;
     let token = settings::app_dir().and_then(|d| phone::load_token(&d));
-    phone::send(&phone::client(), &url, token.as_deref(), &message).await
+    phone::send(&url, token.as_deref(), &message).await
 }
 
 /// Re-reads the Codex CLI's local history off the async runtime, one scan at a time, then has
@@ -3550,6 +3568,8 @@ mod exit_tests {
 }
 
 pub fn run() {
+    // Before any HTTPS client, SlopBar's or the updater's: reqwest cannot build one without it.
+    crate::net::install_crypto();
     migrate::run();
     let diagnostics = std::sync::Arc::new(diagnostics::Recorder::new(settings::app_dir().expect("config directory").join("diagnostics/history.bin")));
     let loaded = settings::load();

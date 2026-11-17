@@ -22,7 +22,7 @@ pub fn forward(app: &AppHandle, title: &str, body: &str, phone: Option<PhoneForw
     let Some(url) = settings.url else { return };
     tauri::async_runtime::spawn(async move {
         let token = crate::settings::app_dir().and_then(|d| crate::phone::load_token(&d));
-        let _ = crate::phone::send(&crate::phone::client(), &url, token.as_deref(), &message).await;
+        let _ = crate::phone::send(&url, token.as_deref(), &message).await;
     });
 }
 
