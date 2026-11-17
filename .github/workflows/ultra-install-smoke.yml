@@ -38,6 +38,7 @@ jobs:
           irm $env:BOOTSTRAP | iex
           $r = $global:SlopBarUltraInstall
           if (-not $r -or -not $r.ok -or $r.message -notmatch ' is installed and running') { throw "first run: $($r.step): $($r.message)" }
+          if ($r.message -notmatch 'Launch at login: on\.') { throw "first run: Launch at login did not read as on: $($r.message)" }
 
       - name: Run it again; it must find the install and change nothing
         shell: powershell
@@ -47,6 +48,7 @@ jobs:
           if (-not $r -or -not $r.ok -or $r.message -notmatch 'already installed and running') { throw "second run: $($r.step): $($r.message)" }
 
       - name: Check the running app through its door
+        if: always()
         shell: pwsh
         run: |
           $door = Join-Path $env:LOCALAPPDATA 'SlopBar\slopbar-mcp.exe'
@@ -55,9 +57,15 @@ jobs:
           Invoke-WebRequest $env:CHANNEL -OutFile latest.json
           $channel = (Get-Content -Raw latest.json | ConvertFrom-Json).version
           "runs $($info.version), channel $channel, build has updates $($info.updates_enabled), auto_update $($settings.auto_update), launch_at_login $($settings.launch_at_login)"
+          "LOCALAPPDATA $env:LOCALAPPDATA; TEMP $env:TEMP"
+          Get-Process slopbar | ForEach-Object { "process $($_.Id) session $($_.SessionId): $($_.Path)" }
+          $run = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue
+          $entries = @($run.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' })
+          $entries | ForEach-Object { "Run entry $($_.Name) = $($_.Value)" }
           if ($info.version -ne $channel) { throw "runs $($info.version), not the channel's $channel" }
           if (-not $info.updates_enabled -or $settings.auto_update -ne $true) { throw 'Update automatically is not on' }
           if ($settings.launch_at_login -ne $true) { throw 'Launch at login is not on' }
+          if (-not ($entries | Where-Object { "$($_.Value)" -match 'slopbar\.exe' })) { throw 'Windows has no startup entry for SlopBar' }
 
   update:
     runs-on: windows-latest
@@ -104,6 +112,7 @@ jobs:
           if (-not $r -or -not $r.ok -or $r.message -notmatch ' is installed and running') { throw "update run: $($r.step): $($r.message)" }
 
       - name: Check the version and settings through the door
+        if: always()
         shell: pwsh
         run: |
           $door = Join-Path $env:LOCALAPPDATA 'SlopBar\slopbar-mcp.exe'
@@ -112,6 +121,11 @@ jobs:
           Invoke-WebRequest $env:CHANNEL -OutFile latest.json
           $channel = (Get-Content -Raw latest.json | ConvertFrom-Json).version
           "runs $($info.version), channel $channel, auto_update $($settings.auto_update), launch_at_login $($settings.launch_at_login)"
+          Get-Process slopbar | ForEach-Object { "process $($_.Id) session $($_.SessionId): $($_.Path)" }
+          $run = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue
+          $entries = @($run.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' })
+          $entries | ForEach-Object { "Run entry $($_.Name) = $($_.Value)" }
           if ($info.version -ne $channel) { throw "runs $($info.version), not the channel's $channel" }
           if ($settings.auto_update -ne $true) { throw 'Update automatically was not turned back on' }
           if ($settings.launch_at_login -ne $true) { throw 'Launch at login is not on' }
+          if (-not ($entries | Where-Object { "$($_.Value)" -match 'slopbar\.exe' })) { throw 'Windows has no startup entry for SlopBar' }

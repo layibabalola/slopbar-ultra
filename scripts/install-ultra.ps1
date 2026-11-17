@@ -106,11 +106,17 @@ function Install-SlopBarUltra {
     else { Start-Process -FilePath $app }
   }
 
-  # Whether Windows has a startup entry (HKCU Run) that starts this copy of SlopBar Ultra.
+  # Whether Windows has a startup entry (HKCU Run) that starts this copy of SlopBar Ultra. The entry
+  # holds the path the app was started from, which can be the long or the short (8.3) form of this
+  # one, so its program is compared as a file (size and time written), not as text.
   function Test-StartupEntry {
     try { $run = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction Stop } catch { return $false }
+    $mine = Get-Item -LiteralPath $app -ErrorAction SilentlyContinue
+    if (-not $mine) { return $false }
     foreach ($property in $run.PSObject.Properties) {
-      if (([string]$property.Value).ToLower().Contains($app.ToLower())) { return $true }
+      if ([string]$property.Value -notmatch '^\s*"?([^"]*?slopbar\.exe)') { continue }
+      $theirs = Get-Item -LiteralPath $Matches[1] -ErrorAction SilentlyContinue
+      if ($theirs -and $theirs.Length -eq $mine.Length -and $theirs.LastWriteTimeUtc -eq $mine.LastWriteTimeUtc) { return $true }
     }
     return $false
   }
