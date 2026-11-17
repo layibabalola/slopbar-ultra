@@ -92,8 +92,8 @@ the getting-started guide), or the `setup_sharing` agent tool, connects a comput
      Smart App Control policy, or antivirus taking the file), the setup stops with
      `rclone_blocked`. That includes an installed rclone: SlopBar never downloads a copy of its own
      to run from another folder in place of one a policy stopped. An installed rclone that fails
-     otherwise ends the setup with `rclone_failed`; only a missing one, one older than v1.60, or
-     SlopBar's own broken copy is replaced by the download.
+     otherwise ends the setup with `rclone_broken` (repair or remove it); only a missing one, one
+     older than v1.60, or SlopBar's own broken copy is replaced by the download.
 2. **Dropbox.** A remote of that name (the one sharing already uses, else `dropbox`) that reaches
    its storage is used as it is. Otherwise rclone signs in with its own flow:
    `rclone config create <remote> dropbox` for a new remote, `rclone config update <remote>

@@ -3054,7 +3054,8 @@ async fn run_sharing_setup(app: &AppHandle, remote: String, via_tunnel: bool, re
     let found = tauri::async_runtime::spawn_blocking(|| rclone::find().map(|path| {
         let checked = rclone::check(&rclone::Cli(path.clone()));
         (path, checked)
-    })).await.unwrap_or(None);
+    // A check that panicked found nothing out: it stops the setup, never leads to a download.
+    })).await.map_err(|_| "setup_failed")?;
     let own = sharing_setup::own_rclone();
     let path = match sharing_setup::rclone_step(found, own.as_deref()) {
         sharing_setup::RcloneStep::Use(path) => path,

@@ -128,7 +128,7 @@ pub enum RcloneStep {
 
 /// What to do with what `rclone::find` found (and `rclone::check`'s verdict on it), `own` being
 /// SlopBar's own copy's path. An rclone that Windows or security software will not run ends the
-/// setup (`rclone_blocked`), and so does an installed one that fails (`rclone_failed`): SlopBar
+/// setup (`rclone_blocked`), and so does an installed one that fails (`rclone_broken`): SlopBar
 /// never puts a copy of its own, somewhere else, in place of one that a policy stopped.
 pub fn rclone_step(found: Option<(std::path::PathBuf, Result<(), crate::rclone::Unusable>)>, own: Option<&std::path::Path>) -> RcloneStep {
     use crate::rclone::Unusable;
@@ -138,7 +138,7 @@ pub fn rclone_step(found: Option<(std::path::PathBuf, Result<(), crate::rclone::
         Some((_, Err(Unusable::Refused))) => RcloneStep::Stop("rclone_blocked"),
         Some((_, Err(Unusable::Old))) => RcloneStep::Download,
         Some((path, Err(Unusable::Failed))) if own.is_some_and(|own| own == path) => RcloneStep::Download,
-        Some((_, Err(Unusable::Failed))) => RcloneStep::Stop("rclone_failed"),
+        Some((_, Err(Unusable::Failed))) => RcloneStep::Stop("rclone_broken"),
     }
 }
 
@@ -743,7 +743,7 @@ mod tests {
         }
         // AppLocker, Application Control, antivirus, a restriction policy, a compatibility block,
         // access denied.
-        for code in [1260, 4551, 225, 226, 786, 1259, 5] {
+        for code in [1260, 4551, 225, 226, 786, 1259, if cfg!(windows) { 5 } else { 1260 }] {
             assert_eq!(check(&Version::Os(code)), Err(Unusable::Refused), "{code}");
         }
         assert_eq!(check(&Version::Os(2)), Err(Unusable::Failed), "a missing file is no refusal");
@@ -762,7 +762,7 @@ mod tests {
         assert_eq!(rclone_step(Some((installed.clone(), Err(Unusable::Refused))), Some(&own)), RcloneStep::Stop("rclone_blocked"));
         assert_eq!(rclone_step(Some((own.clone(), Err(Unusable::Refused))), Some(&own)), RcloneStep::Stop("rclone_blocked"));
         // An installed one that fails is not replaced either; SlopBar's own broken copy is.
-        assert_eq!(rclone_step(Some((installed, Err(Unusable::Failed))), Some(&own)), RcloneStep::Stop("rclone_failed"));
+        assert_eq!(rclone_step(Some((installed, Err(Unusable::Failed))), Some(&own)), RcloneStep::Stop("rclone_broken"));
         assert_eq!(rclone_step(Some((own.clone(), Err(Unusable::Failed))), Some(&own)), RcloneStep::Download);
     }
 
