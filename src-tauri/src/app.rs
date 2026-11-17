@@ -927,7 +927,7 @@ async fn start_add_account(app: AppHandle, provider: Provider, pending: Option<m
     // A fresh profile of its own (who signs in is not known yet), held until the sign-in ends.
     let session = signin_session(&app);
     let options = signin_options(&app, None, session.as_deref());
-    // Probing for the CLI runs wsl.exe / where.exe; keep it off the async runtime.
+    // Looking for the CLI runs wsl.exe and reads the registry and disk; keep it off the async runtime.
     let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, None, options))
         .await
         .map_err(|e| e.to_string())??;
@@ -1058,9 +1058,14 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
     let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, Some(context), options)).await;
     let job = match job {
         Ok(Ok(job)) => job,
-        _ => {
+        failed => {
             app.state::<AppState>().diagnostics.record(Some(provider), Some(&id), diagnostics::Event::Action { action: diagnostics::Action::ConnectFinished, code: diagnostics::Code::LoginFailed, elapsed_ms: diagnostics::millis(started) });
-            return Err("monitor_login_failed".into());
+            // No CLI to sign in with is said so (with how to install one): connecting again would
+            // not help.
+            return Err(match failed {
+                Ok(Err(e)) if e == "CLI not found" => e,
+                _ => "monitor_login_failed".into(),
+            });
         }
     };
     if auto {
@@ -1323,6 +1328,8 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
     tauri::async_runtime::spawn(async move {
         let lang = crate::i18n::resolve(&h.state::<AppState>().settings.lock().unwrap().language);
         let mut error = None;
+        // Whose sign-in failed, for a message that names its CLI (`cliMissing`).
+        let mut failed_provider = None;
         let mut done = 0;
         let mut position = 0;
         let mark = |at: usize, state: StepState, error: Option<String>| publish_bulk(&h, |b| {
@@ -1474,6 +1481,7 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                         done -= 1;
                         mark(at, StepState::Failed, Some(e.clone()));
                         error = Some(e);
+                        failed_provider = Some(target.provider);
                         drop(run);
                         drop(group_session);
                         drop(session);
@@ -1488,7 +1496,14 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
             match &error {
                 Some(e) => {
                     let known = e.starts_with("signin_") || e.starts_with("monitor_") || e.starts_with("desktop_");
-                    let reason = if known { crate::i18n::t(&lang, e, &[]) } else { e.clone() };
+                    let reason = match failed_provider {
+                        Some(provider) if e == "CLI not found" => {
+                            let (cli, install) = crate::cli::install_hint(provider);
+                            crate::i18n::t(&lang, "cliMissing", &[("cli", cli), ("install", install)])
+                        }
+                        _ if known => crate::i18n::t(&lang, e, &[]),
+                        _ => e.clone(),
+                    };
                     sign_in_choice(&h, "bulkConnectStopped", &[("done", &done.to_string()), ("n", &total.to_string()), ("error", &reason)], false);
                 }
                 None => sign_in_notice(&h, "signInAllDone", &[("n", &total.to_string())]),

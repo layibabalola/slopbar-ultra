@@ -313,7 +313,7 @@ $accounts.addEventListener("click", async (e) => {
         render(result.snapshot); showToast(t(result.revoked ? "monitorDisconnected" : "monitorRevokeFailed"));
       } else { await invoke("connect_monitoring", args); showToast(t("monitorPending")); }
     }
-    catch (err) { showToast(errorText("", String(err))); }
+    catch (err) { showToast(errorText(PROVIDER_NAME[monitor.dataset.provider], String(err))); }
     finally { monitor.disabled = false; }
     return;
   }
@@ -332,7 +332,7 @@ $accounts.addEventListener("click", async (e) => {
     render(await invoke("switch_account", { provider, id }));
   } catch (err) {
     render(before);
-    showToast(errorText("", String(err)));
+    showToast(errorText(PROVIDER_NAME[provider], String(err)));
   }
 });
 

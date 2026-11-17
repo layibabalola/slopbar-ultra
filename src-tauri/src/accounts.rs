@@ -491,6 +491,11 @@ pub fn capture(sources: &[Source]) -> Active {
 pub fn switch(sources: &[Source], provider: Provider, id: &str) -> Result<(), String> {
     // Sync live logins first: the account being left may have refreshed its tokens.
     capture(sources);
+    // Where no source has the CLI's folder: a CLI installed on Windows but not run yet gets one,
+    // signed in to this account (never for the Claude desktop app's own copy: the app makes its
+    // folder). Looked for before the vault is locked: it can wait on an offline network folder.
+    let unused_cli = sources.iter().all(|s| !installed(provider, s))
+        && crate::cli::find(provider).is_some_and(|f| f.kind != crate::cli::Kind::DesktopApp);
     let _guard = VAULT.lock().unwrap();
     let mut target = load_slots()
         .into_iter()
@@ -507,6 +512,16 @@ pub fn switch(sources: &[Source], provider: Provider, id: &str) -> Result<(), St
     for source in sources.iter().filter(|s| installed(provider, s)) {
         write_login(&target, source).map_err(|e| format!("{}: {e}", source.label))?;
         written += 1;
+    }
+    if written == 0 {
+        if let Some(source) = sources.iter().find(|s| s.distro.is_none()).filter(|_| unused_cli) {
+            let dir = match provider {
+                Provider::Claude => source.claude_dir(),
+                Provider::Codex => source.codex_dir(),
+            };
+            std::fs::create_dir_all(&dir).and_then(|_| write_login(&target, source)).map_err(|e| format!("{}: {e}", source.label))?;
+            written += 1;
+        }
     }
     if written == 0 {
         return Err("CLI not found".into());
@@ -730,34 +745,36 @@ fn sync_profiles_in(vault: &Path, root: &Path, wanted: &[(Provider, String)], ac
 // ---------------------------------------------------------------------------------------------
 // Adding an account
 
-fn executable(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Claude => "claude",
-        Provider::Codex => "codex",
+/// Whether the CLI can actually be run at `source`: `Some(true)` on PATH (in WSL, its login
+/// shell's), `Some(false)` only in an installer's folder or as the Claude desktop app's own copy,
+/// None not at all. A config dir alone isn't enough: editor extensions and desktop apps create
+/// `~/.codex` or `~/.claude` without installing the CLI. On Windows this is `cli::find` (the
+/// sign-in runs the one it finds, see `login::command`).
+fn cli_at(provider: Provider, source: &Source) -> Option<bool> {
+    match &source.distro {
+        // A login shell, so ~/.local/bin and version managers are on PATH.
+        // With a deadline, so a hung WSL cannot hold up adding an account.
+        Some(distro) => sources::wsl(&["-d", distro, "--", "bash", "-lc", &format!("command -v {}", crate::cli::name(provider))], std::time::Duration::from_secs(15))
+            .is_some_and(|o| o.status.success())
+            .then_some(true),
+        None => crate::cli::find(provider).map(|f| f.kind == crate::cli::Kind::Path),
     }
 }
 
-/// Whether the CLI can actually be run at `source`. A config dir alone isn't enough: editor
-/// extensions and desktop apps create `~/.codex` or `~/.claude` without installing the CLI.
-fn has_cli(provider: Provider, source: &Source) -> bool {
-    let exe = executable(provider);
-    let status = match &source.distro {
-        // A login shell, so ~/.local/bin and version managers are on PATH.
-        // With a deadline, so a hung WSL cannot hold up adding an account.
-        Some(distro) => sources::wsl(&["-d", distro, "--", "bash", "-lc", &format!("command -v {exe}")], std::time::Duration::from_secs(15)),
-        None => sources::command("where.exe").arg(exe).output().ok(),
-    };
-    status.is_some_and(|o| o.status.success())
+/// Where to run a sign-in: a source that has the CLI, one where it is on PATH (or in WSL) before
+/// one with it only in an installer's folder or as the Claude desktop app's own copy, so a WSL
+/// user signs in there as before; within each, one where it's signed in first.
+fn login_source(provider: Provider, sources: &[Source]) -> Option<&Source> {
+    let with_cli: Vec<(&Source, bool)> = sources.iter().filter_map(|s| Some((s, cli_at(provider, s)?))).collect();
+    pick_login_source(&with_cli, |s| read_login(provider, s, &[]).is_some())
 }
 
-/// Where to run a sign-in: a source that has the CLI, preferring one where it's signed in.
-fn login_source(provider: Provider, sources: &[Source]) -> Option<&Source> {
-    let with_cli: Vec<&Source> = sources.iter().filter(|s| has_cli(provider, s)).collect();
-    with_cli
-        .iter()
-        .find(|s| read_login(provider, s, &[]).is_some())
-        .or_else(|| with_cli.first())
-        .copied()
+/// `login_source`'s choice among sources with the CLI (`true`: on PATH or in WSL).
+fn pick_login_source<'a>(with_cli: &[(&'a Source, bool)], signed_in: impl Fn(&Source) -> bool) -> Option<&'a Source> {
+    [true, false].into_iter().find_map(|on_path| {
+        let tier: Vec<&'a Source> = with_cli.iter().filter(|(_, p)| *p == on_path).map(|(s, _)| *s).collect();
+        tier.iter().find(|s| signed_in(s)).or_else(|| tier.first()).copied()
+    })
 }
 
 /// Where a sign-in's page opens and what it prefills (see `signin`). Both apply to sign-ins run on
@@ -1030,6 +1047,34 @@ mod billing_tests {
         let text = serde_json::to_string(&b).unwrap();
         assert!(!text.contains("example.invalid") && !text.contains("\"a\""), "{text}");
         assert!(codex_slot(json!({ "tokens": { "access_token": "a" } })).unwrap().billing().active_until.is_none());
+    }
+}
+
+#[cfg(test)]
+mod login_source_tests {
+    use super::*;
+
+    fn source(label: &str) -> Source {
+        Source { label: label.into(), home: PathBuf::from(label), claude_dir: None, codex_dir: None, distro: None, native_home: label.into() }
+    }
+
+    /// A CLI on PATH (or in WSL) is where sign-ins ran before the installers' folders and the
+    /// Claude desktop app's copy counted, so it still wins over them, signed in or not; within each,
+    /// a source where the CLI is signed in comes first.
+    #[test]
+    fn the_cli_on_path_wins_and_then_the_one_signed_in() {
+        let (windows, wsl, other) = (source("Windows"), source("WSL: Ubuntu"), source("WSL: Debian"));
+        let label = |s: Option<&Source>| s.map(|s| s.label.clone());
+        let windows_signed_in = |s: &Source| s.label == "Windows";
+        // The desktop app's copy on a signed-in Windows, the CLI in WSL: WSL, as before.
+        assert_eq!(label(pick_login_source(&[(&windows, false), (&wsl, true)], windows_signed_in)), Some("WSL: Ubuntu".into()));
+        // Both on PATH: the signed-in one, else the first.
+        assert_eq!(label(pick_login_source(&[(&wsl, true), (&windows, true)], windows_signed_in)), Some("Windows".into()));
+        assert_eq!(label(pick_login_source(&[(&wsl, true), (&other, true)], |_| false)), Some("WSL: Ubuntu".into()));
+        // Only the new places: the signed-in one, else the first; none at all: none.
+        assert_eq!(label(pick_login_source(&[(&other, false), (&windows, false)], windows_signed_in)), Some("Windows".into()));
+        assert_eq!(label(pick_login_source(&[(&other, false)], |_| false)), Some("WSL: Debian".into()));
+        assert_eq!(label(pick_login_source(&[], |_| true)), None);
     }
 }
 
