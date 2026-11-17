@@ -335,21 +335,36 @@ pub fn read(store: &dyn PresenceStore, own_id: &str, now: DateTime<Utc>) -> Vec<
     peers(store.list().unwrap_or_default(), own_id, now)
 }
 
+/// When a record was written, as far as this machine trusts it. A clock running ahead would keep
+/// a dead machine "live" forever: the file's own modification time is trusted then, and never a
+/// moment after now.
+fn seen(presence: &Presence, modified: Option<DateTime<Utc>>, now: DateTime<Utc>) -> DateTime<Utc> {
+    if presence.written_at > now + Duration::seconds(SKEW) {
+        modified.unwrap_or(now - Duration::seconds(IGNORE_AFTER + 1)).min(now)
+    } else {
+        presence.written_at.min(now)
+    }
+}
+
+/// How long after writing a record its machine counts as live.
+fn live_for(presence: &Presence) -> i64 {
+    (presence.interval_s.min(24 * 3600) as i64 * 3).max(MIN_LIVE)
+}
+
+/// Another machine's record, as opposed to junk or this machine's own.
+fn of_peer(presence: &Presence, own_id: &str) -> bool {
+    presence.v == 1 && !presence.machine_id.is_empty() && presence.machine_id != own_id
+}
+
 /// Sync clients leave conflict copies ("<id> (1).json", "<id>-LAPTOP.json"), so records are
 /// grouped by the machine id inside them and the newest wins.
 pub fn peers(files: impl IntoIterator<Item = (Presence, Option<DateTime<Utc>>)>, own_id: &str, now: DateTime<Utc>) -> Vec<Peer> {
     let mut newest: HashMap<String, (Presence, DateTime<Utc>)> = HashMap::new();
     for (presence, modified) in files {
-        if presence.v != 1 || presence.machine_id.is_empty() || presence.machine_id == own_id {
+        if !of_peer(&presence, own_id) {
             continue;
         }
-        // A clock running ahead would keep a dead machine "live" forever: trust the file's own
-        // modification time then, and never a moment after now.
-        let seen = if presence.written_at > now + Duration::seconds(SKEW) {
-            modified.unwrap_or(now - Duration::seconds(IGNORE_AFTER + 1)).min(now)
-        } else {
-            presence.written_at.min(now)
-        };
+        let seen = seen(&presence, modified, now);
         match newest.get(&presence.machine_id) {
             Some((_, at)) if *at >= seen => {}
             _ => {
@@ -364,17 +379,73 @@ pub fn peers(files: impl IntoIterator<Item = (Presence, Option<DateTime<Utc>>)>,
             if age > IGNORE_AFTER {
                 return None;
             }
-            let live_for = (p.interval_s.min(24 * 3600) as i64 * 3).max(MIN_LIVE);
             Some(Peer {
                 machine: clean_name(&p.machine).unwrap_or_else(|| "?".into()),
                 seen_at: seen,
-                live: age <= live_for,
+                live: age <= live_for(&p),
                 seats: p.seats,
             })
         })
         .collect();
     out.sort_by(|a, b| a.machine.cmp(&b.machine));
     out
+}
+
+/// Each other machine's record as last read, so that one read missing it does not make the machine
+/// vanish for a refresh. A read misses a record when its machine is replacing the file at that
+/// moment (earlier SlopBars uploaded a temporary file and moved it over the record, and rclone
+/// deletes the record before such a move), when a sync client is mid-update, or when the listing
+/// fails. A remembered record fills in only for a machine the read brought nothing of,
+/// and only while it is live by the time it was read with, so nothing is shown longer than a read
+/// would have shown it; whatever a read brings of a machine (a clean quit's empty record too)
+/// replaces it. Remembered records keep what accounts show; alarms come from what was read
+/// (`apply`).
+#[derive(Debug, Default)]
+pub struct Recall {
+    /// The place the records were read from (`sharing::Place::same_location`).
+    place: Option<crate::sharing::Place>,
+    /// By machine id, with `written_at` replaced by when this machine trusted it was written
+    /// (`seen`), so a clock running ahead cannot keep it live once its file is gone.
+    records: HashMap<String, Presence>,
+}
+
+impl Recall {
+    /// The records to work out every peer from: those `read` from `place` now (None when the
+    /// listing failed), and the remembered record of each machine the read brought nothing of,
+    /// while it is still live.
+    pub fn fill(&mut self, place: &crate::sharing::Place, read: Option<&[(Presence, Option<DateTime<Utc>>)]>, own_id: &str, now: DateTime<Utc>) -> Vec<(Presence, Option<DateTime<Utc>>)> {
+        if !self.place.as_ref().is_some_and(|p| p.same_location(place)) {
+            self.records.clear();
+            self.place = Some(place.clone());
+        }
+        let read = read.unwrap_or_default();
+        // The newest of each machine the read brought (sync clients leave conflict copies).
+        let mut brought: HashMap<&str, Presence> = HashMap::new();
+        for (presence, modified) in read.iter().filter(|(p, _)| of_peer(p, own_id)) {
+            let at = seen(presence, *modified, now);
+            if brought.get(presence.machine_id.as_str()).is_none_or(|kept| at > kept.written_at) {
+                brought.insert(&presence.machine_id, Presence { written_at: at, ..presence.clone() });
+            }
+        }
+        let missed: Vec<(Presence, Option<DateTime<Utc>>)> = self.records.iter()
+            .filter(|(id, kept)| !brought.contains_key(id.as_str()) && (now - kept.written_at).num_seconds() <= live_for(kept))
+            .map(|(_, kept)| (kept.clone(), None))
+            .collect();
+        for (id, presence) in brought {
+            self.records.insert(id.to_string(), presence);
+        }
+        self.records.retain(|_, kept| (now - kept.written_at).num_seconds() <= live_for(kept));
+        read.iter().cloned().chain(missed).collect()
+    }
+}
+
+/// Fills each account's `remote` and `overlap` from a read: `remote` from every machine, remembered
+/// ones included (`Recall`); `overlap`, which raises notifications and Health warnings, from the
+/// machines the read itself `found` only, as before there was a memory.
+pub fn apply(accounts: &mut [AccountUsage], found: &[Peer], every: &[Peer], me: &str, now: DateTime<Utc>) {
+    attach(accounts, found, now);
+    overlap(accounts, me);
+    attach(accounts, every, now);
 }
 
 /// Fills each account's `remote` from the other machines' files: live ones, and ones that
@@ -596,6 +667,100 @@ mod tests {
         assert_eq!(shown(25 * 60), None, "older than a day is not shown");
         attach(&mut accounts, &[], now);
         assert!(accounts[0].remote.is_empty());
+    }
+
+    type Read = Vec<(Presence, Option<DateTime<Utc>>)>;
+
+    /// What an account shows after a read through `recall`: (machine, live) of each remote seat.
+    fn through(recall: &mut Recall, place: &crate::sharing::Place, read: Option<Read>, now: DateTime<Utc>) -> Vec<(String, bool)> {
+        let mut accounts = vec![account("x", false)];
+        attach(&mut accounts, &peers(recall.fill(place, read.as_deref(), "me", now), "me", now), now);
+        accounts[0].remote.iter().map(|r| (r.machine.clone(), r.live)).collect()
+    }
+
+    fn remote(name: &str) -> crate::sharing::Place {
+        crate::sharing::Place { remote: Some(name.into()), ..Default::default() }
+    }
+
+    fn laptop(written: i64, seats: Vec<Seat>) -> (Presence, Option<DateTime<Utc>>) {
+        (file("b", "LAPTOP-2", at(written), seats), None)
+    }
+
+    #[test]
+    fn a_record_one_read_misses_counts_while_it_is_live() {
+        let (mut recall, place) = (Recall::default(), remote("cloud"));
+        let live = || vec![("LAPTOP-2".to_string(), true)];
+        assert_eq!(through(&mut recall, &place, Some(vec![laptop(0, vec![seat("x")])]), at(0)), live());
+        // LAPTOP-2 was replacing its file while this read listed the folder.
+        assert_eq!(through(&mut recall, &place, Some(vec![]), at(5)), live(), "still in use there");
+        assert_eq!(through(&mut recall, &place, None, at(10)), live(), "a failed listing as well");
+        assert_eq!(through(&mut recall, &place, Some(vec![laptop(11, vec![seat("x")])]), at(11)), live());
+        // Live for 15 minutes after it last wrote, like a record that was read; then forgotten, not
+        // shown dimmed, since nothing says its file is still there.
+        assert_eq!(through(&mut recall, &place, Some(vec![]), at(26)), live());
+        assert!(through(&mut recall, &place, Some(vec![]), at(27)).is_empty());
+        assert!(recall.records.is_empty());
+    }
+
+    #[test]
+    fn whatever_a_read_brings_of_a_machine_replaces_the_remembered_record() {
+        let (mut recall, place) = (Recall::default(), remote("cloud"));
+        through(&mut recall, &place, Some(vec![laptop(0, vec![seat("x")])]), at(0));
+        // A clean quit empties the record: the account is in use nowhere, and stays so on a miss.
+        assert!(through(&mut recall, &place, Some(vec![laptop(2, vec![])]), at(2)).is_empty());
+        assert!(through(&mut recall, &place, Some(vec![]), at(4)).is_empty());
+        // Even when the machine's clock stepped back: what the read brought is what it says now.
+        through(&mut recall, &place, Some(vec![laptop(6, vec![seat("x")])]), at(6));
+        assert!(through(&mut recall, &place, Some(vec![laptop(3, vec![])]), at(8)).is_empty());
+        // Of several copies one read brings (a sync client's conflict copies), the newest.
+        let copies = vec![laptop(9, vec![seat("x")]), laptop(1, vec![])];
+        assert_eq!(through(&mut recall, &place, Some(copies), at(10)), [("LAPTOP-2".to_string(), true)]);
+    }
+
+    #[test]
+    fn a_clock_running_ahead_is_remembered_by_when_the_file_changed() {
+        let (mut recall, place) = (Recall::default(), remote("cloud"));
+        // Written by a clock 10 minutes ahead: the file's own time decides, as in `peers`.
+        let ahead = (file("b", "LAPTOP-2", at(10), vec![seat("x")]), Some(at(0)));
+        assert_eq!(through(&mut recall, &place, Some(vec![ahead]), at(0)), [("LAPTOP-2".to_string(), true)]);
+        assert_eq!(through(&mut recall, &place, Some(vec![]), at(15)), [("LAPTOP-2".to_string(), true)]);
+        // Its own `written_at` would no longer look ahead now, and would keep it live until 25.
+        assert!(through(&mut recall, &place, Some(vec![]), at(16)).is_empty());
+    }
+
+    #[test]
+    fn remembered_records_stay_with_their_place_and_skip_this_machine() {
+        let mut recall = Recall::default();
+        through(&mut recall, &remote("cloud"), Some(vec![laptop(0, vec![seat("x")])]), at(0));
+        assert!(through(&mut recall, &remote("other"), Some(vec![]), at(1)).is_empty(), "sharing moved: nothing from the old place");
+        assert!(through(&mut recall, &remote("cloud"), Some(vec![]), at(2)).is_empty(), "nor when it moves back");
+        let mut recall = Recall::default();
+        let place = remote("cloud");
+        through(&mut recall, &place, Some(vec![(file("me", "DESK-1", at(0), vec![seat("x")]), None)]), at(0));
+        assert!(recall.records.is_empty(), "this machine's own record is not a peer");
+        // Roster on or off is the same place.
+        let mut recall = Recall::default();
+        through(&mut recall, &place, Some(vec![laptop(0, vec![seat("x")])]), at(0));
+        let with_roster = crate::sharing::Place { roster: true, ..place.clone() };
+        assert_eq!(through(&mut recall, &with_roster, Some(vec![]), at(1)), [("LAPTOP-2".to_string(), true)]);
+    }
+
+    #[test]
+    fn remembered_records_keep_what_accounts_show_but_raise_no_overlap() {
+        let (mut recall, place) = (Recall::default(), remote("cloud"));
+        let mut accounts = vec![account("x", true)];
+        let read = |recall: &mut Recall, accounts: &mut Vec<AccountUsage>, files: Read, now| {
+            let found = peers(files.clone(), "me", now);
+            let every = peers(recall.fill(&place, Some(&files), "me", now), "me", now);
+            apply(accounts, &found, &every, "DESK-1", now);
+        };
+        read(&mut recall, &mut accounts, vec![laptop(0, vec![seat("x")])], at(0));
+        assert_eq!(accounts[0].overlap, ["DESK-1", "LAPTOP-2"], "in use here and there at once");
+        // The next read misses LAPTOP-2: the account still shows it, but an overlap is only ever
+        // what was read, so a notification never settles on a record that may be out of date.
+        read(&mut recall, &mut accounts, vec![], at(5));
+        assert_eq!(accounts[0].remote.iter().map(|r| r.machine.as_str()).collect::<Vec<_>>(), ["LAPTOP-2"]);
+        assert!(accounts[0].overlap.is_empty());
     }
 
     #[test]
