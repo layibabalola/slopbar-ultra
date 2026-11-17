@@ -33,13 +33,14 @@ pub fn builder() -> reqwest::ClientBuilder {
 pub enum Why {
     /// The certificate chains to no root this computer trusts.
     Untrusted,
-    /// Windows was told not to trust this certificate or its issuer (the Disallowed store).
+    /// Windows refuses this certificate on purpose: it, or its issuer, is in the Disallowed store,
+    /// or its issuer revoked it (Windows reports both as revoked).
     Distrusted,
     /// The certificate is out of date (or not valid yet: the clock may be wrong).
     Expired,
     /// The certificate is for another name: what a network that redirects blocked names shows.
     WrongName,
-    /// Windows refused the certificate for another reason (revoked, malformed, misused).
+    /// Windows refused the certificate for another reason (malformed, misused).
     Certificate,
     /// The other end refused the secure connection (an alert), or broke it off mid-handshake.
     Tls,
@@ -90,10 +91,12 @@ impl Why {
 }
 
 /// Windows' errors that the verifier passes on as its OS error text (the text is translated, the
-/// number is not): CERT_E_CHAINING, no chain to a trusted root (a missing intermediate, say), and
-/// TRUST_E_EXPLICIT_DISTRUST, a certificate in the Disallowed store.
+/// number is not): CERT_E_CHAINING, no chain to a trusted root (a missing intermediate, say);
+/// TRUST_E_EXPLICIT_DISTRUST, a certificate marked untrusted; and CERT_E_UNTRUSTEDCA, an
+/// authority the policy does not trust.
 const CERT_E_CHAINING: &str = "(os error -2146762486)";
 const TRUST_E_EXPLICIT_DISTRUST: &str = "(os error -2146762479)";
+const CERT_E_UNTRUSTEDCA: &str = "(os error -2146762478)";
 
 /// Why `error` happened: the certificate check's verdict when there was one, else the proxy's,
 /// the connection's or reqwest's own kind. Reads the errors under reqwest's own, whose text has
@@ -133,6 +136,23 @@ pub fn why(error: &reqwest::Error) -> Why {
     }
 }
 
+/// Whether `error` is an answer cut short: the other end closed before the whole body came.
+pub fn cut_short(error: &reqwest::Error) -> bool {
+    fn eof(e: &(dyn std::error::Error + 'static)) -> bool {
+        e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            io.kind() == std::io::ErrorKind::UnexpectedEof || io.get_ref().is_some_and(|inner| eof(inner))
+        })
+    }
+    let mut cause = std::error::Error::source(error);
+    while let Some(e) = cause {
+        if eof(e) {
+            return true;
+        }
+        cause = e.source();
+    }
+    false
+}
+
 /// The certificate check's (or TLS's) verdict in `error`, looking inside every io::Error it wraps,
 /// however deep: io::Error's source() skips the error it carries, and on a direct connection
 /// rustls's error sits two io::Errors down (hyper-rustls's, then tokio-rustls's). Notes in `found`
@@ -159,7 +179,7 @@ fn tls_why(error: &rustls::Error) -> Why {
         rustls::Error::InvalidCertificate(C::UnknownIssuer) => Why::Untrusted,
         rustls::Error::InvalidCertificate(C::Other(other)) => {
             let text = other.to_string();
-            if text.contains(TRUST_E_EXPLICIT_DISTRUST) {
+            if text.contains(TRUST_E_EXPLICIT_DISTRUST) || text.contains(CERT_E_UNTRUSTEDCA) {
                 Why::Distrusted
             } else if text.contains(CERT_E_CHAINING) {
                 Why::Untrusted
@@ -169,6 +189,9 @@ fn tls_why(error: &rustls::Error) -> Why {
         }
         rustls::Error::InvalidCertificate(C::Expired | C::ExpiredContext { .. } | C::NotValidYet | C::NotValidYetContext { .. }) => Why::Expired,
         rustls::Error::InvalidCertificate(C::NotValidForName | C::NotValidForNameContext { .. }) => Why::WrongName,
+        // Windows reports a certificate in its Disallowed store as revoked (CRYPT_E_REVOKED), as
+        // it does one its issuer revoked: refused on purpose, either way.
+        rustls::Error::InvalidCertificate(C::Revoked) => Why::Distrusted,
         rustls::Error::InvalidCertificate(_) => Why::Certificate,
         // Bytes that are no TLS record: a plain-text answer on the secure port.
         rustls::Error::InvalidMessage(_) => Why::NotSecure,
@@ -218,7 +241,8 @@ mod tests {
         assert_eq!(cert(C::Expired), Why::Expired);
         assert_eq!(cert(C::NotValidYet), Why::Expired);
         assert_eq!(cert(C::NotValidForName), Why::WrongName);
-        assert_eq!(cert(C::Revoked), Why::Certificate);
+        assert_eq!(cert(C::Revoked), Why::Distrusted, "Windows reports a certificate in the Disallowed store as revoked");
+        assert_eq!(cert(C::InvalidPurpose), Why::Certificate);
         let distrusted = rustls::OtherError(std::sync::Arc::from(Box::<dyn std::error::Error + Send + Sync>::from(
             std::io::Error::from_raw_os_error(-2146762479_i32).to_string())));
         assert_eq!(cert(C::Other(distrusted)), Why::Distrusted, "explicitly distrusted is refused, not merely unknown");
@@ -293,6 +317,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_answer_cut_short_is_told_from_a_refusal() {
+        let client = builder().no_proxy().build().unwrap();
+        // Promises 100 bytes, sends 2, and hangs up.
+        let port = plain("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nPK").await;
+        let mut response = client.get(format!("http://127.0.0.1:{port}/x")).send().await.unwrap();
+        let mut failure = None;
+        while failure.is_none() {
+            match response.chunk().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("the whole body came"),
+                Err(e) => failure = Some(e),
+            }
+        }
+        assert!(cut_short(&failure.unwrap()));
+        let port = plain("HTTP/1.1 403 Forbidden\r\n\r\n").await;
+        let refused = client.get(format!("https://127.0.0.1:{port}/x")).send().await.unwrap_err();
+        assert!(!cut_short(&refused), "a plain answer on the secure port is no cut-short body");
+    }
+
+    #[tokio::test]
     async fn a_plain_answer_on_the_secure_port_or_a_refusal_is_named() {
         let client = builder().no_proxy().build().unwrap();
         let port = plain("HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n\r\n<html>Blocked</html>").await;
@@ -316,7 +360,9 @@ mod tests {
         let read = |name: &str| std::fs::read(folder.join(name)).unwrap();
         let server = Server::start(read("server.cer").into(), read("server.key").into(),
             |_, _| Answer::Body { status: 200, content_type: "text/plain", body: b"ok".to_vec() });
-        let mut clients = vec![("download", crate::sharing_setup::download_client()), ("phone", crate::phone::client())];
+        let topic = reqwest::Url::parse(&server.url("/")).unwrap();
+        #[allow(unused_mut)] // Only the desktop build adds the usage client.
+        let mut clients = vec![("download", crate::sharing_setup::download_client()), ("phone", crate::phone::client_for(&topic))];
         #[cfg(feature = "desktop")]
         clients.push(("usage", crate::app::http_client()));
         for (name, client) in clients {
@@ -327,11 +373,29 @@ mod tests {
                     assert_eq!(response.status(), 200, "{name}");
                     assert_eq!(response.text().await.unwrap(), "ok", "{name}");
                 }
-                "untrusted" => assert_eq!(why(&got.expect_err(name)), Why::Untrusted, "{name}"),
-                "distrusted" => assert_eq!(why(&got.expect_err(name)), Why::Distrusted, "{name}"),
+                "untrusted" => { let e = got.expect_err(name); assert_eq!(why(&e), Why::Untrusted, "{name}: {}", detail(&e)) }
+                "distrusted" => { let e = got.expect_err(name); assert_eq!(why(&e), Why::Distrusted, "{name}: {}", detail(&e)) }
                 other => panic!("SLOPBAR_TEST_OS_STORE_EXPECT={other}"),
             }
         }
+    }
+
+    /// The TLS error under `error`, for a test's failure message: rustls's own, never a link.
+    fn detail(error: &reqwest::Error) -> String {
+        fn find(e: &(dyn std::error::Error + 'static)) -> Option<String> {
+            if let Some(tls) = e.downcast_ref::<rustls::Error>() {
+                return Some(format!("{tls:?}"));
+            }
+            e.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()).and_then(|inner| find(inner))
+        }
+        let mut cause = std::error::Error::source(error);
+        while let Some(e) = cause {
+            if let Some(found) = find(e) {
+                return found;
+            }
+            cause = e.source();
+        }
+        "no TLS error".into()
     }
 
     /// reqwest 0.13 panics building a client before any TLS cryptography is installed, so every
@@ -345,7 +409,8 @@ mod tests {
                     walk(&path, found);
                 } else if path.extension().is_some_and(|e| e == "rs") && path.file_name().is_some_and(|n| n != "net.rs") {
                     let code = crate::source_guard::tokens(&std::fs::read_to_string(&path).unwrap());
-                    for needle in ["Client::new(", "Client::builder(", "ClientBuilder::new(", "Client::default(", "Client as Default"] {
+                    for needle in ["Client::new(", "Client::builder(", "ClientBuilder::new(", "Client::default(", "ClientBuilder::default(",
+                        "reqwest::get(", ".build().unwrap_or_default()", "reqwest::Client as", "ClientBuilder as", "Client as Default"] {
                         if code.contains(needle) {
                             found.push(format!("{}: {needle}", path.display()));
                         }

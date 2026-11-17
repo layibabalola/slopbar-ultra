@@ -313,7 +313,7 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
 .setup-steps li.result { padding-left: 0; }
 .setup-steps li.result::before { content: none; }
 /* Why rclone's download failed, one line for each site tried, under the result. */
-.setup-steps li.reason { padding-left: 14px; color: var(--dim); }
+.setup-steps li.reason { padding-left: 14px; color: var(--dim); overflow-wrap: anywhere; }
 .setup-steps li.reason::before { content: "–"; width: auto; }
 .setup-actions { display: flex; gap: 8px; }
 #sharing-setup > .btn { flex-shrink: 0; white-space: nowrap; }

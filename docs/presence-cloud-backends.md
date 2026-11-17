@@ -81,14 +81,19 @@ the getting-started guide), or the `setup_sharing` agent tool, connects a comput
      once its certificate is installed in Windows, and a certificate Windows distrusts is refused.
      It uses the proxy Windows is set to (not a proxy script) and HTTPS_PROXY.
    - A failed download says why, for each site tried (Settings and `get_sharing_setup`'s
-     `reasons`): the host and a code such as `untrusted`, `page` (a web page in the zip's place, as
-     a web filter answers), `redirected` (with the host it led to), `status`, `proxy_auth` or
-     `reset`, never a link. The GitHub release is tried only after the first site was down or
-     broken (404, 410, 429, 5xx, a broken or wrong zip): after a refusal that may be on purpose,
-     the download ends there, so a company that blocks rclone is not worked around.
-   - When Windows or security software refuses to run the unpacked rclone (an AppLocker or
-     Application Control policy, or antivirus taking the file), the setup stops with
-     `rclone_blocked` and tries no other way to run it.
+     `reasons`): the host and a code such as `untrusted`, `distrusted`, `page` (a web page in the
+     zip's place, as a web filter answers), `redirected` (with the host it led to), `status`,
+     `proxy_auth` or `reset`, never a link. The GitHub release is tried only after the first site
+     was down or broken (404, 410, 429 or 5xx, its CDN's error page included, or a broken or wrong
+     zip): after a refusal that may be on purpose, the download ends there, so a company that
+     blocks rclone is not worked around. A filter that answers a block with one of those statuses
+     lets the GitHub release be tried, through the same filter.
+   - When Windows or security software refuses to run rclone (an AppLocker, Application Control or
+     Smart App Control policy, or antivirus taking the file), the setup stops with
+     `rclone_blocked`. That includes an installed rclone: SlopBar never downloads a copy of its own
+     to run from another folder in place of one a policy stopped. An installed rclone that fails
+     otherwise ends the setup with `rclone_failed`; only a missing one, one older than v1.60, or
+     SlopBar's own broken copy is replaced by the download.
 2. **Dropbox.** A remote of that name (the one sharing already uses, else `dropbox`) that reaches
    its storage is used as it is. Otherwise rclone signs in with its own flow:
    `rclone config create <remote> dropbox` for a new remote, `rclone config update <remote>

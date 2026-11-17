@@ -3049,11 +3049,18 @@ async fn run_sharing_setup(app: &AppHandle, remote: String, via_tunnel: bool, re
     use sharing_setup::{Connect, Phase};
     use std::sync::atomic::Ordering::SeqCst;
     let state = app.state::<AppState>();
-    let installed = tauri::async_runtime::spawn_blocking(|| rclone::find().filter(|path| rclone::usable(path))).await.unwrap_or(None);
-    let path = match installed {
-        Some(path) => path,
-        None => {
-            let own = sharing_setup::own_rclone().ok_or("extract_failed")?;
+    // The rclone found here, and whether it does: one that Windows or security software will not
+    // run ends the setup, never replaced by a download of SlopBar's own (`rclone_step`).
+    let found = tauri::async_runtime::spawn_blocking(|| rclone::find().map(|path| {
+        let checked = rclone::check(&rclone::Cli(path.clone()));
+        (path, checked)
+    })).await.unwrap_or(None);
+    let own = sharing_setup::own_rclone();
+    let path = match sharing_setup::rclone_step(found, own.as_deref()) {
+        sharing_setup::RcloneStep::Use(path) => path,
+        sharing_setup::RcloneStep::Stop(code) => return Err(code),
+        sharing_setup::RcloneStep::Download => {
+            let own = own.ok_or("extract_failed")?;
             publish_sharing(app, |s| {
                 s.downloaded = true;
                 s.progress = Some(0);
@@ -3066,9 +3073,9 @@ async fn run_sharing_setup(app: &AppHandle, remote: String, via_tunnel: bool, re
             let result = sharing_setup::install_rclone(&own, &state.sharing_cancel, &progress, &mut reasons).await;
             publish_sharing(app, |s| {
                 s.progress = None;
-                // Why the download failed, shown with the failure; a source that failed before
-                // another served the zip is no failure.
-                if result.is_err() {
+                // Why the download failed, shown with that failure only: a site that failed before
+                // another served the zip is no failure, and unpacking or Cancel has its own.
+                if matches!(result, Err("download_failed" | "hash_mismatch")) {
                     s.reasons = reasons;
                 }
             });
@@ -3391,7 +3398,7 @@ async fn send_phone_test(app: AppHandle, title: String, body: String) -> Result<
     let url = phone_settings.url.clone().ok_or("phone_url_missing")?;
     let message = phone::compose(&phone_settings, phone::Kind::Test, (&title, &body), (&title, &body)).ok_or("phone_url_missing")?;
     let token = settings::app_dir().and_then(|d| phone::load_token(&d));
-    phone::send(&phone::client(), &url, token.as_deref(), &message).await
+    phone::send(&url, token.as_deref(), &message).await
 }
 
 /// Re-reads the Codex CLI's local history off the async runtime, one scan at a time, then has

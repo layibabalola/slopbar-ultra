@@ -62,6 +62,8 @@ You can also choose **Connect monitoring** next to each account in Settings or t
 
 SlopBar renews this separate session automatically when its access token is about to expire, and polls the provider's usage endpoint. No prompt or model request is sent. Existing accounts need this one-time sign-in because their copied CLI refresh tokens cannot safely be shared with an independent background refresher.
 
+SlopBar's own connections trust what Windows trusts, through Windows' own certificate checks, and use the proxy Windows is set to (not a proxy script), as its updater and your browser do. On a network that inspects HTTPS with its certificate installed in Windows they work, and that network can read them, sign-in tokens included, as it can read the browser's. A certificate Windows distrusts is refused.
+
 **Disconnect monitoring** works even for the active account. It removes the local monitoring credentials and attempts to revoke that separate session at the provider. If server revocation cannot be confirmed, the UI asks you to revoke it in your provider's account settings. Reconnecting saves the new login before attempting to revoke the previous monitoring session.
 
 If a completed monitoring login is rejected for the wrong account or cannot be saved, SlopBar attempts to revoke that uninstalled login. It first protects every known CLI/monitor token; shared tokens or unreadable ownership stores disable this cleanup. Failed cleanup can leave a provider session to revoke manually in account settings.

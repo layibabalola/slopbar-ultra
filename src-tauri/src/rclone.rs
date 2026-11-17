@@ -89,11 +89,29 @@ pub fn find() -> Option<PathBuf> {
     own.into_iter().chain(winget).chain(on_path).find(|p| p.is_file())
 }
 
-/// Whether the rclone at `path` runs and is recent enough for the guided setup (see
-/// `sharing_setup::recent_enough`).
-pub fn usable(path: &std::path::Path) -> bool {
-    Cli(path.to_path_buf()).run(&["version"], None)
-        .is_ok_and(|ran| ran.code == Some(0) && crate::sharing_setup::recent_enough(&String::from_utf8_lossy(&ran.stdout)))
+/// Why an rclone found here does not do for the guided setup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unusable {
+    /// Windows or security software would not let it start (`sharing_setup::refused_to_start`).
+    Refused,
+    /// It ran and said it is older than the setup needs.
+    Old,
+    /// It did not run to a version: it failed, was stopped, or said something else.
+    Failed,
+}
+
+/// Runs `rclone version` and says whether that rclone does for the guided setup: it runs, and is
+/// recent enough (`sharing_setup::recent_enough`).
+pub fn check(runner: &dyn Runner) -> Result<(), Unusable> {
+    match runner.run(&["version"], None) {
+        Err(e) if crate::sharing_setup::refused_to_start(&e) => Err(Unusable::Refused),
+        Err(_) => Err(Unusable::Failed),
+        Ok(ran) if ran.code != Some(0) => Err(Unusable::Failed),
+        Ok(ran) if !crate::sharing_setup::recent_enough(&String::from_utf8_lossy(&ran.stdout)) => {
+            if String::from_utf8_lossy(&ran.stdout).trim_start().starts_with("rclone v") { Err(Unusable::Old) } else { Err(Unusable::Failed) }
+        }
+        Ok(_) => Ok(()),
+    }
 }
 
 /// A remote the user configured in rclone.

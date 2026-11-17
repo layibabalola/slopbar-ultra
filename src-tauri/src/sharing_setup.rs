@@ -104,13 +104,42 @@ const DOWNLOAD_LIMIT: std::time::Duration = std::time::Duration::from_secs(10 * 
 const UNPACK_LIMIT: std::time::Duration = std::time::Duration::from_secs(3 * 60);
 const VERSION_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Whether a program could not start because Windows or security software refused it: an
-/// AppLocker or software restriction policy (1260), Application Control (4551), antivirus that
-/// found it infected or removed it (225, 226), access denied, or the file gone the moment after it
-/// was unpacked. SlopBar then stops and says so; it never tries another way to run it.
+/// Whether a program could not start because Windows or security software refused it: antivirus
+/// that found it infected or removed it (225, 226), a software restriction or AppLocker policy
+/// (786, 1260), a compatibility block (1259), Application Control and Smart App Control
+/// (4551-4559, 4580-4582), or access denied. SlopBar then stops and says so; it never tries another
+/// way to run it, nor another copy.
 pub fn refused_to_start(error: &std::io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(225 | 226 | 1260 | 4551))
-        || matches!(error.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound)
+    matches!(error.raw_os_error(), Some(225 | 226 | 786 | 1259 | 1260 | 4551..=4559 | 4580..=4582))
+        || error.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+/// What the setup does about rclone.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RcloneStep {
+    /// Use the rclone found.
+    Use(std::path::PathBuf),
+    /// Download SlopBar's own copy: none was found, the one found is too old, or SlopBar's own copy
+    /// is broken.
+    Download,
+    /// Stop with this error code.
+    Stop(&'static str),
+}
+
+/// What to do with what `rclone::find` found (and `rclone::check`'s verdict on it), `own` being
+/// SlopBar's own copy's path. An rclone that Windows or security software will not run ends the
+/// setup (`rclone_blocked`), and so does an installed one that fails (`rclone_failed`): SlopBar
+/// never puts a copy of its own, somewhere else, in place of one that a policy stopped.
+pub fn rclone_step(found: Option<(std::path::PathBuf, Result<(), crate::rclone::Unusable>)>, own: Option<&std::path::Path>) -> RcloneStep {
+    use crate::rclone::Unusable;
+    match found {
+        None => RcloneStep::Download,
+        Some((path, Ok(()))) => RcloneStep::Use(path),
+        Some((_, Err(Unusable::Refused))) => RcloneStep::Stop("rclone_blocked"),
+        Some((_, Err(Unusable::Old))) => RcloneStep::Download,
+        Some((path, Err(Unusable::Failed))) if own.is_some_and(|own| own == path) => RcloneStep::Download,
+        Some((_, Err(Unusable::Failed))) => RcloneStep::Stop("rclone_failed"),
+    }
 }
 
 /// Runs a helper to its end within `limit`, its standard output collected, and kills it after: a
@@ -292,9 +321,14 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// `cancelled`.
 pub async fn install_rclone(dest: &std::path::Path, cancel: &std::sync::atomic::AtomicBool, progress: &(dyn Fn(u8) + Send + Sync), reasons: &mut Vec<Reason>) -> Result<(), &'static str> {
     let asset = asset(std::env::consts::ARCH).ok_or("rclone_unsupported")?;
+    install_from(&urls(&asset), asset, dest, cancel, progress, reasons).await
+}
+
+/// `install_rclone` from these sources.
+async fn install_from(urls: &[String], asset: Asset, dest: &std::path::Path, cancel: &std::sync::atomic::AtomicBool, progress: &(dyn Fn(u8) + Send + Sync), reasons: &mut Vec<Reason>) -> Result<(), &'static str> {
     // Its own client, never one passed in: a client that followed no redirect once made GitHub's
     // link fail every time.
-    let bytes = download(&download_client(), &urls(&asset), asset.sha256, cancel, progress, reasons).await?;
+    let bytes = download(&download_client(), urls, asset.sha256, cancel, progress, reasons).await?;
     let dest = dest.to_path_buf();
     tokio::task::spawn_blocking(move || extract(&bytes, &asset, &dest)).await.unwrap_or(Err("extract_failed"))
 }
@@ -309,6 +343,9 @@ async fn download(client: &reqwest::Client, urls: &[String], sha256: &str, cance
     use crate::net::Why;
     let mut failure = "download_failed";
     for url in urls {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("cancelled");
+        }
         let reason = match fetch(client, url, cancel, progress).await {
             Ok(bytes) if sha256_hex(&bytes) == sha256 => return Ok(bytes),
             // Not even a zip: a page or a message in its place, which is what a filter that
@@ -364,10 +401,15 @@ async fn fetch(client: &reqwest::Client, url: &str, cancel: &std::sync::atomic::
     if status == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED {
         return Err(failed(Why::ProxyAuth, Some(407)));
     }
+    // The site is down or the file is gone: its CDN says so with a page too, so this comes first,
+    // and the next site may be tried (`Why::blocks`).
+    if !Why::Status.blocks(Some(status.as_u16())) {
+        return Err(failed(Why::Status, Some(status.as_u16())));
+    }
     let html = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|t| t.to_str().ok())
         .is_some_and(|t| { let t = t.trim_start().to_ascii_lowercase(); t.starts_with("text/html") || t.starts_with("application/xhtml") });
     if html {
-        // A page where the zip should be, whatever its status: a filter's block page, typically.
+        // A page where the zip should be, with any other status: a filter's block page, typically.
         return Err(failed(Why::Page, Some(status.as_u16())));
     }
     if !status.is_success() {
@@ -385,7 +427,13 @@ async fn fetch(client: &reqwest::Client, url: &str, cancel: &std::sync::atomic::
         let chunk = match tokio::time::timeout(STALL, response.chunk()).await {
             Err(_) => return Err(failed(Why::Timeout, Some(status.as_u16()))),
             Ok(Err(e)) => {
-                let why = match crate::net::why(&e) { Why::Failed => Why::Interrupted, why => why };
+                // Cut short (the other end closed before the whole file came) is a broken
+                // download; a reset or an alert mid-way may be a refusal.
+                let why = match crate::net::why(&e) {
+                    Why::Failed => Why::Interrupted,
+                    _ if crate::net::cut_short(&e) => Why::Interrupted,
+                    why => why,
+                };
                 return Err(failed(why, Some(status.as_u16())));
             }
             Ok(Ok(None)) => break,
@@ -425,10 +473,7 @@ fn extract(zip: &[u8], asset: &Asset, dest: &std::path::Path) -> Result<(), &'st
             tar.arg("-xf").arg(&archive).arg("-C").arg(&work).arg(&inner);
             tar
         } else {
-            let mut ps = crate::sources::command(&system.join(r"System32\WindowsPowerShell\v1.0\powershell.exe").to_string_lossy());
-            ps.args(["-NoProfile", "-NonInteractive", "-Command", "Expand-Archive -LiteralPath $args[0] -DestinationPath $args[1] -Force"])
-                .arg(&archive).arg(&work);
-            ps
+            powershell_unpack(&system, &archive, &work)
         };
         let unpacked = run_within(unpack, UNPACK_LIMIT).is_ok_and(|out| out.status.success());
         let exe = work.join(&inner);
@@ -443,7 +488,8 @@ fn extract(zip: &[u8], asset: &Asset, dest: &std::path::Path) -> Result<(), &'st
         check.arg("version");
         let version = match run_within(check, VERSION_LIMIT) {
             Ok(version) => version,
-            Err(Some(e)) if refused_to_start(&e) => return Err("rclone_blocked"),
+            // Gone the moment after it was unpacked: antivirus took it.
+            Err(Some(e)) if refused_to_start(&e) || e.kind() == std::io::ErrorKind::NotFound => return Err("rclone_blocked"),
             Err(_) => return Err("extract_failed"),
         };
         if !String::from_utf8_lossy(&version.stdout).starts_with(&format!("rclone {RCLONE_VERSION}")) {
@@ -454,6 +500,16 @@ fn extract(zip: &[u8], asset: &Asset, dest: &std::path::Path) -> Result<(), &'st
     })();
     let _ = std::fs::remove_dir_all(&work);
     result
+}
+
+/// Windows PowerShell's Expand-Archive, unpacking `archive` into `work`, where tar.exe is missing.
+/// The paths go in environment variables: after -Command, arguments become part of the script's
+/// text, so `$args` would be empty and a path with a space would split.
+fn powershell_unpack(system: &std::path::Path, archive: &std::path::Path, work: &std::path::Path) -> std::process::Command {
+    let mut ps = crate::sources::command(&system.join(r"System32\WindowsPowerShell\v1.0\powershell.exe").to_string_lossy());
+    ps.args(["-NoProfile", "-NonInteractive", "-Command", "Expand-Archive -LiteralPath $env:SLOPBAR_UNPACK_ZIP -DestinationPath $env:SLOPBAR_UNPACK_TO -Force"])
+        .env("SLOPBAR_UNPACK_ZIP", archive).env("SLOPBAR_UNPACK_TO", work);
+    ps
 }
 
 /// How rclone gets a Dropbox remote here: a new one, or a new sign-in for one that exists (its
@@ -623,9 +679,9 @@ mod tests {
         assert!(!other.exists());
     }
 
-    /// The second source alone, rclone's GitHub release, with the client the app uses: GitHub
-    /// answers with a redirect to its file host, which the client follows (the zip, about 25 MB):
-    /// `cargo test -- --ignored the_github_release`.
+    /// The second source alone, rclone's GitHub release, installed as the app installs it (its own
+    /// client): GitHub answers with a redirect to its file host, which the client follows (the
+    /// zip, about 25 MB): `cargo test -- --ignored the_github_release`.
     #[tokio::test(flavor = "current_thread")]
     #[ignore]
     async fn the_github_release_downloads_through_the_apps_client() {
@@ -633,14 +689,81 @@ mod tests {
         let github = urls(&asset)[1].clone();
         assert!(github.starts_with("https://github.com/"));
         // GitHub answers with a redirect, which the client follows to GitHub's file host.
-        let answer = download_client().get(&github).send().await.unwrap();
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(60), download_client().get(&github).send()).await
+            .expect("GitHub answers within a minute").unwrap();
         assert!(answer.status().is_success(), "{}", answer.status());
         assert!(answer.url().host_str().is_some_and(|h| h.ends_with(".githubusercontent.com")), "{}", crate::net::shown_host(answer.url()));
         drop(answer);
+        let dir = crate::test_support::TempDir::new();
+        let dest = dir.0.join("rclone").join("rclone.exe");
         let mut reasons = Vec::new();
-        let zip = download(&download_client(), &[github], asset.sha256, &std::sync::atomic::AtomicBool::new(false), &|_| {}, &mut reasons).await;
-        assert!(zip.is_ok_and(|zip| sha256_hex(&zip) == asset.sha256), "{reasons:?}");
+        let installed = install_from(&[github], asset, &dest, &std::sync::atomic::AtomicBool::new(false), &|_| {}, &mut reasons).await;
+        assert_eq!(installed, Ok(()), "{reasons:?}");
         assert!(reasons.is_empty(), "{reasons:?}");
+        let out = std::process::Command::new(&dest).arg("version").output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with("rclone v1.76.0"));
+    }
+
+    /// Where tar.exe is missing, Windows PowerShell unpacks the zip, its paths (with spaces) in
+    /// the environment.
+    #[cfg(windows)]
+    #[test]
+    fn powershell_unpacks_where_tar_is_missing() {
+        let dir = crate::test_support::TempDir::new();
+        let from = dir.0.join("with space");
+        std::fs::create_dir_all(from.join("rclone-v1.76.0-windows-amd64")).unwrap();
+        std::fs::write(from.join(r"rclone-v1.76.0-windows-amd64\rclone.exe"), b"synthetic").unwrap();
+        let archive = dir.0.join("an archive.zip");
+        let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\Windows".into());
+        let mut zip = crate::sources::command(&system.join(r"System32\tar.exe").to_string_lossy());
+        zip.arg("-a").arg("-c").arg("-f").arg(&archive).arg("-C").arg(&from).arg("rclone-v1.76.0-windows-amd64");
+        assert!(run_within(zip, std::time::Duration::from_secs(60)).is_ok_and(|out| out.status.success()), "made the test zip");
+        let work = dir.0.join("unpack here");
+        std::fs::create_dir_all(&work).unwrap();
+        let unpacked = run_within(powershell_unpack(&system, &archive, &work), UNPACK_LIMIT);
+        assert!(unpacked.is_ok_and(|out| out.status.success()));
+        assert_eq!(std::fs::read(work.join(r"rclone-v1.76.0-windows-amd64\rclone.exe")).unwrap(), b"synthetic");
+    }
+
+    #[test]
+    fn an_rclone_that_windows_will_not_run_ends_the_setup_and_is_never_replaced() {
+        use crate::rclone::{check, Ran, Runner, Unusable};
+        /// `rclone version` as it went: it ran (exit code, output), or Windows gave this error.
+        enum Version {
+            Ran(Option<i32>, &'static str),
+            Os(i32),
+        }
+        impl Runner for Version {
+            fn run(&self, _: &[&str], _: Option<&[u8]>) -> std::io::Result<Ran> {
+                match self {
+                    Version::Ran(code, out) => Ok(Ran { code: *code, stdout: out.as_bytes().to_vec() }),
+                    Version::Os(code) => Err(std::io::Error::from_raw_os_error(*code)),
+                }
+            }
+        }
+        // AppLocker, Application Control, antivirus, a restriction policy, a compatibility block,
+        // access denied.
+        for code in [1260, 4551, 225, 226, 786, 1259, 5] {
+            assert_eq!(check(&Version::Os(code)), Err(Unusable::Refused), "{code}");
+        }
+        assert_eq!(check(&Version::Os(2)), Err(Unusable::Failed), "a missing file is no refusal");
+        assert_eq!(check(&Version::Ran(Some(0), "rclone v1.76.0\n- os/version: Windows")), Ok(()));
+        assert_eq!(check(&Version::Ran(Some(0), "rclone v1.53.3")), Err(Unusable::Old));
+        assert_eq!(check(&Version::Ran(Some(1), "")), Err(Unusable::Failed));
+        assert_eq!(check(&Version::Ran(None, "")), Err(Unusable::Failed), "killed");
+        assert_eq!(check(&Version::Ran(Some(0), "something else")), Err(Unusable::Failed));
+
+        let own = std::path::PathBuf::from(r"C:\Users\someone\AppData\Local\SlopBar\rclone\rclone.exe");
+        let installed = std::path::PathBuf::from(r"C:\Program Files\rclone\rclone.exe");
+        assert_eq!(rclone_step(None, Some(&own)), RcloneStep::Download);
+        assert_eq!(rclone_step(Some((installed.clone(), Ok(()))), Some(&own)), RcloneStep::Use(installed.clone()));
+        assert_eq!(rclone_step(Some((installed.clone(), Err(Unusable::Old))), Some(&own)), RcloneStep::Download);
+        // Refused to run, here or installed: stop, and download nothing to run from elsewhere.
+        assert_eq!(rclone_step(Some((installed.clone(), Err(Unusable::Refused))), Some(&own)), RcloneStep::Stop("rclone_blocked"));
+        assert_eq!(rclone_step(Some((own.clone(), Err(Unusable::Refused))), Some(&own)), RcloneStep::Stop("rclone_blocked"));
+        // An installed one that fails is not replaced either; SlopBar's own broken copy is.
+        assert_eq!(rclone_step(Some((installed, Err(Unusable::Failed))), Some(&own)), RcloneStep::Stop("rclone_failed"));
+        assert_eq!(rclone_step(Some((own.clone(), Err(Unusable::Failed))), Some(&own)), RcloneStep::Download);
     }
 
     #[test]
@@ -794,8 +917,9 @@ mod tests {
     async fn a_source_that_is_down_or_broken_lets_the_next_one_serve_the_zip() {
         use crate::test_tls::Answer;
         let site = Site::new(|path, _| match path {
-            "/gone.zip" => Answer::Body { status: 404, content_type: "text/plain", body: b"not found".to_vec() },
-            "/down.zip" => Answer::Body { status: 503, content_type: "text/plain", body: Vec::new() },
+            // As downloads.rclone.org's CDN answers: an HTML page with the status.
+            "/gone.zip" => Answer::Body { status: 404, content_type: "text/html; charset=UTF-8", body: b"<html>404 Not Found</html>".to_vec() },
+            "/down.zip" => Answer::Body { status: 503, content_type: "text/html", body: b"<html>Service Unavailable</html>".to_vec() },
             "/corrupt.zip" => Answer::Body { status: 200, content_type: "application/zip", body: b"PK\x03\x04 another zip".to_vec() },
             _ => zip(),
         });
