@@ -502,13 +502,24 @@ fn extract(zip: &[u8], asset: &Asset, dest: &std::path::Path) -> Result<(), &'st
     result
 }
 
-/// Windows PowerShell's Expand-Archive, unpacking `archive` into `work`, where tar.exe is missing.
-/// The paths go in environment variables: after -Command, arguments become part of the script's
-/// text, so `$args` would be empty and a path with a space would split.
+/// Windows PowerShell's Expand-Archive, unpacking `archive` into `work`, where tar.exe is missing;
+/// any error ends it with a failure.
+/// - The paths go in environment variables: after -Command, arguments become part of the script's
+///   text, so `$args` would be empty and a path with a space would split.
+/// - Windows' own Archive module is imported by its path, and PSModulePath is Windows PowerShell's
+///   own module folder (to which it adds Program Files' one). Inherited from PowerShell 7 (SlopBar
+///   or a test started from an agent's shell), PSModulePath put 7's Archive module first, whose
+///   Expand-Archive fails in Windows PowerShell and still exited 0; an Archive module installed
+///   for Windows PowerShell would stand in the same way.
+/// - Expand-Archive stays (rather than .NET's ZipFile called from the script): Windows' own module
+///   also runs where Constrained Language Mode (AppLocker, App Control) blocks .NET calls in scripts.
 fn powershell_unpack(system: &std::path::Path, archive: &std::path::Path, work: &std::path::Path) -> std::process::Command {
-    let mut ps = crate::sources::command(&system.join(r"System32\WindowsPowerShell\v1.0\powershell.exe").to_string_lossy());
-    ps.args(["-NoProfile", "-NonInteractive", "-Command", "Expand-Archive -LiteralPath $env:SLOPBAR_UNPACK_ZIP -DestinationPath $env:SLOPBAR_UNPACK_TO -Force"])
-        .env("SLOPBAR_UNPACK_ZIP", archive).env("SLOPBAR_UNPACK_TO", work);
+    let home = system.join(r"System32\WindowsPowerShell\v1.0");
+    let mut ps = crate::sources::command(&home.join("powershell.exe").to_string_lossy());
+    ps.args(["-NoProfile", "-NonInteractive", "-Command",
+        "$ErrorActionPreference = 'Stop'; Import-Module (Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Archive'); \
+         Expand-Archive -LiteralPath $env:SLOPBAR_UNPACK_ZIP -DestinationPath $env:SLOPBAR_UNPACK_TO -Force"])
+        .env("SLOPBAR_UNPACK_ZIP", archive).env("SLOPBAR_UNPACK_TO", work).env("PSModulePath", home.join("Modules"));
     ps
 }
 
@@ -720,9 +731,20 @@ mod tests {
         assert!(run_within(zip, std::time::Duration::from_secs(60)).is_ok_and(|out| out.status.success()), "made the test zip");
         let work = dir.0.join("unpack here");
         std::fs::create_dir_all(&work).unwrap();
+        // Whichever shell started the tests: PowerShell 7 puts its own modules first in PSModulePath,
+        // and Windows PowerShell must see only its own.
+        let own = system.join(r"System32\WindowsPowerShell\v1.0\Modules");
+        assert!(powershell_unpack(&system, &archive, &work).get_envs().any(|(k, v)| k == "PSModulePath" && v == Some(own.as_os_str())));
         let unpacked = run_within(powershell_unpack(&system, &archive, &work), UNPACK_LIMIT);
         assert!(unpacked.is_ok_and(|out| out.status.success()));
         assert_eq!(std::fs::read(work.join(r"rclone-v1.76.0-windows-amd64\rclone.exe")).unwrap(), b"synthetic");
+        // A zip that is not one ends with a failure, never an exit 0 with nothing unpacked.
+        let broken = dir.0.join("a broken archive.zip");
+        std::fs::write(&broken, b"not a zip").unwrap();
+        let other = dir.0.join("unpack broken");
+        std::fs::create_dir_all(&other).unwrap();
+        let failed = run_within(powershell_unpack(&system, &broken, &other), UNPACK_LIMIT);
+        assert!(failed.is_ok_and(|out| !out.status.success()), "a broken zip fails");
     }
 
     #[test]
