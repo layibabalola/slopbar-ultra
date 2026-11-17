@@ -86,12 +86,48 @@ function Install-SlopBarUltra {
     }
   }
 
-  # Turns on Update automatically and Launch at login. Returns how both now stand.
+  # Where SlopBar is installed for this user: the uninstall entry's folder when it holds slopbar.exe,
+  # else the installer's default.
+  function Resolve-InstallDir {
+    $found = Join-Path $env:LOCALAPPDATA 'SlopBar'
+    try {
+      $location = ([string](Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\SlopBar' -ErrorAction Stop).InstallLocation).Trim('"')
+      if ($location -and (Test-Path -LiteralPath (Join-Path $location 'slopbar.exe'))) { $found = $location }
+    } catch { }
+    return $found
+  }
+
+  # Starts SlopBar Ultra unless this copy already runs. From an elevated window it starts it through
+  # Explorer, as the user normally runs it. An elevated app's door admits only elevated clients, so
+  # the user's agents could not reach it until the next sign-in.
+  function Start-App {
+    if (Get-Process -Name slopbar -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $app }) { return }
+    if ($elevated -and $desktop.Count -gt 0) { Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList ('"' + $app + '"') }
+    else { Start-Process -FilePath $app }
+  }
+
+  # Whether Windows has a startup entry (HKCU Run) that starts this copy of SlopBar Ultra.
+  function Test-StartupEntry {
+    try { $run = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction Stop } catch { return $false }
+    foreach ($property in $run.PSObject.Properties) {
+      if (([string]$property.Value).ToLower().Contains($app.ToLower())) { return $true }
+    }
+    return $false
+  }
+
+  # Turns on Update automatically and Launch at login, and returns how both now stand. Launch at
+  # login counts as on only when Windows also has the startup entry, because the app ignores a
+  # failure to write it.
   function Set-Defaults {
     $r = Invoke-Door @('--call-b64', $turnOn)
     $saved = if ($r) { $r.ok } else { $null }
     $updates = if ($saved -and $saved.auto_update -eq $true) { 'on' } else { 'not on (turn it on in Settings, Updates)' }
-    $atLogin = if ($saved -and $saved.launch_at_login -eq $true) { 'on' } else { 'not on (turn it on in Settings)' }
+    $entry = Test-StartupEntry
+    if (-not $entry) { Start-Sleep -Seconds 2; $entry = Test-StartupEntry }
+    $atLogin = 'not on (turn it on in Settings)'
+    if ($saved -and $saved.launch_at_login -eq $true) {
+      $atLogin = if ($entry) { 'on' } else { 'set, but Windows has no startup entry for it (a policy may block startup apps)' }
+    }
     return "Update automatically: $updates. Launch at login: $atLogin."
   }
 
@@ -170,16 +206,10 @@ function Install-SlopBarUltra {
     }
     $elevated = $false
     try { $elevated = [bool](& whoami.exe /groups 2>$null | Select-String -SimpleMatch 'S-1-16-12288') } catch { }
-    if ($elevated) { Say 'This window runs as administrator, so SlopBar Ultra starts elevated this time. From your next sign-in it starts normally.' }
+    if ($elevated) { Say 'This window runs as administrator. SlopBar Ultra is still started through Explorer, as your normal user.' }
 
     $step = 'find the install folder'
-    $dir = Join-Path $env:LOCALAPPDATA 'SlopBar'
-    $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\SlopBar'
-    if (Test-Path $uninstallKey) {
-      $location = [string](Get-ItemProperty -Path $uninstallKey -ErrorAction SilentlyContinue).InstallLocation
-      $location = $location.Trim('"')
-      if ($location -and (Test-Path -LiteralPath (Join-Path $location 'slopbar.exe'))) { $dir = $location }
-    }
+    $dir = Resolve-InstallDir
     $app = Join-Path $dir 'slopbar.exe'
     $door = Join-Path $dir 'slopbar-mcp.exe'
 
@@ -199,10 +229,13 @@ function Install-SlopBarUltra {
 
     if (Test-Path -LiteralPath $app) {
       $step = 'ask the installed SlopBar its version'
+      if (-not (Test-Path -LiteralPath $door)) {
+        throw "SlopBar in $dir has no slopbar-mcp.exe, so it is upstream SlopBar or a damaged install. Nothing was changed. Uninstall it (Settings, Apps), then run the line again."
+      }
       $info = Wait-Door 5
       if (-not $info) {
-        Say 'SlopBar is installed here but is not running. Starting it.'
-        Start-Process -FilePath $app
+        Say 'SlopBar Ultra is installed here but did not answer. Starting it.'
+        Start-App
         $info = Wait-Door 90
       }
       if (-not $info) { throw "SlopBar is installed in $dir, but it did not answer through slopbar-mcp.exe within 90 seconds" }
@@ -227,19 +260,35 @@ function Install-SlopBarUltra {
       }
       $step = 'update the installed SlopBar Ultra'
       Say "SlopBar Ultra $have runs here. Asking it to install $version."
-      $r = Invoke-Door @('--call', 'install_update')
-      if ($r -and $r.blocked) { throw "slopbar-mcp.exe could not run: $($r.blocked)" }
-      if ($r -and $r.error) { throw "SlopBar Ultra did not take the update: $($r.error)" }
+      $target = Get-UltraKey $version
       $deadline = (Get-Date).AddMinutes(15)
-      do {
-        Start-Sleep -Seconds 10
+      $askedAt = (Get-Date).AddMinutes(-10)
+      $refusals = 0
+      while ($true) {
         $r = Invoke-Door @('--call', 'get_app_info')
-        $now = if ($r -and $r.ok) { [string]$r.ok.version } else { '' }
-      } while ($now -ne $version -and (Get-Date) -lt $deadline)
-      if ($now -ne $version) {
-        $seen = if ($now) { $now } else { 'no answer' }
-        throw "SlopBar Ultra was asked to install $version, but after 15 minutes it reports $seen. Settings, Updates shows why."
+        if ($r -and $r.blocked) { throw "slopbar-mcp.exe could not run: $($r.blocked)" }
+        $info = if ($r) { $r.ok } else { $null }
+        $nowKey = if ($info) { Get-UltraKey ([string]$info.version) } else { $null }
+        if ($nowKey -and $nowKey -ge $target) { break }
+        if ((Get-Date) -ge $deadline) {
+          $seen = if ($info) { [string]$info.version } else { 'no answer' }
+          $why = ''
+          if ($info -and $info.update_check) { $why = (" Its last update check: $($info.update_check.result) $($info.update_check.reason) $($info.update_check.error)").TrimEnd() + '.' }
+          throw "SlopBar Ultra was asked to install $version, but after 15 minutes it reports $seen.$why"
+        }
+        # The app can defer a request (while a sign-in is open, or another install runs), and
+        # nothing retries it. So ask again every 90 seconds, as the fleet report does.
+        if ($info -and ((Get-Date) - $askedAt).TotalSeconds -ge 90) {
+          $r = Invoke-Door @('--call', 'install_update')
+          if ($r -and $r.error) {
+            $refusals++
+            if ($refusals -ge 3) { throw "SlopBar Ultra refused the update three times: $($r.error)" }
+          } else { $refusals = 0 }
+          $askedAt = Get-Date
+        }
+        Start-Sleep -Seconds 10
       }
+      $version = [string]$info.version
       $step = 'turn on updates and Launch at login'
       $state = Set-Defaults
       Write-Outcome $true "SlopBar Ultra $version is installed and running on $env:COMPUTERNAME. $state"
@@ -274,28 +323,36 @@ function Install-SlopBarUltra {
     $hasWebView2 = Test-WebView2
     if (-not $hasWebView2) { Say 'The WebView2 Runtime is missing. The installer fetches it from Microsoft (go.microsoft.com).' }
     Say 'Running the installer quietly, for this user only.'
-    $proc = Start-Process -FilePath $setup -ArgumentList '/S' -Wait -PassThru
+    # Wait for the installer alone. -Wait would also wait for every process it starts, and the
+    # WebView2 bootstrapper can leave an updater running.
+    $proc = Start-Process -FilePath $setup -ArgumentList '/S' -PassThru
+    $proc | Wait-Process -Timeout 900
     if ($null -ne $proc.ExitCode -and $proc.ExitCode -ne 0) {
       if ($proc.ExitCode -eq 2 -and -not $hasWebView2) {
         throw 'the installer stopped before installing anything (code 2), because the WebView2 Runtime it needs could not be downloaded or installed. Install the WebView2 Runtime from Microsoft, then run the line again.'
       }
       throw "the installer exited with code $($proc.ExitCode)"
     }
+    # The installer reuses a folder an earlier install chose, so look again.
+    $dir = Resolve-InstallDir
+    $app = Join-Path $dir 'slopbar.exe'
+    $door = Join-Path $dir 'slopbar-mcp.exe'
     if (-not (Test-Path -LiteralPath $app) -or -not (Test-Path -LiteralPath $door)) { throw "the installer finished, but $app or $door is missing" }
 
     $step = 'start SlopBar Ultra'
-    if (-not (Get-Process -Name slopbar -ErrorAction SilentlyContinue)) { Start-Process -FilePath $app }
+    Start-App
     $info = Wait-Door 120
     if (-not $info) { throw 'SlopBar Ultra did not answer through slopbar-mcp.exe within 120 seconds' }
 
     $step = 'check what runs'
     if ([string]$info.version -ne $version) { throw "it reports $($info.version), not $version" }
     if ($mcpSha -and [string]$info.mcp.sha256 -ne $mcpSha) { throw "slopbar-mcp.exe's SHA-256 is $($info.mcp.sha256), not $mcpSha from the release notes" }
+    if (-not $mcpSha) { Say 'The release notes give no SHA-256 for slopbar-mcp.exe, so that check was skipped.' }
 
     $step = 'turn on updates and Launch at login'
     $state = Set-Defaults
-    Write-Outcome $true "SlopBar Ultra $version is installed and running on $env:COMPUTERNAME. $state"
     Say 'Next: open SlopBar Ultra from the tray and sign in to your accounts.'
+    Write-Outcome $true "SlopBar Ultra $version is installed and running on $env:COMPUTERNAME. $state"
   } catch {
     $message = $_.Exception.Message
     # Windows PowerShell 5.1 keeps GitHub's own words (such as its rate limit) out of the message.
