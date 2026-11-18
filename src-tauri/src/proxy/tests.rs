@@ -313,6 +313,166 @@ async fn a_refused_proxy_fails_the_request_with_its_reason_and_nothing_goes_dire
     assert_eq!(target.count(), 1);
 }
 
+/// Windows whose answer for every link changes when told to, as it does when a VPN comes up or a
+/// setting changes: a proxy script is set, and answers what the test put here last.
+struct Changing(Mutex<Result<Vec<Entry>, Failure>>);
+
+impl Windows for Changing {
+    fn settings(&self) -> Result<Option<Settings>, Refusal> {
+        Ok(set(false, Some(SCRIPT_SET), false))
+    }
+
+    fn automatic(&self, _: &str, _: bool, _: Option<&str>, _: Instant) -> Result<Vec<Entry>, Failure> {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn manual(&self, _: &str, _: Instant) -> Result<Vec<Entry>, Failure> {
+        unreachable!("no manual proxy is set")
+    }
+
+    fn detection_off(&self) -> bool {
+        false
+    }
+}
+
+/// An HTTPS server on this computer for `api.example.test` that answers every request on a
+/// connection and keeps the connection open, as the providers' servers do, so that a client can
+/// send its next request on it. Notes each request's path.
+struct KeepsOpen {
+    addr: std::net::SocketAddr,
+    asked: Arc<Mutex<Vec<String>>>,
+}
+
+impl KeepsOpen {
+    fn start(authority: &crate::test_tls::Authority) -> KeepsOpen {
+        let (cert, key) = authority.issue_for("api.example.test");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions().unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], rustls::pki_types::PrivateKeyDer::Pkcs8(key)).unwrap();
+        let config = Arc::new(config);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let noted = asked.clone();
+        std::thread::spawn(move || {
+            for socket in listener.incoming().map_while(Result::ok) {
+                let (config, noted) = (config.clone(), noted.clone());
+                std::thread::spawn(move || {
+                    let _ = socket.set_read_timeout(Some(Duration::from_secs(10)));
+                    let Ok(connection) = rustls::ServerConnection::new(config) else { return };
+                    let mut stream = rustls::StreamOwned::new(connection, socket);
+                    loop {
+                        let mut head = Vec::new();
+                        let mut byte = [0u8; 1];
+                        while !head.ends_with(b"\r\n\r\n") {
+                            match stream.read(&mut byte) {
+                                Ok(1) if head.len() < 16 * 1024 => head.push(byte[0]),
+                                _ => return,
+                            }
+                        }
+                        let path = String::from_utf8_lossy(&head).split_whitespace().nth(1).unwrap_or_default().to_string();
+                        noted.lock().unwrap().push(path);
+                        if stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").and_then(|_| stream.flush()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        KeepsOpen { addr, asked }
+    }
+
+    fn asked(&self) -> Vec<String> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+/// `KeepsOpen` answers a second request on the same connection. If it did not, the test below would
+/// pass on code that keeps connections for later requests too.
+#[test]
+fn the_target_keeps_its_connections_open() {
+    let authority = crate::test_tls::Authority::new();
+    let server = KeepsOpen::start(&authority);
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(authority.root.clone()).unwrap();
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions().unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from("api.example.test").unwrap();
+    let socket = std::net::TcpStream::connect(server.addr).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut stream = rustls::StreamOwned::new(rustls::ClientConnection::new(Arc::new(config), name).unwrap(), socket);
+    for path in ["/one", "/two"] {
+        stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: api.example.test\r\n\r\n").as_bytes()).unwrap();
+        let mut answer = Vec::new();
+        let mut buf = [0u8; 256];
+        while !answer.ends_with(b"\r\n\r\nok") {
+            let n = stream.read(&mut buf).unwrap();
+            assert!(n > 0, "{path}: the connection was closed");
+            answer.extend_from_slice(&buf[..n]);
+        }
+    }
+    assert_eq!(server.asked(), ["/one", "/two"]);
+}
+
+/// A connection is never used past the route it was opened for: no request starts on a connection
+/// opened for an earlier route. reqwest picks a connection's route only when it opens it, so one it
+/// kept for the next request to the same host would go on going direct after Windows names a proxy
+/// (a VPN coming up, a setting changed) or refuses, for as long as requests kept coming.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_is_never_used_past_its_route() {
+    let fake_proxy = FakeProxy::start();
+    let changed = tokio::join!(
+        after_the_route_changes(Ok(vec![proxy(1, "127.0.0.1", fake_proxy.port)]), Why::ProxyRefused),
+        after_the_route_changes(Err(Failure::Os(12167)), Why::ProxyScript),
+    );
+    assert_eq!(changed, (Ok(()), Ok(())));
+    let lines = fake_proxy.lines();
+    assert!(lines.contains(&"CONNECT api.example.test:443 HTTP/1.1".to_string()), "the proxy Windows names now was asked: {lines:?}");
+}
+
+/// Requests to one host on one client while Windows' answer changes from direct to `now`. The first
+/// goes direct, and those sent while that route is kept may go direct too. They come under a second
+/// apart, as a refresh's do, so a connection kept open never sits idle for long. The first request
+/// after that route has expired must fail for `why`, and never reach the host.
+async fn after_the_route_changes(now: Result<Vec<Entry>, Failure>, why: Why) -> Result<(), String> {
+    let authority = crate::test_tls::Authority::new();
+    let server = KeepsOpen::start(&authority);
+    let windows = Arc::new(Changing(Mutex::new(Ok(vec![direct()]))));
+    let router = Arc::new(Router::with_env(windows.clone(), env_of(&[])));
+    let client = crate::net::with_router(crate::net::builder().no_proxy().tls_certs_merge([authority.reqwest_root()]), router)
+        .resolve("api.example.test", server.addr)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let get = |path: &'static str| {
+        let client = &client;
+        // Read to the end, so that the connection is free for the next request.
+        async move { client.get(format!("https://api.example.test{path}")).send().await?.text().await }
+    };
+    assert_eq!(get("/first").await.unwrap(), "ok", "{why:?}");
+    *windows.0.lock().unwrap() = now;
+    let expired = Instant::now() + KEPT + Duration::from_millis(200);
+    while Instant::now() + Duration::from_secs(1) < expired {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let _ = get("/meanwhile").await;
+    }
+    tokio::time::sleep(expired.saturating_duration_since(Instant::now())).await;
+    match get("/after").await {
+        Ok(_) => return Err(format!("{why:?}: the request went out on a connection opened for the route before")),
+        Err(failed) if crate::net::why(&failed) != why => return Err(format!("{why:?}: failed for {:?}", crate::net::why(&failed))),
+        Err(_) => {}
+    }
+    let asked = server.asked();
+    if asked.first().is_none_or(|p| p != "/first") || asked.iter().any(|p| p == "/after") {
+        return Err(format!("{why:?}: the host was asked {asked:?}"));
+    }
+    Ok(())
+}
+
 /// `Refusal::ALL` is every refusal: a refusal added to the enum does not compile here until it is
 /// matched, and then this fails until it is in ALL too, where `refusal_named` finds it.
 fn listed(refusal: Refusal) -> bool {
