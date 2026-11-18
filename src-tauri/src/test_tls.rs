@@ -1,5 +1,6 @@
 //! Test-only TLS: a throwaway certificate authority, made afresh in every run, and an HTTPS server
-//! on this machine with a certificate it issued for `localhost`. The authority cannot make other
+//! on this machine with a certificate it issued for `localhost` (`issue_for` issues one for another
+//! name, for a test's own server). The authority cannot make other
 //! authorities, and its key never leaves the test process: nothing can be issued with it later,
 //! not even from the root the CI step puts in a runner's store (`write_os_store_files`).
 
@@ -27,10 +28,15 @@ impl Authority {
 
     /// A server certificate for `localhost`, and its key.
     pub fn issue(&self) -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>) {
+        self.issue_for("localhost")
+    }
+
+    /// A server certificate for `name`, and its key.
+    pub fn issue_for(&self, name: &str) -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>) {
         use rcgen::{DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
         let key = rcgen::KeyPair::generate().unwrap();
-        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        params.distinguished_name.push(DnType::CommonName, "localhost");
+        let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        params.distinguished_name.push(DnType::CommonName, name);
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
