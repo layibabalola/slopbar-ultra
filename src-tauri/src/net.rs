@@ -466,10 +466,11 @@ mod tests {
         install_crypto();
         for (name, client) in [("builder", builder().build().unwrap()), ("windows_proxy", windows_proxy(reqwest::Client::builder()).build().unwrap())] {
             let (port, connections) = keeps_open();
-            for _ in 0..2 {
-                let answer = client.get(format!("http://127.0.0.1:{port}/")).send().await.unwrap();
-                assert_eq!(answer.text().await.unwrap(), "ok", "{name}");
-            }
+            let get = || async { client.get(format!("http://127.0.0.1:{port}/")).send().await.unwrap().text().await.unwrap() };
+            assert_eq!(get().await, "ok", "{name}");
+            // Long enough for a connection kept for later requests to be back where they look first.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(get().await, "ok", "{name}");
             assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2, "{name}");
         }
     }
@@ -540,16 +541,17 @@ mod tests {
                     let code = crate::source_guard::tokens(&std::fs::read_to_string(&path).unwrap());
                     // Nor may a client replace the proxy rules or the resolver that refuses a proxy
                     // SlopBar cannot use (`windows_proxy`), connect some way that never asks them
-                    // (a connector layer, a named pipe or socket, a local address of its own), keep a
-                    // connection for later requests, which would outlive the route it was opened with
-                    // (`with_router`), or trust something Windows does not. The builder's own names,
-                    // since a call by path (`ClientBuilder::…`) or with a turbofish slips past `.name(`.
-                    for needle in ["Client::new(", "Client::builder(", "ClientBuilder::new(", "Client::default(", "ClientBuilder::default(",
-                        "reqwest::get(", ".build().unwrap_or_default()", "reqwest::Client as", "ClientBuilder as", "Client as Default",
-                        "ClientBuilder::", "Client>::", "ClientBuilder>::", "Proxy::custom(", "Proxy::all(", "dns_resolver",
-                        "connector_layer", "windows_named_pipe", "unix_socket", "local_address", "pool_max_idle_per_host",
-                        "pool_idle_timeout", "danger_accept_invalid", "tls_certs_only", "add_root_certificate", "use_preconfigured_tls",
-                        "tls_backend_preconfigured", "tls_sni", "tls_sslkeylogfile"] {
+                    // (a connector layer, a named pipe or socket), leave by an address of its own
+                    // (around a VPN's routes), keep a connection for later requests, which would
+                    // outlive the route it was opened with (`with_router`), or trust something
+                    // Windows does not. Names, not calls: a call by path, with a turbofish, through a
+                    // function pointer or a grouped import would slip past `name(`.
+                    for needle in ["Client::new", "Client::builder", "Client::default", "ClientBuilder::", "Client>::", "ClientBuilder>::",
+                        "reqwest::get", "reqwest::{", ".build().unwrap_or_default()", "reqwest::Client as", "ClientBuilder as",
+                        "Client as Default", "Proxy::custom", "Proxy::all", "dns_resolver", "connector_layer", "windows_named_pipe",
+                        "unix_socket", "local_address", "pool_max_idle_per_host", "pool_idle_timeout", "danger_accept_invalid",
+                        "tls_certs_only", "add_root_certificate", "use_preconfigured_tls", "tls_backend_preconfigured", "tls_sni",
+                        "tls_sslkeylogfile"] {
                         if code.contains(needle) {
                             found.push(format!("{}: {needle}", path.display()));
                         }
