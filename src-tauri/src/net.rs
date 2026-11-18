@@ -5,8 +5,9 @@
 //! that inspects HTTPS with a company certificate installed in Windows works, while a certificate
 //! Windows refuses is refused here too. Each request goes through the proxy Windows would use for
 //! it (`proxy`: the HTTPS_PROXY/NO_PROXY variables first, then this user's proxy settings, proxy
-//! scripts and detection included). Nothing here skips a check or goes around a proxy: a network
-//! that blocks a request still blocks it, a proxy SlopBar cannot use stops it, and [`why`] says how.
+//! scripts and detection included), on a connection of its own. Nothing here skips a check or goes
+//! around a proxy: a network that blocks a request still blocks it, a proxy SlopBar cannot use
+//! stops it, and [`why`] says how.
 
 /// The cryptography every client uses: ring, which the updater installs the same way when it
 /// checks first. Clients cannot be built without it.
@@ -36,11 +37,17 @@ pub fn windows_proxy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder 
     with_router(builder, crate::proxy::system().clone())
 }
 
-/// `windows_proxy` with these routes.
+/// `windows_proxy` with these routes. Every request opens a connection of its own: reqwest picks a
+/// connection's route only when it opens the connection, and keeps idle connections by destination
+/// (scheme, host and port), never by route, so one kept for the next request to the same host would
+/// go on going where its route said, direct included, after Windows names a proxy (a VPN coming up,
+/// a setting changed) or refuses, for as long as requests kept coming. Closing idle ones sooner
+/// (`pool_idle_timeout`) leaves one that is never idle for long.
 pub(crate) fn with_router(builder: reqwest::ClientBuilder, router: std::sync::Arc<crate::proxy::Router>) -> reqwest::ClientBuilder {
     builder
         .proxy(reqwest::Proxy::custom(move |url| router.proxy_for(url)))
         .dns_resolver(crate::proxy::Resolver)
+        .pool_max_idle_per_host(0)
 }
 
 /// Why a request failed, in words a person can act on. Never carries a link, a header or a
@@ -417,6 +424,56 @@ mod tests {
         assert_eq!(failure(&client, &format!("https://127.0.0.1:{closed}/x")).await, Why::Refused);
     }
 
+    /// A server on this machine that answers every request on a connection and keeps the
+    /// connection open for the next one; counts the connections it gets.
+    fn keeps_open() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = connections.clone();
+        std::thread::spawn(move || {
+            for mut socket in listener.incoming().map_while(Result::ok) {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                    loop {
+                        let mut head = Vec::new();
+                        let mut byte = [0u8; 1];
+                        while !head.ends_with(b"\r\n\r\n") {
+                            match socket.read(&mut byte) {
+                                Ok(1) if head.len() < 16 * 1024 => head.push(byte[0]),
+                                _ => return,
+                            }
+                        }
+                        if socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, connections)
+    }
+
+    /// Every request opens a connection of its own, so that each asks for its route
+    /// (`with_router`; `proxy::tests::a_connection_is_never_used_past_its_route` shows why): from
+    /// `builder`, as SlopBar's own clients are made, and from `windows_proxy`, as the updater's is.
+    /// A server that keeps its connections open would otherwise get the second request on the
+    /// first one's connection.
+    #[tokio::test]
+    async fn every_request_opens_a_connection_of_its_own() {
+        install_crypto();
+        for (name, client) in [("builder", builder().build().unwrap()), ("windows_proxy", windows_proxy(reqwest::Client::builder()).build().unwrap())] {
+            let (port, connections) = keeps_open();
+            for _ in 0..2 {
+                let answer = client.get(format!("http://127.0.0.1:{port}/")).send().await.unwrap();
+                assert_eq!(answer.text().await.unwrap(), "ok", "{name}");
+            }
+            assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2, "{name}");
+        }
+    }
+
     /// The CI step's proof (`.github/workflows/tests.yml`): SlopBar's own clients decide what to
     /// trust as Windows does. The step makes a throwaway authority (`test_tls`), and then, on a
     /// disposable runner only, runs this with SLOPBAR_TEST_OS_STORE_EXPECT saying what Windows'
@@ -482,10 +539,17 @@ mod tests {
                 } else if path.extension().is_some_and(|e| e == "rs") && path.file_name().is_some_and(|n| n != "net.rs") {
                     let code = crate::source_guard::tokens(&std::fs::read_to_string(&path).unwrap());
                     // Nor may a client replace the proxy rules or the resolver that refuses a proxy
-                    // SlopBar cannot use (`windows_proxy`).
+                    // SlopBar cannot use (`windows_proxy`), connect some way that never asks them
+                    // (a connector layer, a named pipe or socket, a local address of its own), keep a
+                    // connection for later requests, which would outlive the route it was opened with
+                    // (`with_router`), or trust something Windows does not. The builder's own names,
+                    // since a call by path (`ClientBuilder::…`) or with a turbofish slips past `.name(`.
                     for needle in ["Client::new(", "Client::builder(", "ClientBuilder::new(", "Client::default(", "ClientBuilder::default(",
                         "reqwest::get(", ".build().unwrap_or_default()", "reqwest::Client as", "ClientBuilder as", "Client as Default",
-                        ".dns_resolver(", "Proxy::custom(", "Proxy::all(", ".danger_accept_invalid"] {
+                        "ClientBuilder::", "Client>::", "ClientBuilder>::", "Proxy::custom(", "Proxy::all(", "dns_resolver",
+                        "connector_layer", "windows_named_pipe", "unix_socket", "local_address", "pool_max_idle_per_host",
+                        "pool_idle_timeout", "danger_accept_invalid", "tls_certs_only", "add_root_certificate", "use_preconfigured_tls",
+                        "tls_backend_preconfigured", "tls_sni", "tls_sslkeylogfile"] {
                         if code.contains(needle) {
                             found.push(format!("{}: {needle}", path.display()));
                         }
@@ -500,9 +564,10 @@ mod tests {
 
     /// Outside its tests, nothing sets a proxy of its own, looks names up its own way, goes
     /// direct, or routes by routes of its own (only proxy.rs makes a `Router`: this user's): each
-    /// would be a way around the proxy Windows names. The exceptions: phone.rs reaches a server on
-    /// this computer or its local network directly, on purpose; test_support.rs, which only tests
-    /// compile, makes tests' own routes.
+    /// would be a way around the proxy Windows names. Nor does it trust certificates of its own,
+    /// which tests' servers need. The exceptions: phone.rs reaches a server on this computer or its
+    /// local network directly, on purpose; test_support.rs, which only tests compile, makes tests'
+    /// own routes.
     #[test]
     fn nothing_goes_around_the_proxy() {
         fn walk(dir: &std::path::Path, found: &mut Vec<String>) {
@@ -515,7 +580,8 @@ mod tests {
                     let code = crate::source_guard::tokens(&std::fs::read_to_string(&path).unwrap());
                     // Only the code before the file's own tests.
                     let code = code.split("#[cfg(test)]mod tests").next().unwrap_or_default();
-                    for needle in [".no_proxy(", ".proxy(", ".resolve(", ".resolve_to_addrs(", "with_router(", "Router::with_env(", "Router::new("] {
+                    for needle in [".no_proxy(", ".proxy(", ".resolve(", "resolve_to_addrs", "tls_certs_merge", "with_router(", "Router::with_env(",
+                        "Router::new("] {
                         let allowed = (needle == ".no_proxy(" && name == "phone.rs")
                             || (needle.starts_with("Router::") && name == "proxy.rs")
                             || (needle == "Router::with_env(" && name == "test_support.rs");
