@@ -520,6 +520,14 @@ async fn open_billing_page(provider: Provider) -> Result<(), String> {
         .await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
 }
 
+/// Opens Claude's usage page in the browser (`subscriptions::CLAUDE_USAGE_PAGE`): a fixed address, so the
+/// window chooses nothing. It shows the banked resets of whichever account the browser is signed in to.
+#[tauri::command]
+async fn open_claude_usage_page() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| std::process::Command::new("explorer.exe").arg(subscriptions::CLAUDE_USAGE_PAGE).spawn().map(|_| ()))
+        .await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
+}
+
 /// Writes a diagnostics export; shared by Settings and the agents' door.
 async fn write_export(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     let state = app.state::<AppState>();
@@ -4792,6 +4800,7 @@ pub fn run() {
             check_calendar_path,
             default_calendar_path,
             open_billing_page,
+            open_claude_usage_page,
             export_diagnostics,
             record_frontend_error,
             refresh,
