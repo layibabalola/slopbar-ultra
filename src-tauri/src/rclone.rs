@@ -132,9 +132,11 @@ pub fn apply_env(cmd: &mut std::process::Command, env: Vec<(&'static str, Option
 impl Runner for Cli {
     fn run(&self, args: &[&str], input: Option<&[u8]>) -> std::io::Result<Ran> {
         let ran = self.run_once(args, input);
-        // A command that failed may have gone through the proxy of a cloud the remote no longer is
-        // (pointed elsewhere since): its kind is looked up again for the next one.
-        if let Some(remote) = &self.remote {
+        // A listing, upload or deletion that failed may have gone through the proxy of a cloud the
+        // remote no longer is (pointed elsewhere since): its kind is looked up again for the next
+        // one. Not for a download: it follows a listing that worked through the same proxy.
+        let first = args.first().is_some_and(|verb| matches!(*verb, "lsjson" | "rcat" | "deletefile"));
+        if let (Some(remote), true) = (&self.remote, first) {
             if !ran.as_ref().is_ok_and(|r| matches!(r.code, Some(0) | Some(DIR_NOT_FOUND) | Some(FILE_NOT_FOUND))) {
                 forget_kind(remote);
             }
@@ -380,15 +382,16 @@ impl<R: Runner> Rclone<R> {
     }
 
     /// `files`, with the names listed whose download failed, and, with `hashes` on a remote whose
-    /// listing carries content hashes at no cost (`cloud(kind).known`: Dropbox, Google Drive,
-    /// OneDrive, Box), each file's hash as listed. A file listed with a hash is handed to `known`
-    /// with its size and modification time first: the bytes it gives back stand in for that file's
-    /// `cat`, one rclone process fewer. Without a hash every file is downloaded.
+    /// listing carries a content hash this computer can check at no cost (`HASHED_KINDS`: Dropbox,
+    /// Google Drive), each file's hash. A file listed with one goes to `known` first, with its name
+    /// and size: the bytes it gives back stand in for that file's `cat`, one rclone process fewer.
+    /// A file downloaded keeps its listed hash only when its bytes have it (the file can change
+    /// between the listing and the download). Without a hash every file is downloaded.
     pub fn files_listed(&self, dir: &str, ext: &str, max: u64, hashes: bool, known: Known) -> std::io::Result<Listed> {
         let path = format!("{}:{dir}", self.remote);
         // `--hash` makes a remote that cannot list hashes compute them, reading every file (a local
-        // or SFTP remote): asked only of the clouds whose listing already holds them.
-        let hashes = hashes && self.runner.kind().is_some_and(|kind| cloud(&kind).known);
+        // or SFTP remote): asked only of the clouds whose listing already holds one that counts.
+        let hashes = hashes && self.runner.kind().is_some_and(|kind| HASHED_KINDS.contains(&kind.as_str()));
         let mut args = vec!["lsjson", "--files-only", "--no-mimetype"];
         if hashes {
             args.push("--hash");
@@ -405,12 +408,15 @@ impl<R: Runner> Rclone<R> {
         let suffix = format!(".{ext}");
         let mut listed = Listed::default();
         for e in entries.into_iter().filter(|e| !e.is_dir && e.name.ends_with(&suffix) && (0..=max as i64).contains(&e.size) && !e.name.contains('/')) {
-            let hash = hashes.then(|| e.hash()).flatten();
+            let mut hash = hashes.then(|| e.hash()).flatten();
             let kept = hash.as_deref().and_then(|h| known(&e.name, e.size as u64, h));
             let bytes = match kept {
                 Some(bytes) => bytes,
                 None => match self.run(&["cat", &self.path_in(dir, &e.name)], None) {
-                    Ok(ran) => ran.stdout,
+                    Ok(ran) => {
+                        hash = hash.filter(|h| holds(h, &ran.stdout));
+                        ran.stdout
+                    }
                     Err(_) => {
                         listed.unread.push(e.name);
                         continue;
@@ -452,7 +458,8 @@ pub struct RemoteFile {
     pub name: String,
     pub bytes: Vec<u8>,
     pub modified: Option<DateTime<Utc>>,
-    /// Its content hashes as the listing gave them (`kind:value`, comma-separated), when asked for.
+    /// Its keyed content hashes as the listing gave them (`kind:value`, comma-separated), when they
+    /// were asked for and the bytes have them.
     pub hash: Option<String>,
 }
 
@@ -479,17 +486,44 @@ struct Entry {
     hashes: std::collections::BTreeMap<String, String>,
 }
 
-/// The hash kinds a file is known by: ones nobody can match with other bytes of the same size.
-/// OneDrive's quickxor (all OneDrive Business lists) is not one: whoever can write to the folder
-/// could make other bytes list as a kept file, and the reader would keep the copy it has.
-const STRONG_HASHES: [&str; 7] = ["blake3", "dropbox", "md5", "sha1", "sha256", "sha512", "whirlpool"];
+/// The remotes asked for hashes (`--hash`): clouds whose listing carries one of `KEYED_HASHES` at
+/// no cost. OneDrive lists only a quickxor and Box only a SHA-1, so they download every file.
+const HASHED_KINDS: [&str; 2] = ["dropbox", "drive"];
+
+/// The hash kinds a file is known by: ones nobody can match with other bytes (unlike OneDrive's
+/// quickxor, which whoever can write the folder could), and that this computer checks against the
+/// bytes it downloads (`holds`), so a hash listed before the file changed never stands for bytes
+/// read after.
+const KEYED_HASHES: [&str; 3] = ["dropbox", "sha256", "sha512"];
 
 impl Entry {
-    /// Its strong hashes as one string, in kind order; none when the listing gave none.
+    /// Its keyed hashes as one string, in kind order; none when the listing gave none.
     fn hash(&self) -> Option<String> {
-        let all: Vec<String> = self.hashes.iter().filter(|(k, v)| STRONG_HASHES.contains(&k.as_str()) && !v.is_empty()).map(|(k, v)| format!("{k}:{v}")).collect();
+        let all: Vec<String> = self.hashes.iter().filter(|(k, v)| KEYED_HASHES.contains(&k.as_str()) && !v.is_empty()).map(|(k, v)| format!("{k}:{v}")).collect();
         (!all.is_empty()).then(|| all.join(","))
     }
+}
+
+/// Whether `bytes` have every hash in `hash` (as `Entry::hash` writes them).
+fn holds(hash: &str, bytes: &[u8]) -> bool {
+    use sha2::{Digest, Sha256, Sha512};
+    let hex = |digest: &[u8]| digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    hash.split(',').all(|pair| match pair.split_once(':') {
+        Some(("dropbox", v)) => v.eq_ignore_ascii_case(&hex(&dropbox_hash(bytes))),
+        Some(("sha256", v)) => v.eq_ignore_ascii_case(&hex(&Sha256::digest(bytes))),
+        Some(("sha512", v)) => v.eq_ignore_ascii_case(&hex(&Sha512::digest(bytes))),
+        _ => false,
+    })
+}
+
+/// Dropbox's content hash: the SHA-256 of the SHA-256s of each 4 MiB block, one after another.
+fn dropbox_hash(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut blocks = Sha256::new();
+    for block in bytes.chunks(4 * 1024 * 1024) {
+        blocks.update(Sha256::digest(block));
+    }
+    blocks.finalize().into()
 }
 
 impl<R: Runner> PresenceStore for Rclone<R> {
@@ -520,11 +554,12 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         files: Mutex<BTreeMap<String, Vec<u8>>>,
-        /// The remote's kind (`Runner::kind`): one of `cloud`'s known kinds lists content hashes
-        /// with `--hash` (a SHA-256 of the bytes, as Dropbox's is one of blocks of them; OneDrive's a
-        /// quickxor), except for the files in `hashless`.
+        /// The remote's kind (`Runner::kind`): with `--hash`, Dropbox lists its block hash and Drive
+        /// MD5, SHA-1 and SHA-256, as theirs do, except for the files in `hashless`, and for those in
+        /// `stale` the hash of other bytes (the file changed between the listing and the download).
         kind: Option<String>,
         hashless: Mutex<Vec<String>>,
+        stale: Mutex<Vec<String>>,
         /// Each upload's modification time, in seconds after a fixed time: every upload takes the
         /// next second of `clock` (set it back for two uploads in one second). A file put in `files`
         /// by hand lists at the fixed time.
@@ -567,9 +602,13 @@ mod tests {
                             let mut entry = serde_json::json!({ "Path": n, "Name": n, "Size": v.len(), "ModTime": at, "IsDir": false });
                             if hashes {
                                 use sha2::{Digest, Sha256};
-                                let hash: String = Sha256::digest(v).iter().map(|b| format!("{b:02x}")).collect();
-                                let kind = if self.kind.as_deref() == Some("onedrive") { "quickxor" } else { "dropbox" };
-                                entry["Hashes"] = if hashless.contains(k) { serde_json::json!({}) } else { serde_json::json!({ kind: hash }) };
+                                let hex = |d: &[u8]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                                let bytes: &[u8] = if self.stale.lock().unwrap().contains(k) { b"other bytes" } else { v };
+                                entry["Hashes"] = match (hashless.contains(k), self.kind.as_deref()) {
+                                    (true, _) => serde_json::json!({}),
+                                    (_, Some("drive")) => serde_json::json!({ "md5": "synthetic-md5", "sha1": "synthetic-sha1", "sha256": hex(&Sha256::digest(bytes)) }),
+                                    _ => serde_json::json!({ "dropbox": hex(&Sha256::digest(Sha256::digest(bytes))) }),
+                                };
                             }
                             entry
                         }))
@@ -754,10 +793,20 @@ mod tests {
         store.runner.hashless.lock().unwrap().clear();
         assert_eq!(cats(&mut me, min(104), false, false), 1, "listed with a hash again: read once more (nothing was kept of it without one), then known");
         assert_eq!(cats(&mut me, min(114), false, false), 0);
-        // A remote whose listing carries no hashes (S3, WebDAV, SFTP, local: rclone would compute
-        // them by reading every file) is not asked for them, and every file is downloaded; nor does a
-        // weak hash (OneDrive's quickxor, which other bytes can be made to match) stand for a file.
-        for (kind, asked) in [("sftp", false), ("onedrive", true)] {
+        // A file whose listed hash its downloaded bytes do not have (it changed between the listing
+        // and the download) is kept under no hash: downloaded again at the next read.
+        store.runner.stale.lock().unwrap().push(idle_path.clone());
+        peer_writes(&store, &key, IDLE, "IDLE-PC", 26.0, at(min(115)), None);
+        assert_eq!(cats(&mut me, min(124), false, false), 1);
+        assert_eq!(cats(&mut me, min(134), false, false), 1, "its bytes never stood for that hash");
+        store.runner.stale.lock().unwrap().clear();
+        assert_eq!(cats(&mut me, min(144), false, false), 1);
+        assert_eq!(cats(&mut me, min(154), false, false), 0);
+        // Google Drive lists MD5, SHA-1 and SHA-256: known by its SHA-256. Remotes whose listing
+        // carries none this computer counts are not asked for hashes and download every file: those
+        // with none at all (S3, WebDAV, SFTP, local: rclone would compute them by reading every
+        // file), OneDrive (a quickxor, which other bytes can be made to match) and Box (a SHA-1).
+        for (kind, asked, downloads) in [("drive", true, 1 + 1), ("sftp", false, 1 + 2 + 2), ("onedrive", false, 1 + 2 + 2), ("box", false, 1 + 2 + 2)] {
             let plain = Rclone::with("cloud", Fake { kind: Some(kind.into()), ..Fake::default() });
             peer_writes(&plain, &key, IDLE, "IDLE-PC", 20.0, at(0), None);
             let mut other = Syncer::default();
@@ -766,8 +815,27 @@ mod tests {
             }
             let calls = plain.runner.calls.lock().unwrap().clone();
             assert!(calls.iter().filter(|c| c.starts_with("lsjson ")).all(|c| c.contains("--hash") == asked), "{kind}: {calls:?}");
-            assert_eq!(calls.iter().filter(|c| c.starts_with("cat ")).count(), 1 + 2 + 2, "{kind}: {calls:?}");
+            assert_eq!(calls.iter().filter(|c| c.starts_with("cat ")).count(), downloads, "{kind}: {calls:?}");
         }
+    }
+
+    /// The hashes the clouds list, checked against the bytes as they compute them: Dropbox's is the
+    /// SHA-256 of each 4 MiB block's SHA-256 (checked on a real roster: a file under 4 MiB lists
+    /// SHA-256(SHA-256(bytes))).
+    #[test]
+    fn listed_hashes_are_checked_against_the_bytes() {
+        use sha2::{Digest, Sha256};
+        let hex = |d: &[u8]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let small = b"synthetic roster bytes".to_vec();
+        assert!(holds(&format!("dropbox:{}", hex(&Sha256::digest(Sha256::digest(&small)))), &small));
+        assert!(holds(&format!("dropbox:{}", hex(&Sha256::digest(Sha256::digest(&small))).to_uppercase()), &small), "hex in either case");
+        let big = vec![7u8; 4 * 1024 * 1024 + 3];
+        let blocks: Vec<u8> = big.chunks(4 * 1024 * 1024).flat_map(|b| Sha256::digest(b).to_vec()).collect();
+        assert!(holds(&format!("dropbox:{}", hex(&Sha256::digest(&blocks))), &big));
+        assert!(holds(&format!("sha256:{}", hex(&Sha256::digest(&small))), &small));
+        assert!(!holds(&format!("sha256:{}", hex(&Sha256::digest(b"other"))), &small));
+        assert!(!holds(&format!("dropbox:{},sha256:{}", hex(&Sha256::digest(Sha256::digest(&small))), hex(&Sha256::digest(b"other"))), &small), "every hash must hold");
+        assert!(!holds("md5:whatever", &small), "a kind this computer does not check never holds");
     }
 
     /// This machine's own roster as the cloud has it: an older copy put back at the same size is
@@ -799,11 +867,34 @@ mod tests {
         assert_eq!(sync(&mut me, 60.0, 35, false), (1, 0), "found at the read");
         assert_eq!(sync(&mut me, 60.0, 40, false), (0, 1), "written again at the next sync");
         assert_eq!(me.seen.own_rewritten, 1);
-        // Its download breaks off: listed, so not gone; unread, so not changed. Nothing is written.
+        // Put back again at once: found without a download (its listed hash is that of the copy kept
+        // when it was found the first time), and written over once 15 minutes have passed since the
+        // last time. A read meanwhile whose download breaks off (another copy, listed so not gone,
+        // unread so not changed) leaves it due.
+        let watch = |me: &mut Syncer, m: i64| {
+            let from = store.runner.count();
+            me.sync(&store, &passphrase, (ME, "DESK-1"), &[read_at("synthetic-a:org", 60.0, at(m))], at(m), false, true);
+            (store.runner.ran(from, "cat"), store.runner.ran(from, "rcat"))
+        };
+        store.runner.files.lock().unwrap().insert(own_path.clone(), old.clone());
+        assert_eq!(watch(&mut me, 45), (0, 0), "found, from the copy kept");
+        let key = crate::backup::SealKey::new(&passphrase).unwrap();
+        let theirs = crate::roster::seal(&crate::roster::own(ME, "DESK-1-COPY", &[account("synthetic-a:org")], at(46)), &key).unwrap();
+        store.runner.files.lock().unwrap().insert(own_path.clone(), theirs);
         store.runner.unreadable.lock().unwrap().push(own_path.clone());
-        assert_eq!(sync(&mut me, 60.0, 41, true).0, 1, "a forced read downloads everything");
-        assert_eq!(sync(&mut me, 60.0, 46, false), (0, 0));
-        assert_eq!(me.seen.own_rewritten, 1);
+        assert_eq!(watch(&mut me, 50), (1, 0), "unread: still due, and not yet");
+        assert_eq!(watch(&mut me, 55), (1, 1), "written over 15 minutes after the last time");
+        assert_eq!(me.seen.own_rewritten, 2);
+        // Its download keeps breaking off: nothing more is written, read after read, though the next
+        // wait (an hour) passes; a forced read writes, as every forced sync does, and downloads all.
+        for m in [60, 70, 80] {
+            assert_eq!(watch(&mut me, m), (1, 0), "{m}");
+        }
+        assert_eq!(sync(&mut me, 60.0, 81, true), (1, 1));
+        for m in [91, 101, 111, 121] {
+            assert_eq!(sync(&mut me, 60.0, m, false), (1, 0), "{m}");
+        }
+        assert_eq!(me.seen.own_rewritten, 2);
     }
 
     /// rclone processes one machine's roster syncs start in an hour, by command, beside two other
@@ -917,10 +1008,13 @@ mod tests {
         assert_eq!(kept_kind(remote, minutes(29), look("drive")).as_deref(), Some("dropbox"));
         assert_eq!(looked.get(), 1, "kept: no listremotes");
         assert_eq!(kept_kind(remote, minutes(31), look("drive")).as_deref(), Some("drive"));
-        // A command on the remote that fails (here rclone is missing) forgets it.
+        // A listing on the remote that fails (here rclone is missing) forgets it; a download that
+        // fails does not (it follows a listing that worked).
         let dir = crate::test_support::TempDir::new();
         let missing = dir.0.join(if cfg!(windows) { "rclone.exe" } else { "rclone" });
         let cli = Cli::routed(missing, remote, crate::test_support::router(None, &[]));
+        assert!(cli.run(&["cat", "kept-kind-test:SlopBar/roster/x.roster"], None).is_err());
+        assert_eq!(kept_kind(remote, minutes(31) + Duration::from_secs(30), look("box")).as_deref(), Some("drive"));
         assert!(cli.run(&["lsjson", "--files-only", "--no-mimetype", "kept-kind-test:SlopBar/roster"], None).is_err());
         assert_eq!(kept_kind(remote, minutes(32), look("onedrive")).as_deref(), Some("onedrive"));
         assert_eq!(looked.get(), 3);

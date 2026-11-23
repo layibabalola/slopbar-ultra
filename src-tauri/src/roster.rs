@@ -30,13 +30,14 @@
 //! changed (coalesced, see `READINGS_GAP_MINUTES`) or to re-date them now and then.
 //!
 //! Each machine reads its own roster back with the others. When the copy there is not the one it
-//! last wrote (a sync service put back an older version, something else wrote over it, or it is
-//! gone), it is written again at the next sync (`RESTORE_GAP_MINUTES`), so a restored file cannot
-//! keep old readings or an old run in front of the other machines.
+//! last wrote (a sync service put back an older version, something else wrote over it, it is
+//! damaged, or it is gone), it is written again at the next sync, and less often while that keeps
+//! happening (`RESTORE_WAITS_MINUTES`), so a restored file cannot keep old readings or an old run
+//! in front of the other machines.
 //!
-//! Over rclone each file read is a process: at the slow pace (`READ_EVERY_MINUTES`) a roster whose
-//! name, size and modification time are as the last read found them is not downloaded again
-//! (`RosterStore::list_known`).
+//! Over rclone each file read is a process: a roster the cloud lists with the content hash of the
+//! copy the last read kept (Dropbox, Google Drive) is not downloaded again, at any pace but a
+//! forced read (`RosterStore::listing`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -413,8 +414,13 @@ impl Folder {
 }
 
 impl RosterStore for Folder {
-    /// Every file is read: a folder lists no hashes, and a read costs no process.
+    /// Every file is read: a folder lists no hashes, and a read costs no process. The sharing folder
+    /// itself missing (a cloud drive's letter while its app restarts) is a failed read, not an empty
+    /// one: this machine's roster is not gone from it.
     fn listing(&self, _: Known) -> std::io::Result<Listed> {
+        if !self.0.is_dir() {
+            return Err(std::io::Error::other("sharing folder missing"));
+        }
         let entries = match std::fs::read_dir(self.dir()) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Listed::default()),
@@ -558,9 +564,12 @@ pub struct Seen {
     pub unsupported: usize,
     /// How many times this machine's roster was found not as it last wrote it, or gone, and was
     /// written again (`Syncer::restore`), since the roster sync last started afresh (SlopBar started,
-    /// or the passphrase or sharing location changed). One that keeps rising means something else
-    /// writes this machine's file: Health says so from `OWN_REWRITTEN_WARN`.
+    /// or the passphrase or sharing location changed).
     pub own_rewritten: usize,
+    /// How many of those tries came one after another, each within `RESTORE_CALM_HOURS` of the one
+    /// before, up to now: from `OWN_REWRITTEN_WARN` something keeps writing this machine's file, and
+    /// Health says so. A calm day brings it back to none.
+    pub own_restores: usize,
 }
 
 impl Seen {
@@ -603,9 +612,10 @@ pub struct Syncer {
     pub withhold_readings: bool,
     /// Whether the last sync withheld readings: the first sync that does tries at once.
     withheld: bool,
-    /// The rosters the last read used (this machine's and the other machines' own files) that were
-    /// listed with a content hash: by name, that hash and the bytes read. At the slow pace a file
-    /// listed again with the same hash and size is not downloaded again (`RosterStore::listing`).
+    /// The rosters the last read used (this machine's and the other machines' own files) whose bytes
+    /// have the content hash they were listed with: by name, that hash and the bytes. A file listed
+    /// again with the same hash and size is not downloaded again, at any pace but a forced read
+    /// (`RosterStore::listing`).
     files: HashMap<String, (String, Vec<u8>)>,
     /// The SHA-256 of the sealed roster this run last wrote: what its own file must read back as.
     written_hash: Option<[u8; 32]>,
@@ -761,6 +771,10 @@ impl Syncer {
                 }
             }
         }
+        self.seen.own_restores = match self.restore_tried {
+            Some(t) if now - t < Duration::hours(RESTORE_CALM_HOURS) => self.restores,
+            _ => 0,
+        };
         // A machine sent a Retry stays live until its run changes or the wait runs out.
         let peers = &self.seen.peers;
         self.expecting.retain(|id, (until, at)| {
@@ -844,6 +858,9 @@ impl Syncer {
             }
             let roster = match open(&bytes, passphrase, &mut self.keys) {
                 Ok(r) => r,
+                // This machine's own file not opening is no other machine's passphrase (Health would
+                // say so): it is not one this run wrote, so it is written again.
+                Err(_) if mine => continue,
                 Err(OpenError::WrongOrDamaged) => { unreadable += 1; continue; }
                 Err(_) => { unsupported += 1; continue; }
             };
@@ -927,8 +944,8 @@ impl Syncer {
     }
 }
 
-/// From this many rewrites of this machine's roster found not as written (`Seen::own_rewritten`),
-/// Health says something else writes it.
+/// From this many rewrites in a row of this machine's roster found not as written
+/// (`Seen::own_restores`), Health says something else writes it.
 pub const OWN_REWRITTEN_WARN: usize = 3;
 
 /// A run going on whose machine has not rewritten its roster for this long has gone quiet (its
@@ -1919,6 +1936,16 @@ mod tests {
         // machine's file: under its name, a roster saying it is another machine's is nobody's.
         let claimed = seal(&own(&format!("{MACHINE_A}Z"), "DESK-A", &[account("claude", "cl-one")], at(1)), &key).unwrap();
         assert_eq!(fresh(&|file| std::fs::write(file, &claimed).unwrap()), rewritten, "another machine's under this one's name");
+        // Sealed with another passphrase: put back too, and not counted among the rosters another
+        // passphrase sealed (Health would blame the passphrase, not what writes this file).
+        let other = seal(&own(MACHINE_A, "DESK-A", &[account("claude", "cl-one")], at(1)), &SealKey::new(&pass("synthetic other passphrase")).unwrap()).unwrap();
+        assert_eq!(fresh(&|file| std::fs::write(file, &other).unwrap()), rewritten, "another passphrase's");
+        let dir = TempDir::new();
+        let mut c = Syncer::default();
+        c.sync(&Folder(dir.0.clone()), &p, (MACHINE_A, "DESK-A"), &read(10.0, 0), at(0), false, false);
+        std::fs::write(roster_file(&dir, MACHINE_A), &other).unwrap();
+        c.sync(&Folder(dir.0.clone()), &p, (MACHINE_A, "DESK-A"), &read(10.0, 0), at(10), false, false);
+        assert_eq!((c.seen.unreadable, c.seen.own_accounts), (0, None));
         // Listed but not read (a sync app holds it): nothing is written.
         #[cfg(windows)]
         {
@@ -1979,21 +2006,37 @@ mod tests {
         // Found by the read at 15 s: written at 30 s, then after 15 minutes, an hour, 6 hours.
         assert_eq!(rewrites, [30, 30 + 900, 30 + 900 + 3600, 30 + 900 + 3600 + 6 * 3600]);
         assert_eq!(writes(), 1 + rewrites.len(), "nothing but the first write and the rewrites");
-        // It stops, and B's run ends: a day later, an older copy put back once is written over at the
-        // next sync after the read that finds it, as the first time.
+        assert_eq!(a.seen.own_restores, 4, "four in a row: Health says something else writes it");
+        // It stops (its copy, last put there, is written over 6 hours after the last time), and B's
+        // run ends. A day after that last rewrite, the waits start over: a fight that starts again
+        // is written over at once, then after 15 minutes, not 6 hours.
         let mut ended = own(MACHINE_B, "LAPTOP-B", &one, at(8 * 3600));
         ended.run = Some(Run { at: at(8 * 3600), ..run(2, true, "done") });
         store.0.put(&b_file, &seal(&ended, &key).unwrap()).unwrap();
-        let calm = 8 * 3600 + 25 * 3600;
-        for s in (8 * 3600 + 300..calm).step_by(300) {
+        let mut last = *rewrites.last().unwrap();
+        let mut s = 8 * 3600;
+        while s < last + RESTORE_CALM_HOURS * 3600 + 300 {
+            s += 300;
+            let before = a.seen.own_rewritten;
             a.sync(&store, &p, (MACHINE_A, "DESK-A"), &one, at(s), false, false);
+            if a.seen.own_rewritten > before {
+                last = s;
+            }
         }
-        std::fs::write(&file, &theirs).unwrap();
-        let before = a.seen.own_rewritten;
-        for s in (calm..calm + 20 * 60).step_by(300) {
+        let due = 30 + 900 + 3600 + 2 * 6 * 3600;
+        assert!((due..due + 300).contains(&last), "the copy last put there, written over at the first sync after the next wait: {last}");
+        assert_eq!(a.seen.own_restores, 0, "a calm day: none in a row");
+        let mut again = vec![];
+        for s in (s + 300..s + 3600).step_by(300) {
+            std::fs::write(&file, &theirs).unwrap();
+            let before = a.seen.own_rewritten;
             a.sync(&store, &p, (MACHINE_A, "DESK-A"), &one, at(s), false, false);
+            if a.seen.own_rewritten > before {
+                again.push(s);
+            }
         }
-        assert_eq!(a.seen.own_rewritten, before + 1, "after a calm day, at once again");
+        assert_eq!(again.len(), 2, "{again:?}");
+        assert_eq!(again[1] - again[0], 15 * 60, "the waits started over");
         // A store whose writes fail and whose listing has no file of this machine's (the sharing
         // folder gone, say): one try a gap, as for readings alone.
         let mut b = Syncer::default();
@@ -2101,5 +2144,26 @@ mod tests {
         let made = other.1.load(std::sync::atomic::Ordering::SeqCst);
         sync(&mut b, 27, false);
         assert_eq!((b.seen.own_rewritten, other.1.load(std::sync::atomic::Ordering::SeqCst)), (1, made), "the latest read found its own: nothing to put back");
+    }
+
+    /// A sharing folder that is not there (a cloud drive's letter while its app restarts) is a read
+    /// that failed, not one that found this machine's roster gone: nothing is written over it.
+    #[test]
+    fn a_sharing_folder_that_is_not_there_is_a_failed_read() {
+        let p = pass("synthetic roster passphrase");
+        let dir = TempDir::new();
+        let root = dir.0.join("drive");
+        std::fs::create_dir(&root).unwrap();
+        let store = Counting(Folder(root.clone()), Default::default());
+        let one = [account("claude", "cl-one")];
+        let mut a = Syncer::default();
+        a.sync(&store, &p, (MACHINE_A, "DESK-A"), &one, now(), false, false);
+        let away = dir.0.join("away");
+        std::fs::rename(&root, &away).unwrap();
+        a.sync(&store, &p, (MACHINE_A, "DESK-A"), &one, now() + Duration::minutes(10), false, false);
+        assert_eq!(a.seen.read, Some(false));
+        std::fs::rename(&away, &root).unwrap();
+        a.sync(&store, &p, (MACHINE_A, "DESK-A"), &one, now() + Duration::minutes(15), false, false);
+        assert_eq!((store.1.load(std::sync::atomic::Ordering::SeqCst), a.seen.own_rewritten), (1, 0));
     }
 }

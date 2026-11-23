@@ -140,8 +140,8 @@ pub struct Roster {
     pub unreadable: usize,
     /// Accounts those rosters name that are not signed in here.
     pub waiting: usize,
-    /// Times this machine's roster was found not as it wrote it and written again (`roster::Seen`).
-    pub own_rewritten: usize,
+    /// Rewrites in a row of this machine's roster found not as it wrote it (`roster::Seen::own_restores`).
+    pub own_restores: usize,
 }
 
 /// The diagnostics journal's own counters (see `Recorder::health`).
@@ -232,8 +232,8 @@ fn roster_checks(r: &Roster, place: bool) -> Vec<Check> {
             (_, Some(false)) => check("roster", Status::Problem, title,
                 format!("Could not read the rosters, so this computer does not learn the others' accounts.{}", proxy_reason(r.read_error)), data),
             _ if r.unreadable > 0 => check("roster", Status::Warning, title, format!("{} roster(s) did not open with this computer's passphrase: set the same passphrase on every computer.", r.unreadable), data),
-            _ if r.own_rewritten >= crate::roster::OWN_REWRITTEN_WARN => check("roster", Status::Warning, title,
-                format!("This computer's roster was found changed or gone, and written again, {} times: something else writes it (another computer copied from this one, or a sync service putting back an older copy), and your other computers may see that one meanwhile.", r.own_rewritten), data),
+            _ if r.own_restores >= crate::roster::OWN_REWRITTEN_WARN => check("roster", Status::Warning, title,
+                format!("This computer's roster was found changed or gone, and written again, {} times in a row: something else writes it (another computer copied from this one, or a sync service putting back an older copy), and your other computers may see that one meanwhile.", r.own_restores), data),
             (None, None) => check("roster", Status::Ok, title, "Shared at the next refresh.", None),
             _ => check("roster", Status::Ok, title, "Shared with your other computers, encrypted.", None),
         }
@@ -1295,13 +1295,13 @@ mod tests {
         case.roster.unreadable = 0;
         // Its own roster found changed and written again: once or twice is a restore put right
         // quietly; from three times something keeps writing it.
-        case.roster.own_rewritten = crate::roster::OWN_REWRITTEN_WARN - 1;
+        case.roster.own_restores = crate::roster::OWN_REWRITTEN_WARN - 1;
         assert_eq!(find(&case.run(), "roster").status, Status::Ok);
-        case.roster.own_rewritten = crate::roster::OWN_REWRITTEN_WARN;
+        case.roster.own_restores = crate::roster::OWN_REWRITTEN_WARN;
         let rewritten = find(&case.run(), "roster").clone();
         assert_eq!(rewritten.status, Status::Warning);
-        assert!(rewritten.reason.starts_with("This computer's roster was found changed or gone, and written again, 3 times"), "{}", rewritten.reason);
-        case.roster.own_rewritten = 0;
+        assert!(rewritten.reason.starts_with("This computer's roster was found changed or gone, and written again, 3 times in a row"), "{}", rewritten.reason);
+        case.roster.own_restores = 0;
         case.roster.waiting = 13;
         let r = case.run();
         assert_eq!(find(&r, "roster").status, Status::Ok);
