@@ -470,7 +470,7 @@ impl RosterStore for Folder {
 
 impl<R: crate::rclone::Runner> RosterStore for crate::rclone::Rclone<R> {
     fn listing(&self, known: Known) -> std::io::Result<Listed> {
-        self.files_listed(REMOTE_DIR, EXTENSION, MAX_FILE, true, None, known)
+        self.files_listed(REMOTE_DIR, EXTENSION, MAX_FILE, crate::rclone::Reading { hashes: true, ..Default::default() }, known)
     }
 
     fn put(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
