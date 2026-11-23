@@ -186,23 +186,26 @@ impl Default for Batching {
     }
 }
 
-/// Reads in a row whose batched calls only refused (printed nothing and failed, while the same files
-/// one at a time could be read) before none is made: one such read can be the network's moment.
+/// Reads in a row whose batched calls rclone did not take (one printed nothing and failed, while the
+/// same files one at a time could be read; none took the call) before none is made: one such read
+/// can be the network's moment.
 const REFUSALS: u8 = 2;
 
 /// How long `Batching` holds after it last went down before it starts over: a slow link or an
-/// rclone that refuses the call is asked again in full an hour later (at most one call's worth of
-/// records unread, or two refused calls, an hour), and refusals far apart do not add up.
+/// rclone that refuses the call is asked again in full an hour later (a chunk unread at each
+/// halving, at most four reads an hour, or two refused calls), and refusals far apart do not add up.
 const BATCHING_KEPT: Duration = Duration::from_secs(60 * 60);
 
 /// What one read's batched calls did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Batched {
-    /// One printed files (some, at least).
+    /// How many it asked for at once.
+    pub most: usize,
+    /// rclone took one (it printed something, or ended well).
     pub gave: bool,
     /// One printed nothing and failed, while the same files one at a time could be read.
     pub refused: bool,
-    /// One ran out of time.
+    /// One ran out of time (rclone took it, too: a flag it does not know ends a call at once).
     pub timed_out: bool,
 }
 
@@ -215,18 +218,20 @@ impl Batching {
         }
     }
 
-    /// After a read at `now`: a call that ran out of time halves how many the next ask for (one:
-    /// none together), so a slow link or a stalling file holds back fewer records and a timed-out
-    /// chunk is read in smaller ones; a call that gave anything clears the refusals; the
-    /// `REFUSALS`th read in a row that only refused stops batching. For `BATCHING_KEPT` (or until
-    /// SlopBar restarts).
+    /// After a read at `now`: a call that ran out of time halves how many that read asked for at
+    /// once (one: none together), so a slow link or a stalling file holds back fewer records and a
+    /// timed-out chunk is read in smaller ones; a call rclone took clears the refusals; the
+    /// `REFUSALS`th read in a row whose calls it did not take stops batching. For `BATCHING_KEPT`
+    /// (or until SlopBar restarts).
     fn after(&mut self, read: Batched, now: Instant) {
         *self = self.at(now);
         if read.timed_out {
-            self.most = (self.most / 2).max(1);
+            // Halved from what the read asked for, even when the hour ran out meanwhile.
+            let asked = if read.most > 0 { read.most } else { self.most };
+            self.most = (asked / 2).max(1);
             self.changed = Some(now);
         }
-        if read.gave {
+        if read.gave || read.timed_out {
             self.refusals = 0;
         } else if read.refused {
             self.refusals = self.refusals.saturating_add(1);
@@ -509,8 +514,8 @@ impl<R: Runner> Rclone<R> {
         let mut given_up = vec![false; entries.len()];
         // Files a batched call failed to give while printing nothing at all, downloaded alone below.
         let mut after_nothing = vec![false; entries.len()];
-        let mut batched = Batched::default();
         let most = if reading.batch { self.runner.batch_most() } else { 1 };
+        let mut batched = Batched { most, ..Batched::default() };
         if most > 1 {
             let due: Vec<usize> = (0..entries.len()).filter(|&i| got[i].is_none() && listed_hash(&entries[i]).is_some() && record_name_shaped(&entries[i].name, ext)).collect();
             for chunk in due.chunks(most).filter(|chunk| chunk.len() > 1) {
@@ -561,7 +566,8 @@ impl<R: Runner> Rclone<R> {
         // Where they could not be read either (the network, or a filter set in rclone's
         // environment, which refuses a `cat` of one file as well), it was not refused.
         batched.refused = (0..entries.len()).any(|i| after_nothing[i] && got[i].is_some());
-        if batched != Batched::default() {
+        // A read with no batched call says nothing either way.
+        if batched.gave || batched.refused || batched.timed_out {
             self.runner.batched(batched);
         }
         let mut listed = Listed::default();
@@ -624,8 +630,8 @@ pub struct Reading<'a> {
     pub hashes: bool,
     /// A file left out altogether, neither read nor unread.
     pub except: Option<&'a str>,
-    /// Download the files due in one rclone process each `BATCH_MOST`, where each has a hash to
-    /// tell its bytes by and a name SlopBar writes (`Rclone::batch`).
+    /// Download the files due in one rclone process for as many as `Batching` allows (16 at first),
+    /// where each has a hash to tell its bytes by and a name SlopBar writes (`Rclone::batch`).
     pub batch: bool,
 }
 
@@ -638,7 +644,8 @@ enum Batch {
     /// What it printed, the separator each file is followed by, and whether it ended well.
     Printed { stdout: Vec<u8>, separator: String, complete: bool },
     /// It failed having printed nothing: an rclone that does not take the command (older than
-    /// 1.63), or no file it could read (the network; a filter set in rclone's environment).
+    /// 1.63, or with a filter set in its environment, which refuses a `cat` of one file as well),
+    /// or no file it could read (the network).
     Nothing,
     /// It did not end (ran out of time) or did not start.
     Failed { timed_out: bool },
@@ -815,6 +822,10 @@ mod tests {
         batched: Mutex<Vec<Vec<String>>>,
         refuse: Option<i32>,
         batch_skips: Mutex<Vec<String>>,
+        /// A batched call asking for one of these times out (a file whose download stalls), and
+        /// with `unstartable` set none starts (an error other than running out of time).
+        stalls: Mutex<Vec<String>>,
+        unstartable: std::sync::atomic::AtomicBool,
         refuse_from: usize,
         batch_calls: std::sync::atomic::AtomicUsize,
         hang: std::sync::atomic::AtomicBool,
@@ -879,12 +890,16 @@ mod tests {
                     if let Some(code) = self.refuse.filter(|_| call >= self.refuse_from) {
                         return Ok(Ran { code: Some(code), stdout: vec![] });
                     }
-                    if self.hang.load(std::sync::atomic::Ordering::SeqCst) {
-                        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "rclone timed out"));
-                    }
                     let mut names: Vec<String> = String::from_utf8_lossy(input.unwrap_or_default()).lines().filter(|l| !l.is_empty()).map(String::from).collect();
                     names.sort();
                     self.batched.lock().unwrap().push(names.clone());
+                    if self.unstartable.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(std::io::Error::other("rclone did not start"));
+                    }
+                    let stalled = names.iter().any(|name| self.stalls.lock().unwrap().contains(&format!("{dir}/{name}")));
+                    if self.hang.load(std::sync::atomic::Ordering::SeqCst) || stalled {
+                        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "rclone timed out"));
+                    }
                     names.reverse();
                     let (mut out, mut code) = (Vec::new(), 0);
                     for name in names {
@@ -1454,13 +1469,14 @@ mod tests {
         let now = Utc::now();
         let write = |store: &Rclone<Fake>, n: usize, at: DateTime<Utc>| store.write(&record(&id(n), &format!("PC-{n}"), at)).unwrap();
         // What a read gives and costs: (records, `cat` processes, batched calls' names). What it gives
-        // is what downloading every record gives, but where a batched call timed out.
+        // is what downloading every record gives, but where a batched call timed out or did not start.
         let read = |store: &Rclone<Fake>, kept: &Kept| {
             store.write(&record(ME, "DESK-1", now)).unwrap();
             let (from, batches) = (store.runner.count(), store.runner.batched.lock().unwrap().len());
             let read = store.others(ME, kept).unwrap();
             let (cats, batched) = (store.runner.ran(from, "cat"), store.runner.batched.lock().unwrap()[batches..].to_vec());
-            if !store.runner.hang.load(std::sync::atomic::Ordering::SeqCst) {
+            let failing = store.runner.hang.load(std::sync::atomic::Ordering::SeqCst) || store.runner.unstartable.load(std::sync::atomic::Ordering::SeqCst) || !store.runner.stalls.lock().unwrap().is_empty();
+            if !failing {
                 assert_eq!(raw(&read), raw(&store.list().unwrap()), "the records and times downloading every record gives");
             }
             (read, cats, batched)
@@ -1597,6 +1613,40 @@ mod tests {
         store.runner.hang.store(false, std::sync::atomic::Ordering::SeqCst);
         let (records, _, batched) = read(&store, &kept);
         assert_eq!((records.len(), batched.iter().map(Vec::len).collect::<Vec<_>>()), (20, vec![8, 8, 4]));
+        // One stalling file: its call runs out of time while another gives; that is enough to ask
+        // for half as many, and the calls without it are read all along.
+        let store = Rclone::with("cloud", dropbox());
+        let kept = Kept::default();
+        for n in 0..20 {
+            write(&store, n, now);
+        }
+        store.runner.stalls.lock().unwrap().push(path(18));
+        let (records, cats, _) = read(&store, &kept);
+        assert_eq!((records.len(), cats, store.runner.batch_most()), (16, 2, 8));
+        for n in 0..20 {
+            write(&store, n, now + chrono::Duration::seconds(1));
+        }
+        let (records, _, batched) = read(&store, &kept);
+        assert_eq!((records.len(), batched.iter().map(Vec::len).collect::<Vec<_>>(), store.runner.batch_most()), (16, vec![8, 8, 4], 4));
+        for n in 0..20 {
+            write(&store, n, now + chrono::Duration::seconds(2));
+        }
+        let (records, _, batched) = read(&store, &kept);
+        assert_eq!((records.len(), batched.iter().map(Vec::len).collect::<Vec<_>>()), (16, vec![4, 4, 4, 4, 4]));
+        for n in 0..20 {
+            write(&store, n, now + chrono::Duration::seconds(3));
+        }
+        let (records, _, batched) = read(&store, &kept);
+        assert_eq!((records.len(), batched.iter().map(Vec::len).collect::<Vec<_>>()), (18, vec![2; 10]), "two at a time");
+        // A call that does not start (no time out): none read this time, and no halving.
+        let store = Rclone::with("cloud", dropbox());
+        let kept = Kept::default();
+        for n in 0..3 {
+            write(&store, n, now);
+        }
+        store.runner.unstartable.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (records, cats, _) = read(&store, &kept);
+        assert_eq!((records.len(), cats, store.runner.batch_most()), (0, 1, BATCH_MOST));
     }
 
     /// The pieces of a batched call go by size and hash alone: a record gone since the listing is
@@ -1652,13 +1702,22 @@ mod tests {
             b.after(timed_out, minutes(m));
         }
         assert_eq!(b.at(minutes(6)).most, 1, "halved down to one at a time");
-        b.after(Batched { gave: true, refused: true, timed_out: false }, minutes(7));
+        b.after(Batched { gave: true, refused: true, ..Default::default() }, minutes(7));
         assert_eq!(b.refusals, 0);
-        // Refusals far apart do not add up.
+        // Refusals far apart do not add up, nor across a read that ran out of time (rclone took that
+        // call: a flag it does not know ends one at once).
         let mut b = Batching::default();
         b.after(refused, t0);
         b.after(refused, minutes(61));
         assert_eq!((b.at(minutes(61)).most, b.refusals), (BATCH_MOST, 1));
+        b.after(timed_out, minutes(62));
+        b.after(refused, minutes(63));
+        assert_eq!((b.at(minutes(63)).most, b.refusals), (8, 1));
+        // A read that ran out of time is halved from what it asked for, though the hour ran out
+        // while it ran.
+        let mut b = Batching { most: 2, refusals: 0, changed: Some(t0) };
+        b.after(Batched { most: 2, timed_out: true, ..Default::default() }, minutes(61));
+        assert_eq!(b.at(minutes(61)).most, 1);
         // Kept by the rclone's path, for every Cli of it.
         let dir = crate::test_support::TempDir::new();
         let (one, other) = (dir.0.join("rclone-batching-one.exe"), dir.0.join("rclone-batching-other.exe"));

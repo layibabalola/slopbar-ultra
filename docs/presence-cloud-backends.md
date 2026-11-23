@@ -76,17 +76,18 @@ MEGA, S3, WebDAV, SFTP and the other rclone backends. rclone keeps its own confi
   listing, or holds the separator, is downloaded alone. When the call fails having given some,
   the records it did not give are not read that time, and `Recall` keeps their machines while
   they are live; so are all of a call's records when it is killed at 20 seconds, whatever it
-  printed, and the next read then asks for half as many in a call (down to one at a time). When
-  it fails having printed nothing, its records are downloaded alone; if that works, the call was
-  refused (an rclone older than 1.63 refuses `--separator`), and after two reads in a row like
-  that none is made (one such read can be the network's moment; a read whose call gave anything
-  starts the count again). Either holds for an hour after it last went down, or until SlopBar
-  restarts, and then the call is made in full again. A filter set in rclone's environment
-  (`RCLONE_MAX_SIZE`…) refuses the batched call and a `cat` of one file alike, so presence over
-  rclone reads nothing there, with or without batching. Output is not limited in size, as a
-  `cat` of one file is not: a file that grows after the listing is read until rclone ends or is
-  killed (rclone refuses `--max-size` beside `--files-from-raw`). Modelled for a refresh every 5
-  minutes
+  printed, and the next read then asks for half as many in a call as that one did (down to one at
+  a time). When it fails having printed nothing, its records are downloaded alone, as are those
+  of the calls it would have made after it in that read; if that works, the call was refused (an
+  rclone older than 1.63 refuses `--separator`), and after two reads in a row like that none is
+  made (one such read can be the network's moment; a read with a call rclone took, one that
+  printed something, ended well or ran out of time, starts the count again). Both hold until an
+  hour after the last read that ran out of time or was refused, or until SlopBar restarts; then
+  the call is made in full again. A filter set in rclone's environment (`RCLONE_MAX_SIZE`…)
+  refuses the batched call and a `cat` of one file alike, so presence over rclone reads nothing
+  there, with or without batching. Output is not limited in size, as a `cat` of one file is not:
+  a file that grows after the listing is read until rclone ends or is killed (rclone refuses
+  `--max-size` beside `--files-from-raw`). Modelled for a refresh every 5 minutes
   (`rclone::tests::an_hour_of_presence_exchanges_over_rclone_starts_fewer_processes`), presence
   processes an hour go from 120 to 36 beside five running machines and two asleep ones (84 with
   each record downloaded alone), 60 to 36 beside two running ones, and 60 to 24 beside two asleep
