@@ -21,6 +21,94 @@ pub fn key(slot: &Slot) -> String {
     format!("{}:{}", slot.provider.name(), slot.id)
 }
 
+/// How long before its end a monitoring sign-in is due for a new one: "Connect monitoring for all"
+/// and "Sign in all accounts" take it from then, so sign-ins ending a few days apart are made again
+/// in one sitting and end together next time. Claude ends every sign-in on a date it sets when the
+/// sign-in is made, about 30 days later; renewing never moves that date (Claude Code keeps the
+/// earliest end it was given, and allows for the end coming up to 3 days before it).
+pub const RENEW_DAYS: i64 = 7;
+
+/// How long before its end Health and the flyout say a monitoring sign-in ends soon.
+pub const WARN_DAYS: i64 = 3;
+
+/// How long before the end it gave the provider may end a sign-in: a refusal this close to that
+/// end is the end, not a fault (Claude Code dates an end "between" this much before it and it).
+pub const EARLY_DAYS: i64 = 3;
+
+/// Monitoring errors only a new sign-in clears: the provider refused the saved sign-in, two
+/// renewals ended uncertain, or the saved one is another account's or gone.
+pub const SIGN_IN_ERRORS: [&str; 4] = ["monitor_reconnect", "monitor_uncertain", "monitor_wrong_account", "monitor_setup"];
+
+/// Where a connected account's monitoring sign-in stands (see [`renewal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Renewal {
+    /// Working, and not ending within [`RENEW_DAYS`].
+    Fine,
+    /// Ends at this time, within [`RENEW_DAYS`]: a new sign-in before then avoids a gap.
+    Ending(DateTime<Utc>),
+    /// Stopped renewing at, or within [`EARLY_DAYS`] before, the end it was given (this time):
+    /// the provider's limit, not a fault.
+    Ended(DateTime<Utc>),
+    /// Can no longer be renewed, with no end near: signed out at the provider, two uncertain
+    /// renewals, an unreadable renewal, or another account's sign-in.
+    Refused,
+}
+
+impl Renewal {
+    /// Whether it needs a new sign-in now (ending soon included), and why.
+    pub fn kind(self) -> Option<crate::model::RenewalKind> {
+        use crate::model::RenewalKind;
+        match self {
+            Self::Fine => None,
+            Self::Ending(_) => Some(RenewalKind::Ending),
+            Self::Ended(_) => Some(RenewalKind::Ended),
+            Self::Refused => Some(RenewalKind::Refused),
+        }
+    }
+
+    /// Whether it needs a new sign-in now (ending soon included).
+    pub fn due(self) -> bool {
+        self != Self::Fine
+    }
+}
+
+/// Where a connected account's monitoring sign-in stands, from its saved state (`Monitor::health`),
+/// else from the last refresh's monitoring error. The saved state wins when there is one: it changes
+/// the moment a sign-in finishes, while the error stays until the next refresh. A passed end that
+/// the provider has not refused yet is left to the next renewal, which the provider decides.
+pub fn renewal(state: Option<&crate::health::MonitorState>, error: Option<&str>, now: DateTime<Utc>) -> Renewal {
+    let ends = state.and_then(|s| s.ends_at);
+    let refused = match state {
+        Some(s) => s.reconnect || s.uncertain,
+        // No saved state of this account's (another account's, or unreadable): the error says.
+        None => error.is_some_and(|e| SIGN_IN_ERRORS.contains(&e)),
+    };
+    if refused {
+        return match ends {
+            Some(at) if at <= now + chrono::Duration::days(EARLY_DAYS) => Renewal::Ended(at),
+            _ => Renewal::Refused,
+        };
+    }
+    match ends {
+        Some(at) if at > now && at <= now + chrono::Duration::days(RENEW_DAYS) => Renewal::Ending(at),
+        _ => Renewal::Fine,
+    }
+}
+
+/// A sign-in's end after a renewal that succeeded at `now`, from the end it had and the one the
+/// reply gave (either may be unknown). Claude's only ever moves earlier, as Claude Code keeps it,
+/// unless the renewal succeeded on or after it: then that end was not the provider's, and the
+/// reply's stands. Another provider's end is whatever its latest reply said.
+fn next_end(provider: Provider, had: Option<DateTime<Utc>>, reply: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if provider != Provider::Claude || had.is_some_and(|t| t <= now) {
+        return reply;
+    }
+    match (had, reply) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// The site monitoring renews `provider`'s sign-ins at, for Health to name when that fails.
 pub fn token_host(provider: Provider) -> &'static str {
     match provider {
@@ -111,6 +199,11 @@ struct Session {
     scopes: Vec<String>,
     #[serde(default)]
     refresh_expires_at: Option<DateTime<Utc>>,
+    /// When the sign-in ends: the earliest end the provider gave, at sign-in or in any renewal.
+    /// Unlike `refresh_expires_at` (a renewal hint, replaced by each renewal), it is never moved
+    /// later or cleared. Sessions saved before it existed start from `refresh_expires_at`.
+    #[serde(default)]
+    ends_at: Option<DateTime<Utc>>,
     // Persist the replay budget and backoff, so restarting cannot replay indefinitely.
     #[serde(default)]
     uncertain_attempts: u8,
@@ -186,7 +279,8 @@ impl Monitor {
                 None => private_store::load_secret(&self.path(&slot)).ok().and_then(|b| serde_json::from_slice::<Session>(&b).ok()),
             };
             if let Some(s) = session.filter(|s| s.provider == *provider && s.id == *id) {
-                found.insert(key, crate::health::MonitorState { reconnect: s.reconnect, refresh_expires_at: s.refresh_expires_at });
+                found.insert(key, crate::health::MonitorState { reconnect: s.reconnect, uncertain: s.uncertain_attempts >= 2,
+                    ends_at: s.ends_at.or(s.refresh_expires_at) });
             }
         }
         found
@@ -310,6 +404,7 @@ impl Monitor {
                 expires_at: None,
                 scopes: vec![],
                 refresh_expires_at: None,
+                ends_at: None,
                 uncertain_attempts: 0,
                 uncertain_retry_at: None,
                 reconnect: false,
@@ -376,6 +471,9 @@ impl Monitor {
                 })
                 .unwrap_or_default(),
             refresh_expires_at: login.data["credentials"]["claudeAiOauth"]["refreshTokenExpiresAt"]
+                .as_i64()
+                .and_then(DateTime::from_timestamp_millis),
+            ends_at: login.data["credentials"]["claudeAiOauth"]["refreshTokenExpiresAt"]
                 .as_i64()
                 .and_then(DateTime::from_timestamp_millis),
             uncertain_attempts: 0,
@@ -589,6 +687,8 @@ impl Monitor {
                 else if expired { RefreshReason::AccessExpiry } else { RefreshReason::ExpiryHint };
             self.record(slot, Event::Refresh { outcome: RefreshOutcome::Started, reason, elapsed_ms: 0 });
             let started = std::time::Instant::now();
+            // Sessions saved before `ends_at` existed keep the end their hint gave.
+            let previous_end = state.session.refresh_expires_at;
             let result = transport.refresh(&state.session).await;
             let outcome = match &result { Ok(_) => RefreshOutcome::Success, Err(Failure::Revoked) => RefreshOutcome::Revoked,
                 Err(Failure::RotatedUnreadable) => RefreshOutcome::RotatedUnreadable, Err(Failure::Transient | Failure::Proxy(_)) => RefreshOutcome::Transient,
@@ -610,6 +710,8 @@ impl Monitor {
                     state.session.refresh_expires_at = reply
                         .refresh_token_expires_in
                         .and_then(|seconds| after_seconds(now, seconds));
+                    state.session.ends_at = next_end(state.session.provider, state.session.ends_at.or(previous_end),
+                        state.session.refresh_expires_at, now);
                     state.session.uncertain_attempts = 0;
                     state.session.uncertain_retry_at = None;
                     state.session.expires_at = reply

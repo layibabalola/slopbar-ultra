@@ -1285,6 +1285,8 @@ mod tests {
             stale: true,
             fetched_at: None,
             monitor_connected: true,
+            monitor_ends_at: None,
+            monitor_renewal: None,
             billing: crate::model::BillingHints { tier: Some(canary.into()), billing_type: Some(canary.into()), ..Default::default() },
             remote: vec![crate::model::RemoteSeat { machine: canary.into(), where_: vec![canary.into()], seen_at: chrono::Utc::now(), live: true }],
             overlap: vec![canary.into(), canary.into()],

@@ -692,7 +692,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::ConnectMonitoring { provider, id } => {
             desktop_shown()?;
             connect_monitoring(app.clone(), provider, id).await?;
-            Ok(serde_json::json!({ "started": true, "next": "The user completes the monitoring sign-in that opened; get_usage then shows monitor_connected." }))
+            Ok(serde_json::json!({ "started": true, "next": "The user completes the monitoring sign-in that opened; get_usage then shows monitor_connected, and no monitor_renewal." }))
         }
         R::DisconnectMonitoring { provider, id } => value(disconnect_monitoring(app.clone(), provider, id).await?),
         R::RemoveAccount { provider, id } => value(remove_account(app.clone(), provider, id).await?),
@@ -707,14 +707,14 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         }
         R::ConnectMonitoringAll { confirm } => {
             if !confirm {
-                let to_connect = bulk::unmonitored(&app.state::<AppState>().snapshot.lock().unwrap());
+                let to_connect = bulk::to_connect(&app.state::<AppState>().snapshot.lock().unwrap());
                 return Ok(serde_json::json!({ "started": false, "to_connect": to_connect,
                     "next": "Nothing was started. With confirm: true the sign-ins open one at a time; the user signs in as each account named here." }));
             }
             desktop_shown()?;
             let queued = connect_all(&app).await?;
             Ok(serde_json::json!({ "started": !queued.is_empty(), "queued": queued,
-                "next": "Each sign-in opens after the previous one finishes; the user signs in as the account named in Settings. get_usage shows monitor_connected as they complete." }))
+                "next": "Each sign-in opens after the previous one finishes; the user signs in as the account named in Settings. get_usage shows monitor_connected, and no monitor_renewal, as they complete." }))
         }
         R::SignInAll { confirm, monitoring, retry } => {
             if !confirm {
@@ -728,7 +728,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             }
             let plan = sign_in_all(&app, monitoring).await?;
             Ok(serde_json::json!({ "started": !plan.is_empty(), "plan": plan,
-                "next": "Each sign-in opens after the previous one finishes. get_usage shows the accounts and monitor_connected as they complete." }))
+                "next": "Each sign-in opens after the previous one finishes. get_usage shows the accounts, monitor_connected and no monitor_renewal as they complete." }))
         }
         R::RemoveLapsedAccounts { confirm } => {
             if !confirm {
@@ -1113,6 +1113,14 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
     }))
 }
 
+/// Whether an account needs a monitoring sign-in, by what the monitor holds for it: none of its
+/// own, or one that ended, was refused or ends soon (`monitoring::renewal`). A sign-in that just
+/// finished counts at once, where the snapshot shows it only after the next refresh.
+async fn needs_monitor_sign_in(app: &AppHandle, target: &bulk::Target) -> bool {
+    let held = app.state::<AppState>().monitor.health(&[(target.provider, target.id.clone())]).await.into_values().next();
+    held.is_none_or(|s| monitoring::renewal(Some(&s), None, chrono::Utc::now()).due())
+}
+
 /// Updates "Connect monitoring for all" and tells Settings.
 fn publish_bulk(app: &AppHandle, change: impl FnOnce(&mut BulkConnect)) {
     let state = app.state::<AppState>();
@@ -1172,8 +1180,8 @@ async fn wait_for_sign_in_change(app: &AppHandle, revision: u64, wait: Duration)
     }
 }
 
-/// Queues a monitoring sign-in for every account without one (see `run_sign_ins`). Returns the
-/// queued accounts.
+/// Queues a monitoring sign-in for every account that needs one (`bulk::needs_sign_in`: none yet,
+/// or one ended, refused or ending soon; see `run_sign_ins`). Returns the queued accounts.
 async fn connect_all(app: &AppHandle) -> Result<Vec<bulk::Target>, String> {
     let groups = bulk::sign_in_plan(&app.state::<AppState>().snapshot.lock().unwrap(), &[], true);
     let targets = groups.iter().flat_map(|g| g.steps.iter().map(|s| s.target.clone())).collect();
@@ -1182,7 +1190,7 @@ async fn connect_all(app: &AppHandle) -> Result<Vec<bulk::Target>, String> {
 }
 
 /// "Sign in all accounts": signs every pending account in again and, with `monitoring`, connects
-/// monitoring for each account without it, one email at a time (see `bulk::sign_in_plan`).
+/// monitoring for each account that needs it, one email at a time (see `bulk::sign_in_plan`).
 /// Returns the plan.
 async fn sign_in_all(app: &AppHandle, monitoring: bool) -> Result<Vec<bulk::Group>, String> {
     let groups = sign_in_plan(app, monitoring);
@@ -1376,9 +1384,11 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     let account = snapshot.accounts.iter().find(|a| a.provider == target.provider && a.id == target.id);
                     match step.kind {
                         bulk::Kind::Add => account.is_none(),
-                        bulk::Kind::Connect => account.map_or(added.contains(&(target.provider, &target.id)), |a| !a.monitor_connected),
+                        // Still here; whether it still needs the sign-in is the monitor's to say.
+                        bulk::Kind::Connect => account.is_some() || added.contains(&(target.provider, &target.id)),
                     }
                 };
+                let still = still && (step.kind == bulk::Kind::Add || needs_monitor_sign_in(&h, target).await);
                 if !still {
                     mark(at, StepState::Skipped, None);
                     page.steps[in_group].1 = signin::PageStep::Skipped;
@@ -1402,6 +1412,13 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     _ = free => false,
                     _ = stop.notified() => true,
                 };
+                // A sign-in that finished during that wait may have connected this account already:
+                // never ask for it twice.
+                if !stopped && step.kind == bulk::Kind::Connect && !needs_monitor_sign_in(&h, target).await {
+                    mark(at, StepState::Skipped, None);
+                    page.steps[in_group].1 = signin::PageStep::Skipped;
+                    continue;
+                }
                 let session = group_session.get_or_insert_with(|| {
                     let session = signin_session(&h);
                     if let (Some(s), Some(email)) = (session.as_deref(), group.email.as_deref()) {
@@ -1575,7 +1592,9 @@ fn bulk_status(state: tauri::State<AppState>) -> serde_json::Value {
     let snapshot = state.snapshot.lock().unwrap().clone();
     let settings = state.settings.lock().unwrap().clone();
     serde_json::json!({
-        "unmonitored": bulk::unmonitored(&snapshot),
+        // "Connect monitoring for all": accounts without monitoring, or whose sign-in ended,
+        // was refused or ends soon.
+        "to_connect": bulk::to_connect(&snapshot),
         "lapsed": bulk::lapsed(&snapshot, &settings, chrono::Utc::now()),
         "connecting": state.bulk_connect.lock().unwrap().clone(),
         // "Sign in all accounts" with monitoring; without it, only the `add` steps run.

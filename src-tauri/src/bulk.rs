@@ -29,6 +29,20 @@ pub fn unmonitored(snapshot: &Snapshot) -> Vec<Target> {
     snapshot.accounts.iter().filter(|a| !a.monitor_connected).map(|a| target(a, None)).collect()
 }
 
+/// Whether an account needs a monitoring sign-in: it has none, or its saved one ended, was refused
+/// or ends within `monitoring::RENEW_DAYS` (`AccountUsage::monitor_renewal`). Never one known only
+/// by a token hash (`token:` ids): there is no account to check a sign-in against, so it would only
+/// fail and stop the queue.
+pub fn needs_sign_in(a: &AccountUsage) -> bool {
+    (!a.monitor_connected || a.monitor_renewal.is_some()) && !a.id.starts_with("token:")
+}
+
+/// What "Connect monitoring for all" signs in, in the order Settings lists them: every account
+/// that needs a monitoring sign-in (see `needs_sign_in`).
+pub fn to_connect(snapshot: &Snapshot) -> Vec<Target> {
+    snapshot.accounts.iter().filter(|a| needs_sign_in(a)).map(|a| target(a, None)).collect()
+}
+
 /// The day an account's plan ended, if it has: the user's last paid day is past, or the provider
 /// said the plan would not renew and its end has passed.
 pub fn ended(a: &AccountUsage, settings: &Settings, now: DateTime<Utc>) -> Option<NaiveDate> {
@@ -104,9 +118,10 @@ pub struct Group {
 }
 
 /// What "Sign in all accounts" does: every pending account signed in again, and, with
-/// `monitoring`, a monitoring sign-in for each account without one, grouped by email in the order
-/// the emails first appear. Within an email: Claude before Codex, each account's own sign-in before
-/// its monitoring one. An account without an email is a group of its own.
+/// `monitoring`, a monitoring sign-in for each account that needs one (`needs_sign_in`: none yet,
+/// or one ended, refused or ending soon), grouped by email in the order the emails first appear.
+/// Within an email: Claude before Codex, each account's own sign-in before its monitoring one. An
+/// account without an email is a group of its own.
 pub fn sign_in_plan(snapshot: &Snapshot, pending: &[Pending], monitoring: bool) -> Vec<Group> {
     let mut steps: Vec<Step> = Vec::new();
     for p in pending {
@@ -120,7 +135,7 @@ pub fn sign_in_plan(snapshot: &Snapshot, pending: &[Pending], monitoring: bool) 
         }
     }
     if monitoring {
-        for a in snapshot.accounts.iter().filter(|a| !a.monitor_connected) {
+        for a in snapshot.accounts.iter().filter(|a| needs_sign_in(a)) {
             steps.push(Step { kind: Kind::Connect, target: target(a, None), email: a.email.clone() });
         }
     }
@@ -251,6 +266,28 @@ mod tests {
             (None, vec!["Connect claude cl-four".to_string()]),
         ]);
         assert!(sign_in_plan(&snapshot, &list[..1], false).is_empty(), "nothing pending, nothing to sign in");
+    }
+
+    #[test]
+    fn monitoring_that_ended_or_ends_soon_is_signed_in_again_with_the_unmonitored() {
+        use crate::model::RenewalKind;
+        let mut ended = account("ended", false, true);
+        ended.monitor_renewal = Some(RenewalKind::Ended);
+        let mut refused = account("refused", false, true);
+        refused.provider = Provider::Codex;
+        refused.monitor_renewal = Some(RenewalKind::Refused);
+        let mut token = account("token:abc", false, false);
+        token.email = None;
+        let snapshot = Snapshot { accounts: vec![account("none", false, false), ended, refused, account("fine", true, true), token], updated_at: None };
+        let ids = |list: Vec<Target>| list.into_iter().map(|t| t.id).collect::<Vec<_>>();
+        assert_eq!(ids(to_connect(&snapshot)), ["none", "ended", "refused"], "never a token-only account: it cannot connect");
+        assert_eq!(ids(unmonitored(&snapshot)), ["none", "token:abc"], "unmonitored still means without monitoring");
+        assert_eq!(summary(&sign_in_plan(&snapshot, &[], true)), [
+            (Some("none@example.invalid"), vec!["Connect claude none".to_string()]),
+            (Some("ended@example.invalid"), vec!["Connect claude ended".to_string()]),
+            (Some("refused@example.invalid"), vec!["Connect codex refused".to_string()]),
+        ]);
+        assert!(sign_in_plan(&snapshot, &[], false).is_empty(), "without monitoring, nothing to sign in");
     }
 
     #[test]

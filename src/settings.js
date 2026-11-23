@@ -116,7 +116,7 @@ function accountRow(p, a) {
         ${windowResets}
         ${a.stale && a.fetched_at ? `<small>${esc(t("lastObserved", { t: duration(Math.max(1, Math.round((Date.now() - new Date(a.fetched_at)) / 60000))) }))}</small>` : ""}
         ${a.error || a.monitor_error ? `<small>${esc(accountErrorText(p, a))}</small>` : ""}
-        ${!a.monitor_connected || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account", "monitor_network", "monitor_uncertain"].includes(a.monitor_error ?? a.error)
+        ${!a.monitor_connected || a.monitor_renewal || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account", "monitor_network", "monitor_uncertain"].includes(a.monitor_error ?? a.error)
           ? `<button class="btn" data-monitor="${p}" data-id="${esc(a.id)}">${t(a.monitor_connected ? "monitorReconnect" : "monitorConnect")}</button>`
           : ""}
         ${a.monitor_connected ? `<button class="btn" data-disconnect="${p}" data-id="${esc(a.id)}">${t("monitorDisconnect")}</button>` : ""}
@@ -1192,10 +1192,11 @@ $("calendar-export").addEventListener("click", exportCalendar);
 let health = null;
 const FIX_PAGES = { data: "sData", notifications: "sNotifications", general: "sGeneral" };
 
-function fixButton(fix, i) {
+function fixButton(fix, i, count) {
   if (!fix) return "";
   const label = {
     connect_monitoring: () => t("monitorConnect"),
+    connect_monitoring_all: () => count ? `${t("bulkConnectButton")} (${count})` : t("bulkConnectButton"),
     refresh: () => t("healthFixRefresh"),
     restart_app: () => t("healthFixRestart"),
     open_settings: () => `${t("healthFixOpen")} ${t(FIX_PAGES[fix.page] ?? "settings")}`,
@@ -1208,7 +1209,7 @@ function renderHealth() {
   $("health").innerHTML = health.checks.map((c, i) => `
     <div class="row health-check" data-key="${esc(c.id)}">
       <div class="title"><label><span class="health-dot ${c.status}" role="img" aria-label="${esc(t({ ok: "healthOk", warning: "healthWarning", problem: "healthProblem" }[c.status] ?? "healthOk"))}"></span>${esc(c.title)}</label><small>${esc(c.reason)}</small></div>
-      ${c.status === "ok" ? "" : fixButton(c.fix, i)}
+      ${c.status === "ok" ? "" : fixButton(c.fix, i, c.count)}
     </div>`).join("");
   const badge = $("health-nav-badge");
   badge.hidden = !health.problems;
@@ -1230,6 +1231,10 @@ $("health").addEventListener("click", async (e) => {
     if (fix.action === "connect_monitoring") {
       await invoke("connect_monitoring", { provider: fix.provider, id: fix.id });
       status.textContent = t("monitorPending"); status.hidden = false;
+    } else if (fix.action === "connect_monitoring_all") {
+      // One sign-in at a time; Settings > Accounts follows the run and can stop it.
+      const queued = await invoke("connect_monitoring_all");
+      if (queued.length) { status.textContent = t("monitorPending"); status.hidden = false; }
     } else if (fix.action === "refresh") {
       snapshot = await invoke("refresh");
       renderAccounts();
@@ -1452,10 +1457,11 @@ for (const h of HOTKEYS) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Bulk actions (Accounts): monitoring for every unmonitored account, one sign-in at a time, and
-// removing accounts whose plan has ended.
+// Bulk actions (Accounts): monitoring for every account that needs a monitoring sign-in (none yet,
+// or one that ended, was refused or ends soon), one sign-in at a time, and removing accounts whose
+// plan has ended.
 
-let bulk = { unmonitored: [], lapsed: { remove: [], in_use: [] }, connecting: null, sign_in: [], signin_profiles: 0 };
+let bulk = { to_connect: [], lapsed: { remove: [], in_use: [] }, connecting: null, sign_in: [], signin_profiles: 0 };
 const who = (target) => target.account || t("unknownAccount");
 
 /** "Sign in all accounts" as it would run now: its groups (one per email) and sign-ins. */
@@ -1478,8 +1484,8 @@ function renderBulk() {
   $("sign-in-all-hint").textContent = plan.steps ? t("signInAllHint", { n: plan.steps, e: plan.groups.length }) : t("signInAllNone");
   $("signin-forget").disabled = !bulk.signin_profiles;
   $("signin-forget-hint").textContent = bulk.signin_profiles ? t("signinForgetHint", { n: bulk.signin_profiles }) : t("signinForgetNone");
-  $("bulk-connect").disabled = !running && !bulk.unmonitored.length;
-  $("bulk-connect-hint").textContent = bulk.unmonitored.length ? t("bulkConnectHint", { n: bulk.unmonitored.length }) : t("bulkConnectNone");
+  $("bulk-connect").disabled = !running && !bulk.to_connect.length;
+  $("bulk-connect-hint").textContent = bulk.to_connect.length ? t("bulkConnectHint", { n: bulk.to_connect.length }) : t("bulkConnectNone");
   $("bulk-remove").disabled = !bulk.lapsed.remove.length;
   $("bulk-remove-hint").textContent = bulk.lapsed.remove.length
     ? t("bulkRemoveHint", { list: bulk.lapsed.remove.map(who).join(", ") })
