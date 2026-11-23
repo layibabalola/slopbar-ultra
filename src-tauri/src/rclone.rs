@@ -39,13 +39,12 @@ pub trait Runner: Send + Sync {
     fn kind(&self) -> Option<String> {
         None
     }
-    /// Whether to ask it for several files in one `cat` (`Rclone::batch`): until it refuses.
-    fn batches(&self) -> bool {
-        true
+    /// How many files to ask it for in one `cat` (`Rclone::batch`); one, none together.
+    fn batch_most(&self) -> usize {
+        BATCH_MOST
     }
-    /// It refused a batched `cat` (it failed printing nothing, while the same files one at a time
-    /// could be read): files one at a time from now on.
-    fn batch_refused(&self) {}
+    /// What a read's batched calls did, for what the next read asks (`Batching::after`).
+    fn batched(&self, _read: Batched) {}
 }
 
 /// The real rclone executable, and the remote its commands reach (none for commands that stay on
@@ -156,21 +155,70 @@ impl Runner for Cli {
         kind_of(&self.exe, self.remote.as_deref()?)
     }
 
-    /// Until this rclone refused once, while SlopBar runs (a newer one put in its place counts
-    /// after a restart).
-    fn batches(&self) -> bool {
-        !refused().lock().unwrap_or_else(|e| e.into_inner()).contains(&self.exe)
+    /// As this rclone's batched calls went while SlopBar runs (a newer one put in its place starts
+    /// over after a restart).
+    fn batch_most(&self) -> usize {
+        batching().lock().unwrap_or_else(|e| e.into_inner()).get(&self.exe).copied().unwrap_or_default().most
     }
 
-    fn batch_refused(&self) {
-        refused().lock().unwrap_or_else(|e| e.into_inner()).insert(self.exe.clone());
+    fn batched(&self, read: Batched) {
+        batching().lock().unwrap_or_else(|e| e.into_inner()).entry(self.exe.clone()).or_default().after(read);
     }
 }
 
-/// The rclones that refused a batched `cat`.
-fn refused() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
-    static REFUSED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = std::sync::OnceLock::new();
-    REFUSED.get_or_init(Default::default)
+/// How each rclone's batched calls went, by its path.
+fn batching() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Batching>> {
+    static BATCHING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Batching>>> = std::sync::OnceLock::new();
+    BATCHING.get_or_init(Default::default)
+}
+
+/// How an rclone's batched calls have gone (`Rclone::batch`): how many files to ask it for at once,
+/// and how many reads in a row its calls only refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Batching {
+    most: usize,
+    refusals: u8,
+}
+
+impl Default for Batching {
+    fn default() -> Self {
+        Batching { most: BATCH_MOST, refusals: 0 }
+    }
+}
+
+/// Reads in a row whose batched calls only refused (printed nothing and failed, while the same files
+/// one at a time could be read) before none is made: one such read can be the network's moment.
+const REFUSALS: u8 = 2;
+
+/// What one read's batched calls did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Batched {
+    /// One printed files (some, at least).
+    pub gave: bool,
+    /// One printed nothing and failed, while the same files one at a time could be read.
+    pub refused: bool,
+    /// One ran out of time.
+    pub timed_out: bool,
+}
+
+impl Batching {
+    /// After a read: a call that ran out of time halves how many the next ask for (one: none
+    /// together), so a slow link or a stalling file holds back fewer records and a timed-out chunk
+    /// is read in smaller ones; a call that gave anything clears the refusals; the `REFUSALS`th read
+    /// in a row that only refused stops batching. Until SlopBar restarts.
+    fn after(&mut self, read: Batched) {
+        if read.timed_out {
+            self.most = (self.most / 2).max(1);
+        }
+        if read.gave {
+            self.refusals = 0;
+        } else if read.refused {
+            self.refusals = self.refusals.saturating_add(1);
+            if self.refusals >= REFUSALS {
+                self.most = 1;
+            }
+        }
+    }
 }
 
 impl Cli {
@@ -444,17 +492,23 @@ impl<R: Runner> Rclone<R> {
         let mut given_up = vec![false; entries.len()];
         // Files a batched call failed to give while printing nothing at all, downloaded alone below.
         let mut after_nothing = vec![false; entries.len()];
-        if reading.batch && self.runner.batches() {
+        let mut batched = Batched::default();
+        let most = if reading.batch { self.runner.batch_most() } else { 1 };
+        if most > 1 {
             let due: Vec<usize> = (0..entries.len()).filter(|&i| got[i].is_none() && listed_hash(&entries[i]).is_some() && record_name_shaped(&entries[i].name, ext)).collect();
-            for chunk in due.chunks(BATCH_MOST).filter(|chunk| chunk.len() > 1) {
+            for chunk in due.chunks(most).filter(|chunk| chunk.len() > 1) {
                 let names: Vec<&str> = chunk.iter().map(|&i| entries[i].name.as_str()).collect();
                 match self.batch(dir, &names) {
-                    Batch::Pieces { pieces, complete } => {
+                    Batch::Printed { stdout, separator, complete } => {
+                        batched.gave = true;
+                        let mut pieces = split(&stdout, separator.as_bytes());
+                        // What follows the last separator: nothing, or a file cut off.
+                        pieces.pop();
                         for &i in chunk {
                             let (size, hash) = (entries[i].size, listed_hash(&entries[i]).unwrap_or_default());
                             // A file's bytes are the piece with its listed size and hash, wherever it came.
                             match pieces.iter().find(|p| p.len() as i64 == size && holds(&hash, p)) {
-                                Some(piece) => got[i] = Some((piece.clone(), Some(hash))),
+                                Some(piece) => got[i] = Some((piece.to_vec(), Some(hash))),
                                 // Not there after a call that went wrong: not read this time (`Recall`
                                 // covers a presence record). After one that went right, the file
                                 // changed or went since the listing: it is downloaded alone, below.
@@ -462,13 +516,16 @@ impl<R: Runner> Rclone<R> {
                             }
                         }
                     }
-                    // One file at a time, below; if that works, this rclone cannot batch.
+                    // One file at a time, below; if that works, the call was refused.
                     Batch::Nothing => {
                         chunk.iter().for_each(|&i| after_nothing[i] = true);
                         break;
                     }
-                    // Timed out: none read this time, and none downloaded alone either.
-                    Batch::Failed => chunk.iter().for_each(|&i| given_up[i] = true),
+                    // None read this time, and none downloaded alone either (each would wait as long).
+                    Batch::Failed { timed_out } => {
+                        batched.timed_out |= timed_out;
+                        chunk.iter().for_each(|&i| given_up[i] = true);
+                    }
                 }
             }
         }
@@ -484,10 +541,11 @@ impl<R: Runner> Rclone<R> {
         }
         // A batched call that printed nothing and failed, where the same files one at a time could
         // be read: an rclone older than 1.63, or settings of its own that refuse the call (a filter
-        // in the environment, which `--files-from-raw` will not run beside). Not batched again
-        // while SlopBar runs. Where they could not be read either (the network), it may be again.
-        if (0..entries.len()).any(|i| after_nothing[i] && got[i].is_some()) {
-            self.runner.batch_refused();
+        // in the environment, which `--files-from-raw` will not run beside), or the network's
+        // moment. Where they could not be read either (the network), it was not refused.
+        batched.refused = (0..entries.len()).any(|i| after_nothing[i] && got[i].is_some());
+        if batched != Batched::default() {
+            self.runner.batched(batched);
         }
         let mut listed = Listed::default();
         for (e, got) in entries.into_iter().zip(got) {
@@ -512,14 +570,9 @@ impl<R: Runner> Rclone<R> {
         let input: String = names.iter().map(|name| format!("{name}\n")).collect();
         let path = format!("{}:{dir}", self.remote);
         match self.runner.run(&["cat", "--files-from-raw", "-", "--separator", &separator, &path], Some(input.as_bytes())) {
-            Err(_) => Batch::Failed,
+            Err(e) => Batch::Failed { timed_out: e.kind() == std::io::ErrorKind::TimedOut },
             Ok(ran) if ran.code != Some(0) && ran.stdout.is_empty() => Batch::Nothing,
-            Ok(ran) => {
-                let mut pieces = split(&ran.stdout, separator.as_bytes());
-                // What follows the last separator: nothing, or a file cut off.
-                pieces.pop();
-                Batch::Pieces { pieces, complete: ran.code == Some(0) }
-            }
+            Ok(ran) => Batch::Printed { stdout: ran.stdout, separator, complete: ran.code == Some(0) },
         }
     }
 
@@ -559,37 +612,37 @@ pub struct Reading<'a> {
     pub batch: bool,
 }
 
-/// At most this many files in one batched download: rclone downloads them one after another, all
-/// within one call's `TIMEOUT`.
+/// At most this many files in one batched download at first (fewer after one ran out of time:
+/// `Batching`): rclone downloads them one after another, all within one call's `TIMEOUT`.
 const BATCH_MOST: usize = 16;
 
 /// How a batched download went (`Rclone::batch`).
 enum Batch {
-    /// What it printed, cut at each separator, and whether it ended well.
-    Pieces { pieces: Vec<Vec<u8>>, complete: bool },
+    /// What it printed, the separator each file is followed by, and whether it ended well.
+    Printed { stdout: Vec<u8>, separator: String, complete: bool },
     /// It failed having printed nothing: an rclone that does not take the command (older than
     /// 1.63, or set up so that it refuses it), or no file it could read (the network).
     Nothing,
-    /// It did not end (timed out) or did not start.
-    Failed,
+    /// It did not end (ran out of time) or did not start.
+    Failed { timed_out: bool },
 }
 
 /// `bytes` cut at each `separator` (the last piece is what follows the last one).
-fn split(bytes: &[u8], separator: &[u8]) -> Vec<Vec<u8>> {
+fn split<'a>(bytes: &'a [u8], separator: &[u8]) -> Vec<&'a [u8]> {
     let mut pieces = Vec::new();
     let mut rest = bytes;
     while let Some(at) = (!separator.is_empty()).then(|| rest.windows(separator.len()).position(|w| w == separator)).flatten() {
-        pieces.push(rest[..at].to_vec());
+        pieces.push(&rest[..at]);
         rest = &rest[at + separator.len()..];
     }
-    pieces.push(rest.to_vec());
+    pieces.push(rest);
     pieces
 }
 
 /// A name as SlopBar writes them: a machine id's hex digits and dashes, then `.<ext>`. Only such
 /// names go on a batched download's input, one per line (a cloud's names can hold line breaks).
 fn record_name_shaped(name: &str, ext: &str) -> bool {
-    name.strip_suffix(&format!(".{ext}")).is_some_and(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c) || c == '-'))
+    name.strip_suffix(&format!(".{ext}")).is_some_and(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
 }
 
 /// One file as `Rclone::files_listed` found it.
@@ -736,15 +789,21 @@ mod tests {
         calls: Mutex<Vec<String>>,
         remotes: String,
         fail: Option<i32>,
-        /// A batched `cat` (`--files-from-raw -`): the names each one was given; `refuse` fails it with
-        /// that exit code and nothing printed, as rclone before 1.63 does (2) or one whose
-        /// environment sets a filter (1); `hang` times it out, and the files in `guessed` print the
-        /// call's separator inside their bytes.
+        /// A batched `cat` (`--files-from-raw -`): the names each one was given; from its
+        /// `refuse_from`th call on, `refuse` fails it with that exit code and nothing printed, as
+        /// rclone before 1.63 does (2) or one whose environment sets a filter (1); `hang` times it
+        /// out; the files in `guessed` print the call's separator inside their bytes. It prints the
+        /// files in reverse order of their names (rclone's is by name), so nothing goes by order.
         batched: Mutex<Vec<Vec<String>>>,
         refuse: Option<i32>,
+        refuse_from: usize,
+        batch_calls: std::sync::atomic::AtomicUsize,
         hang: std::sync::atomic::AtomicBool,
         guessed: Mutex<Vec<String>>,
-        refused: std::sync::atomic::AtomicBool,
+        /// Files listed but gone by the time they are downloaded: a batched call leaves them out, a
+        /// `cat` of one finds nothing (exit 3, as of any missing file).
+        gone: Mutex<Vec<String>>,
+        batching: Mutex<Batching>,
     }
 
     fn dropbox() -> Fake {
@@ -782,7 +841,8 @@ mod tests {
                                 entry["Hashes"] = match (hashless.contains(k), self.kind.as_deref()) {
                                     (true, _) => serde_json::json!({}),
                                     (_, Some("drive")) => serde_json::json!({ "md5": "synthetic-md5", "sha1": "synthetic-sha1", "sha256": hex(&Sha256::digest(bytes)) }),
-                                    _ => serde_json::json!({ "dropbox": hex(&Sha256::digest(Sha256::digest(bytes))) }),
+                                    // SHA-256 of each 4 MiB block's SHA-256: of nothing for an empty file.
+                                    _ => serde_json::json!({ "dropbox": hex(&Sha256::digest(bytes.chunks(4 * 1024 * 1024).flat_map(|b| Sha256::digest(b).to_vec()).collect::<Vec<u8>>())) }),
                                 };
                             }
                             entry
@@ -796,7 +856,8 @@ mod tests {
                 // Each named file there, in the folder's order, then the separator; a name gone is left
                 // out, an unreadable file too and the call ends failing.
                 ["cat", "--files-from-raw", "-", "--separator", separator, dir] => {
-                    if let Some(code) = self.refuse {
+                    let call = self.batch_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(code) = self.refuse.filter(|_| call >= self.refuse_from) {
                         return Ok(Ran { code: Some(code), stdout: vec![] });
                     }
                     if self.hang.load(std::sync::atomic::Ordering::SeqCst) {
@@ -805,6 +866,7 @@ mod tests {
                     let mut names: Vec<String> = String::from_utf8_lossy(input.unwrap_or_default()).lines().filter(|l| !l.is_empty()).map(String::from).collect();
                     names.sort();
                     self.batched.lock().unwrap().push(names.clone());
+                    names.reverse();
                     let (mut out, mut code) = (Vec::new(), 0);
                     for name in names {
                         let path = format!("{dir}/{name}");
@@ -812,7 +874,7 @@ mod tests {
                             code = 1;
                             continue;
                         }
-                        let Some(bytes) = files.get(&path) else { continue };
+                        let Some(bytes) = files.get(&path).filter(|_| !self.gone.lock().unwrap().contains(&path)) else { continue };
                         if self.guessed.lock().unwrap().contains(&path) {
                             let half = bytes.len() / 2;
                             out.extend_from_slice(&bytes[..half]);
@@ -826,7 +888,10 @@ mod tests {
                     Ok(Ran { code: Some(code), stdout: out })
                 }
                 ["cat", path] if self.unreadable.lock().unwrap().iter().any(|p| p == path) => Ok(Ran { code: Some(1), stdout: vec![] }),
-                ["cat", path] => ok(files.get(*path).cloned().unwrap_or_default()),
+                ["cat", path] => match files.get(*path).filter(|_| !self.gone.lock().unwrap().iter().any(|p| p == path)) {
+                    Some(bytes) => ok(bytes.clone()),
+                    None => Ok(Ran { code: Some(DIR_NOT_FOUND), stdout: vec![] }),
+                },
                 ["deletefile", path] => {
                     files.remove(*path);
                     ok(vec![])
@@ -845,12 +910,12 @@ mod tests {
             self.kind.clone()
         }
 
-        fn batches(&self) -> bool {
-            !self.refused.load(std::sync::atomic::Ordering::SeqCst)
+        fn batch_most(&self) -> usize {
+            self.batching.lock().unwrap().most
         }
 
-        fn batch_refused(&self) {
-            self.refused.store(true, std::sync::atomic::Ordering::SeqCst);
+        fn batched(&self, read: Batched) {
+            self.batching.lock().unwrap().after(read);
         }
     }
 
@@ -1047,6 +1112,8 @@ mod tests {
         let big = vec![7u8; 4 * 1024 * 1024 + 3];
         let blocks: Vec<u8> = big.chunks(4 * 1024 * 1024).flat_map(|b| Sha256::digest(b).to_vec()).collect();
         assert!(holds(&format!("dropbox:{}", hex(&Sha256::digest(&blocks))), &big));
+        // An empty file has no blocks: SHA-256 of nothing (as rclone 1.74.4's `hashsum dropbox` gives).
+        assert!(holds("dropbox:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", b""));
         assert!(holds(&format!("sha256:{}", hex(&Sha256::digest(&small))), &small));
         assert!(!holds(&format!("sha256:{}", hex(&Sha256::digest(b"other"))), &small));
         assert!(!holds(&format!("dropbox:{},sha256:{}", hex(&Sha256::digest(Sha256::digest(&small))), hex(&Sha256::digest(b"other"))), &small), "every hash must hold");
@@ -1438,20 +1505,37 @@ mod tests {
         assert_eq!((records.len(), cats, batched.len()), (22, 2, 0));
 
         // A call that fails having printed nothing (an rclone before 1.63 refuses it with 2, one whose
-        // environment sets a filter with 1): one at a time at once, and since that works, from then on.
+        // environment sets a filter with 1): one at a time at once; since that works, it was refused,
+        // and after two such reads in a row none is made.
         for code in [2, 1] {
             let refusing = Rclone::with("cloud", Fake { refuse: Some(code), ..dropbox() });
             let kept = Kept::default();
-            for n in 0..3 {
-                write(&refusing, n, now);
+            for second in 0..3 {
+                for n in 0..3 {
+                    write(&refusing, n, now + chrono::Duration::seconds(second));
+                }
+                let (records, cats, _) = read(&refusing, &kept);
+                let expected = if second < 2 { 1 + 3 } else { 3 };
+                assert_eq!((records.len(), cats), (3, expected), "{code}, read {second}");
             }
-            let (records, cats, _) = read(&refusing, &kept);
-            assert_eq!((records.len(), cats), (3, 1 + 3), "{code}: refused, then one at a time");
-            for n in 0..3 {
-                write(&refusing, n, now + chrono::Duration::seconds(1));
-            }
-            assert_eq!(read(&refusing, &kept).1, 3, "{code}: not asked again");
         }
+        // Twenty due and refused: the first call only, then one at a time.
+        let refusing = Rclone::with("cloud", Fake { refuse: Some(1), ..dropbox() });
+        let kept = Kept::default();
+        for n in 0..20 {
+            write(&refusing, n, now);
+        }
+        let (records, cats, _) = read(&refusing, &kept);
+        assert_eq!((records.len(), cats, refusing.runner.batch_calls.load(std::sync::atomic::Ordering::SeqCst)), (20, 1 + 20, 1));
+        // A read in which one call gave and the next refused is no refusal: still batched after.
+        let mixed = Rclone::with("cloud", Fake { refuse: Some(1), refuse_from: 1, ..dropbox() });
+        let kept = Kept::default();
+        for n in 0..20 {
+            write(&mixed, n, now);
+        }
+        let (records, cats, _) = read(&mixed, &kept);
+        assert_eq!((records.len(), cats), (20, 2 + 4), "sixteen given, four refused and read alone");
+        assert_eq!(*mixed.runner.batching.lock().unwrap(), Batching::default());
         // Where one at a time fails too (the network), the call is not given up on.
         let store = Rclone::with("cloud", dropbox());
         let kept = Kept::default();
@@ -1464,6 +1548,81 @@ mod tests {
         store.runner.unreadable.lock().unwrap().clear();
         let (records, cats, batched) = read(&store, &kept);
         assert_eq!((records.len(), cats, batched.len()), (3, 1, 1), "batched again");
+        assert_eq!(*store.runner.batching.lock().unwrap(), Batching::default());
+
+        // A call that runs out of time: its records are not read that time, and the next read asks
+        // for half as many at once, so a slow link still reads them.
+        let store = Rclone::with("cloud", dropbox());
+        let kept = Kept::default();
+        for n in 0..20 {
+            write(&store, n, now);
+        }
+        store.runner.hang.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (records, cats, _) = read(&store, &kept);
+        assert_eq!((records.len(), cats), (0, 2));
+        store.runner.hang.store(false, std::sync::atomic::Ordering::SeqCst);
+        let (records, _, batched) = read(&store, &kept);
+        assert_eq!((records.len(), batched.iter().map(Vec::len).collect::<Vec<_>>()), (20, vec![8, 8, 4]));
+    }
+
+    /// The pieces of a batched call go by size and hash alone: a record gone since the listing is
+    /// downloaded alone (and found gone), an empty file is an empty piece, two names with the same
+    /// bytes both get them, and a name in capitals is one SlopBar may write too.
+    #[test]
+    fn batched_pieces_go_by_size_and_hash_alone() {
+        let store = Rclone::with("cloud", dropbox());
+        let kept = Kept::default();
+        let now = Utc::now();
+        let id = |n: usize| format!("{n:08x}-0000-4000-8000-000000000000");
+        let path = |name: &str| format!("cloud:SlopBar/presence/{name}");
+        for n in 0..3 {
+            store.write(&record(&id(n), &format!("PC-{n}"), now)).unwrap();
+        }
+        let copy = store.runner.files.lock().unwrap()[&path(&format!("{}.json", id(1)))].clone();
+        let upper = "0000000A-0000-4000-8000-00000000000B.json";
+        for (name, bytes) in [("0000000f-0000-4000-8000-000000000000.json", vec![]), ("00000010-0000-4000-8000-000000000000.json", copy.clone()), (upper, serde_json::to_vec(&record(IDLE, "CAPITALS", now)).unwrap())] {
+            store.runner.files.lock().unwrap().insert(path(name), bytes);
+        }
+        store.runner.gone.lock().unwrap().push(path(&format!("{}.json", id(2))));
+        let from = store.runner.count();
+        let read = store.others(ME, &kept).unwrap();
+        let alone: Vec<String> = store.runner.calls.lock().unwrap()[from..].iter().filter_map(|c| c.strip_prefix("cat ")).filter(|c| !c.starts_with("--files-from-raw")).map(String::from).collect();
+        assert_eq!(alone, [path(&format!("{}.json", id(2)))], "only the one gone since the listing, downloaded alone and found gone");
+        assert_eq!(store.runner.batched.lock().unwrap().last().unwrap().len(), 6, "the empty file, the copy and the name in capitals went with the rest");
+        let machines: Vec<&str> = read.iter().map(|(p, _)| p.machine.as_str()).collect();
+        assert_eq!(machines, ["PC-0", "PC-1", "CAPITALS", "PC-1"], "in the listing's order; the empty file is no record; the copy is read with its bytes");
+        assert_eq!(raw(&read), raw(&store.list().unwrap()));
+    }
+
+    /// What a read's batched calls did sets how many the next ask for: halved after one ran out of
+    /// time, none together after two reads in a row that only refused, and a read that gave clears
+    /// the refusals. Each rclone (by its path) keeps its own, while SlopBar runs.
+    #[test]
+    fn batching_follows_how_the_calls_went() {
+        let mut b = Batching::default();
+        let (gave, refused, timed_out) = (Batched { gave: true, ..Default::default() }, Batched { refused: true, ..Default::default() }, Batched { timed_out: true, ..Default::default() });
+        b.after(timed_out);
+        assert_eq!(b.most, 8);
+        b.after(refused);
+        b.after(gave);
+        b.after(refused);
+        assert_eq!(b.most, 8, "a read that gave between two refusals");
+        b.after(refused);
+        assert_eq!(b.most, 1, "two refusals in a row");
+        let mut b = Batching::default();
+        for _ in 0..6 {
+            b.after(timed_out);
+        }
+        assert_eq!(b.most, 1, "halved down to one at a time");
+        b.after(Batched { gave: true, refused: true, timed_out: false });
+        assert_eq!(b.refusals, 0);
+        // Kept by the rclone's path, for every Cli of it.
+        let dir = crate::test_support::TempDir::new();
+        let (one, other) = (dir.0.join("rclone-batching-one.exe"), dir.0.join("rclone-batching-other.exe"));
+        for _ in 0..REFUSALS {
+            Cli::local(one.clone()).batched(refused);
+        }
+        assert_eq!((Cli::local(one).batch_most(), Cli::local(other).batch_most()), (1, BATCH_MOST));
     }
 
     #[test]
@@ -1471,7 +1630,7 @@ mod tests {
         assert_eq!(split(b"a--b----c--", b"--"), [b"a".to_vec(), b"b".to_vec(), vec![], b"c".to_vec(), vec![]]);
         assert_eq!(split(b"", b"--"), [Vec::<u8>::new()]);
         assert_eq!(split(b"cut off", b"--"), [b"cut off".to_vec()]);
-        for (name, shaped) in [("0f3a-b9.json", true), ("0F3A.json", false), ("a b.json", false), (".json", false), ("abc.roster", false), ("ab\nc.json", false), ("abg.json", false)] {
+        for (name, shaped) in [("0f3a-b9.json", true), ("0F3A.json", true), ("a b.json", false), (".json", false), ("abc.roster", false), ("ab\nc.json", false), ("abg.json", false), ("ab/c.json", false), ("..json", false)] {
             assert_eq!(record_name_shaped(name, "json"), shaped, "{name:?}");
         }
     }
