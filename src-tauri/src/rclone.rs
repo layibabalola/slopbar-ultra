@@ -1638,7 +1638,7 @@ mod tests {
         let mut b = Batching::default();
         let (gave, refused, timed_out) = (Batched { gave: true, ..Default::default() }, Batched { refused: true, ..Default::default() }, Batched { timed_out: true, ..Default::default() });
         b.after(timed_out, t0);
-        assert_eq!(b.at(t0).most, 8);
+        assert_eq!((b.at(t0).most, b.at(minutes(59)).most, b.at(minutes(60)).most), (8, 8, BATCH_MOST), "halved, for an hour");
         b.after(refused, minutes(5));
         b.after(gave, minutes(10));
         b.after(refused, minutes(15));
@@ -1665,7 +1665,12 @@ mod tests {
         for _ in 0..REFUSALS {
             Cli::local(one.clone()).batched(refused);
         }
-        assert_eq!((Cli::local(one).batch_most(), Cli::local(other).batch_most()), (1, BATCH_MOST));
+        assert_eq!((Cli::local(one.clone()).batch_most(), Cli::local(other).batch_most()), (1, BATCH_MOST));
+        // An hour after it went down, the Cli asks in full again.
+        if let Some(then) = Instant::now().checked_sub(BATCHING_KEPT + Duration::from_secs(1)) {
+            batching().lock().unwrap().get_mut(&one).unwrap().changed = Some(then);
+            assert_eq!(Cli::local(one).batch_most(), BATCH_MOST);
+        }
     }
 
     #[test]
