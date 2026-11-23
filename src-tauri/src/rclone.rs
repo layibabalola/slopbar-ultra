@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::presence::{Presence, PresenceStore};
+use crate::presence::{Kept, Presence, PresenceStore};
 
 /// No rclone call may take longer than this.
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -379,7 +379,7 @@ impl<R: Runner> Rclone<R> {
     /// The files directly in `dir` on the remote named `*.<ext>` and at most `max` bytes, with
     /// their contents and modification times. A missing folder is an empty one.
     pub fn files(&self, dir: &str, ext: &str, max: u64) -> std::io::Result<Vec<(String, Vec<u8>, Option<DateTime<Utc>>)>> {
-        Ok(self.files_listed(dir, ext, max, false, &|_, _, _| None)?.files.into_iter().map(|f| (f.name, f.bytes, f.modified)).collect())
+        Ok(self.files_listed(dir, ext, max, false, None, &|_, _, _| None)?.files.into_iter().map(|f| (f.name, f.bytes, f.modified)).collect())
     }
 
     /// `files`, with the names listed whose download failed, and, with `hashes` on a remote whose
@@ -387,8 +387,9 @@ impl<R: Runner> Rclone<R> {
     /// Google Drive), each file's hash. A file listed with one goes to `known` first, with its name
     /// and size: the bytes it gives back stand in for that file's `cat`, one rclone process fewer.
     /// A file downloaded keeps its listed hash only when its bytes have it (the file can change
-    /// between the listing and the download). Without a hash every file is downloaded.
-    pub fn files_listed(&self, dir: &str, ext: &str, max: u64, hashes: bool, known: Known) -> std::io::Result<Listed> {
+    /// between the listing and the download). Without a hash every file is downloaded. The file
+    /// named `except` is left out altogether, neither read nor unread.
+    pub fn files_listed(&self, dir: &str, ext: &str, max: u64, hashes: bool, except: Option<&str>, known: Known) -> std::io::Result<Listed> {
         let path = format!("{}:{dir}", self.remote);
         // `--hash` makes a remote that cannot list hashes compute them, reading every file (a local
         // or SFTP remote): asked only of the clouds whose listing already holds one that counts.
@@ -408,7 +409,7 @@ impl<R: Runner> Rclone<R> {
         let entries: Vec<Entry> = serde_json::from_slice(&ran.stdout).map_err(std::io::Error::other)?;
         let suffix = format!(".{ext}");
         let mut listed = Listed::default();
-        for e in entries.into_iter().filter(|e| !e.is_dir && e.name.ends_with(&suffix) && (0..=max as i64).contains(&e.size) && !e.name.contains('/')) {
+        for e in entries.into_iter().filter(|e| !e.is_dir && e.name.ends_with(&suffix) && (0..=max as i64).contains(&e.size) && !e.name.contains('/') && except != Some(e.name.as_str())) {
             let mut hash = hashes.then(|| e.hash()).flatten();
             let kept = hash.as_deref().and_then(|h| known(&e.name, e.size as u64, h));
             let bytes = match kept {
@@ -527,6 +528,12 @@ fn dropbox_hash(bytes: &[u8]) -> [u8; 32] {
     blocks.finalize().into()
 }
 
+/// The file a machine's presence record goes to: its id's hex digits and dashes, then `.json`.
+fn record_name(machine_id: &str) -> Option<String> {
+    let safe: String = machine_id.chars().filter(|c| c.is_ascii_hexdigit() || *c == '-').collect();
+    (!safe.is_empty()).then(|| format!("{safe}.json"))
+}
+
 impl<R: Runner> PresenceStore for Rclone<R> {
     fn list(&self) -> std::io::Result<Vec<(Presence, Option<DateTime<Utc>>)>> {
         Ok(self.files(DIR, "json", MAX_RECORD)?
@@ -535,12 +542,30 @@ impl<R: Runner> PresenceStore for Rclone<R> {
             .collect())
     }
 
-    fn write(&self, presence: &Presence) -> std::io::Result<()> {
-        let safe: String = presence.machine_id.chars().filter(|c| c.is_ascii_hexdigit() || *c == '-').collect();
-        if safe.is_empty() {
-            return Err(std::io::Error::other("no machine id"));
+    /// The listing and a `cat` per record the refresh needs: none for this machine's own file, and
+    /// on Dropbox and Google Drive none for a record listed with the content hash (and size) of
+    /// the copy `kept` holds, whose bytes stand in for it. `kept` then holds the records this read
+    /// has the bytes of under a hash they have; a listing that fails leaves it as it was.
+    fn others(&self, own_id: &str, kept: &Kept) -> std::io::Result<Vec<(Presence, Option<DateTime<Utc>>)>> {
+        let own = record_name(own_id);
+        let listed = self.files_listed(DIR, "json", MAX_RECORD, true, own.as_deref(), &|name, size, hash| kept.get(name, size, hash))?;
+        let mut records = Vec::new();
+        let mut keep = Vec::new();
+        for RemoteFile { name, bytes, modified, hash } in listed.files {
+            // Only records: anything else is downloaded again at each read, as it always was.
+            let Ok(presence) = serde_json::from_slice::<Presence>(&bytes) else { continue };
+            records.push((presence, modified));
+            if let Some(hash) = hash {
+                keep.push((name, hash, bytes));
+            }
         }
-        self.put(DIR, &format!("{safe}.json"), &serde_json::to_vec_pretty(presence)?)
+        kept.replace(keep);
+        Ok(records)
+    }
+
+    fn write(&self, presence: &Presence) -> std::io::Result<()> {
+        let name = record_name(&presence.machine_id).ok_or_else(|| std::io::Error::other("no machine id"))?;
+        self.put(DIR, &name, &serde_json::to_vec_pretty(presence)?)
     }
 }
 
@@ -987,6 +1012,203 @@ mod tests {
             assert_eq!(after[2], uploads, "{hour:?}: uploads");
         }
         eprintln!("roster rclone processes an hour [lsjson, cat, rcat], before -> after: {}", said.join("; "));
+    }
+
+    /// `machine`'s presence record as it writes it at `at`, with one account in use.
+    fn record(id: &str, machine: &str, at: DateTime<Utc>) -> Presence {
+        own(id, machine, 300, &[account("synthetic-a:org")], at)
+    }
+
+    /// The peers a read gives, as accounts would show them.
+    fn shown(read: &[(Presence, Option<DateTime<Utc>>)], now: DateTime<Utc>) -> Vec<(String, DateTime<Utc>, bool, Vec<crate::presence::Seat>)> {
+        crate::presence::peers(read.iter().cloned(), ME, now).into_iter().map(|p| (p.machine, p.seen_at, p.live, p.seats)).collect()
+    }
+
+    /// A read's records as JSON, with their times, but for this machine's own: what `others` must give
+    /// where downloading every record (`list`) gives the same.
+    fn raw(read: &[(Presence, Option<DateTime<Utc>>)]) -> Vec<(String, Option<DateTime<Utc>>)> {
+        read.iter().filter(|(p, _)| p.machine_id != ME).map(|(p, at)| (serde_json::to_string(p).unwrap(), *at)).collect()
+    }
+
+    /// A refresh's read never downloads this machine's own record (nothing reads it), and on Dropbox
+    /// and Google Drive downloads a record again only when the cloud lists it with another content
+    /// hash than the copy the last read kept: a machine that went to sleep is downloaded once. What
+    /// the read gives, records and times, is what downloading every record gives.
+    #[test]
+    fn presence_reads_skip_this_machines_record_and_records_listed_unchanged() {
+        presence_reads_on(dropbox());
+        presence_reads_on(Fake { kind: Some("drive".into()), ..Fake::default() });
+    }
+
+    fn presence_reads_on(fake: Fake) {
+        let kind = fake.kind.clone();
+        let store = Rclone::with("cloud", fake);
+        let kept = Kept::default();
+        let t0: DateTime<Utc> = "2026-11-23T12:00:00Z".parse().unwrap();
+        let at = |m: i64| t0 + chrono::Duration::minutes(m);
+        let path = |id: &str| format!("cloud:SlopBar/presence/{id}.json");
+        store.write(&record(IDLE, "IDLE-PC", at(-24 * 60))).unwrap();
+        // This machine writes its record, then reads; what it downloads, and what it gives.
+        let refresh = |m: i64| {
+            store.write(&record(ME, "DESK-1", at(m))).unwrap();
+            let from = store.runner.count();
+            let read = store.others(ME, &kept).unwrap();
+            let calls = store.runner.calls.lock().unwrap()[from..].to_vec();
+            assert!(calls.iter().filter(|c| c.starts_with("lsjson ")).all(|c| c.contains(" --hash ")), "{kind:?}: {calls:?}");
+            assert!(!calls.iter().any(|c| c.contains(ME)), "this machine's own record is never downloaded: {calls:?}");
+            let every = store.list().unwrap();
+            assert_eq!(raw(&read), raw(&every), "{kind:?}: the records and times downloading every record gives");
+            assert_eq!(shown(&read, at(m)), shown(&every, at(m)), "{kind:?}: so the same peers");
+            let cats: Vec<String> = calls.iter().filter_map(|c| c.strip_prefix("cat ")).map(String::from).collect();
+            (read, cats)
+        };
+        store.write(&record(BUSY, "BUSY-PC", at(0))).unwrap();
+        let (read, cats) = refresh(0);
+        assert_eq!(cats, [path(BUSY), path(IDLE)], "the first read downloads the other machines' records");
+        assert_eq!(read.iter().map(|(p, _)| p.machine.as_str()).collect::<Vec<_>>(), ["BUSY-PC", "IDLE-PC"]);
+        store.write(&record(BUSY, "BUSY-PC", at(5))).unwrap();
+        assert_eq!(refresh(5).1, [path(BUSY)], "only the record written since");
+        let (read, cats) = refresh(10);
+        assert!(cats.is_empty(), "nothing written since: the listing alone");
+        assert_eq!(read.len(), 2, "the kept records stand in for the downloads");
+        // A rewrite in the same second at the same size is still a change: its hash is another.
+        let idle = path(IDLE);
+        let (second, size) = (store.runner.times.lock().unwrap()[&idle], store.runner.files.lock().unwrap()[&idle].len());
+        store.runner.clock.store(second - 1, std::sync::atomic::Ordering::SeqCst);
+        store.write(&record(IDLE, "IDLE-PD", at(-24 * 60))).unwrap();
+        assert_eq!((store.runner.times.lock().unwrap()[&idle], store.runner.files.lock().unwrap()[&idle].len()), (second, size));
+        let (read, cats) = refresh(15);
+        assert_eq!((cats, read.iter().any(|(p, _)| p.machine == "IDLE-PD")), (vec![idle.clone()], true));
+        assert!(refresh(20).1.is_empty());
+        // Its time moving while its bytes stay (the same bytes uploaded again): the listing's new time,
+        // with no download.
+        let moved = store.runner.times.lock().unwrap()[&idle] + 3600;
+        store.runner.times.lock().unwrap().insert(idle.clone(), moved);
+        let (read, cats) = refresh(22);
+        let base: DateTime<Utc> = "2026-10-21T07:00:00Z".parse().unwrap();
+        assert_eq!((cats, read.iter().find(|(p, _)| p.machine_id == IDLE).unwrap().1), (vec![], Some(base + chrono::Duration::seconds(moved))));
+        // A record listed with no hash is downloaded at every read, and once more when it is listed
+        // with one again (nothing was kept of it without one).
+        store.runner.hashless.lock().unwrap().push(idle.clone());
+        assert_eq!((refresh(25).1, refresh(30).1), (vec![idle.clone()], vec![idle.clone()]));
+        store.runner.hashless.lock().unwrap().clear();
+        assert_eq!((refresh(35).1, refresh(40).1), (vec![idle.clone()], vec![]));
+        // A record whose bytes do not have the hash it was listed with (it changed between the listing
+        // and the download) is kept under none: downloaded again at the next read.
+        store.runner.stale.lock().unwrap().push(idle.clone());
+        assert_eq!((refresh(45).1, refresh(50).1), (vec![idle.clone()], vec![idle.clone()]));
+        store.runner.stale.lock().unwrap().clear();
+        assert_eq!((refresh(55).1, refresh(60).1), (vec![idle.clone()], vec![]));
+        // A download that breaks off leaves the record out of that read, so `Recall` keeps the machine
+        // while it is live, as for any record a read misses; the next read downloads it.
+        let busy = path(BUSY);
+        let mut recall = crate::presence::Recall::default();
+        let place = crate::sharing::Place { remote: Some("cloud".into()), ..Default::default() };
+        store.write(&record(BUSY, "BUSY-PC", at(60))).unwrap();
+        let (read, cats) = refresh(61);
+        assert_eq!(cats, [busy.clone()]);
+        recall.fill(&place, Some(read.as_slice()), ME, at(61));
+        store.write(&record(BUSY, "BUSY-PC", at(64))).unwrap();
+        store.runner.unreadable.lock().unwrap().push(busy.clone());
+        let (read, cats) = refresh(65);
+        assert_eq!((cats, read.iter().any(|(p, _)| p.machine == "BUSY-PC")), (vec![busy.clone()], false));
+        let filled = recall.fill(&place, Some(read.as_slice()), ME, at(65));
+        assert!(shown(&filled, at(65)).iter().any(|(machine, _, live, _)| machine == "BUSY-PC" && *live), "remembered while live");
+        store.runner.unreadable.lock().unwrap().clear();
+        assert_eq!(refresh(70).1, [busy.clone()]);
+        assert!(refresh(75).1.is_empty());
+        // A listing that fails reads nothing and forgets nothing: the read after it still skips.
+        let failing = Rclone::with("cloud", Fake { fail: Some(1), kind: kind.clone(), ..Fake::default() });
+        assert!(failing.others(ME, &kept).is_err());
+        assert!(refresh(80).1.is_empty());
+        // Records only: a file there that is not one is downloaded at every read, as it always was.
+        store.runner.files.lock().unwrap().insert(path("junk"), b"not a record".to_vec());
+        assert_eq!((refresh(85).1, refresh(90).1), (vec![path("junk")], vec![path("junk")]));
+    }
+
+    /// The file under this machine's name is not read, whatever it holds: only this machine writes
+    /// it, so another machine's record there (a forgery; no two SlopBar ids share their hex digits
+    /// and dashes) is not shown here, as it was when every record was read.
+    #[test]
+    fn the_file_under_this_machines_name_is_not_read_whatever_it_holds() {
+        let store = Rclone::with("cloud", dropbox());
+        let forged = serde_json::to_vec(&record(BUSY, "FORGED-PC", Utc::now())).unwrap();
+        store.runner.files.lock().unwrap().insert(format!("cloud:SlopBar/presence/{ME}.json"), forged);
+        let from = store.runner.count();
+        assert!(store.others(ME, &Kept::default()).unwrap().is_empty());
+        assert_eq!((store.runner.ran(from, "lsjson"), store.runner.ran(from, "cat")), (1, 0));
+        assert_eq!(store.list().unwrap().len(), 1, "every record, as before");
+    }
+
+    /// Remotes whose listing carries no hash this computer counts are not asked for one, and download
+    /// every record at every read, but for this machine's own.
+    #[test]
+    fn presence_reads_elsewhere_download_every_other_record() {
+        for kind in ["sftp", "onedrive", "box"] {
+            let store = Rclone::with("cloud", Fake { kind: Some(kind.into()), ..Fake::default() });
+            let kept = Kept::default();
+            let now = Utc::now();
+            for (id, machine) in [(ME, "DESK-1"), (BUSY, "BUSY-PC"), (IDLE, "IDLE-PC")] {
+                store.write(&record(id, machine, now)).unwrap();
+            }
+            for _ in 0..2 {
+                let from = store.runner.count();
+                assert_eq!(store.others(ME, &kept).unwrap().len(), 2, "{kind}");
+                let calls = store.runner.calls.lock().unwrap()[from..].to_vec();
+                assert!(calls.iter().filter(|c| c.starts_with("lsjson ")).all(|c| !c.contains("--hash")), "{kind}: {calls:?}");
+                assert_eq!(calls.iter().filter(|c| c.starts_with("cat ")).count(), 2, "{kind}: {calls:?}");
+                assert!(!calls.iter().any(|c| c.contains(ME)), "{kind}: {calls:?}");
+            }
+        }
+    }
+
+    /// rclone processes an hour of one machine's presence exchanges starts, refreshing every 5
+    /// minutes beside `live` machines that write at each of theirs and `asleep` ones that stopped:
+    /// [lsjson, cat, rcat]. `every_file` is the read before this change (`list`: every record).
+    fn presence_hour(every_file: bool, live: usize, asleep: usize) -> [usize; 3] {
+        let store = Rclone::with("cloud", dropbox());
+        let kept = Kept::default();
+        let t0: DateTime<Utc> = "2026-11-23T12:00:00Z".parse().unwrap();
+        let id = |n: usize| format!("{n:08x}-0000-4000-8000-000000000000");
+        for n in 0..asleep {
+            store.write(&record(&id(100 + n), &format!("ASLEEP-{n}"), t0 - chrono::Duration::days(2))).unwrap();
+        }
+        let mut ran = [0; 3];
+        // An hour since SlopBar started, then the hour measured.
+        for m in (-60..60i64).step_by(5) {
+            let now = t0 + chrono::Duration::minutes(m);
+            for n in 0..live {
+                store.write(&record(&id(n), &format!("LIVE-{n}"), now - chrono::Duration::seconds(40))).unwrap();
+            }
+            let from = store.runner.count();
+            store.write(&record(ME, "DESK-1", now)).unwrap();
+            let read = if every_file { store.list() } else { store.others(ME, &kept) };
+            assert_eq!(read.unwrap().len(), live + asleep + every_file as usize);
+            if m >= 0 {
+                for (i, command) in ["lsjson", "cat", "rcat"].iter().enumerate() {
+                    ran[i] += store.runner.ran(from, command);
+                }
+            }
+        }
+        ran
+    }
+
+    /// The saving, modelled: a refresh's downloads go from every record (this machine's own
+    /// included) to the records written since the last read. Live machines rewrite theirs at every
+    /// refresh, so they are downloaded as before; asleep and retired machines' records, and this
+    /// machine's own, are not. The listings and uploads are the same.
+    #[test]
+    fn an_hour_of_presence_exchanges_over_rclone_starts_fewer_processes() {
+        let mut said = Vec::new();
+        // ULTRA-MAGNUS's fleet on 2026-11-23 (five others live, two asleep), then one beside two
+        // live machines only, and one beside two asleep ones only.
+        for (live, asleep) in [(5, 2), (2, 0), (0, 2)] {
+            let (before, after) = (presence_hour(true, live, asleep), presence_hour(false, live, asleep));
+            said.push(format!("{live} live, {asleep} asleep: {before:?} -> {after:?}"));
+            assert_eq!(before, [12, 12 * (1 + live + asleep), 12], "{live} live, {asleep} asleep: before, every record at every read");
+            assert_eq!(after, [12, 12 * live, 12], "{live} live, {asleep} asleep: after, the records written since only");
+        }
+        eprintln!("presence rclone processes an hour [lsjson, cat, rcat], before -> after: {}", said.join("; "));
     }
 
     /// A remote's kind (one `listremotes` each time it is looked up) is kept half an hour, so a sync

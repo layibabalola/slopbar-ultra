@@ -123,11 +123,54 @@ fn clean_name(name: &str) -> Option<String> {
 pub trait PresenceStore: Send + Sync {
     /// Every record there, with when the storage last modified it (when it knows).
     fn list(&self) -> std::io::Result<Vec<(Presence, Option<DateTime<Utc>>)>>;
+    /// The records a refresh reads: `list`, less what costs a download for nothing where reading
+    /// costs one (an rclone process per file). This machine's own file, the one named after `own_id`,
+    /// is not read: this machine's record is never used (`peers` and `Recall` leave it out), and only
+    /// a forgery puts another machine's record there. On a cloud that lists a content hash this
+    /// computer checks, a record listed with the hash of the copy `kept` holds of it is not read
+    /// again: that copy is the record. A store whose reads cost no process (a folder) reads every
+    /// record and leaves `kept` alone.
+    fn others(&self, own_id: &str, kept: &Kept) -> std::io::Result<Vec<(Presence, Option<DateTime<Utc>>)>> {
+        let _ = (own_id, kept);
+        self.list()
+    }
     /// Replaces this machine's record.
     fn write(&self, own: &Presence) -> std::io::Result<()>;
     /// Says this machine has nothing signed in.
     fn clear(&self, machine_id: &str, machine: &str, interval_s: u64) -> std::io::Result<()> {
         self.write(&own(machine_id, machine, interval_s, &[], Utc::now()))
+    }
+}
+
+/// The records the last read downloaded or kept (`PresenceStore::others`), by file name, each under
+/// the content hash it was listed with and its bytes have: what stands in for downloading it again
+/// while it is listed with that hash. Every entry's bytes have the hash they are kept under: they
+/// were checked against it when downloaded (`rclone::holds`), or `get` gave them back for that same
+/// hash. Held between refreshes, in memory only; locked only to look up or replace, never while the
+/// storage is read.
+#[derive(Debug, Default)]
+pub struct Kept(std::sync::Mutex<HashMap<String, (String, Vec<u8>)>>);
+
+/// A record is kept for the next read only up to this size, and at most this many records: one is a
+/// few hundred bytes (about 130 more per account), and whoever can write the folder could otherwise
+/// have this computer hold `MAX_RECORD` bytes between refreshes for every file they put there. Any
+/// other record is downloaded at every read, as every record was.
+const KEEP_BYTES: usize = 16 * 1024;
+const KEEP_RECORDS: usize = 64;
+
+impl Kept {
+    /// The bytes kept of the file `name`, when it is listed with this hash and size.
+    pub fn get(&self, name: &str, size: u64, hash: &str) -> Option<Vec<u8>> {
+        let kept = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        kept.get(name).filter(|(h, bytes)| h == hash && bytes.len() as u64 == size).map(|(_, bytes)| bytes.clone())
+    }
+
+    /// What the latest read had the bytes of (name, the hash they have, bytes), in place of what was
+    /// kept, up to `KEEP_RECORDS` of at most `KEEP_BYTES`: a file it did not list or read is
+    /// forgotten.
+    pub fn replace(&self, files: Vec<(String, String, Vec<u8>)>) {
+        let kept = files.into_iter().filter(|(_, _, bytes)| bytes.len() <= KEEP_BYTES).take(KEEP_RECORDS);
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = kept.map(|(name, hash, bytes)| (name, (hash, bytes))).collect();
     }
 }
 
@@ -816,6 +859,48 @@ mod tests {
         let peers = read(&store, &mine.machine_id, now + Duration::minutes(1));
         attach(&mut idle, &peers, now);
         assert!(idle[0].remote.is_empty());
+    }
+
+    /// A folder costs no process per file: a refresh reads every record there, this machine's own
+    /// too (`peers` leaves it out), and keeps nothing.
+    #[test]
+    fn a_folder_reads_every_record_for_a_refresh() {
+        let dir_ = TempDir::new();
+        let store = SyncedFolder(dir_.0.clone());
+        let now = at(0);
+        let (me, other) = ("11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222");
+        store.write(&file(me, "DESK-1", now, vec![seat("x")])).unwrap();
+        store.write(&file(other, "LAPTOP-2", now, vec![seat("x")])).unwrap();
+        let kept = Kept::default();
+        let read = store.others(me, &kept).unwrap();
+        assert_eq!(read.len(), 2);
+        assert_eq!(peers(read, me, now).iter().map(|p| p.machine.as_str()).collect::<Vec<_>>(), ["LAPTOP-2"]);
+        assert_eq!(format!("{kept:?}"), format!("{:?}", Kept::default()), "nothing kept");
+    }
+
+    /// What a read kept stands in for a file only at the hash and size it was kept under; each read
+    /// replaces what was kept.
+    #[test]
+    fn kept_bytes_stand_in_only_at_their_hash_and_size() {
+        let kept = Kept::default();
+        kept.replace(vec![("a.json".into(), "dropbox:aa".into(), b"{}".to_vec()), ("b.json".into(), "dropbox:bb".into(), b"[1]".to_vec())]);
+        assert_eq!(kept.get("a.json", 2, "dropbox:aa"), Some(b"{}".to_vec()));
+        assert_eq!(kept.get("a.json", 3, "dropbox:aa"), None, "another size");
+        assert_eq!(kept.get("a.json", 2, "dropbox:ab"), None, "another hash");
+        assert_eq!(kept.get("c.json", 2, "dropbox:aa"), None, "another name");
+        kept.replace(vec![("a.json".into(), "dropbox:ab".into(), b"{ }".to_vec())]);
+        assert_eq!((kept.get("a.json", 2, "dropbox:aa"), kept.get("b.json", 3, "dropbox:bb")), (None, None));
+        assert_eq!(kept.get("a.json", 3, "dropbox:ab"), Some(b"{ }".to_vec()));
+        // Bounded, whatever the folder holds: records up to KEEP_BYTES...
+        let big = vec![b' '; KEEP_BYTES + 1];
+        kept.replace(vec![("big.json".into(), "dropbox:big".into(), big.clone()), ("edge.json".into(), "dropbox:edge".into(), vec![b' '; KEEP_BYTES])]);
+        assert_eq!(kept.get("big.json", big.len() as u64, "dropbox:big"), None, "too big to keep");
+        assert!(kept.get("edge.json", KEEP_BYTES as u64, "dropbox:edge").is_some(), "KEEP_BYTES itself is kept");
+        // ...and KEEP_RECORDS of them.
+        let many: Vec<_> = (0..KEEP_RECORDS + 36).map(|n| (format!("{n:03}.json"), format!("dropbox:{n}"), b"{}".to_vec())).collect();
+        kept.replace(many);
+        let held = (0..KEEP_RECORDS + 36).filter(|n| kept.get(&format!("{n:03}.json"), 2, &format!("dropbox:{n}")).is_some()).count();
+        assert_eq!(held, KEEP_RECORDS, "the first KEEP_RECORDS only");
     }
 
     #[test]

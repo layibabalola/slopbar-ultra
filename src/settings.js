@@ -212,7 +212,8 @@ function renderAccounts() {
         <div class="group">
           ${list.length ? list.map((a) => accountRow(p, a)).join("") : `<div class="empty">${t("noAccounts")}</div>`}
         </div>
-        ${p === "claude" && list.length && list.every((a) => a.resets_withheld) ? `<p class="hint">${esc(t("resetsWithheld"))}</p>` : ""}
+        ${p === "claude" && list.length && list.every((a) => a.resets_withheld)
+          ? `<p class="hint">${esc(t("resetsWithheld"))} <button class="link" data-claude-usage>${esc(t("resetsWithheldOpen"))} <svg viewBox="0 0 16 16"><path d="M6 3h7v7M13 3 5 11"/></svg></button></p>` : ""}
         <div class="group balancer">
           <div class="row">
             <label class="title" for="auto-${p}">${t("autoSwitch")}</label>
@@ -232,6 +233,11 @@ function renderAccounts() {
 }
 
 $("accounts").addEventListener("click", async (e) => {
+  // Claude lists banked resets to its own clients only: its usage page shows the signed-in account's.
+  if (e.target.closest("[data-claude-usage]")) {
+    try { await invoke("open_claude_usage_page"); } catch (err) { alert(String(err)); }
+    return;
+  }
   const disconnect = e.target.closest("[data-disconnect]");
   if (disconnect) {
     // Reconnecting means a whole browser sign-in, so a stray click must not do this.
