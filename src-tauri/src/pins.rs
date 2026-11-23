@@ -128,7 +128,8 @@ pub fn set(pins: &[ProjectPin], folder: &str, provider: Provider, id: Option<&st
         }
         Some(id) => {
             if !known.iter().any(|(p, k)| *p == provider && k == id) {
-                return Err(format!("no {} account {id:?}; ids come from get_usage", provider.name()));
+                // The id last: a long one cuts only itself at mcp::MAX_TEXT, never the advice.
+                return Err(format!("ids come from get_usage; no {} account has the id {id:?}", provider.name()));
             }
             let folder = normalize_folder(folder)?;
             let pin = ProjectPin { folder: folder.clone(), provider, id: id.to_string() };
@@ -462,6 +463,10 @@ mod tests {
         let folder = repo.0.to_string_lossy().into_owned();
         assert!(set(&[], &folder, Provider::Claude, Some("user-2:acct-2"), &known()).is_err(), "a Codex id is not a Claude account");
         assert!(set(&[], &folder, Provider::Claude, Some("nobody"), &known()).is_err());
+        // The id the agent sent comes last, so however long it is, the advice stays whole where
+        // agents read it (cut at mcp::MAX_TEXT).
+        let long = "x".repeat(2000);
+        assert!(set(&[], &folder, Provider::Claude, Some(&long), &known()).unwrap_err().starts_with("ids come from get_usage; no "));
         for bad in ["relative\\repo", "", "C:\\definitely\\not\\a\\slopbar\\repo", "C:\\repo\nrm"] {
             assert!(set(&[], bad, Provider::Claude, Some("user-1:org-1"), &known()).is_err(), "{bad:?}");
         }

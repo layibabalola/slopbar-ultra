@@ -213,6 +213,17 @@ fn proxy_reasons(write: Option<&str>, read: Option<&str>) -> String {
     format!("{}{}", of("Writing", write), of("Reading", read))
 }
 
+/// The longest reason a sharing row gives: get_health's strings reach agents cut at `mcp::MAX_TEXT`.
+const SHARING_REASON_MAX: usize = 480;
+
+/// `before`, `place` and `after` in one reason of at most `SHARING_REASON_MAX` characters, `place`
+/// (a folder path or an rclone remote) clipped as far as it must be, so that what is said after
+/// it, the network's proxy's reasons included, is never cut.
+fn around(before: &str, place: &str, after: &str) -> String {
+    let room = SHARING_REASON_MAX.saturating_sub(before.chars().count() + after.chars().count());
+    format!("{before}{}{after}", crate::mcp::clipped(place, room.max(24)))
+}
+
 /// The account roster, while it is on: whether it can be shared, and the accounts it found that
 /// wait to be signed in here.
 fn roster_checks(r: &Roster, place: bool) -> Vec<Check> {
@@ -257,7 +268,7 @@ fn wsl_check(s: &crate::sources::WslStatus) -> Option<Check> {
     // listings keep missing (see `sources::listing_stuck`) or a distro did not answer.
     if s.timed_out {
         let slow: Vec<&str> = s.distros.iter().filter(|d| d.timed_out).map(|d| d.name.as_str()).collect();
-        let what = if slow.is_empty() { "WSL did not answer in time".to_string() } else { format!("WSL ({}) did not answer in time", slow.join(", ")) };
+        let what = if slow.is_empty() { "WSL did not answer in time".to_string() } else { format!("WSL ({}) did not answer in time", crate::mcp::listed(&slow)) };
         return Some(check("wsl", Status::Warning, "WSL",
             format!("{what}, so SlopBar skipped it rather than wait; it tries again in a few minutes. If WSL stays stuck, `wsl --shutdown` in a terminal restarts it, or set Look for accounts in WSL to Off (Settings > Data)."), data));
     }
@@ -269,9 +280,11 @@ fn wsl_check(s: &crate::sources::WslStatus) -> Option<Check> {
     let read = names(&|d| d.plan != WslPlan::Skip);
     let skipped = names(&|d| d.plan == WslPlan::Skip);
     let mut parts = vec![];
-    if !read.is_empty() { parts.push(format!("Read: {}.", read.join(", "))); }
+    // Distro names are listed in a room of their own: get_health's strings reach agents cut at
+    // `mcp::MAX_TEXT`, which must never cut the advice after them.
+    if !read.is_empty() { parts.push(format!("Read: {}.", crate::mcp::listed(&read))); }
     if !skipped.is_empty() {
-        parts.push(format!("Left stopped: {} (no CLI sign-ins seen there; Rescan WSL in Settings > Data looks once).", skipped.join(", ")));
+        parts.push(format!("Left stopped: {} (no CLI sign-ins seen there; Rescan WSL in Settings > Data looks once).", crate::mcp::listed(&skipped)));
     }
     if parts.is_empty() { parts.push("No distros.".into()); }
     Some(check("wsl", Status::Ok, "WSL", parts.join(" "), None))
@@ -487,8 +500,10 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         let connect = Some(Fix::ConnectMonitoring { provider: a.provider, id: a.id.clone() });
         // Another of the user's computers read it recently (the shared account roster): its
         // readings show here, so this computer's own sign-in matters less.
+        // Short: with the sign-in limit and the advice to reconnect, it makes the longest row an
+        // agent reads, cut at `mcp::MAX_TEXT` (see `every_reason_reaches_an_agent_whole`).
         let covered = a.covered_by.as_deref().map(|m| format!(
-            "{m} still reads this account's usage, through the account list your computers share, so its readings show here while this computer has none of its own."));
+            "{m} still reads this account's usage, which shows here through your computers' shared account list."));
         if !a.monitor_connected {
             let how = if inputs.auto_connect {
                 "Connect monitoring automatically is on (Settings > Data): SlopBar starts its sign-in once it has been in use for 3 minutes, or connect it now."
@@ -517,7 +532,7 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         // Ended or refused here but covered: a warning, since this computer's switching and alerts
         // still go by its own readings alone.
         let (status, reconnect) = match &covered {
-            Some(c) => (Status::Warning, format!("{c} Reconnect for this computer's own readings, which automatic switching and alerts here go by; it is one browser sign-in as this account, switches nothing and needs no account use.")),
+            Some(c) => (Status::Warning, format!("{c} Automatic switching and alerts here go by this computer's own readings, so reconnect: one browser sign-in as this account that switches nothing and needs no account use.")),
             None => {
                 sign_ins.faults += usize::from(matches!(renewal, Renewal::Ended(_) | Renewal::Refused));
                 (Status::Problem, "Reconnecting is one browser sign-in as this account; it switches nothing and needs no account use.".into())
@@ -529,7 +544,7 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
             sign_ins.limited = sign_ins.limited.or(Some(a.provider));
             explained.insert(key);
             let when = if at <= now { format!("ended {}", ago(now, at)) }
-                else { "ended just before the date it was due to end, which the provider may do".into() };
+                else { "ended a little early, which the provider may do".into() };
             monitoring.push(check(id, status, format!("{who}: monitoring sign-in ended"),
                 format!("{} This one {when}. {reconnect}", sign_in_limit(a.provider)), connect));
         } else if renewal == Renewal::Refused {
@@ -713,15 +728,15 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         (None, _) => check("sharing", Status::Ok, "In-use sharing", "Off: in-use status is not shared with other computers.", None),
         (Some(_), _) if sharing.remote.is_some() && !sharing.rclone_installed => check("sharing", Status::Problem, "In-use sharing",
             "Not running: rclone is missing.", data),
-        (Some(p), None) => check("sharing", Status::Ok, "In-use sharing", format!("Shares through {p}; checked at the next refresh."), None),
+        (Some(p), None) => check("sharing", Status::Ok, "In-use sharing", around("Shares through ", &p, "; checked at the next refresh."), None),
         (Some(p), Some(r)) => match (r.wrote, r.read) {
-            (true, true) => check("sharing", Status::Ok, "In-use sharing", format!("Shared through {p} {}.", ago(now, r.at)), None),
+            (true, true) => check("sharing", Status::Ok, "In-use sharing", around("Shared through ", &p, &format!(" {}.", ago(now, r.at))), None),
             (false, true) => check("sharing", Status::Problem, "In-use sharing",
-                format!("Could not write to {p}, so other computers do not see this one.{}", proxy_reason(r.write_error)), data),
+                around("Could not write to ", &p, &format!(", so other computers do not see this one.{}", proxy_reason(r.write_error))), data),
             (true, false) => check("sharing", Status::Problem, "In-use sharing",
-                format!("Could not read {p}, so this computer does not see the others.{}", proxy_reason(r.read_error)), data),
+                around("Could not read ", &p, &format!(", so this computer does not see the others.{}", proxy_reason(r.read_error))), data),
             (false, false) => check("sharing", Status::Problem, "In-use sharing",
-                format!("Could not write to or read {p}.{}", proxy_reasons(r.write_error, r.read_error)), data),
+                around("Could not write to or read ", &p, &format!(".{}", proxy_reasons(r.write_error, r.read_error))), data),
         },
     });
 
@@ -730,7 +745,7 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         let n = a.overlap.len();
         checks.push(check(format!("overlap:{}:{}", a.provider.key(), a.id), Status::Warning,
             format!("{}: in use on {n} computers at once", name(a)),
-            format!("In use on {} at the same time: its limits drain about {n}x as fast and the provider may sign sessions out. Switch one of them to another account (recommend_account names a free one).", a.overlap.join(", ")),
+            format!("In use on {} at the same time: its limits drain about {n}x as fast and the provider may sign sessions out. Switch one of them to another account (recommend_account names a free one).", crate::mcp::listed(&a.overlap)),
             Some(Fix::OpenSettings { page: "accounts" })));
     }
 
@@ -742,11 +757,12 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
             continue;
         }
         drifted.push(a.provider);
-        let desktop = d.desktop.clone().unwrap_or_else(|| "an account SlopBar does not have".into());
+        // Each name clipped, so the advice after them reaches an agent (`mcp::MAX_TEXT`).
+        let desktop = d.desktop.as_deref().map_or_else(|| "an account SlopBar does not have".into(), |n| crate::mcp::clipped(n, crate::mcp::NAME_ROOM));
         checks.push(check(format!("desktop_drift:{}", a.provider.key()), Status::Warning,
             format!("{} and the CLI use different accounts", d.app),
             format!("CLI: {} · Desktop: {desktop}. Sign {} in with the CLI's account from its own account menu, or use another account with \"Use also switches the desktop app\" on to move both.",
-                d.cli.clone().unwrap_or_default(), d.app),
+                crate::mcp::clipped(d.cli.as_deref().unwrap_or_default(), crate::mcp::NAME_ROOM), d.app),
             Some(Fix::OpenSettings { page: "accounts" })));
     }
 
@@ -998,7 +1014,7 @@ mod tests {
         // The provider may end a sign-in a little before the date it gave: still its limit.
         let c = find(&r, "monitoring:claude:c");
         assert_eq!(c.title, "c@example.invalid: monitoring sign-in ended");
-        assert!(c.reason.contains("just before the date it was due to end"), "{}", c.reason);
+        assert!(c.reason.contains("ended a little early, which the provider may do"), "{}", c.reason);
         // An account not in use carries its monitoring error as its error.
         let mut case = Case::healthy();
         case.accounts[0].error = Some("monitor_uncertain".into());
@@ -1137,6 +1153,86 @@ mod tests {
         }
     }
 
+    /// Every title and reason get_health gives reaches an agent whole (`mcp::MAX_TEXT`), at the
+    /// longest what it names can make it: Codex's longer limit sentence; sign-ins that ended a
+    /// little early, were refused or were never connected, read by another computer with
+    /// a 63-character name (the most a roster or presence record keeps); a thousand computers or WSL
+    /// distros with long names; 254-character emails; a 1024-character sharing folder or a
+    /// 64-character rclone remote, with every outcome and every pair of the network's proxy's reasons.
+    #[test]
+    fn every_reason_reaches_an_agent_whole() {
+        use crate::sources::{DistroStatus, WslPlan, WslScan, WslStatus};
+        let whole = |r: &Report| {
+            for c in &r.checks {
+                for text in [&c.title, &c.reason] {
+                    assert!(text.chars().count() <= crate::mcp::MAX_TEXT, "{}: {} characters: {text}", c.id, text.chars().count());
+                }
+            }
+        };
+        let email = format!("{}@example.invalid", "e".repeat(254 - "@example.invalid".len()));
+        // Short names fill a list's whole room; long ones are clipped.
+        for (provider, len) in [(Provider::Claude, 8), (Provider::Claude, 300), (Provider::Codex, 8), (Provider::Codex, 300)] {
+            let names: Vec<String> = (0..1000).map(|i| format!("{i:03}{}", "n".repeat(len))).collect();
+            let mut case = Case::healthy();
+            case.accounts = ["a", "b", "c", "d"].into_iter().map(|id| account(id, true, Some(1))).collect();
+            for a in &mut case.accounts {
+                a.provider = provider;
+                a.email = Some(email.clone());
+                a.covered_by = Some("M".repeat(63));
+                a.overlap = names.clone();
+                a.cli_ends_at = Some(now() - Duration::days(2));
+            }
+            // a ended a little early, b was refused well before its end, c was never connected,
+            // d is in use, its CLI sign-in ended and the desktop app is on another account.
+            case.monitoring.insert(format!("{}:a", provider.name()), MonitorState { reconnect: true, uncertain: false, ends_at: Some(now() + Duration::days(1)) });
+            case.monitoring.insert(format!("{}:b", provider.name()), MonitorState { reconnect: true, uncertain: false, ends_at: Some(now() + Duration::days(9)) });
+            case.accounts[2].monitor_connected = false;
+            case.accounts[3].active = true;
+            case.accounts[3].seats = Some(crate::model::SeatDrift { app: "Claude Desktop".into(), cli: Some(email.clone()), desktop: Some(email.clone()) });
+            case.other_computers = 999;
+            case.wsl = WslStatus { mode: WslScan::Auto, checked_at: Some(now()), installed: true, timed_out: true, backing_off: false,
+                distros: names.iter().map(|n| DistroStatus { name: n.clone(), running: true, plan: WslPlan::Read, has_logins: false, known: false, timed_out: true }).collect() };
+            let r = case.run();
+            let a = find(&r, &format!("monitoring:{}:a", provider.key()));
+            assert!(a.reason.contains("ended a little early") && a.reason.ends_with("needs no account use."), "{}", a.reason);
+            let (overlap, drift) = (format!("overlap:{}:a", provider.key()), format!("desktop_drift:{}", provider.key()));
+            for id in ["wsl", RENEWAL_SUMMARY, CLI_RENEWAL_SUMMARY, overlap.as_str(), drift.as_str()] {
+                find(&r, id);
+            }
+            whole(&r);
+            // WSL answering: what it read and what it left stopped, each list in its room.
+            case.wsl.timed_out = false;
+            for (i, d) in case.wsl.distros.iter_mut().enumerate() {
+                d.timed_out = false;
+                d.plan = if i % 2 == 0 { WslPlan::Read } else { WslPlan::Skip };
+            }
+            let r = case.run();
+            assert!(find(&r, "wsl").reason.ends_with("looks once)."), "{}", find(&r, "wsl").reason);
+            whole(&r);
+        }
+        // Sharing: a long folder or remote, every outcome, every pair of the proxy's reasons.
+        let codes: Vec<Option<&'static str>> = std::iter::once(None).chain(crate::net::PROXY_CODES.iter().copied().map(Some)).collect();
+        let mut case = Case::healthy();
+        for (folder, remote) in [(Some(format!("C:\\{}", "f".repeat(1021))), None), (None, Some("r".repeat(64)))] {
+            case.sharing = Sharing { folder: folder.clone(), remote: remote.clone(), rclone_installed: true, last: None };
+            whole(&case.run());
+            for (wrote, read) in [(true, true), (false, true), (true, false), (false, false)] {
+                for &write_error in &codes {
+                    for &read_error in &codes {
+                        case.sharing.last = Some(SharingResult { at: now(), wrote, read, write_error, read_error });
+                        let r = case.run();
+                        whole(&r);
+                        let reason = &find(&r, "sharing").reason;
+                        // The place is clipped, never what is said after it.
+                        if !wrote || !read {
+                            assert!(reason.ends_with('.'), "{reason}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn monitoring_and_cli_sign_ins_due_together_are_made_in_one_sitting() {
         let mut case = Case::healthy();
@@ -1203,7 +1299,8 @@ mod tests {
         let r = case.run();
         let a = find(&r, "monitoring:claude:a");
         assert_eq!((a.status, a.title.as_str()), (Status::Warning, "a@example.invalid: monitoring sign-in ended"));
-        assert!(a.reason.contains("ended 2 days ago") && a.reason.contains("DESK-A still reads this account's usage") && a.reason.contains("automatic switching and alerts"), "{}", a.reason);
+        assert!(a.reason.contains("ended 2 days ago") && a.reason.contains("DESK-A still reads this account's usage, which shows here")
+            && a.reason.contains("Automatic switching and alerts here go by this computer's own readings"), "{}", a.reason);
         assert_eq!(a.fix, Some(Fix::ConnectMonitoring { provider: Provider::Claude, id: "a".into() }), "reconnecting stays offered");
         assert_eq!(find(&r, "monitoring:claude:b").status, Status::Problem);
         let c = find(&r, "monitoring:claude:c");
