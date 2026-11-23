@@ -1482,7 +1482,7 @@ mod tests {
         let store = Folder(shared.0.clone());
         let p = pass("synthetic roster passphrase");
         let key = SealKey::new(&p).unwrap();
-        let mut a = own(MACHINE_A, " DESK\u{200B}-A\u{202E}\u{FE0F}\u{34F}\u{E0041}\u{2028}\u{2029} ", &[account("claude", "cl-one")], now());
+        let mut a = own(MACHINE_A, " DESK\u{200B}\u{2028}-A\u{2029}\u{202E}\u{FE0F}\u{34F}\u{E0041} ", &[account("claude", "cl-one")], now());
         a.readings = vec![Reading { lapsed: false, provider: Provider::Claude, id: "cl-one".into(), taken_at: now(),
             windows: vec![UsageWindow { kind: "weekly".into(), window_seconds: None, used_percent: 5.0, resets_at: None }] }];
         store.put(&file_name(MACHINE_A).unwrap(), &seal(&a, &key).unwrap()).unwrap();
@@ -2044,6 +2044,7 @@ mod tests {
         }
         assert_eq!(again.len(), 2, "{again:?}");
         assert_eq!(again[1] - again[0], 15 * 60, "the waits started over");
+        assert_eq!(a.seen.own_restores, 2, "and the rewrites in a row with them");
         // A store whose writes fail and whose listing has no file of this machine's (the sharing
         // folder gone, say): one try a gap, as for readings alone.
         let mut b = Syncer::default();
