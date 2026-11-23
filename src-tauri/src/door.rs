@@ -219,6 +219,10 @@ pub enum Request {
     RelayPlan {
         #[serde(default)]
         monitoring: bool,
+        /// The machine id of the computer asking: its own relayed sign-in still open here (its
+        /// stop on the way) does not count as busy, since its next start replaces it.
+        #[serde(default)]
+        from: String,
     },
     /// `slopbar-mcp --relay` only: computer `from` starts sign-in `kind` of this computer's plan
     /// for the account, under its id `step`, with no window or browser here. `machine` is the id it

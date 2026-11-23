@@ -69,9 +69,10 @@ pub struct Page {
 /// Checks a page a relayed sign-in for `provider`'s account `email` hands over: the provider's own
 /// CLI's authorization page (host, path and OAuth client pinned, see [`Cli`]), an authorization code
 /// request with a PKCE S256 challenge and a state, no parameter that would skip or reshape the
-/// consent (`prompt`, `request`, `request_uri`, `response_mode`), a login hint, if any, that is the
-/// step's email, and a `redirect_uri` of `http://localhost:<port>/…` or `http://127.0.0.1:<port>/…`
-/// at or above port 1024. Each of those parameters may appear once.
+/// consent (`prompt`, `request`, `request_uri`, `response_mode`), a login hint that is the step's
+/// email (Claude's always names a plain address it was given; none on Codex's), and a `redirect_uri`
+/// of `http://localhost:<port>/…` or `http://127.0.0.1:<port>/…` at or above port 1024. Each of
+/// those parameters may appear once.
 pub fn check_page(url: &str, provider: Provider, email: Option<&str>) -> Result<Page, &'static str> {
     const BAD: &str = "relay_page_unexpected";
     if !crate::signin::allowed_url(url) {
@@ -105,7 +106,12 @@ pub fn check_page(url: &str, provider: Provider, email: Option<&str>) -> Result<
         return Err(BAD);
     }
     let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
-    if hint.is_some_and(|h| !email.is_some_and(|e| same(&h, e))) {
+    if hint.as_deref().is_some_and(|h| !email.is_some_and(|e| same(h, e))) {
+        return Err(BAD);
+    }
+    // Claude Code is given the email to prefill (`--email`) whenever it is a plain address: its
+    // page names it then, or it is not that sign-in's page. Codex's pages name none.
+    if provider == Provider::Claude && hint.is_none() && crate::signin::prefill_email(email).is_some() {
         return Err(BAD);
     }
     let back = reqwest::Url::parse(&redirect.ok_or(BAD)?).map_err(|_| BAD)?;
@@ -178,6 +184,8 @@ struct Open {
     nonce: String,
     phase: Phase,
     url: Option<String>,
+    /// The revision at which the page came: a caller that has seen it is not sent it again.
+    page_revision: u64,
     error: Option<String>,
     started: Instant,
     heard: Instant,
@@ -230,7 +238,7 @@ impl Slot {
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let now = Instant::now();
         *open = Some(Open { step: step.to_owned(), from: from.to_owned(), provider, email: email.map(str::to_owned), nonce: nonce.clone(),
-            phase: Phase::Starting, url: None, error: None, started: now, heard: now, stop: false });
+            phase: Phase::Starting, url: None, page_revision: 0, error: None, started: now, heard: now, stop: false });
         drop(open);
         self.bump();
         Ok(Begun::New(nonce))
@@ -251,6 +259,8 @@ impl Slot {
         }
         o.phase = Phase::Page;
         o.url = Some(url.to_owned());
+        // The bump below makes this the page's revision.
+        o.page_revision = self.revision() + 1;
         drop(open);
         self.bump();
         true
@@ -267,26 +277,33 @@ impl Slot {
         self.bump();
     }
 
-    /// The state of step `step` (None: another step holds the slot, or none ever did); asking is
-    /// also what keeps it going (see [`UNHEARD_LIMIT`]).
+    /// The state of step `step` (None: another step holds the slot, or none ever did), with its
+    /// page; asking is also what keeps it going (see [`UNHEARD_LIMIT`]).
     pub fn state(&self, step: &str) -> Option<State> {
+        self.state_since(step, 0)
+    }
+
+    /// [`state`](Self::state) for a caller that has seen revision `since`: the page only when it
+    /// came after that, so it crosses SSH (and any record kept of a session's output) once.
+    fn state_since(&self, step: &str, since: u64) -> Option<State> {
         let mut open = self.lock();
         let o = open.as_mut().filter(|o| o.step == step)?;
         o.heard = Instant::now();
-        Some(State { step: o.step.clone(), phase: o.phase, url: o.url.clone(), error: o.error.clone(), revision: self.revision() })
+        let url = o.url.clone().filter(|_| o.page_revision > since);
+        Some(State { step: o.step.clone(), phase: o.phase, url, error: o.error.clone(), revision: self.revision() })
     }
 
     /// Waits up to `wait` for step `step` to change after revision `since` (at once when it has, or
-    /// has ended), then answers as [`state`](Self::state).
+    /// has ended), then answers as [`state`](Self::state), with the page only if it came after `since`.
     pub async fn wait_state(&self, step: &str, since: u64, wait: Duration) -> Option<State> {
         let until = tokio::time::Instant::now() + wait;
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let ended = self.state(step).is_none_or(|s| s.phase.ended());
+            let ended = self.state_since(step, since).is_none_or(|s| s.phase.ended());
             if self.revision() > since || ended || tokio::time::timeout_at(until, changed).await.is_err() {
-                return self.state(step);
+                return self.state_since(step, since);
             }
         }
     }
@@ -469,6 +486,49 @@ struct MachineAnswer {
     name: String,
 }
 
+/// One computer's part in a sitting, as the person confirms it: keyed by machine id, so two
+/// computers that give the same name never merge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Computer {
+    pub id: String,
+    pub name: String,
+    /// The SSH host that reaches it; None for this computer.
+    pub host: Option<String>,
+    /// Its sign-ins in the sitting.
+    pub steps: usize,
+    /// The emails they sign in as, each once.
+    pub emails: Vec<String>,
+    /// Sign-ins for accounts without an email.
+    pub unnamed: usize,
+}
+
+/// The computers of a sitting's plan, in the order their first sign-in runs: `here` (this
+/// computer's id and name) for steps that name no computer.
+pub fn computers(groups: &[crate::bulk::Group], here: (&str, &str)) -> Vec<Computer> {
+    let mut list: Vec<Computer> = Vec::new();
+    for step in groups.iter().flat_map(|g| g.steps.iter()) {
+        let (id, name, host) = match &step.machine {
+            Some(m) => (m.id.as_str(), m.name.as_str(), Some(m.host.clone())),
+            None => (here.0, here.1, None),
+        };
+        let at = match list.iter().position(|c| c.id == id) {
+            Some(at) => at,
+            None => {
+                list.push(Computer { id: id.to_owned(), name: name.to_owned(), host, steps: 0, emails: vec![], unnamed: 0 });
+                list.len() - 1
+            }
+        };
+        let c = &mut list[at];
+        c.steps += 1;
+        match step.email.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+            Some(email) if !c.emails.iter().any(|e| e.eq_ignore_ascii_case(email)) => c.emails.push(email.to_owned()),
+            Some(_) => {}
+            None => c.unnamed += 1,
+        }
+    }
+    list
+}
+
 /// One computer's part in a sitting, as it answered.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Offer {
@@ -508,7 +568,7 @@ const PLAN_WAIT: Duration = Duration::from_secs(10);
 /// computer's. Its screen does not matter (locked, or nobody at it): nothing opens there.
 pub fn ask(remote: &dyn crate::pairing::Remote, host: &str, expected: Option<&str>, here: &str, monitoring: bool) -> Asked {
     let skip = |machine: &str, reason: &str| Asked::Skipped(Skipped::computer(machine, reason));
-    let answer = crate::pairing::relay_call(remote, host, &Request::RelayPlan { monitoring }, PLAN_WAIT);
+    let answer = crate::pairing::relay_call(remote, host, &Request::RelayPlan { monitoring, from: here.to_owned() }, PLAN_WAIT);
     let answer = match answer {
         Ok(answer) => answer,
         Err(e) if e.starts_with("ssh_") || e == "bad_ssh_host" || e == "no_pwsh_over_ssh" || e == "slopbar_not_installed" => return skip(host, &e),
@@ -534,7 +594,9 @@ pub fn ask(remote: &dyn crate::pairing::Remote, host: &str, expected: Option<&st
     if answer.busy {
         return skip(&name, "peer_busy");
     }
-    let in_use = answer.in_use.into_iter().map(|u| InUse { machine: name.clone(), ..u }).collect();
+    // Shown to the person and agents: cleaned like a name (see `shown_name`).
+    let in_use = answer.in_use.into_iter()
+        .map(|u| InUse { machine: name.clone(), id: shown_name(&u.id, "?"), email: u.email.map(|e| shown_name(&e, "?")), ..u }).collect();
     Asked::Offer(Offer { machine: crate::bulk::Machine { id: machine.id, name, host: host.to_owned() }, plan: answer.plan, own: answer.own_readings, in_use })
 }
 
@@ -606,16 +668,19 @@ const KNOWN: &[&str] = &[
     "signin_stopped", "signin_window_closed", "monitor_wrong_account", "monitor_wrong_workspace", "desktop_locked", "desktop_not_shown",
     "no_desktop_session", "signin_browser_missing", "signin_profile_storage", "signin_url_rejected", "relay_port_unusable", "monitor_login_failed",
     "monitor_storage", "relay_unknown_account", "relay_lost", "relay_unheard", "relay_no_page", "relay_unsupported", "relay_page_unexpected",
-    "relay_outdated", "relay_step_unknown", "wrong_machine", "peer_busy", "signin_busy", "monitor_busy", "CLI not found", "tunnel_failed",
+    "relay_outdated", "relay_step_unknown", "relay_stopped_there", "wrong_machine", "peer_busy", "signin_busy", "monitor_busy", "CLI not found", "tunnel_failed",
     "app_not_running", "slopbar_not_installed", "not_running", "door_unavailable", "timeout", "ssh_timeout", "ssh_missing", "ssh_failed",
     "bad_ssh_host", "remote_no_answer", "no_pwsh_over_ssh", "ssh_shell_windows_powershell", "no_ssh_host", "relay_failed",
 ];
 
-/// `code` as it may be kept and shown here: one of [`KNOWN`] (ssh's own failure keeps its first
-/// line, which this computer's ssh wrote), else `relay_failed`.
+/// `code` as it may be kept and shown here: one of [`KNOWN`], else `relay_failed`. ssh's own
+/// failure loses its line: an exit of 255 with text on standard error may come from the command
+/// the other computer ran, not from ssh here.
 pub fn known(code: &str) -> String {
-    if code.starts_with("ssh_failed: ") || KNOWN.contains(&code) {
-        code.chars().filter(|c| !c.is_control()).take(240).collect()
+    if code.starts_with("ssh_failed") {
+        "ssh_failed".into()
+    } else if KNOWN.contains(&code) {
+        code.into()
     } else {
         "relay_failed".into()
     }
@@ -625,7 +690,7 @@ pub fn known(code: &str) -> String {
 pub fn fault(code: &str) -> Fault {
     match code {
         "signin_stopped" | "signin_window_closed" | "monitor_wrong_account" | "monitor_wrong_workspace" | "desktop_locked" | "desktop_not_shown"
-        | "no_desktop_session" | "signin_browser_missing" | "signin_profile_storage" => Fault::StopRun,
+        | "signin_browser_missing" | "signin_profile_storage" => Fault::StopRun,
         "relay_port_unusable" | "monitor_login_failed" | "monitor_storage" | "relay_unknown_account" => Fault::SkipStep,
         _ => Fault::DropComputer,
     }
@@ -634,9 +699,11 @@ pub fn fault(code: &str) -> Fault {
 /// The words the windows show for a computer or sign-in left out with `code`: an i18n key.
 pub fn why(code: &str) -> &'static str {
     match code {
-        c if c.starts_with("ssh_") || matches!(c, "bad_ssh_host" | "relay_lost" | "no_ssh_host" | "remote_no_answer" | "tunnel_failed") => "leftUnreachable",
-        "app_not_running" | "no_desktop_session" | "not_running" | "door_unavailable" | "timeout" | "slopbar_not_installed" => "leftNotRunning",
-        "relay_outdated" | "relay_unsupported" | "relay_page_unexpected" => "leftOutdated",
+        c if c.starts_with("ssh_") || matches!(c, "bad_ssh_host" | "relay_lost" | "remote_no_answer" | "tunnel_failed") => "leftUnreachable",
+        "app_not_running" | "no_desktop_session" | "not_running" | "door_unavailable" | "timeout" => "leftNotRunning",
+        "slopbar_not_installed" => "leftNotInstalled",
+        "no_ssh_host" => "leftNoHost",
+        "relay_outdated" | "relay_unsupported" => "leftOutdated",
         "peer_busy" | "signin_busy" | "monitor_busy" => "leftBusy",
         "no_pwsh_over_ssh" => "leftNoPwsh",
         "ssh_shell_windows_powershell" => "leftShell",
@@ -688,22 +755,13 @@ impl Tunnel {
             command.arg("-L").arg(arg);
         }
         command.arg(host).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        // Started suspended and put in the kill-on-close job before it runs (nothing it starts,
+        // such as a ProxyCommand, can begin outside it), or not at all: a tunnel never outlives
+        // this app.
         #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
-        let mut child = command.spawn().map_err(|_| "tunnel_failed")?;
-        // In the kill-on-close job, or not at all: a tunnel must never outlive this app.
-        #[cfg(windows)]
-        let tree = match crate::login::ProcessTree::attach(&child) {
-            Ok(tree) => tree,
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("tunnel_failed");
-            }
-        };
+        let (child, tree) = crate::login::ProcessTree::spawn(&mut command, false).map_err(|_| "tunnel_failed")?;
+        #[cfg(not(windows))]
+        let child = command.spawn().map_err(|_| "tunnel_failed")?;
         let mut tunnel = Tunnel { child, #[cfg(windows)] _tree: tree };
         let started = Instant::now();
         loop {
@@ -712,7 +770,8 @@ impl Tunnel {
                 return Err(if port_free(port) { "tunnel_failed" } else { "relay_port_unusable" });
             }
             let through = reaches(std::net::Ipv4Addr::LOCALHOST.into(), port) && (!ipv6 || reaches(std::net::Ipv6Addr::LOCALHOST.into(), port));
-            if through && listeners(port).iter().all(|pid| *pid == tunnel.child.id()) {
+            // Only ssh listens there (a table that could not be read proves nothing).
+            if through && listeners(port).is_some_and(|pids| pids.iter().all(|pid| *pid == tunnel.child.id())) {
                 return Ok(tunnel);
             }
             if started.elapsed() > TUNNEL_READY {
@@ -749,10 +808,11 @@ fn ipv6_loopback() -> bool {
     std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).is_ok()
 }
 
-/// Whether nothing here listens on `port`, on any address of either family, and Windows lets a
-/// program listen on its loopback there (a port in an excluded range is refused).
+/// Whether nothing here listens on `port`, on any address of either family (as far as Windows'
+/// listener table says: one that could not be read counts as taken), and Windows lets a program
+/// listen on its loopback there (a port in an excluded range is refused).
 fn port_free(port: u16) -> bool {
-    listeners(port).is_empty() && std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
+    listeners(port).is_some_and(|pids| pids.is_empty()) && std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
 }
 
 /// Whether an HTTP request through `port` on `addr` gets an HTTP answer: the tunnel is up and
@@ -769,12 +829,14 @@ fn reaches(addr: std::net::IpAddr, port: u16) -> bool {
     stream.read_exact(&mut head).is_ok() && head.starts_with(b"HTTP/1.")
 }
 
-/// The processes listening on `port` here, on any address of either family.
+/// The processes listening on `port` here, on any address of either family; None when Windows'
+/// table of them could not be read.
 #[cfg(windows)]
-fn listeners(port: u16) -> Vec<u32> {
+fn listeners(port: u16) -> Option<Vec<u32>> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{GetExtendedTcpTable, TCP_TABLE_OWNER_PID_LISTENER};
     const AF_INET: u32 = 2;
     const AF_INET6: u32 = 23;
+    const NO_ROOM: u32 = 122; // ERROR_INSUFFICIENT_BUFFER: the table grew between the two calls.
     let mut found = Vec::new();
     // Each row's local port is in network order in the low 16 bits of a u32; rows are u32s after
     // the count: IPv4 (state, address, port, remote address, remote port, pid), IPv6 (address 16
@@ -782,10 +844,19 @@ fn listeners(port: u16) -> Vec<u32> {
     for (family, row, at_port, at_pid) in [(AF_INET, 24usize, 8usize, 20usize), (AF_INET6, 56, 20, 52)] {
         let mut size = 0u32;
         unsafe { GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, family, TCP_TABLE_OWNER_PID_LISTENER, 0) };
-        let mut buf = vec![0u32; (size as usize).div_ceil(4) + 64];
-        let mut room = (buf.len() * 4) as u32;
-        if unsafe { GetExtendedTcpTable(buf.as_mut_ptr().cast(), &mut room, 0, family, TCP_TABLE_OWNER_PID_LISTENER, 0) } != 0 {
-            continue;
+        let mut buf;
+        let mut tries = 0;
+        loop {
+            buf = vec![0u32; (size as usize).div_ceil(4) + 64];
+            let mut room = (buf.len() * 4) as u32;
+            match unsafe { GetExtendedTcpTable(buf.as_mut_ptr().cast(), &mut room, 0, family, TCP_TABLE_OWNER_PID_LISTENER, 0) } {
+                0 => break,
+                NO_ROOM if tries < 3 => {
+                    tries += 1;
+                    size = room;
+                }
+                _ => return None,
+            }
         }
         let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), buf.len() * 4) };
         let word = |at: usize| bytes.get(at..at + 4).map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]));
@@ -798,12 +869,12 @@ fn listeners(port: u16) -> Vec<u32> {
             }
         }
     }
-    found
+    Some(found)
 }
 
 #[cfg(not(windows))]
-fn listeners(_: u16) -> Vec<u32> {
-    Vec::new()
+fn listeners(_: u16) -> Option<Vec<u32>> {
+    Some(Vec::new())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -898,6 +969,10 @@ fn drive_timed(desk: &dyn Desk, host: &str, ids: &Ids, step: &crate::bulk::Step,
     let email = step.email.as_deref();
     let mut tries = 0;
     loop {
+        // Never a new sign-in there once this one was stopped here.
+        if shared.cancelled() {
+            return Err("signin_stopped".into());
+        }
         let id = uuid::Uuid::new_v4().simple().to_string();
         *shared.step.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
         let start = Request::RelayStart {
@@ -907,22 +982,34 @@ fn drive_timed(desk: &dyn Desk, host: &str, ids: &Ids, step: &crate::bulk::Step,
         let mut state = start_there(desk, host, &start, shared, timing)?;
         let mut last_heard = Instant::now();
         let mut reopened = false;
+        // The page, as it came (it is sent once).
+        let mut page_url: Option<String> = None;
         loop {
-            if shared.cancelled() {
-                return Err("signin_stopped".into());
-            }
             if state.phase.ended() {
                 shared.ended_there.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            // Stopped here while it runs there: stopped there in order, after its start.
+            if shared.cancelled() {
+                if !state.phase.ended() {
+                    let _ = desk.call(host, &Request::RelayStop { step: id.clone() }, Duration::ZERO);
+                }
+                return Err("signin_stopped".into());
+            }
+            if state.url.is_some() {
+                page_url = state.url.clone();
             }
             match state.phase {
                 Phase::Done => return Ok(true),
                 Phase::Skipped => return Ok(false),
+                // Stopped there, not here (its own Stop, or another sitting's start): that computer
+                // is left out, the run goes on.
+                Phase::Failed if state.error.as_deref() == Some("signin_stopped") => return Err("relay_stopped_there".into()),
                 Phase::Failed => return Err(known(state.error.as_deref().unwrap_or("relay_failed"))),
                 Phase::Starting => {}
                 Phase::Page => {
                     let held = shared.tunnel.lock().unwrap_or_else(|e| e.into_inner()).is_some();
                     if !held {
-                        let Some(url) = state.url.clone() else { return Err("relay_failed".into()) };
+                        let Some(url) = page_url.clone() else { return Err("relay_failed".into()) };
                         let page = check_page(&url, provider, email).map_err(String::from)?;
                         match desk.tunnel(host, &page) {
                             Ok(tunnel) => *shared.tunnel.lock().unwrap_or_else(|e| e.into_inner()) = Some(tunnel),
@@ -951,9 +1038,13 @@ fn drive_timed(desk: &dyn Desk, host: &str, ids: &Ids, step: &crate::bulk::Step,
                 }
                 reopened = true;
                 *shared.tunnel.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                let url = state.url.clone().ok_or("tunnel_failed")?;
+                let url = page_url.clone().ok_or("tunnel_failed")?;
                 let page = check_page(&url, provider, email).map_err(String::from)?;
                 let tunnel = desk.tunnel(host, &page).map_err(String::from)?;
+                if shared.cancelled() {
+                    let _ = desk.call(host, &Request::RelayStop { step: id.clone() }, Duration::ZERO);
+                    return Err("signin_stopped".into());
+                }
                 *shared.tunnel.lock().unwrap_or_else(|e| e.into_inner()) = Some(tunnel);
             }
             let ask = Request::RelayState { step: id.clone(), since: state.revision, wait_seconds: STATE_WAIT };
@@ -979,6 +1070,9 @@ fn drive_timed(desk: &dyn Desk, host: &str, ids: &Ids, step: &crate::bulk::Step,
 fn start_there(desk: &dyn Desk, host: &str, start: &Request, shared: &Shared, timing: &Timing) -> Result<State, String> {
     let until = Instant::now() + timing.start_retry;
     loop {
+        if shared.cancelled() {
+            return Err("signin_stopped".into());
+        }
         match desk.call(host, start, START_WAIT) {
             Ok(answer) => return serde_json::from_value::<State>(answer).map_err(|_| "relay_failed".to_string()),
             Err(e) => {

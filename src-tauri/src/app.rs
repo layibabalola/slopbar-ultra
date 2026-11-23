@@ -108,9 +108,11 @@ pub struct AppState {
     sharing_cancel: Arc<std::sync::atomic::AtomicBool>,
     /// The SSH tunnel while another computer's Dropbox sign-in waits for this computer's browser.
     sharing_tunnel: Mutex<Option<sharing_setup::Tunnel>>,
-    /// "Sign in all your computers from here": the plan last gathered, so the person's OK (or an
-    /// agent's confirm) runs exactly what was shown (see `gather_everywhere`).
+    /// "Sign in all your computers from here": the plan last gathered, so the person's OK runs
+    /// exactly what was shown (see `gather_everywhere`), once.
     everywhere: Mutex<Option<Everywhere>>,
+    /// A sitting waiting for the person's confirmation in Settings (see `confirm_everywhere_here`).
+    everywhere_ask: Mutex<Option<bool>>,
 }
 
 impl AppState {
@@ -251,12 +253,17 @@ pub(crate) async fn health_report(app: &AppHandle) -> health::Report {
     }, chrono::Utc::now())
 }
 
-/// How many of the user's other computers this one knows: paired or checked over SSH from here,
-/// or named by the roster. "Sign in all your computers from here" can ask each (see `relay`).
+/// How many of the user's other computers "Sign in all your computers from here" would ask (see
+/// `gather_everywhere`): those paired or checked over SSH from here, and the roster's that
+/// ~/.ssh/config names.
 fn other_computers(state: &AppState) -> usize {
     let here = presence::identity().map(|(id, _)| id.to_string());
     let mut ids: HashSet<String> = settings::app_dir().map(|d| pairing::paired(&d)).unwrap_or_default().into_iter().map(|(id, _)| id).collect();
-    ids.extend(state.roster_seen.lock().unwrap().peers.iter().map(|p| p.machine_id.clone()));
+    let peers = state.roster_seen.lock().unwrap().peers.clone();
+    if peers.iter().any(|p| !ids.contains(&p.machine_id)) {
+        let aliases = ssh_aliases();
+        ids.extend(peers.into_iter().filter(|p| aliases.contains(&p.machine.trim().to_lowercase())).map(|p| p.machine_id));
+    }
     ids.into_iter().filter(|id| Some(id) != here.as_ref()).count()
 }
 
@@ -751,8 +758,8 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
                 let plan = gather_everywhere(&app, monitoring).await?;
                 let mut shown = value(&plan)?;
                 shown["started"] = false.into();
-                shown["next"] = "Nothing was started. With confirm: true a notification on this computer asks the person here to start it (Start); \
-                    then this computer's sign-ins and every other computer's in plan open in this computer's browser one at a time, an email's together \
+                shown["next"] = "Nothing was started. With confirm: true a notification on this computer asks the person here to review it, and Settings starts \
+                    it only on their OK; then this computer's sign-ins and every other computer's in plan open in this computer's browser one at a time, an email's together \
                     in one fresh profile (Google once per email), while nothing opens on the other computers' screens. left_out names computers or \
                     sign-ins left out and why; in_use names accounts in use whose CLI sign-in ends, which no sitting renews (claude /login at that \
                     computer). Follow it with get_machine_readiness (this computer) and its sign_in, whose steps carry machine.".into();
@@ -760,13 +767,13 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             }
             desktop_shown()?;
             let plan = gather_everywhere(&app, monitoring).await?;
-            let any = plan.computers.iter().any(|(_, n)| *n > 0);
-            let asked = any && ask_everywhere(&app, plan.clone());
+            let any = !plan.computers.is_empty();
+            let asked = any && ask_everywhere(&app, &plan);
             let mut shown = value(&plan)?;
             shown["started"] = false.into();
             shown["asked"] = asked.into();
             shown["next"] = if asked {
-                "A notification on this computer asks the person here to start it: nothing starts until they click Start. Then follow it with get_machine_readiness and its sign_in."
+                "A notification on this computer asks the person here to review it: Settings then checks every computer again and starts only on their OK. Then follow it with get_machine_readiness and its sign_in."
             } else if any {
                 "The notification asking the person here could not be shown (notifications off?): they start it themselves in Settings > Accounts, Sign in all your computers from here."
             } else {
@@ -792,7 +799,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             Ok(serde_json::json!({ "started": !plan.is_empty(), "plan": plan,
                 "next": "Each sign-in opens after the previous one finishes. get_usage shows the accounts, monitor_connected, and no monitor_renewal or cli_renewal, as they complete." }))
         }
-        R::RelayPlan { monitoring } => Ok(relay_plan(&app, monitoring).await),
+        R::RelayPlan { monitoring, from } => Ok(relay_plan(&app, monitoring, &from).await),
         R::RelayStart { step, from, machine, kind, provider, id, email } => relay_start(&app, step, from, machine, kind, provider, id, email).await,
         R::RelayState { step, since, wait_seconds } => {
             let wait = Duration::from_secs(u64::from(wait_seconds.min(40)));
@@ -1136,13 +1143,15 @@ fn wrong_account(provider: Provider, expected: Option<&str>, signed_in: Option<&
 /// now, which accounts it reads usage for itself (automatic switching per provider, rotation
 /// thresholds), its accounts in use whose CLI sign-ins ended or end soon (the CLI manages those: no
 /// sitting renews them), whether a sign-in is open here or its own run goes, and what its OpenSSH
-/// server starts.
-async fn relay_plan(app: &AppHandle, monitoring: bool) -> serde_json::Value {
+/// server starts. A relayed sign-in of `from`'s own still open here (its stop on the way) is not
+/// busy: its next start replaces it (see `relay_start`).
+async fn relay_plan(app: &AppHandle, monitoring: bool, from: &str) -> serde_json::Value {
     let state = app.state::<AppState>();
     let settings = state.settings.lock().unwrap().clone();
     let snapshot = state.snapshot.lock().unwrap().clone();
     let running = state.bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished);
-    let busy = running || state.account_operations.busy(monitoring::SIGN_IN) || relay::SLOT.busy();
+    let its_own = !from.is_empty() && relay::SLOT.holder().is_some_and(|(_, holder)| holder == from);
+    let busy = running || (!its_own && (state.account_operations.busy(monitoring::SIGN_IN) || relay::SLOT.busy()));
     let ssh_shell = tauri::async_runtime::spawn_blocking(pairing::ssh_shell).await.ok().flatten();
     serde_json::json!({
         "machine": presence::identity().map(|(id, name)| serde_json::json!({ "id": id, "name": name })),
@@ -1456,10 +1465,11 @@ async fn retry_run(app: &AppHandle) -> Result<(), String> {
     stop_and_wait(app).await?;
     match last {
         Some(b) if !b.by_email => connect_all(app).await.map(|_| ()),
-        // Every computer again, those left out last time too: what already worked is not asked for.
+        // Every computer again, those left out last time too, through the person's confirmation
+        // in Settings (what already worked is not asked for).
         Some(b) if b.everywhere => {
-            let plan = gather_everywhere(app, b.monitoring).await?;
-            start_everywhere(app, plan)
+            confirm_everywhere_here(app, b.monitoring);
+            Ok(())
         }
         Some(b) => sign_in_all(app, b.monitoring).await.map(|_| ()),
         None => sign_in_all(app, true).await.map(|_| ()),
@@ -1559,7 +1569,7 @@ const STILL_WAITING: Duration = Duration::from_secs(5 * 60);
 /// Watches the open sign-in: resolves with `signin_no_page` when its page never opened in the
 /// email's profile (only a profile can tell), and, once it has waited long, asks the person at the
 /// desktop whether to retry it (and never resolves after that).
-async fn watch_step(app: &AppHandle, session: Option<&signin::Session>, since: std::time::SystemTime, account: &str) -> String {
+async fn watch_step(app: &AppHandle, session: Option<&signin::Session>, since: std::time::SystemTime, account: &str, browser: bool) -> String {
     let started = tokio::time::Instant::now();
     if let Some(session) = session {
         tokio::time::sleep(NO_PAGE_LIMIT).await;
@@ -1569,7 +1579,13 @@ async fn watch_step(app: &AppHandle, session: Option<&signin::Session>, since: s
     }
     tokio::time::sleep_until(started + STILL_WAITING).await;
     publish_bulk(app, |b| b.still_waiting = true);
-    sign_in_choice(app, "signInStillWaiting", &[("account", account)], true);
+    // Another computer's sign-in waits in a browser here, whatever the window setting says.
+    let place = browser.then(|| crate::i18n::t(&crate::i18n::resolve(&app.state::<AppState>().settings.lock().unwrap().language), "signInWhereBrowser", &[]));
+    let mut vars = vec![("account", account)];
+    if let Some(place) = place.as_deref() {
+        vars.insert(0, ("where", place));
+    }
+    sign_in_choice(app, "signInStillWaiting", &vars, true);
     std::future::pending().await
 }
 
@@ -1677,11 +1693,13 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                         s.show(&page);
                     }
                     let account = for_machine(&lang, &target.account.clone().unwrap_or_default(), &machine.name);
-                    // Once per email: its page here lists every computer's sign-in as it goes.
+                    // Once per email: its page here lists every computer's sign-in as it goes. Always in a
+                    // browser here (never the terminal a sign-in here may open).
                     if by_email && !stopped && in_group == 0 {
                         let (g, e, i, n) = ((index + 1).to_string(), groups.len().to_string(), done.to_string(), total.to_string());
                         let key = if step.kind == bulk::Kind::Connect { "signInAllConnecting" } else { "signInAllAdding" };
-                        sign_in_notice(&h, key, &[("g", &g), ("e", &e), ("i", &i), ("n", &n), ("account", &account)]);
+                        let browser = crate::i18n::t(&lang, "signInWhereBrowser", &[]);
+                        sign_in_notice(&h, key, &[("where", &browser), ("g", &g), ("e", &e), ("i", &i), ("n", &n), ("account", &account)]);
                     }
                     let outcome = if stopped {
                         Err("signin_stopped".to_string())
@@ -1845,7 +1863,7 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     Err("signin_stopped".into())
                 } else {
                     let closed = browser_closed(session.as_deref());
-                    let watch = watch_step(&h, session.as_deref(), since, &account);
+                    let watch = watch_step(&h, session.as_deref(), since, &account, false);
                     let opened = page_opened(session.as_deref(), since);
                     tokio::pin!(closed, watch, opened);
                     let mut opening = true;
@@ -1911,7 +1929,17 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                         _ if known => crate::i18n::t(&lang, e, &[]),
                         _ => e.clone(),
                     };
-                    sign_in_choice(&h, "bulkConnectStopped", &[("done", &done.to_string()), ("n", &total.to_string()), ("error", &reason)], false);
+                    // A sitting counts what it made, and names who it left out.
+                    let (made, left) = if gathered.is_some() {
+                        let state = h.state::<AppState>();
+                        let run = state.bulk_connect.lock().unwrap();
+                        let made = run.as_ref().map_or(0, |b| b.steps.iter().filter(|s| s.state == StepState::Done).count());
+                        (made, run.as_ref().map(|b| left_out_text(&lang, &b.left_out)).unwrap_or_default())
+                    } else {
+                        (done, String::new())
+                    };
+                    let reason = if left.is_empty() { reason } else { format!("{reason} {}", crate::i18n::t(&lang, "signInLeftOut", &[("list", &left)])) };
+                    sign_in_choice(&h, "bulkConnectStopped", &[("done", &made.to_string()), ("n", &total.to_string()), ("error", &reason)], false);
                 }
                 None if gathered.is_some() => {
                     // Counted as the person sees it: the sign-ins made, and who was left out.
@@ -1963,10 +1991,11 @@ struct Everywhere {
     monitoring: bool,
     /// The sign-ins by email, this computer's first in each; another computer's name theirs.
     groups: Vec<bulk::Group>,
-    /// How many sign-ins on each computer (this one as "here"), in the order they run.
-    computers: Vec<(String, usize)>,
-    /// The other computers reached over SSH, by name, with the SSH host that reaches each.
-    hosts: Vec<(String, String)>,
+    /// Each computer with sign-ins in it, by machine id: its name, the SSH host that reaches it,
+    /// its sign-ins and their emails (see `relay::computers`).
+    computers: Vec<relay::Computer>,
+    /// This computer's machine id, so the confirmation can mark it.
+    here: String,
     left_out: Vec<relay::Skipped>,
     in_use: Vec<relay::InUse>,
 }
@@ -2026,6 +2055,8 @@ async fn gather_everywhere(app: &AppHandle, monitoring: bool) -> Result<Everywhe
         known.extend(peer.accounts.iter().map(|e| (e.provider, e.id.clone(), e.email.clone())));
     }
     let reads_here = |provider: Provider, id: &str| snapshot.accounts.iter().any(|a| a.provider == provider && a.id == id && !a.id.starts_with("token:"));
+    let name_here = |provider: Provider, id: &str| snapshot.accounts.iter().find(|a| a.provider == provider && a.id == id)
+        .and_then(|a| a.alias.clone().or_else(|| a.email.clone()));
     // This computer's readings reach another only through the encrypted rosters: with readings
     // shared here, to a computer whose roster this one reads (so it reads this one's).
     let settings = state.settings.lock().unwrap().clone();
@@ -2044,13 +2075,20 @@ async fn gather_everywhere(app: &AppHandle, monitoring: bool) -> Result<Everywhe
                 if let (Some(dir), Some((_, alias))) = (dir.as_deref(), by_name.iter().find(|(id, _)| *id == offer.machine.id)) {
                     pairing::remember_new_host(dir, &offer.machine.id, alias);
                 }
-                in_use.extend(offer.in_use.clone());
+                // Only accounts this computer knows are named to the person (the rest is that
+                // computer's own word).
+                let knows = |provider: Provider, id: &str, email: &Option<String>| known.iter().any(|(p, i, e)| *p == provider && i == id
+                    && match (e, email) { (Some(a), Some(b)) => a.trim().eq_ignore_ascii_case(b.trim()), (None, None) => true, _ => false });
+                in_use.extend(offer.in_use.iter().filter(|u| knows(u.provider, &u.id, &u.email)).cloned());
                 let shares_with_it = shares && peers.iter().any(|p| p.machine_id == offer.machine.id);
                 let mut kept = Vec::new();
                 for step in offer.plan.iter().flat_map(|g| g.steps.iter()) {
                     match relay::keep(step, &offer, &known, reads_here, shares_with_it) {
-                        relay::Keep::Yes => kept.push(step.clone()),
-                        relay::Keep::Unknown => left_out.push(relay::Skipped { account: step.target.account.clone(),
+                        // Named as this computer names the account (its alias), else by its email.
+                        relay::Keep::Yes => kept.push(bulk::Step { target: bulk::Target { account: name_here(step.target.provider, &step.target.id)
+                            .or_else(|| step.email.clone()), ..step.target.clone() }, ..step.clone() }),
+                        relay::Keep::Unknown => left_out.push(relay::Skipped {
+                            account: step.target.account.as_deref().map(|a| relay::shown_name(a, "?")),
                             ..relay::Skipped::computer(&offer.machine.name, "relay_unknown_account") }),
                         relay::Keep::Covered => {}
                     }
@@ -2060,17 +2098,9 @@ async fn gather_everywhere(app: &AppHandle, monitoring: bool) -> Result<Everywhe
         }
     }
     others.sort_by(|(a, _), (b, _)| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    let hosts = others.iter().map(|(m, _)| (m.name.clone(), m.host.clone())).collect();
     let groups = bulk::everywhere(sign_in_plan(app, monitoring), others);
-    let mut computers: Vec<(String, usize)> = Vec::new();
-    for step in groups.iter().flat_map(|g| g.steps.iter()) {
-        let name = step.machine.as_ref().map_or_else(|| here_name.clone(), |m| m.name.clone());
-        match computers.iter_mut().find(|(n, _)| *n == name) {
-            Some((_, count)) => *count += 1,
-            None => computers.push((name, 1)),
-        }
-    }
-    let plan = Everywhere { id: uuid::Uuid::new_v4().simple().to_string(), at: Instant::now(), monitoring, groups, computers, hosts, left_out, in_use };
+    let computers = relay::computers(&groups, (&here_id, &here_name));
+    let plan = Everywhere { id: uuid::Uuid::new_v4().simple().to_string(), at: Instant::now(), monitoring, groups, computers, here: here_id, left_out, in_use };
     *state.everywhere.lock().unwrap() = Some(plan.clone());
     Ok(plan)
 }
@@ -2083,31 +2113,40 @@ fn start_everywhere(app: &AppHandle, plan: Everywhere) -> Result<(), String> {
 }
 
 /// An agent's confirm (`sign_in_all` with `everywhere`): a notification asks the person at this
-/// screen to start the sitting; it starts only on their Start, so no agent relays pages without
-/// someone here. False when there is nothing to sign in.
-fn ask_everywhere(app: &AppHandle, plan: Everywhere) -> bool {
-    let n: usize = plan.computers.iter().map(|(_, c)| c).sum();
-    if n == 0 {
-        return false;
-    }
+/// screen to review the sitting; Review (or the notification itself) opens Settings > Accounts with
+/// the same confirmation the person's own click shows (see `confirm_everywhere_here`), so no agent
+/// relays pages without someone here agreeing to exactly what each computer will sign in. False
+/// when the notification could not be shown.
+fn ask_everywhere(app: &AppHandle, plan: &Everywhere) -> bool {
+    let n: usize = plan.computers.iter().map(|c| c.steps).sum();
     let settings = app.state::<AppState>().settings.lock().unwrap().clone();
     let lang = crate::i18n::resolve(&settings.language);
-    let list = plan.computers.iter().map(|(name, count)| format!("{name} {count}")).collect::<Vec<_>>().join(", ");
+    let list = plan.computers.iter().map(|c| format!("{} ({})", c.name, c.steps)).collect::<Vec<_>>().join(", ");
     let title = crate::i18n::t(&lang, "signInEverywhere", &[]);
     let body = crate::i18n::t(&lang, "signInEverywhereAsk", &[("n", &n.to_string()), ("list", &list)]);
-    let buttons = vec![(crate::i18n::t(&lang, "signInEverywhereStart", &[]), "start")];
-    let h = app.clone();
+    let buttons = vec![(crate::i18n::t(&lang, "signInEverywhereStart", &[]), "review")];
+    let (h, monitoring) = (app.clone(), plan.monitoring);
     notify::notify_choice(app.clone(), title, body, buttons, move |action| match action {
-        Some("start") => {
-            let fresh = h.state::<AppState>().everywhere.lock().unwrap().clone().filter(|p| p.id == plan.id && p.at.elapsed() < EVERYWHERE_FRESH);
-            if let Some(plan) = fresh {
-                let _ = start_everywhere(&h, plan);
-            }
-        }
-        // The notification itself: Settings > Accounts, where the same sitting can be started.
-        None => show_settings_page(&h, Some("accounts".into())),
+        Some("review") | None => confirm_everywhere_here(&h, monitoring),
         Some(_) => {}
     }).is_ok()
+}
+
+/// Opens Settings > Accounts on "Sign in all your computers from here"'s confirmation: it checks
+/// every computer again and shows what each will sign in, and starts only on the person's OK. How
+/// an agent's request and Retry of such a sitting start, so every sitting is one the person saw.
+fn confirm_everywhere_here(app: &AppHandle, monitoring: bool) {
+    // Read by the page as it loads, or at once by one already open.
+    *app.state::<AppState>().everywhere_ask.lock().unwrap() = Some(monitoring);
+    let _ = app.emit_to(SETTINGS_LABEL, "sign-in-everywhere-ask", ());
+    show_settings_page(app, Some("accounts".into()));
+}
+
+/// Settings > Accounts asks whether a sitting waits for the person's confirmation (see
+/// `confirm_everywhere_here`): its monitoring switch, once.
+#[tauri::command]
+fn take_everywhere_ask(state: tauri::State<AppState>) -> Option<bool> {
+    state.everywhere_ask.lock().unwrap().take()
 }
 
 /// Where a relayed sign-in's page opens here: the email's fresh profile (made now if its turn has
@@ -2180,12 +2219,15 @@ async fn relayed_turn(h: &AppHandle, step: &bulk::Step, machine: &bulk::Machine,
         (_, None) => return Err("signin_profile_storage".into()),
     };
     let from = presence::identity().map(|(id, _)| id.to_string()).ok_or("relay_failed")?;
-    let until = Instant::now() + Duration::from_secs(10);
+    // This computer's one sign-in: waited for (another may have started since the run's own wait),
+    // never a reason to leave that computer out; Stop ends the wait.
     let _sign_in = loop {
-        match h.state::<AppState>().account_operations.begin_key(monitoring::SIGN_IN) {
-            Ok(held) => break held,
-            Err(e) if Instant::now() > until => return Err(e),
-            Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+        if let Ok(held) = h.state::<AppState>().account_operations.begin_key(monitoring::SIGN_IN) {
+            break held;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            _ = stop.notified() => return Err("signin_stopped".into()),
         }
     };
     let _open = h.state::<AppState>().sign_ins.open();
@@ -2207,7 +2249,7 @@ async fn relayed_turn(h: &AppHandle, step: &bulk::Step, machine: &bulk::Machine,
     }
     let closed = browser_closed(session.map(|s| &**s));
     // No page limit here: the other computer has its own (`relay::PAGE_LIMIT`).
-    let watch = watch_step(h, None, std::time::SystemTime::now(), account);
+    let watch = watch_step(h, None, std::time::SystemTime::now(), account, true);
     let page_open = async {
         while !page.load(std::sync::atomic::Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -2240,10 +2282,11 @@ async fn plan_sign_in_everywhere(app: AppHandle, monitoring: bool) -> Result<Eve
     gather_everywhere(&app, monitoring).await
 }
 
-/// The person's OK on that plan: runs exactly it, while it is fresh.
+/// The person's OK on that plan: runs exactly it, while it is fresh, and once.
 #[tauri::command]
 fn start_sign_in_everywhere(app: AppHandle, id: String) -> Result<(), String> {
-    let plan = app.state::<AppState>().everywhere.lock().unwrap().clone().filter(|p| p.id == id && p.at.elapsed() < EVERYWHERE_FRESH).ok_or("signin_plan_expired")?;
+    let state = app.state::<AppState>();
+    let plan = state.everywhere.lock().unwrap().take_if(|p| p.id == id && p.at.elapsed() < EVERYWHERE_FRESH).ok_or("signin_plan_expired")?;
     start_everywhere(&app, plan)
 }
 
@@ -4408,6 +4451,7 @@ pub fn run() {
         sharing_cancel: Arc::default(),
         sharing_tunnel: Mutex::default(),
         everywhere: Mutex::default(),
+        everywhere_ask: Mutex::default(),
     };
     tauri::Builder::default()
         // Must come first: a second launch hands over to the running instance and exits.
@@ -4429,6 +4473,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             plan_sign_in_everywhere,
             start_sign_in_everywhere,
+            take_everywhere_ask,
             get_usage,
             get_health,
             restart_app,

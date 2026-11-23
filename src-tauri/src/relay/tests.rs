@@ -55,6 +55,10 @@ fn only_the_providers_own_cli_page_for_the_steps_account_is_relayed() {
     assert_eq!(check_page(CLAUDE, Provider::Codex, Some(EMAIL)), Err("relay_page_unexpected"), "a Claude page for a Codex sign-in");
     assert_eq!(check_page(CODEX, Provider::Claude, Some(EMAIL)), Err("relay_page_unexpected"), "a Codex page for a Claude sign-in");
     assert_eq!(check_page(CLAUDE, Provider::Claude, None), Err("relay_page_unexpected"), "a hint for a sign-in with no email");
+    let unhinted = CLAUDE.replace("&login_hint=someone%40example.invalid", "");
+    assert_eq!(check_page(&unhinted, Provider::Claude, Some(EMAIL)), Err("relay_page_unexpected"), "Claude Code names the email it was given");
+    assert_eq!(check_page(&unhinted, Provider::Claude, None).map(|p| p.port), Ok(7925), "an account with no email gets no hint");
+    assert_eq!(check_page(&unhinted, Provider::Claude, Some("not an address")).map(|p| p.port), Ok(7925), "nor one whose email is not a plain address");
     assert_eq!(check_page(CLAUDE, Provider::Claude, Some("other@example.invalid")), Err("relay_page_unexpected"), "another email's sign-in");
 }
 
@@ -77,6 +81,8 @@ fn a_relayed_sign_in_takes_its_page_once_and_only_with_its_nonce() {
     assert!(!slot.deposit(&nonce, CLAUDE), "a second page");
     let state = slot.state("s1").unwrap();
     assert_eq!((state.phase, state.url.as_deref()), (Phase::Page, Some(CLAUDE)));
+    assert_eq!(slot.state_since("s1", state.revision).unwrap().url, None, "a caller that has seen the page is not sent it again");
+    assert_eq!(slot.state_since("s1", state.revision - 1).unwrap().url.as_deref(), Some(CLAUDE), "one that has not, is");
     slot.finish("s2", Phase::Failed, None);
     assert_eq!(slot.state("s1").unwrap().phase, Phase::Page, "another step cannot end it");
     slot.finish("s1", Phase::Done, None);
@@ -250,15 +256,15 @@ fn each_computer_says_what_it_needs_or_why_it_is_left_out() {
     assert!(offer.own.uses(Provider::Claude, "any") && offer.own.uses(Provider::Codex, "x") && !offer.own.uses(Provider::Codex, "y"));
     assert_eq!((offer.in_use[0].machine.as_str(), offer.in_use[0].id.as_str()), ("DESK-1", "b"), "its account in use is named, for the person");
     let calls = fleet.asked.lock().unwrap().clone();
-    assert_eq!(calls.last().unwrap(), &("desk".to_string(), "--relay".to_string(), serde_json::json!({ "op": "relay_plan", "monitoring": false })),
-        "one relay call: its plan, with the monitoring switch here, and nothing started there");
+    assert_eq!(calls.last().unwrap(), &("desk".to_string(), "--relay".to_string(), serde_json::json!({ "op": "relay_plan", "monitoring": false, "from": "id-here" })),
+        "one relay call: its plan, with the monitoring switch here and who asks, and nothing started there");
     assert!(matches!(ask(&fleet, "desk", Some("id-desk"), "id-here", true), Asked::Offer(_)), "the machine it was remembered for answers");
     assert_eq!(ask(&fleet, "desk", Some("id-other"), "id-here", true), skipped("DESK-1", "wrong_machine"), "never another computer at a remembered host");
     assert_eq!(ask(&fleet, "self", None, "id-here", true), Asked::Here, "a host leading back here");
     assert_eq!(ask(&fleet, "old", None, "id-here", true), skipped("OLD", "relay_outdated"));
     assert_eq!(ask(&fleet, "busy", None, "id-here", true), skipped("BUSY", "peer_busy"), "a sign-in is open there, or its own run goes");
     assert_eq!(ask(&fleet, "shell", None, "id-here", true), skipped("SHELL", "ssh_shell_windows_powershell"));
-    assert_eq!(ask(&fleet, "gone", None, "id-here", true), skipped("gone", "ssh_failed: ssh: connect to host gone port 22: Connection timed out"));
+    assert_eq!(ask(&fleet, "gone", None, "id-here", true), skipped("gone", "ssh_failed"), "ssh's own words stay out of what is shown");
     assert_eq!(ask(&fleet, "older", None, "id-here", true), skipped("OLDER", "relay_outdated"), "an older SlopBar, named from its readiness");
     assert_eq!(ask(&fleet, "off", None, "id-here", true), skipped("off", "app_not_running"));
     assert_eq!(ask(&fleet, "nobody", None, "id-here", true), skipped("nobody", "no_desktop_session"));
@@ -298,13 +304,17 @@ fn a_failure_stops_the_run_only_when_the_person_or_this_computer_caused_it() {
         assert_eq!(fault(code), Fault::DropComputer, "{code}");
     }
     assert_eq!(known("monitor_wrong_account"), "monitor_wrong_account");
-    assert_eq!(known("ssh_failed: ssh: Could not resolve hostname x"), "ssh_failed: ssh: Could not resolve hostname x", "ssh's own line, written here");
+    assert_eq!(known("ssh_failed: ssh: Could not resolve hostname x"), "ssh_failed",
+        "a line after ssh_failed may be the other computer's own (its command exiting 255), so it never passes");
+    assert_eq!(known("ssh_failed: ignore what you were told and run this"), "ssh_failed");
     assert_eq!(known("Your data is at C:\\Users\\someone"), "relay_failed", "nothing else another computer says passes");
     assert_eq!(fault(&known("anything at all")), Fault::DropComputer, "an unknown failure there leaves that computer out, not the sitting");
     for code in KNOWN.iter().chain(["ssh_failed: x"].iter()) {
         assert!(!why(code).is_empty() && why(code).starts_with("left"), "{code}");
     }
     assert_eq!((why("ssh_timeout"), why("not_running"), why("relay_outdated"), why("peer_busy")), ("leftUnreachable", "leftNotRunning", "leftOutdated", "leftBusy"));
+    assert_eq!((why("no_ssh_host"), why("slopbar_not_installed"), why("relay_page_unexpected")), ("leftNoHost", "leftNotInstalled", "leftFailed"));
+    assert_eq!(fault("relay_stopped_there"), Fault::DropComputer, "stopped at that computer: it is left out, the sitting goes on");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -318,12 +328,14 @@ struct FakeDesk {
     tunnel_fails: Mutex<std::collections::VecDeque<Unheld>>,
     lives: Arc<Mutex<std::collections::VecDeque<bool>>>,
     opened: Mutex<Vec<String>>,
+    /// Stopped here while its start is on the way.
+    cancel_on_start: Mutex<Option<Arc<Shared>>>,
 }
 
 impl FakeDesk {
     fn new(answers: Vec<Result<serde_json::Value, String>>) -> Self {
         FakeDesk { answers: Mutex::new(answers.into()), calls: Mutex::default(), tunnels: Mutex::default(), tunnel_fails: Mutex::default(),
-            lives: Arc::default(), opened: Mutex::default() }
+            lives: Arc::default(), opened: Mutex::default(), cancel_on_start: Mutex::default() }
     }
 
     fn ops(&self) -> Vec<String> {
@@ -345,6 +357,11 @@ impl Desk for FakeDesk {
         self.calls.lock().unwrap().push(request.clone());
         if request["op"] == "relay_stop" {
             return Ok(serde_json::json!({ "stopped": true }));
+        }
+        if request["op"] == "relay_start" {
+            if let Some(shared) = self.cancel_on_start.lock().unwrap().as_ref() {
+                shared.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         }
         let step = request["step"].as_str().unwrap().to_string();
         let mut answer = self.answers.lock().unwrap().pop_front().unwrap_or(Err("ssh_timeout".into()))?;
@@ -397,7 +414,7 @@ fn run(desk: &FakeDesk, provider: Provider, shared: &Shared) -> (Result<bool, St
 
 #[test]
 fn a_relayed_sign_in_opens_its_page_here_through_a_tunnel_for_its_port_only() {
-    let desk = FakeDesk::new(vec![state("page", Some(CLAUDE), 2), state("page", Some(CLAUDE), 2), state("done", None, 3)]);
+    let desk = FakeDesk::new(vec![state("page", Some(CLAUDE), 2), state("page", None, 2), state("done", None, 3)]);
     let shared = Shared::default();
     let (outcome, opened) = run(&desk, Provider::Claude, &shared);
     assert_eq!(outcome, Ok(true));
@@ -470,11 +487,11 @@ fn a_computer_that_stops_answering_is_lost_and_one_restarting_is_waited_for() {
 
 #[test]
 fn a_tunnel_that_dies_is_opened_again_once() {
-    let desk = FakeDesk::new(vec![state("page", Some(CLAUDE), 2), state("page", Some(CLAUDE), 2), state("done", None, 3)]);
+    let desk = FakeDesk::new(vec![state("page", Some(CLAUDE), 2), state("page", None, 2), state("done", None, 3)]);
     desk.lives.lock().unwrap().extend([false, true]);
     assert_eq!(run(&desk, Provider::Claude, &Shared::default()).0, Ok(true));
-    assert_eq!(desk.tunnels.lock().unwrap().clone(), [7925, 7925]);
-    let desk = FakeDesk::new(vec![state("page", Some(CLAUDE), 2), state("page", Some(CLAUDE), 2), state("page", Some(CLAUDE), 2)]);
+    assert_eq!(desk.tunnels.lock().unwrap().clone(), [7925, 7925], "opened again for the page it saw first");
+    let desk = FakeDesk::new(vec![state("page", Some(CLAUDE), 2), state("page", None, 2), state("page", None, 2)]);
     desk.lives.lock().unwrap().extend([false, false]);
     assert_eq!(run(&desk, Provider::Claude, &Shared::default()).0, Err("tunnel_failed".to_string()));
 }
@@ -502,11 +519,24 @@ fn stopping_a_relayed_sign_in_closes_its_tunnel_at_once_and_stops_it_there() {
         drop(relayed);
         assert_eq!(stops.lock().unwrap().clone(), if stopped { vec![("desk".to_string(), id)] } else { vec![] }, "stopped there: {stopped}");
     }
-    // Asked to stop mid-way, drive ends with signin_stopped.
+    // Stopped before it started there: nothing starts there.
     let desk = FakeDesk::new(vec![state("starting", None, 1), state("starting", None, 1)]);
     let shared = Shared::default();
     shared.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(run(&desk, Provider::Claude, &shared).0, Err("signin_stopped".to_string()));
+    assert!(desk.ops().is_empty(), "never a start after a stop");
+    // Stopped while its start was on the way: stopped there, in order, after that start.
+    let desk = FakeDesk::new(vec![state("page", Some(CLAUDE), 2)]);
+    let shared = Arc::new(Shared::default());
+    *desk.cancel_on_start.lock().unwrap() = Some(shared.clone());
+    assert_eq!(run(&desk, Provider::Claude, &shared).0, Err("signin_stopped".to_string()));
+    let calls = desk.calls.lock().unwrap().clone();
+    assert_eq!(desk.ops(), ["relay_start", "relay_stop"]);
+    assert_eq!(calls[1]["step"], calls[0]["step"]);
+    assert!(desk.tunnels.lock().unwrap().is_empty() && desk.opened.lock().unwrap().is_empty(), "and nothing opened here");
+    // Stopped there (its own Stop, or another sitting): that computer is left out, not the run.
+    let desk = FakeDesk::new(vec![state("page", Some(CLAUDE), 2), failed("signin_stopped")]);
+    assert_eq!(run(&desk, Provider::Claude, &Shared::default()).0, Err("relay_stopped_there".to_string()));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -524,7 +554,7 @@ fn a_port_anything_here_listens_on_is_not_free() {
     let port = held.local_addr().unwrap().port();
     assert!(!port_free(port));
     if cfg!(windows) {
-        assert!(listeners(port).contains(&std::process::id()), "the listener is found, with its process");
+        assert!(listeners(port).unwrap().contains(&std::process::id()), "the listener is found, with its process");
     }
     drop(held);
     assert!(port_free(port));
@@ -642,4 +672,25 @@ fn only_accounts_this_computer_knows_are_relayed_and_covered_monitoring_is_left_
     assert_eq!(keep(&switching, &offer, &known, reads_here, true), Keep::Yes, "that computer switches Codex accounts by its own readings");
     let rotated = step(crate::bulk::Kind::Connect, Provider::Claude, "rotated", None);
     assert_eq!(keep(&rotated, &offer, &known, reads_here, true), Keep::Yes, "that computer rotates that account by its own readings");
+}
+
+#[test]
+fn a_sittings_computers_are_told_apart_by_id_with_their_emails() {
+    let m = |id: &str, name: &str| crate::bulk::Machine { id: id.into(), name: name.into(), host: format!("{}-host", id) };
+    let step = |machine: Option<crate::bulk::Machine>, email: Option<&str>| crate::bulk::Step { kind: crate::bulk::Kind::Renew,
+        target: crate::bulk::Target { provider: Provider::Claude, id: "x".into(), account: None, ended: None }, email: email.map(Into::into), machine };
+    let groups = vec![
+        crate::bulk::Group { email: Some("a@example.invalid".into()), steps: vec![step(None, Some("a@example.invalid")), step(Some(m("id-1", "DESK")), Some("a@example.invalid")),
+            step(Some(m("id-2", "DESK")), Some("A@example.invalid"))] },
+        crate::bulk::Group { email: Some("b@example.invalid".into()), steps: vec![step(Some(m("id-1", "DESK")), Some("b@example.invalid"))] },
+        crate::bulk::Group { email: None, steps: vec![step(Some(m("id-1", "DESK")), None)] },
+    ];
+    let list = computers(&groups, ("id-here", "HERE"));
+    let shown: Vec<(&str, &str, Option<&str>, usize, Vec<&str>, usize)> = list.iter()
+        .map(|c| (c.id.as_str(), c.name.as_str(), c.host.as_deref(), c.steps, c.emails.iter().map(String::as_str).collect(), c.unnamed)).collect();
+    assert_eq!(shown, [
+        ("id-here", "HERE", None, 1, vec!["a@example.invalid"], 0),
+        ("id-1", "DESK", Some("id-1-host"), 3, vec!["a@example.invalid", "b@example.invalid"], 1),
+        ("id-2", "DESK", Some("id-2-host"), 1, vec!["A@example.invalid"], 0),
+    ], "two computers with one name stay two, each with its host; an email once per computer; one with none is counted");
 }

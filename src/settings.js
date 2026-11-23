@@ -1530,9 +1530,9 @@ function renderBulk() {
     ? t("bulkRemoveHint", { list: bulk.lapsed.remove.map(who).join(", ") })
     : bulk.lapsed.in_use.length ? t("bulkRemoveInUse", { list: bulk.lapsed.in_use.map(who).join(", ") }) : t("bulkRemoveNone");
   const status = $("bulk-status");
-  const where = settings.signin_window === "system" ? t("signInWhereTerminal") : t("signInWhereBrowser");
-  // Another computer's sign-in (see `relay`): named with its computer.
+  // Another computer's sign-in (see `relay`): named with its computer, and always in a browser here.
   const open = c?.steps?.find((s) => s.state === "running");
+  const where = settings.signin_window === "system" && !open?.machine ? t("signInWhereTerminal") : t("signInWhereBrowser");
   const account = c?.current ? (open?.machine ? t("signInFor", { what: who(c.current), machine: open.machine }) : who(c.current)) : "";
   if (running && c.current && c.still_waiting) {
     status.textContent = t("signInStillWaiting", { account, where });
@@ -1557,7 +1557,7 @@ function renderBulk() {
   $("bulk-retry-row").hidden = !((c?.finished && (c.error || (c.everywhere && c.left_out?.length))) || (running && c.still_waiting));
   // Another computer can be asked once this one knows one (paired or checked over SSH, or in the roster).
   $("sign-in-everywhere-row").hidden = !bulk.other_computers;
-  $("sign-in-everywhere").textContent = t(running && c.everywhere ? "signInAllStop" : "signInEverywhereButton");
+  $("sign-in-everywhere").textContent = t(running ? "signInAllStop" : "signInEverywhereButton");
 }
 
 /** The computers (and sign-ins) a sitting left out, in words: "PC-MINI1 (not reachable over SSH)". */
@@ -1581,22 +1581,23 @@ async function signInEverywhere(monitoring = $("sign-in-all-monitoring").checked
   button.disabled = true;
   status.textContent = t("signInEverywhereChecking");
   status.hidden = false;
+  // What to say once the redraw below is done (it shows the last run's state, not this check's).
+  let message = "";
   try {
     const plan = await invoke("plan_sign_in_everywhere", { monitoring });
-    const n = plan.groups.reduce((total, g) => total + g.steps.length, 0);
+    const n = plan.computers.reduce((total, c) => total + c.steps, 0);
     const left = plan.left_out.length ? ` ${t("signInLeftOut", { list: leftOut(plan.left_out) })}` : "";
     const inuse = plan.in_use.length ? ` ${inUseText(plan.in_use)}` : "";
     if (!n) {
-      status.textContent = t("signInEverywhereNone", { left, inuse });
+      message = t("signInEverywhereNone", { left, inuse });
       return;
     }
-    const steps = plan.groups.flatMap((g) => g.steps);
-    const list = plan.computers.map(([name, count]) => {
-      const host = plan.hosts.find(([n]) => n === name)?.[1];
-      // This computer's are the steps naming no computer; another's name it.
-      const its = steps.filter((s) => host ? s.machine?.name === name : !s.machine);
-      const emails = [...new Set(its.map((s) => s.email ?? s.account).filter(Boolean))];
-      return `${name}${host ? ` [${host}]` : ""} ${count}: ${emails.join(", ")}`;
+    // One line per computer, by machine id: this one marked, another with the SSH host that
+    // reaches it, its sign-ins and the emails they sign in as.
+    const list = plan.computers.map((c) => {
+      const name = c.id === plan.here ? t("thisPc", { machine: c.name }) : `${c.name} [${c.host}]`;
+      const who = [...c.emails, ...(c.unnamed ? [t("signInUnnamed", { n: c.unnamed })] : [])];
+      return `${name} (${c.steps}): ${who.join(", ")}`;
     }).join("; ");
     if (!confirm(t("signInEverywhereConfirm", { n, e: plan.groups.length, list, left, inuse }))) {
       status.hidden = true;
@@ -1604,12 +1605,28 @@ async function signInEverywhere(monitoring = $("sign-in-all-monitoring").checked
     }
     await invoke("start_sign_in_everywhere", { id: plan.id });
   } catch (err) {
-    status.textContent = errorText("", String(err));
+    message = errorText("", String(err));
   } finally {
     button.disabled = false;
-    loadBulk();
+    await loadBulk();
+    if (message) {
+      status.textContent = message;
+      status.hidden = false;
+    }
   }
 }
+
+/** A sitting waiting for the person's confirmation (an agent's request, or Retry): asked here,
+ * once the page has loaded (it asks again as it finishes loading). */
+async function everywhereAsked() {
+  if (!settings) return;
+  const monitoring = await invoke("take_everywhere_ask").catch(() => null);
+  if (monitoring === null || monitoring === undefined) return;
+  document.querySelector('.nav[data-page="accounts"]')?.click();
+  await loadBulk();
+  signInEverywhere(monitoring);
+}
+listen("sign-in-everywhere-ask", everywhereAsked);
 async function loadBulk() {
   bulk = await invoke("bulk_status").catch(() => bulk);
   renderBulk();
@@ -1624,6 +1641,8 @@ $("sign-in-all").addEventListener("click", async () => {
 $("sign-in-all-monitoring").addEventListener("change", renderBulk);
 $("sign-in-everywhere").addEventListener("click", () => signInEverywhere());
 $("bulk-retry").addEventListener("click", async () => {
+  const c = bulk.connecting;
+  if (c?.everywhere && c.finished) return void signInEverywhere(c.monitoring);
   $("bulk-retry").disabled = true;
   try { await invoke("retry_sign_ins"); } catch (err) { alert(errorText("", String(err))); }
   finally { $("bulk-retry").disabled = false; }
@@ -1679,12 +1698,17 @@ function peerRunLines(p) {
   const r = p.run;
   const machine = p.machine;
   const current = r.steps.find((s) => s.state === "running");
+  // Its sitting for every computer (pages open there, no Retry from here): what it made.
+  if (r.everywhere && r.finished) {
+    const made = r.steps.filter((s) => s.state === "done").length;
+    return [r.error ? t("bulkConnectStopped", { done: made, n: r.total, error: errorText("", r.error) }) : t("signInEverywhereDone", { n: made }), ""];
+  }
   if (r.finished && r.error) {
     return [t("bulkConnectStopped", { done: r.done, n: r.total, error: errorText("", r.error) }), t("peerSignInStoppedHint", { machine })];
   }
   if (r.finished) return [t(r.total ? "signInAllDone" : "signInAllNone", { n: r.total }), ""];
   const step = !current ? t("peerSignInStarting")
-    : r.still_waiting ? t("peerSignInWaiting", { machine, account: who(current) })
+    : r.still_waiting && !r.everywhere ? t("peerSignInWaiting", { machine, account: who(current) })
     : t(current.kind === "connect" ? "signInAllConnecting" : "signInAllAdding",
       { g: r.email, e: r.emails, i: r.done + 1, n: r.total, account: who(current), where: t("signInWhereMachine", { machine }) });
   const quiet = Math.max(1, Math.round((Date.now() - new Date(p.written_at)) / 60000));
@@ -1863,3 +1887,5 @@ if (page === "usage") loadUsage();
 // Another computer's sign-ins are read from its roster, which can be slow: waited for briefly.
 await Promise.race([firstPeerRuns, new Promise((done) => setTimeout(done, 4000))]);
 delete document.documentElement.dataset.loading;
+// A sitting asked for while this window was being created (see `confirm_everywhere_here`).
+everywhereAsked();

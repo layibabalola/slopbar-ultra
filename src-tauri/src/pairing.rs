@@ -265,8 +265,9 @@ impl Remote for Ssh {
     }
 
     fn run_within(&self, host: &str, command: &str, input: &[u8], limit: Duration) -> Result<Vec<u8>, String> {
-        // A connection that stops answering is given up in 15 seconds, not at the limit.
-        ssh_run(host, command, input, limit, &["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"])
+        // A connection that stops answering is given up in 15 seconds, not at the limit; and no
+        // port forward ~/.ssh/config names for the host rides along with a relay call.
+        ssh_run(host, command, input, limit, &["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3", "-o", "ClearAllForwardings=yes"])
     }
 }
 
