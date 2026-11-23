@@ -359,6 +359,11 @@ struct SignIns {
     unconnected: usize,
     /// What "Connect monitoring for all" would sign in: these, and those ending within `RENEW_DAYS`.
     queued: usize,
+    /// Of those with a row of their own, the ones another computer's recent reading covers
+    /// (`covered_by`).
+    covered: usize,
+    /// Ended or refused with no other computer covering them: what makes the summary a problem.
+    faults: usize,
     /// The provider whose fixed limit ended one of them, or ends one soon.
     limited: Option<Provider>,
 }
@@ -457,18 +462,24 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         let id = format!("monitoring:{}:{}", a.provider.key(), a.id);
         let who = name(a);
         let connect = Some(Fix::ConnectMonitoring { provider: a.provider, id: a.id.clone() });
+        // Another of the user's computers read it recently (the shared account roster): its
+        // readings show here, so this computer's own sign-in matters less.
+        let covered = a.covered_by.as_deref().map(|m| format!(
+            "{m} still reads this account's usage, through the account list your computers share, so its readings show here while this computer has none of its own."));
         if !a.monitor_connected {
             let how = if inputs.auto_connect {
                 "Connect monitoring automatically is on (Settings > Data): SlopBar starts its sign-in once it has been in use for 3 minutes, or connect it now."
             } else {
                 "Connect monitoring automatically is off (Settings > Data): connect it now, or turn that on to have SlopBar start the sign-in when it is in use."
             };
+            let meanwhile = covered.as_deref().map(|c| format!(" {c}")).unwrap_or_default();
             monitoring.push(check(id, Status::Warning, format!("{who}: monitoring not connected"),
-                format!("Its usage is only read while it is the account in use. {how}"), connect));
+                format!("Its usage is only read here while it is the account in use.{meanwhile} {how}"), connect));
             // As Connect all counts them (`bulk::needs_sign_in`): never a token-only account.
             if !a.id.starts_with("token:") {
                 sign_ins.unconnected += 1;
                 sign_ins.queued += 1;
+                sign_ins.covered += usize::from(covered.is_some());
             }
             continue;
         }
@@ -480,26 +491,37 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
             sign_ins.queued += 1;
         }
         let ending = match renewal { Renewal::Ending(at) if at <= now + Duration::days(WARN_DAYS) => Some(at), _ => None };
+        // Ended or refused here but covered: a warning, since this computer's switching and alerts
+        // still go by its own readings alone.
+        let (status, reconnect) = match &covered {
+            Some(c) => (Status::Warning, format!("{c} Reconnect for this computer's own readings, which automatic switching and alerts here go by; it is one browser sign-in as this account, switches nothing and needs no account use.")),
+            None => {
+                sign_ins.faults += usize::from(matches!(renewal, Renewal::Ended(_) | Renewal::Refused));
+                (Status::Problem, "Reconnecting is one browser sign-in as this account; it switches nothing and needs no account use.".into())
+            }
+        };
         if let Renewal::Ended(at) = renewal {
             sign_ins.ended += 1;
+            sign_ins.covered += usize::from(covered.is_some());
             sign_ins.limited = sign_ins.limited.or(Some(a.provider));
             explained.insert(key);
             let when = if at <= now { format!("ended {}", ago(now, at)) }
                 else { "ended just before the date it was due to end, which the provider may do".into() };
-            monitoring.push(check(id, Status::Problem, format!("{who}: monitoring sign-in ended"),
-                format!("{} This one {when}. Reconnecting is one browser sign-in as this account; it switches nothing and needs no account use.",
-                    sign_in_limit(a.provider)), connect));
+            monitoring.push(check(id, status, format!("{who}: monitoring sign-in ended"),
+                format!("{} This one {when}. {reconnect}", sign_in_limit(a.provider)), connect));
         } else if renewal == Renewal::Refused {
             sign_ins.refused += 1;
+            sign_ins.covered += usize::from(covered.is_some());
             explained.insert(key);
             let early = if state.and_then(|s| s.ends_at).is_some_and(|t| t > now) { ", well before the date it was due to end" } else { "" };
-            monitoring.push(check(id, Status::Problem, format!("{who}: monitoring sign-in needs reconnecting"),
-                format!("Its monitoring sign-in can no longer be renewed{early}. Reconnecting needs no account use."), connect));
+            monitoring.push(check(id, status, format!("{who}: monitoring sign-in needs reconnecting"),
+                format!("Its monitoring sign-in can no longer be renewed{early}. {reconnect}"), connect));
         } else if error == Some("monitor_storage") {
             monitoring.push(check(id, Status::Problem, format!("{who}: monitoring sign-in unreadable"),
                 "The saved monitoring sign-in could not be read or saved. Check disk space and file access, then reconnect.", connect));
         } else if let Some(at) = ending {
             sign_ins.ending += 1;
+            sign_ins.covered += usize::from(covered.is_some());
             sign_ins.limited = sign_ins.limited.or(Some(a.provider));
             monitoring.push(check(id, Status::Warning, format!("{who}: monitoring sign-in ends soon"),
                 format!("{} This one ends {}; reconnect before then to avoid a gap.", sign_in_limit(a.provider), within(at - now)), connect));
@@ -524,7 +546,12 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         if sign_ins.refused > 0 { parts.push(format!("{} {} reconnecting", sign_ins.refused, if sign_ins.refused == 1 { "needs" } else { "need" })); }
         if sign_ins.ending > 0 { parts.push(format!("{} {} soon", sign_ins.ending, if sign_ins.ending == 1 { "ends" } else { "end" })); }
         if sign_ins.unconnected > 0 { parts.push(format!("{} not connected", sign_ins.unconnected)); }
-        let status = if sign_ins.ended + sign_ins.refused > 0 { Status::Problem } else { Status::Warning };
+        // A problem only while one that ended or was refused has no other computer covering it.
+        let status = if sign_ins.faults > 0 { Status::Problem } else { Status::Warning };
+        let covered = match sign_ins.covered {
+            0 => String::new(),
+            n => format!(" ({n} covered by your other computers' readings)"),
+        };
         let mut reason = if let Some(p) = sign_ins.limited {
             format!("{} No setting makes it permanent. Connect all signs in the {} accounts that need it one after another, including any ending within {RENEW_DAYS} days, so they next end together.",
                 sign_in_limit(p), sign_ins.queued)
@@ -540,7 +567,7 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         } else {
             Fix::ConnectMonitoringAll
         };
-        let mut summary = check(RENEWAL_SUMMARY, status, format!("Monitoring sign-ins: {}", parts.join(", ")), reason, Some(fix));
+        let mut summary = check(RENEWAL_SUMMARY, status, format!("Monitoring sign-ins: {}{covered}", parts.join(", ")), reason, Some(fix));
         summary.count = Some(sign_ins.queued);
         monitoring.insert(0, summary);
     }
@@ -1082,6 +1109,52 @@ mod tests {
         // In use, it is read with the CLI's own sign-in, so an old reading there is news.
         case.accounts[0].active = true;
         assert!(case.run().checks.iter().any(|c| c.id == "freshness:claude:a"));
+    }
+
+    #[test]
+    fn a_sign_in_another_computer_covers_is_a_warning_that_names_it() {
+        let mut case = Case::healthy();
+        case.accounts.push(account("c", false, None));
+        for id in ["a", "b"] {
+            case.monitoring.insert(format!("Claude:{id}"), MonitorState { reconnect: true, uncertain: false, ends_at: Some(now() - Duration::days(2)) });
+        }
+        // Another computer read a and c recently (a is in use here, read through the CLI, or not:
+        // either way covered); b nobody covers.
+        case.accounts[0].covered_by = Some("DESK-A".into());
+        case.accounts[2].covered_by = Some("DESK-A".into());
+        let r = case.run();
+        let a = find(&r, "monitoring:claude:a");
+        assert_eq!((a.status, a.title.as_str()), (Status::Warning, "a@example.invalid: monitoring sign-in ended"));
+        assert!(a.reason.contains("ended 2 days ago") && a.reason.contains("DESK-A still reads this account's usage") && a.reason.contains("automatic switching and alerts"), "{}", a.reason);
+        assert_eq!(a.fix, Some(Fix::ConnectMonitoring { provider: Provider::Claude, id: "a".into() }), "reconnecting stays offered");
+        assert_eq!(find(&r, "monitoring:claude:b").status, Status::Problem);
+        let c = find(&r, "monitoring:claude:c");
+        assert_eq!(c.status, Status::Warning);
+        assert!(c.reason.contains("DESK-A still reads this account's usage"), "{}", c.reason);
+        let s = find(&r, RENEWAL_SUMMARY);
+        assert_eq!((s.status, s.title.as_str()), (Status::Problem, "Monitoring sign-ins: 2 ended, 1 not connected (2 covered by your other computers' readings)"));
+        assert_eq!((r.status, r.problems, r.warnings), (Status::Problem, 1, 2));
+        // All covered: nothing is a problem, the summary included, and nothing reads as one.
+        case.accounts[1].covered_by = Some("LAPTOP-B".into());
+        let r = case.run();
+        assert_eq!((r.status, r.problems, r.warnings), (Status::Warning, 0, 3));
+        assert_eq!(find(&r, RENEWAL_SUMMARY).title, "Monitoring sign-ins: 2 ended, 1 not connected (3 covered by your other computers' readings)");
+    }
+
+    #[test]
+    fn a_refused_sign_in_nobody_covers_is_a_problem_and_a_covered_one_ending_soon_counts_as_covered() {
+        let mut case = Case::healthy();
+        case.monitoring.insert("Claude:a".into(), MonitorState { reconnect: true, uncertain: false, ends_at: None });
+        case.monitoring.insert("Claude:b".into(), MonitorState { reconnect: false, uncertain: false, ends_at: Some(now() + Duration::hours(30)) });
+        case.accounts[1].covered_by = Some("DESK-A".into());
+        let r = case.run();
+        assert_eq!(find(&r, "monitoring:claude:a").status, Status::Problem);
+        assert_eq!(find(&r, "monitoring:claude:b").status, Status::Warning);
+        let s = find(&r, RENEWAL_SUMMARY);
+        assert_eq!((s.status, s.title.as_str()), (Status::Problem, "Monitoring sign-ins: 1 needs reconnecting, 1 ends soon (1 covered by your other computers' readings)"));
+        // Covered too: no problem left.
+        case.accounts[0].covered_by = Some("DESK-A".into());
+        assert_eq!(find(&case.run(), RENEWAL_SUMMARY).status, Status::Warning);
     }
 
     #[test]

@@ -2,7 +2,7 @@ import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { sparkline } from "./sparkline.js";
 import { money, pct, amount, renewalText, adviceText, creditsLine, extraUsageLine, cliSignInText } from "./accounttext.js";
-import { t, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, LANGUAGES, resetText, errorText, accountErrorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText, overlapText, seatsText } from "./i18n.js";
+import { t, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, LANGUAGES, resetText, errorText, accountErrorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText, overlapText, seatsText, shownReading, currentWindows } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -70,19 +70,22 @@ function accountRow(p, a) {
   const key = `${p}:${a.id}`;
   // The fullest window is the limit that binds next (and what the balancer compares), so it is
   // the headline; on a tie prefer the overall weekly window, whose reset lies further out.
-  const top = a.windows.reduce((m, w) => (!m || w.used_percent > m.used_percent
+  // The reading shown: this computer's own, or another computer's newer one while this one has no
+  // fresh reading, which says whose it is and how old (`shownReading`).
+  const reading = shownReading(a);
+  const top = currentWindows(reading).reduce((m, w) => (!m || w.used_percent > m.used_percent
     || (w.used_percent === m.used_percent && w.kind === "weekly") ? w : m), null);
   const usage = top?.used_percent ?? null;
-  const timedWindows = visibleResetWindows(a.windows);
+  const timedWindows = visibleResetWindows(reading.windows);
   const meter = usage == null
     ? `<div class="meter none"><b>—</b></div>`
-    : `<div class="meter ${a.stale ? "stale" : ""}" title="${esc(a.windows.map(w => `${windowLabel(w)}: ${w.used_percent}% ${t("used")}${w.resets_at ? ` · ${w.resets_at}` : ""}`).join("\n"))}"><b>${Math.round(usage)}%</b><small class="window-label">${esc(windowLabel(top))} · ${t("used")}</small><div class="track" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(Math.min(100, usage))}" aria-label="${esc(`${windowLabel(top)} ${t("used")}`)}"><i style="width:${Math.min(100, usage)}%;background:${color(usage)}"></i></div>
-        ${sparkline(trails[key], { width: 140, height: 18 })}
-        ${a.stale ? `<small>${t("lastReading")}</small>` : ""}</div>`;
+    : `<div class="meter ${reading.stale ? "stale" : ""}" title="${esc([...reading.windows.map(w => `${windowLabel(w)}: ${w.used_percent}% ${t("used")}${w.resets_at ? ` · ${w.resets_at}` : ""}`), reading.from].filter(Boolean).join("\n"))}"><b>${Math.round(usage)}%</b><small class="window-label">${esc(windowLabel(top))} · ${t("used")}</small><div class="track" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(Math.min(100, usage))}" aria-label="${esc([`${windowLabel(top)} ${t("used")}`, reading.from].filter(Boolean).join(", "))}"><i style="width:${Math.min(100, usage)}%;background:${color(usage)}"></i></div>
+        ${sparkline(trails[key], { width: 140, height: 18, silent: reading.shared })}
+        ${reading.from ? `<small class="from">${esc(reading.from)}</small>` : reading.stale ? `<small>${t("lastReading")}</small>` : ""}</div>`;
   // A zero-usage session can lack a reset while its weekly window has one.
   // Never hide that weekly timestamp behind the headline's tie-breaking.
   const windowResets = timedWindows.length
-    ? `<div class="window-resets">${timedWindows.map(w => `<small class="window-reset" title="${esc(w.resets_at)}">${esc(windowLabel(w))}: ${Math.round(w.used_percent)}% ${t("used")} · ${esc(windowResetText(w, a.stale, a.fetched_at))}</small>`).join("")}</div>`
+    ? `<div class="window-resets">${timedWindows.map(w => `<small class="window-reset" title="${esc(w.resets_at)}">${esc(windowLabel(w))}: ${Math.round(w.used_percent)}% ${t("used")} · ${esc(windowResetText(w, reading.stale, reading.at, reading.shared))}</small>`).join("")}</div>`
     : "";
   // In use here and on the user's other computers (shared through a synced folder), by machine.
   const places = placesText(a);
@@ -114,7 +117,7 @@ function accountRow(p, a) {
       </div>
       <div class="monitor-state">
         ${windowResets}
-        ${a.stale && a.fetched_at ? `<small>${esc(t("lastObserved", { t: duration(Math.max(1, Math.round((Date.now() - new Date(a.fetched_at)) / 60000))) }))}</small>` : ""}
+        ${a.stale && a.fetched_at ? `<small>${esc(t(reading.shared ? "lastObservedHere" : "lastObserved", { t: duration(Math.max(1, Math.round((Date.now() - new Date(a.fetched_at)) / 60000))) }))}</small>` : ""}
         ${a.error || a.monitor_error ? `<small>${esc(accountErrorText(p, a))}</small>` : ""}
         ${!a.monitor_connected || a.monitor_renewal || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account", "monitor_network", "monitor_uncertain"].includes(a.monitor_error ?? a.error)
           ? `<button class="btn" data-monitor="${p}" data-id="${esc(a.id)}">${t(a.monitor_connected ? "monitorReconnect" : "monitorConnect")}</button>`
@@ -917,6 +920,9 @@ async function renderRoster() {
   const placed = Boolean(settings.presence_folder || settings.presence_remote);
   $("account-roster").checked = settings.account_roster;
   $("account-roster").disabled = !placed && !settings.account_roster;
+  // Usage readings ride the account list: offered, and shown on, only while it is on.
+  $("share-readings").checked = settings.account_roster && settings.share_readings !== false;
+  $("share-readings").disabled = !settings.account_roster;
   const r = await invoke("get_roster").catch(() => null);
   $("roster-passphrase-state").textContent = r?.passphrase_saved ? t("rosterPassphraseSaved") : t("rosterPassphraseNone");
   $("roster-passphrase-clear").disabled = !r?.passphrase_saved;
@@ -941,6 +947,10 @@ $("account-roster").addEventListener("change", async (e) => {
   await update({ account_roster: e.target.checked });
   renderRoster();
   loadBulk();
+});
+$("share-readings").addEventListener("change", async (e) => {
+  await update({ share_readings: e.target.checked });
+  renderRoster();
 });
 async function saveRosterPassphrase(passphrase) {
   rosterMessage = "";

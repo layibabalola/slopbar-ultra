@@ -184,6 +184,11 @@ body.panel #accounts { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollba
 .reset { font-size: 11px; color: var(--text-2); }
 .reset.runs-out { color: var(--warn); margin-top: 2px; }
 .error { color: var(--warn); font-size: 12px; margin-top: 4px; }
+/* Another computer's recent reading covers this account: its monitoring sign-in here is a note. */
+.error.covered { color: var(--text-2); }
+/* A window of another computer's reading that has reset since: its old numbers, dimmed. */
+.win.passed .bar { opacity: .5; }
+.win.passed .row { opacity: .65; }
 .empty { color: var(--text-2); padding: 4px 0 2px; }
 
 /* Accounts: cards like the Settings app's, the signed-in one raised. */
@@ -265,6 +270,9 @@ body.panel #accounts { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollba
 .acct.line .where { font-size: 11px; line-height: 13px; color: var(--text-3); }
 .acct.line .where .glyph { font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets"; font-size: 10px; line-height: 0; margin-right: 4px; vertical-align: -1px; }
 .acct.line .pct { width: 34px; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+/* Another computer's reading, marked with a computer: wider than 34px, and its row has no "!". */
+.acct.line .pct.shared { width: auto; min-width: 34px; white-space: nowrap; }
+.acct.line .pct .glyph { font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets"; font-size: 10px; font-weight: 400; margin-right: 3px; vertical-align: 1px; color: var(--text-3); }
 .acct.line .in-use, .acct.line .use { min-width: 52px; text-align: center; }
 .acct.line .in-use { color: var(--ok); font-weight: 600; font-size: 11px; }
 .acct.line .in-use.pending { opacity: 0.55; }

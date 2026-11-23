@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 
 // i18n.js sets the page language on load.
 globalThis.document ??= { documentElement: {} };
-const { t, setLanguage, setThisMachine, setSharing, windowResetText, placesText, compactPlaces, overlapText } = await import("../src/i18n.js");
+const { t, setLanguage, setThisMachine, setSharing, windowResetText, placesText, compactPlaces, overlapText, shownReading, duration, currentWindows, coveredMonitoring, resetSince } = await import("../src/i18n.js");
 const { accountTip, accountTipLines, adviceText, cliSignInText } = await import("../src/accounttext.js");
 const { sparkline, sparklineText } = await import("../src/sparkline.js");
 setLanguage("en");
@@ -35,6 +35,13 @@ test("no readings draw nothing, keep their place and say so", () => {
     assert.ok(!html.includes("spark-base") && !html.includes("<svg"), "no flat baseline");
     assert.ok(html.includes(`aria-label="${t("sparkNone")}"`));
   }
+});
+
+test("a silent sparkline keeps only its place and says nothing", () => {
+  const html = sparkline([[now - HOUR, 40]], { now, silent: true });
+  assert.match(html, /aria-hidden="true"/);
+  assert.match(html, /width:56px;height:16px/);
+  for (const said of ["role=", "aria-label", "title", "<svg"]) assert.ok(!html.includes(said), said);
 });
 
 test("readings older than 7 days count as none", () => {
@@ -244,6 +251,64 @@ test("a monitoring renewal the network's proxy stopped says it was monitoring", 
   // A usage error (a read, or a renewal with nothing to fall back on) is the proxy's words alone.
   const usage = accountTipLines({ ...account, error: "proxy_script", monitor_error: "proxy_script", stale: true }, { now }).flat();
   assert.ok(usage.includes(script) && !usage.includes(t("monitorProxy", { reason: script })), usage.join("\n"));
+});
+
+test("another computer's reading shows while this one has none fresh, marked with whose and how old", () => {
+  const shared = { machine: "LAPTOP-2", taken_at: iso(now - 12 * 60000),
+    windows: [{ kind: "weekly", window_seconds: null, used_percent: 61, resets_at: iso(now + 50 * HOUR) }] };
+  const ended = { ...account, error: "monitor_reconnect", stale: true, fetched_at: iso(now - 72 * HOUR), shared };
+  const reading = shownReading(ended, now);
+  assert.equal(reading.from, t("readOn", { machine: "LAPTOP-2", t: duration(12) }));
+  assert.deepEqual([reading.windows, reading.at, reading.stale], [shared.windows, shared.taken_at, false], "its reset is as of that reading");
+  const lines = accountTipLines(ended, { now }).flat();
+  assert.ok(lines.some((l) => l.startsWith(`${t("weekly")}: 61% ${t("used")} · `)), lines.join("\n"));
+  assert.ok(!lines.some((l) => l.startsWith(`${t("weekly")}: ${Math.round(account.windows.find((w) => w.kind === "weekly")?.used_percent ?? -1)}%`)), "not this computer's old numbers");
+  assert.ok(lines.includes(reading.from), "whose it is and how old");
+  assert.ok(lines.includes(`${t("lastObservedHere", { t: duration(72 * 60) })} · ${t("lastReading")}`), "this computer's own reading stays said, as its own");
+  assert.ok(lines.includes(t("monitor_reconnect", { provider: "Claude Code" })), "and its error");
+  // No shared reading: this computer's own, unmarked.
+  assert.deepEqual(shownReading(account, now), { windows: account.windows, at: account.fetched_at, stale: account.stale, from: "", shared: false });
+  assert.ok(accountTipLines(account, { now }).flat().includes(t("lastObserved", { t: duration(3) })));
+});
+
+test("a window of another computer's reading that has reset since keeps its numbers and says so", () => {
+  const session = { kind: "session", window_seconds: null, used_percent: 80, resets_at: iso(now - HOUR) };
+  const weekly = { kind: "weekly", window_seconds: null, used_percent: 40, resets_at: iso(now + 50 * HOUR) };
+  const shared = { machine: "LAPTOP-2", taken_at: iso(now - 3 * HOUR), windows: [session, weekly] };
+  const a = { ...account, error: "monitor_reconnect", stale: true, shared };
+  const reading = shownReading(a, now);
+  assert.deepEqual(currentWindows(reading, now), [weekly], "the headline comes from windows that have not reset");
+  assert.equal(windowResetText(session, false, reading.at, true), t("resetSinceReading", { d: windowResetText(session, true).replace(/^.*: /, "") }));
+  const lines = accountTipLines(a, { now }).flat();
+  assert.ok(lines.some((l) => l.startsWith(`${t("session")}: 80% ${t("used")} · ${t("resetSinceReading", { d: "" }).split("(")[0]}`)), lines.join(" | "));
+  // All reset since: no number at all.
+  assert.deepEqual(currentWindows(shownReading({ ...a, shared: { ...shared, windows: [session] } }, now), now), []);
+  // This computer's own windows are never filtered.
+  assert.equal(currentWindows(shownReading({ ...account, windows: [session] }, now), now).length, 1);
+});
+
+test("a monitoring sign-in another computer covers is no problem mark; any other error still is", () => {
+  const covered = { ...account, covered_by: "LAPTOP-2" };
+  assert.equal(coveredMonitoring({ ...covered, monitor_renewal: "ended", error: "monitor_reconnect", stale: true }), true);
+  assert.equal(coveredMonitoring({ ...covered, monitor_connected: false, error: "monitor_setup", stale: true }), true);
+  assert.equal(coveredMonitoring({ ...covered, monitor_renewal: "ended", monitor_error: "monitor_reconnect" }), true, "in use here, read through the CLI");
+  for (const error of ["token_expired", "rate_limited", "http_500", "proxy_script"]) {
+    assert.equal(coveredMonitoring({ ...covered, monitor_connected: false, error, stale: true }), false, error);
+  }
+  assert.equal(coveredMonitoring({ ...covered, monitor_renewal: null }), false, "nothing to make here");
+  assert.equal(coveredMonitoring({ ...account, covered_by: null, monitor_renewal: "ended", error: "monitor_reconnect" }), false);
+});
+
+test("beside another computer's reading, this computer's trail is not described", () => {
+  const shared = { machine: "LAPTOP-2", taken_at: iso(now - 12 * 60000), windows: [{ kind: "weekly", window_seconds: null, used_percent: 61, resets_at: iso(now + 50 * HOUR) }] };
+  const trail = [[now - 2 * HOUR, 12], [now - HOUR, 48]];
+  assert.ok(accountTipLines(account, { now, trail }).flat().includes(sparklineText(trail)));
+  assert.ok(!accountTipLines({ ...account, stale: true, shared }, { now, trail }).flat().includes(sparklineText(trail)));
+  // A Codex window not started when it was read is not "reset since", whatever its age.
+  const unused = { kind: "session", window_seconds: 18000, used_percent: 0, resets_at: iso(now - 6 * HOUR + 18000 * 1000) };
+  const old = shownReading({ ...account, stale: true, shared: { ...shared, taken_at: iso(now - 6 * HOUR), windows: [unused] } }, now);
+  assert.deepEqual(currentWindows(old, now), [unused]);
+  assert.equal(resetSince(old, unused, now), false);
 });
 
 test("a saved CLI sign-in that ended or ends soon says so before anyone presses Use", () => {
