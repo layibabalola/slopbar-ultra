@@ -7,9 +7,9 @@
 //! recommend_account and automatic switching.
 //!
 //! Another computer's reading of an account this one has no fresh reading of
-//! (`AccountUsage::shared`) rides along with each account as information (`SharedHeadroom`), so an
-//! agent reads "not measured here; LAPTOP-2 read it 12 min ago" rather than nothing. Nothing here
-//! goes by it: every computer holding the roster passphrase can write one, under any name.
+//! (`AccountUsage::shared`) rides along with it as information (`SharedHeadroom`), so an agent reads
+//! that another of the user's computers read it 12 minutes ago, and what it read, rather than nothing.
+//! Nothing here goes by it: every computer holding the roster passphrase can write one, under any name.
 
 use std::collections::{HashMap, VecDeque};
 

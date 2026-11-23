@@ -976,13 +976,14 @@ mod tests {
     #[test]
     fn an_hour_of_roster_reads_over_rclone_starts_fewer_processes() {
         let mut said = Vec::new();
-        for (hour, reads, after_cats) in [(Hour::Quiet, 6, 0), (Hour::Busy, 6, 8), (Hour::Watching, 60, 0), (Hour::Running, 12, 12)] {
+        for (hour, reads, after_cats, uploads) in [(Hour::Quiet, 6, 0, 0), (Hour::Busy, 6, 8, 4), (Hour::Watching, 60, 0, 0), (Hour::Running, 12, 12, 0)] {
             let (before, after) = (an_hour(true, hour), an_hour(false, hour));
             said.push(format!("{hour:?} {before:?} -> {after:?}"));
             assert_eq!((before[0], before[2]), (after[0], after[2]), "{hour:?}: the same listings and uploads");
             assert_eq!(before[0], reads, "{hour:?}: listings");
             assert_eq!(before[1], 3 * reads, "{hour:?}: before, every file at every read");
             assert_eq!(after[1], after_cats, "{hour:?}: after, the changed files only");
+            assert_eq!(after[2], uploads, "{hour:?}: uploads");
         }
         eprintln!("roster rclone processes an hour [lsjson, cat, rcat], before -> after: {}", said.join("; "));
     }
