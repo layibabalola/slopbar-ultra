@@ -2461,7 +2461,6 @@ struct Turn<'a> {
 /// one there stops, a new one starts, `on_page(false)`); dropping it closes the tunnel at once and
 /// asks that computer to stop. This computer holds its one sign-in (`monitoring::SIGN_IN`) and the
 /// open sign-in's mark, which puts updates off, while it runs. Returns as `relay::drive` does.
-#[allow(clippy::too_many_arguments)]
 async fn relayed_turn(h: &AppHandle, step: &bulk::Step, machine: &bulk::Machine, window: signin::Window, session: Option<&Arc<signin::Session>>, turn: &Turn<'_>,
     mut on_page: impl FnMut(bool)) -> Result<bool, String> {
     let stop = turn.stop;
@@ -4987,6 +4986,7 @@ mod sign_in_tests {
         let relayed = profile.relayed(make).expect("the email's profile");
         assert!(Arc::ptr_eq(&relayed, &shared), "another computer's sign-in opens there too");
         assert_eq!(relay_target(profile.window, Some(&relayed)), Ok(shared.target()));
+        assert_eq!(relay_target(Window::Private, Some(&relayed)), Ok(Target::Private), "a private window never opens in a profile");
         assert_eq!(made.get(), 1, "one profile for the email");
         assert_eq!(first.options(email).email.as_deref(), email);
 
