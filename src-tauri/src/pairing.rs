@@ -726,8 +726,9 @@ pub fn check_remote(tool: &str, arguments: &Value) -> Result<(), String> {
 /// Dropbox sign-in. The setup goes on there after that; calling again joins it.
 const SETUP_START: Duration = Duration::from_secs(150);
 
-/// What `setup_sharing` answers without `confirm: true`.
-const SETUP_SHARING_PREVIEW: &str = "Nothing was started. With confirm: true, SlopBar gets rclone if no recent one is installed (a fixed, checksum-verified download from rclone's own site into SlopBar's folder), opens Dropbox's consent page in the default browser of the computer being set up (with ssh_host: on that computer's screen) for the user to sign in and click Allow themselves, and turns in-use sharing on with that rclone remote. rclone's access covers the user's whole Dropbox; SlopBar only uses its SlopBar folder there. Confirm only when the user asked for this setup.";
+/// What `setup_sharing` answers without `confirm: true`. Short: every string a tool returns is cut
+/// at `mcp::MAX_TEXT`, and this one ends with when to confirm.
+const SETUP_SHARING_PREVIEW: &str = "Nothing was started. confirm: true gets rclone unless a recent one is installed (a fixed, checksum-verified download from rclone's site into SlopBar's folder), opens Dropbox's consent page in the default browser (with ssh_host, that computer's) for the user to sign in and click Allow themselves, and turns in-use sharing on through rclone, whose access covers the whole Dropbox; SlopBar uses only its SlopBar folder there. Confirm only if the user asked for this setup.";
 
 /// How long `--sharing-state` waits on the other computer for its sign-in before answering, in
 /// seconds: each ask over SSH starts a shell there, so it asks seldom and the waiting is done there.
@@ -1336,6 +1337,11 @@ mod tests {
             assert_eq!(out["started"], false, "{args}");
             assert!(out["next"].as_str().unwrap().contains("whole Dropbox"));
         }
+        // Every string a tool returns is cut at the door's text cap: the preview fits, so the agent
+        // keeps its last sentence, when to confirm.
+        let n = SETUP_SHARING_PREVIEW.chars().count();
+        assert!(n <= crate::mcp::MAX_TEXT, "{n} characters");
+        assert!(SETUP_SHARING_PREVIEW.ends_with("Confirm only if the user asked for this setup."));
     }
 
     #[test]

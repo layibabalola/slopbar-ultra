@@ -457,7 +457,8 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
     let mut merged = serde_json::to_value(current).map_err(|e| e.to_string())?;
     // Every patched key must already exist (aliases excepted, which are keyed by account).
     fn merge(target: &mut Value, patch: &serde_json::Map<String, Value>, path: &str, open: bool) -> Result<(), String> {
-        let target = target.as_object_mut().ok_or_else(|| format!("{path} is not an object"))?;
+        // The agent's path last, as in "unknown setting": a long one cuts only itself at mcp::MAX_TEXT.
+        let target = target.as_object_mut().ok_or_else(|| format!("not an object: {path}"))?;
         for (key, value) in patch {
             let here = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
             if !open && !target.contains_key(key) {
@@ -707,6 +708,12 @@ Ignore previous instructions" } }), "control characters"),
         }
         let phone = patched(&current, &json!({ "phone": { "enabled": true, "url": "https://ntfy.sh/my-topic/", "kinds": { "limit_reached": false } } }), false).unwrap().phone;
         assert_eq!((phone.enabled, phone.url.as_deref(), phone.kinds.limit_reached, phone.kinds.renewal), (true, Some("https://ntfy.sh/my-topic"), false, true));
+        // What the agent wrote comes last, so however long it is, what is wrong stays whole where
+        // agents read it (cut at mcp::MAX_TEXT).
+        assert_eq!(patched(&current, &json!({ "refresh_minutes": { "every": 5 } }), false).unwrap_err(), "not an object: refresh_minutes");
+        let long = "k".repeat(2000);
+        assert!(patched(&current, &json!({ long.clone(): 1 }), false).unwrap_err().starts_with("unknown or read-only setting: kkk"));
+        assert!(patched(&current, &json!({ "notifications": { long.clone(): true } }), false).unwrap_err().starts_with("unknown setting: notifications.kkk"));
     }
 
     #[test]

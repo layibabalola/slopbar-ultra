@@ -364,8 +364,10 @@ pub struct Recommendation {
     pub overlap: Vec<String>,
 }
 
+/// An account as a summary names it, clipped: the summary reaches agents cut at `mcp::MAX_TEXT`,
+/// which must never cut its advice after the name.
 fn name(label: &Option<String>, id: &str) -> String {
-    label.clone().unwrap_or_else(|| id.to_string())
+    crate::mcp::clipped(label.as_deref().unwrap_or(id), crate::mcp::NAME_ROOM)
 }
 
 /// Why an account cannot take a job, or None when it can be ranked: the first of `cli_exclusion`,
@@ -407,7 +409,7 @@ fn reading_exclusion(acc: &AccountUsage, settings: &Settings, now: DateTime<Utc>
 fn elsewhere_exclusion(acc: &AccountUsage, settings: &Settings, now: DateTime<Utc>) -> Option<String> {
     if acc.overlap.len() > 1 {
         return Some(format!("in use on {} machines at once ({}): its limits drain about {}x as fast and sessions may be signed out",
-            acc.overlap.len(), acc.overlap.join(", "), acc.overlap.len()));
+            acc.overlap.len(), crate::mcp::listed(&acc.overlap), acc.overlap.len()));
     }
     if let Some(seat) = acc.remote.iter().find(|r| r.live) {
         return Some(format!("in use on another machine ({})", seat.machine));
@@ -484,11 +486,12 @@ pub fn recommend(accounts: &[AccountUsage], settings: &Settings, provider: Provi
     with_overlap(finish(provider, expected_percent, hours, ranking, excluded), overlap)
 }
 
-/// Says the account in use here is also in use elsewhere, ahead of what to do about it.
+/// Says the account in use here is also in use elsewhere, ahead of what to do about it: the
+/// machines in a list of bounded length, so the advice after it reaches agents (`mcp::MAX_TEXT`).
 fn with_overlap(mut rec: Recommendation, overlap: Vec<String>) -> Recommendation {
     if overlap.len() > 1 {
         rec.summary = format!("The account in use is in use on {} machines at once ({}), so its limits drain faster and sessions may be signed out. {}",
-            overlap.len(), overlap.join(", "), rec.summary);
+            overlap.len(), crate::mcp::listed(&overlap), rec.summary);
     }
     rec.overlap = overlap;
     rec
@@ -581,6 +584,51 @@ mod tests {
         // Kept when leases are taken out.
         let rec = without_leased(rec, &[("nobody".into(), "x".into())]);
         assert_eq!(rec.overlap.len(), 2);
+    }
+
+    /// What recommend_account answers and lease_account's error quotes reaches an agent whole
+    /// (`mcp::MAX_TEXT`), its advice last: however many computers use the account in use at once,
+    /// with names as long as presence keeps them (63 characters), emails of 254 and another
+    /// computer's readings noted.
+    #[test]
+    fn what_a_recommendation_says_reaches_an_agent_whole() {
+        let now = at(NOW);
+        let settings = Settings::default();
+        let long = |mut a: AccountUsage| {
+            a.email = Some(format!("{}{}@example.invalid", a.id, "e".repeat(254 - a.id.len() - "@example.invalid".len())));
+            a
+        };
+        // Another computer read the ones this computer cannot plan with.
+        let mut stale = long(account("stale", false, 90.0, 30));
+        stale.stale = true;
+        stale.fetched_at = Some(now - Duration::days(2));
+        let mut failed = long(account("failed", false, 10.0, 30));
+        failed.error = Some("monitor_reconnect".into());
+        failed.stale = true;
+        for a in [&mut stale, &mut failed] {
+            a.shared = Some(shared_from("LAPTOP-2", 12, 5.0, 40));
+        }
+        // Short names fill the list's whole room; long ones are clipped.
+        for len in [8, 60] {
+            let mut current = long(account("current", true, 20.0, 100));
+            current.overlap = (0..1000).map(|i| format!("{i:03}{}", "m".repeat(len))).collect();
+            let switch = vec![current.clone(), long(account("free", false, 30.0, 50))];
+            let none = vec![current, stale.clone(), failed.clone()];
+            for (accounts, action, advice) in [(switch, Action::Switch, "Switch only if the user allowed switching."), (none, Action::None, "ask the user.")] {
+                let rec = recommend(&accounts, &settings, Provider::Claude, Some(30.0), None, now);
+                assert_eq!(rec.action, action, "{}", rec.summary);
+                // As recommend_account answers (the note added) and as lease_account's error quotes it.
+                let answer = format!("{}{}", rec.summary, shared_note(&rec));
+                assert!(answer.ends_with(advice), "{answer}");
+                let texts = [answer, format!("no_account_free: {}", rec.summary)].into_iter()
+                    .chain(rec.excluded.iter().map(|e| e.reason.clone()))
+                    .chain(rec.ranking.iter().flat_map(|c| c.reasons.clone()));
+                for text in texts {
+                    assert!(text.chars().count() <= crate::mcp::MAX_TEXT, "{len}: {} characters: {text}", text.chars().count());
+                }
+                assert!(rec.excluded[0].reason.ends_with("sessions may be signed out"), "{}", rec.excluded[0].reason);
+            }
+        }
     }
 
     #[test]
