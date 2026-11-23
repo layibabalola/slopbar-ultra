@@ -3,7 +3,7 @@ import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { creditAdviceText } from "./alerts.js";
 import { sparkline } from "./sparkline.js";
-import { accountTip } from "./accounttext.js";
+import { accountTip, cliSignInText } from "./accounttext.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -193,6 +193,8 @@ function renderDetails(snap) {
         // Every row has one detail line, whatever its state, so switching doesn't change heights.
         // Where it's in use: here and on the user's other computers (shared via a synced folder).
         const places = placesText(a);
+        // A saved CLI sign-in that ended or ends soon, said before anyone presses Use.
+        const cli = cliSignInText(a);
         const meta = [places.inUse || (a.alias ? a.email : ""), ...places.seen, a.leased ? t("leased", { purpose: a.leased }) : "", a.used_outside ? t("usedOutside") : "", a.org, stale]
           .filter(Boolean).join(" · ") || " ";
         return `
@@ -210,6 +212,7 @@ function renderDetails(snap) {
           ${overlapLine(a)}
           <div class="acc-meta" title="${esc([meta, a.leased ? t("leasedHint") : "", a.used_outside ? t("usedOutsideHint") : ""].filter(Boolean).join("\n"))}">${esc(meta)}</div>
           ${a.error || a.monitor_error ? `<div class="error">${esc(accountErrorText(PROVIDER_NAME[provider], a))}</div>` : ""}
+          ${cli ? `<div class="error" title="${esc(cli.hint)}">${esc(cli.label)}</div>` : ""}
           ${!a.monitor_connected || a.monitor_renewal || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account", "monitor_network", "monitor_uncertain"].includes(a.monitor_error ?? a.error)
             ? `<button class="monitor" data-provider="${provider}" data-id="${esc(a.id)}">${t(a.monitor_connected ? "monitorReconnect" : "monitorConnect")}</button>` : ""}
           ${a.monitor_connected ? `<button class="monitor" data-disconnect="true" data-provider="${provider}" data-id="${esc(a.id)}">${t("monitorDisconnect")}</button>` : ""}
@@ -231,7 +234,9 @@ function renderCompactList(snap) {
   patch($accounts, `<div class="compact-list" role="list" aria-label="${esc(t("title"))}">${list.map((a, i) => {
     const key = `${a.provider}:${a.id}`;
     const w = a.stale || a.error ? null : peak(a);
-    const problem = accountErrorText(PROVIDER_NAME[a.provider], a);
+    // A saved CLI sign-in that ended is a problem too: Use would stop the CLI.
+    const cli = cliSignInText(a);
+    const problem = accountErrorText(PROVIDER_NAME[a.provider], a) || (cli?.ended ? cli.label : "");
     const used = w ? `${Math.round(w.used_percent)}%` : "—";
     const usedText = w ? `${windowLabel(w)}: ${used} ${t("used")}` : t("usageUnknown");
     const tip = accountTip(a, { sub: subs[key], trail: trails[key], creditAdvice: creditAdvice[key] });
