@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 // i18n.js sets the page language on load.
 globalThis.document ??= { documentElement: {} };
 const { t, setLanguage, setThisMachine, setSharing, windowResetText, placesText, compactPlaces, overlapText } = await import("../src/i18n.js");
-const { accountTip, accountTipLines, adviceText } = await import("../src/accounttext.js");
+const { accountTip, accountTipLines, adviceText, cliSignInText } = await import("../src/accounttext.js");
 const { sparkline, sparklineText } = await import("../src/sparkline.js");
 setLanguage("en");
 setThisMachine("DESK-1");
@@ -244,6 +244,47 @@ test("a monitoring renewal the network's proxy stopped says it was monitoring", 
   // A usage error (a read, or a renewal with nothing to fall back on) is the proxy's words alone.
   const usage = accountTipLines({ ...account, error: "proxy_script", monitor_error: "proxy_script", stale: true }, { now }).flat();
   assert.ok(usage.includes(script) && !usage.includes(t("monitorProxy", { reason: script })), usage.join("\n"));
+});
+
+test("a saved CLI sign-in that ended or ends soon says so before anyone presses Use", () => {
+  const spare = { ...account, active: false, sources: [] };
+  const ended = cliSignInText({ ...spare, cli_renewal: "ended", cli_ends_at: iso(now - 26 * HOUR) }, now);
+  assert.equal(ended.ended, true);
+  assert.equal(ended.label, t("cliSignInEnded"));
+  assert.match(ended.hint, /30 days/);
+  assert.match(ended.hint, /Use would stop the CLI/);
+  const ending = cliSignInText({ ...spare, cli_renewal: "ending", cli_ends_at: iso(now + 50 * HOUR) }, now);
+  assert.equal(ending.ended, false);
+  assert.match(ending.label, /^CLI sign-in ends in 2d 2h$/);
+  // By the date, not the last refresh's verdict: an end that passed since says so already.
+  assert.equal(cliSignInText({ ...spare, cli_renewal: "ending", cli_ends_at: iso(now - 60000) }, now).ended, true);
+  // Nothing to say: the account in use (even with the verdict from before a switch), no end known,
+  // or an end more than 3 days away (Sign in all accounts still takes it from 7).
+  assert.equal(cliSignInText({ ...account, cli_renewal: "ended", cli_ends_at: iso(now - HOUR) }, now), null);
+  assert.equal(cliSignInText({ ...spare, cli_renewal: "ended" }, now), null);
+  assert.equal(cliSignInText({ ...spare, cli_renewal: "ending", cli_ends_at: iso(now + 5 * 24 * HOUR) }, now), null);
+  // An account known only by its token is never promised a sign-in it cannot get.
+  const token = cliSignInText({ ...spare, id: "token:abc", cli_ends_at: iso(now - HOUR) }, now);
+  assert.equal(token.ended, true);
+  assert.equal(token.hint, t("cliRejectedHint", { cli: "claude /login" }));
+  // The compact flyout's tooltip carries it with everything else.
+  const lines = accountTipLines({ ...spare, cli_renewal: "ended", cli_ends_at: iso(now - HOUR) }, { now }).flat();
+  assert.ok(lines.some((l) => l.startsWith(`${t("cliSignInEnded")}: `)), lines.join("\n"));
+  // Every language has its own words for them, with the same placeholders.
+  const keys = ["cliSignInEnded", "cliSignInEnding", "cliSignInEndedHint", "cliSignInEndingHint"];
+  const english = Object.fromEntries(keys.map((k) => [k, t(k, { t: "{t}", d: "{d}" })]));
+  try {
+    for (const lang of ["pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"]) {
+      setLanguage(lang);
+      for (const key of keys) {
+        const text = t(key, { t: "{t}", d: "{d}" });
+        assert.notEqual(text, english[key], `${lang} ${key} is translated`);
+        for (const slot of ["{t}", "{d}"]) assert.equal(text.includes(slot), english[key].includes(slot), `${lang} ${key} keeps ${slot}`);
+      }
+    }
+  } finally {
+    setLanguage("en");
+  }
 });
 
 console.log(`${passed} account tooltip and sparkline checks passed`);

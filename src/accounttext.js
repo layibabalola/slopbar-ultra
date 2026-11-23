@@ -54,6 +54,31 @@ export function extraUsageLine(x) {
 const PROVIDER_NAME = { claude: "Claude", codex: "Codex" };
 const ago = (iso, now) => duration(Math.max(1, Math.round((now - new Date(iso)) / 60000)));
 
+/** How long before its end a saved CLI sign-in is said to end soon (`monitoring::WARN_DAYS`). */
+const CLI_WARN_MS = 3 * 86_400_000;
+
+/**
+ * The saved CLI sign-in of an account not in use that ended, or ends within 3 days (from
+ * `cli_ends_at`, as `accounts::cli_renewal` judges it): a short label and the hint that says why
+ * using it would stop the CLI and what signs it in again. Null when there is nothing to say,
+ * always for the account in use, whose sign-in the CLI manages (`active` may be newer than
+ * `cli_renewal` after a switch).
+ */
+export function cliSignInText(a, now = Date.now()) {
+  if (a.active || !a.cli_ends_at) return null;
+  const left = new Date(a.cli_ends_at) - now;
+  const d = shortDate(a.cli_ends_at);
+  // An account known only by its token cannot be signed in again by Sign in all accounts, so its
+  // hint never offers that.
+  const unknown = String(a.id ?? "").startsWith("token:");
+  if (left <= 0) {
+    return { ended: true, label: t("cliSignInEnded"), hint: unknown ? t("cliRejectedHint", { cli: "claude /login" }) : t("cliSignInEndedHint", { d }) };
+  }
+  if (left > CLI_WARN_MS) return null;
+  const label = t("cliSignInEnding", { t: duration(Math.max(1, Math.round(left / 60000))) });
+  return { ended: false, label, hint: unknown ? label : t("cliSignInEndingHint", { d }) };
+}
+
 /**
  * Everything known about an account, as groups of lines (empty groups and fields left out):
  * who it is, where it is in use, each usage window with its reset, the forecast, how current the
@@ -90,10 +115,12 @@ export function accountTipLines(a, { sub = null, trail = null, creditAdvice = ""
     trail?.length ? sparklineText(trail) : "",
   ]);
 
+  const cli = cliSignInText(a, now);
   groups.push([
     a.fetched_at ? t("lastObserved", { t: ago(a.fetched_at, now) }) + (a.stale ? ` · ${t("lastReading")}` : "") : "",
     accountErrorText(provider, a),
     t(a.monitor_connected ? "tipMonitorOn" : "tipMonitorOff"),
+    cli ? `${cli.label}: ${cli.hint}` : "",
   ]);
 
   groups.push([

@@ -77,7 +77,7 @@ mod tests {
             active, sources: vec![], windows: percent.map(|used_percent| UsageWindow {
                 kind: "session".into(), window_seconds: None, used_percent, resets_at: None,
             }).into_iter().collect(), credits: None, resets: vec![], error: None, monitor_error: None, stale: false,
-            fetched_at: Some(chrono::Utc::now()), monitor_connected: true, monitor_ends_at: None, monitor_renewal: None, billing: Default::default(), remote: vec![], overlap: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None, desktop: false, seats: None,
+            fetched_at: Some(chrono::Utc::now()), monitor_connected: true, monitor_ends_at: None, monitor_renewal: None, billing: Default::default(), remote: vec![], overlap: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None,
         }
     }
 
@@ -91,6 +91,18 @@ mod tests {
         let both = [(Provider::Claude, "leased".to_string()), (Provider::Claude, "free".to_string())];
         assert!(decide_avoiding(&accounts, &settings, &HashMap::new(), &both).is_empty());
         assert_eq!(decide_avoiding(&accounts, &settings, &HashMap::new(), &[(Provider::Codex, "leased".to_string())]).len(), 1, "another provider's lease");
+    }
+
+    #[test]
+    fn automatic_switching_never_moves_to_an_account_whose_saved_cli_sign_in_ended() {
+        let mut settings = Settings::default();
+        settings.balancer.claude.auto = true;
+        let mut ended = account("ended", false, Some(5.0));
+        ended.cli_ends_at = Some(chrono::Utc::now() - chrono::Duration::minutes(5));
+        let accounts = [account("active", true, Some(95.0)), ended.clone(), account("free", false, Some(20.0))];
+        assert_eq!(decide(&accounts, &settings, &HashMap::new()), [(Provider::Claude, "free".into())]);
+        assert!(decide(&[account("active", true, Some(95.0)), ended], &settings, &HashMap::new()).is_empty(),
+            "the CLI would stop until it signs in again: better to stay");
     }
 
     #[test]
