@@ -1,4 +1,4 @@
-use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, desktop, desktop_apps, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, pairing, panel, phone, pins, plan_alerts, presence, providers, rclone, refresh_wait, reset_credits, roster, settings, sharing, sharing_setup, signin, sources, subscriptions, unexpected, updates, usage_index, wind_down};
+use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, desktop, desktop_apps, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, pairing, panel, phone, pins, plan_alerts, presence, providers, rclone, refresh_wait, relay, reset_credits, roster, settings, sharing, sharing_setup, signin, sources, subscriptions, unexpected, updates, usage_index, wind_down};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -108,6 +108,12 @@ pub struct AppState {
     sharing_cancel: Arc<std::sync::atomic::AtomicBool>,
     /// The SSH tunnel while another computer's Dropbox sign-in waits for this computer's browser.
     sharing_tunnel: Mutex<Option<sharing_setup::Tunnel>>,
+    /// "Sign in all your computers from here": the plan last gathered, so the person's OK runs
+    /// exactly what was shown (see `gather_everywhere`), once.
+    everywhere: Mutex<Option<Everywhere>>,
+    /// A sitting waiting for the person's confirmation in Settings (see `confirm_everywhere_here`):
+    /// its monitoring switch, and when it was asked.
+    everywhere_ask: Mutex<Option<(bool, Instant)>>,
 }
 
 impl AppState {
@@ -158,6 +164,12 @@ struct BulkConnect {
     still_waiting: bool,
     /// Bumped at every change, across runs (see `wait_for_sign_in_change`).
     revision: u64,
+    /// "Sign in all your computers from here" (see `relay`): its steps include other computers'.
+    everywhere: bool,
+    /// The computers (or their sign-ins) it left out, before it started or as it went, with why.
+    left_out: Vec<relay::Skipped>,
+    /// Accounts in use on a computer whose CLI sign-in ended or ends soon: no sitting renews them.
+    in_use: Vec<relay::InUse>,
 }
 
 /// One sign-in of a run.
@@ -166,6 +178,9 @@ struct StepRecord {
     #[serde(flatten)]
     target: bulk::Target,
     kind: bulk::Kind,
+    /// Another computer whose sign-in this is, completed here (see `relay`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine: Option<String>,
     state: StepState,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -236,7 +251,22 @@ pub(crate) async fn health_report(app: &AppHandle) -> health::Report {
         processes: tauri::async_runtime::spawn_blocking(crate::instance::processes).await.ok().flatten(),
         disk: tauri::async_runtime::spawn_blocking(disk_use).await.ok().flatten(),
         wsl: sources::wsl_status(),
+        other_computers: other_computers(&state),
     }, chrono::Utc::now())
+}
+
+/// How many of the user's other computers "Sign in all your computers from here" would ask (see
+/// `gather_everywhere`): those paired or checked over SSH from here, and the roster's that
+/// ~/.ssh/config names.
+fn other_computers(state: &AppState) -> usize {
+    let here = presence::identity().map(|(id, _)| id.to_string());
+    let mut ids: HashSet<String> = settings::app_dir().map(|d| pairing::paired(&d)).unwrap_or_default().into_iter().map(|(id, _)| id).collect();
+    let peers = state.roster_seen.lock().unwrap().peers.clone();
+    if peers.iter().any(|p| !ids.contains(&p.machine_id)) {
+        let aliases = ssh_aliases();
+        ids.extend(peers.into_iter().filter(|p| aliases.contains(&p.machine.trim().to_lowercase())).map(|p| p.machine_id));
+    }
+    ids.into_iter().filter(|id| Some(id) != here.as_ref()).count()
 }
 
 /// Space on disk for Health, measured at most every few minutes: the flyout asks after every
@@ -727,19 +757,65 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             Ok(serde_json::json!({ "started": !queued.is_empty(), "queued": queued,
                 "next": "Each sign-in opens after the previous one finishes; the user signs in as the account named in Settings. get_usage shows monitor_connected, and no monitor_renewal, as they complete." }))
         }
-        R::SignInAll { confirm, monitoring, retry } => {
+        R::SignInAll { everywhere: true, confirm, monitoring, retry: _ } => {
+            if !confirm {
+                let plan = gather_everywhere(&app, monitoring).await?;
+                let mut shown = value(&plan)?;
+                shown["started"] = false.into();
+                shown["next"] = "Nothing was started. With confirm: true a notification on this computer asks the person here to review it, and Settings starts \
+                    it only on their OK; then this computer's sign-ins and every other computer's in plan open in this computer's browser one at a time, an email's together \
+                    in one fresh profile (Google once per email), while nothing opens on the other computers' screens. left_out names computers or \
+                    sign-ins left out and why; in_use names accounts in use whose CLI sign-in ends, which no sitting renews (claude /login at that \
+                    computer). Follow it with get_machine_readiness (this computer) and its sign_in, whose steps carry machine.".into();
+                return Ok(shown);
+            }
+            desktop_shown()?;
+            // One run at a time: an open sign-in is never stopped for an agent's request.
+            if app.state::<AppState>().bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished) {
+                return Err("signin_busy".into());
+            }
+            let plan = gather_everywhere(&app, monitoring).await?;
+            let any = !plan.computers.is_empty();
+            let asked = any && ask_everywhere(&app, &plan);
+            let mut shown = value(&plan)?;
+            shown["started"] = false.into();
+            shown["asked"] = asked.into();
+            shown["next"] = if asked {
+                "A notification on this computer asks the person here to review it: Settings then checks every computer again and starts only on their OK. Then follow it with get_machine_readiness and its sign_in."
+            } else if any {
+                "The notification asking the person here could not be shown (notifications off?): they start it themselves in Settings > Accounts, Sign in all your computers from here."
+            } else {
+                "Nothing to sign in on any computer reached; left_out says which were not reached and why."
+            }.into();
+            Ok(shown)
+        }
+        R::SignInAll { confirm, monitoring, retry, everywhere: false } => {
             if !confirm {
                 return Ok(serde_json::json!({ "started": false, "plan": sign_in_plan(&app, monitoring),
                     "next": "Nothing was started. With confirm: true the sign-ins open one at a time, an email's back to back in one fresh browser profile that is closed and deleted when the email is done; the user signs in as each account named here and completes every page." }));
             }
             desktop_shown()?;
-            // Retry from another computer: a run still going (one left waiting) gives way first.
+            // Retry from another computer: a run still going (one left waiting) gives way first,
+            // but never one signing in every computer from here (its pages open here).
             if retry {
+                if app.state::<AppState>().bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished && b.everywhere) {
+                    return Err("signin_busy".into());
+                }
                 stop_and_wait(&app).await?;
             }
             let plan = sign_in_all(&app, monitoring).await?;
             Ok(serde_json::json!({ "started": !plan.is_empty(), "plan": plan,
                 "next": "Each sign-in opens after the previous one finishes. get_usage shows the accounts, monitor_connected, and no monitor_renewal or cli_renewal, as they complete." }))
+        }
+        R::RelayPlan { monitoring, from } => Ok(relay_plan(&app, monitoring, &from).await),
+        R::RelayStart { step, from, machine, kind, provider, id, email } => relay_start(&app, step, from, machine, kind, provider, id, email).await,
+        R::RelayState { step, since, wait_seconds } => {
+            let wait = Duration::from_secs(u64::from(wait_seconds.min(40)));
+            relay::SLOT.wait_state(&step, since, wait).await.map_or_else(|| Err("relay_step_unknown".into()), value)
+        }
+        R::RelayStop { step } => Ok(serde_json::json!({ "stopped": relay::SLOT.stop(&step) })),
+        R::RelayPage { nonce, url } => {
+            if relay::SLOT.deposit(&nonce, &url) { Ok(serde_json::json!({ "taken": true })) } else { Err("signin_url_rejected".into()) }
         }
         R::RemoveLapsedAccounts { confirm } => {
             if !confirm {
@@ -798,7 +874,9 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             let state = app.state::<AppState>();
             let running = state.bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished);
             stop_running_sign_ins(&state);
-            Ok(serde_json::json!({ "stopped": running }))
+            // A sign-in another computer is completing in its browser stops too.
+            let relayed = relay::SLOT.stop_any();
+            Ok(serde_json::json!({ "stopped": running || relayed }))
         }
         R::GetReadiness { wait_seconds, since } => {
             if let Some(wait) = wait_seconds {
@@ -971,6 +1049,12 @@ fn signin_options(app: &AppHandle, email: Option<&str>, session: Option<&signin:
     accounts::LoginOptions { email: email.map(str::to_owned), target: signin::Target::choose(window, session) }
 }
 
+/// A sign-in another computer completes in its own browser (see `relay_start`): its page is handed
+/// over under `nonce`, and nothing opens here.
+fn relay_options(email: Option<&str>, nonce: &str) -> accounts::LoginOptions {
+    accounts::LoginOptions { email: email.map(str::to_owned), target: Some(signin::Target::Relay(nonce.to_owned())) }
+}
+
 /// A restored account that is signed in again is no longer pending.
 fn forget_pending(provider: Provider, id: &str) {
     let mut list = bulk::load_pending();
@@ -986,8 +1070,9 @@ fn forget_pending(provider: Provider, id: &str) {
 /// login of any other account is not saved and is revoked, the way monitoring rejects a wrong
 /// account. The new login replaces the vault's saved one; nothing is signed out, and the CLI's own
 /// files are never written. Returns once the user is done: whether a login was saved (a renewal is
-/// not, once the account is in use or was removed meanwhile; see `accounts::store_renewal`).
-async fn add_expected(app: &AppHandle, expected: &bulk::Step, session: Option<&signin::Session>) -> Result<bool, String> {
+/// not, once the account is in use or was removed meanwhile; see `accounts::store_renewal`). With
+/// `relay` (a nonce), another computer completes it in its own browser (see `relay_start`).
+async fn add_expected(app: &AppHandle, expected: &bulk::Step, session: Option<&signin::Session>, relay: Option<&str>) -> Result<bool, String> {
     let provider = expected.target.provider;
     let id = expected.target.id.clone();
     let _operation = app.state::<AppState>().account_operations.begin(provider, "add-account")?;
@@ -996,7 +1081,10 @@ async fn add_expected(app: &AppHandle, expected: &bulk::Step, session: Option<&s
     let _sign_in = app.state::<AppState>().account_operations.begin_key(monitoring::SIGN_IN)?;
     let _open = app.state::<AppState>().sign_ins.open();
     let found = app.state::<AppState>().sources.lock().unwrap().clone();
-    let options = signin_options(app, expected.email.as_deref(), session);
+    let options = match relay {
+        Some(nonce) => relay_options(expected.email.as_deref(), nonce),
+        None => signin_options(app, expected.email.as_deref(), session),
+    };
     let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, None, options))
         .await.map_err(|_| "monitor_login_failed".to_string())??;
     let client = http_client();
@@ -1058,18 +1146,155 @@ fn wrong_account(provider: Provider, expected: Option<&str>, signed_in: Option<&
     if provider == Provider::Codex && same_email { "monitor_wrong_workspace" } else { "monitor_wrong_account" }.into()
 }
 
+/// What another of the user's computers asks before completing this one's sign-ins in its own
+/// browser (see `relay::ask`): who this computer is, the plan its "Sign in all accounts" would run
+/// now, which accounts it reads usage for itself (automatic switching per provider, rotation
+/// thresholds), its accounts in use whose CLI sign-ins ended or end soon (the CLI manages those: no
+/// sitting renews them), whether a sign-in is open here or its own run goes, and what its OpenSSH
+/// server starts. A relayed sign-in of `from`'s own still open here (its stop on the way) is not
+/// busy: its next start replaces it (see `relay_start`).
+async fn relay_plan(app: &AppHandle, monitoring: bool, from: &str) -> serde_json::Value {
+    let state = app.state::<AppState>();
+    let settings = state.settings.lock().unwrap().clone();
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    let running = state.bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished);
+    let its_own = !from.is_empty() && relay::SLOT.holder().is_some_and(|(_, holder)| holder == from);
+    let busy = running || (!its_own && (state.account_operations.busy(monitoring::SIGN_IN) || relay::SLOT.busy()));
+    let ssh_shell = tauri::async_runtime::spawn_blocking(pairing::ssh_shell).await.ok().flatten();
+    serde_json::json!({
+        "machine": presence::identity().map(|(id, name)| serde_json::json!({ "id": id, "name": name })),
+        "relay": relay::VERSION,
+        "plan": sign_in_plan(app, monitoring),
+        "own_readings": { "claude": settings.balancer.claude.auto, "codex": settings.balancer.codex.auto, "rotate": settings.rotate_at.keys().collect::<Vec<_>>() },
+        "in_use": in_use_ending(&snapshot, chrono::Utc::now()),
+        "busy": busy,
+        "ssh_shell": ssh_shell,
+    })
+}
+
+/// This computer's accounts in use whose saved CLI sign-in ended or ends within
+/// `monitoring::RENEW_DAYS`: the CLI manages that sign-in, so nothing here renews it, and a sitting
+/// names it (`claude /login` at this computer).
+fn in_use_ending(snapshot: &Snapshot, now: chrono::DateTime<chrono::Utc>) -> Vec<relay::InUse> {
+    let horizon = now + chrono::Duration::days(monitoring::RENEW_DAYS);
+    snapshot.accounts.iter().filter(|a| a.active && !a.id.starts_with("token:") && a.cli_ends_at.is_some_and(|e| e <= horizon))
+        .map(|a| relay::InUse { machine: String::new(), provider: a.provider, id: a.id.clone(), email: a.email.clone(), ends_at: a.cli_ends_at })
+        .collect()
+}
+
+/// Another of the user's computers (`from`) completing one of this computer's sign-ins in its own
+/// browser ("Sign in all your computers from here", see `relay`): starts sign-in `kind` for the
+/// account under that computer's id `step`, with no window or browser here, and answers with its
+/// state once its page is ready or it ended (waiting up to 40 seconds). Only a sign-in this
+/// computer's own "Sign in all accounts" would make now, checked as a run checks a step at its turn
+/// (whether the account is saved, from the vault itself, so a monitoring sign-in right after its
+/// account was added is not missed); never while this computer's own run goes, a sign-in is open
+/// here or another computer's relayed one is. A step of `from`'s still open (its stop never came)
+/// gives way. `machine` must be this computer's id. This computer's desktop need not be shown:
+/// nothing opens on it. The sign-in stops when that computer asks, stops asking after it, or the
+/// CLI never hands over its page (see `relay::Slot::should_stop`).
+#[allow(clippy::too_many_arguments)]
+async fn relay_start(app: &AppHandle, step: String, from: String, machine: String, kind: bulk::Kind, provider: Provider, id: String, email: Option<String>) -> Result<serde_json::Value, String> {
+    let to_value = |state: relay::State| serde_json::to_value(state).map_err(|e| e.to_string());
+    if presence::identity().is_none_or(|(id, _)| id.as_str() != machine) {
+        return Err("wrong_machine".into());
+    }
+    // The same step again (a start whose answer was lost): how it goes, nothing new.
+    if let Some(state) = relay::SLOT.state(&step) {
+        return to_value(relay::SLOT.wait_page(&step, Duration::from_secs(40)).await.unwrap_or(state));
+    }
+    // A step of the same computer's that is still open (its stop did not arrive) gives way.
+    if let Some((old, old_from)) = relay::SLOT.holder() {
+        if old_from == from {
+            relay::SLOT.stop(&old);
+            let until = Instant::now() + Duration::from_secs(5);
+            while relay::SLOT.busy() && Instant::now() < until {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    let state = app.state::<AppState>();
+    let running = state.bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished);
+    if running || state.account_operations.busy(monitoring::SIGN_IN) || relay::SLOT.busy() {
+        return Err("signin_busy".into());
+    }
+    let target = bulk::Target { provider, id: id.clone(), account: email.clone(), ended: None };
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    let saved = tauri::async_runtime::spawn_blocking({
+        let id = id.clone();
+        move || accounts::load_slots().iter().any(|s| s.provider == provider && s.id == id)
+    }).await.unwrap_or(false);
+    let active = snapshot.accounts.iter().any(|a| a.provider == provider && a.id == id && a.active);
+    let due = match kind {
+        bulk::Kind::Add => !saved && pending_accounts(&state, &snapshot).iter().any(|p| p.provider == provider && p.id == id),
+        bulk::Kind::Renew => saved && !active && cli_sign_in_due(app, &target),
+        bulk::Kind::Connect => saved && needs_monitor_sign_in(app, &target).await,
+    };
+    if !due {
+        return to_value(relay::State { step, phase: relay::Phase::Skipped, url: None, error: None, revision: relay::SLOT.revision() });
+    }
+    let nonce = match relay::SLOT.begin(&step, &from, provider, email.as_deref())? {
+        relay::Begun::New(nonce) => nonce,
+        relay::Begun::Again => return relay::SLOT.state(&step).map_or_else(|| Err("relay_step_unknown".into()), to_value),
+    };
+    let h = app.clone();
+    let task_step = step.clone();
+    tauri::async_runtime::spawn(async move {
+        let step = task_step;
+        // However this task ends, the slot is never left held.
+        let _end = relay::EndGuard { slot: &relay::SLOT, step: step.clone() };
+        let expected = bulk::Step { kind, target, email, machine: None };
+        let run = async {
+            match kind {
+                bulk::Kind::Add | bulk::Kind::Renew => add_expected(&h, &expected, None, Some(&nonce)).await,
+                bulk::Kind::Connect => {
+                    // Asked for by the user, at the other computer: a manual start, never an automatic one.
+                    let key = format!("{}:{}", provider.name(), id);
+                    auto_monitor_saved(&h, |t| t.manual(&key, true));
+                    match start_monitoring_login(h.clone(), provider, id.clone(), false, None, Some(nonce.clone())).await {
+                        // Stopping drops this future, and with it the sign-in.
+                        Ok(task) => AbortOnDrop(task).await.unwrap_or_else(|_| Err("monitor_login_failed".into())).map(|()| true),
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+        };
+        let stop = async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if let Some(why) = relay::SLOT.should_stop(&step) {
+                    break why;
+                }
+            }
+        };
+        let outcome = tokio::select! {
+            outcome = run => outcome,
+            why = stop => Err(why.to_string()),
+        };
+        let (phase, error) = match outcome {
+            Ok(true) => (relay::Phase::Done, None),
+            // A renewal for an account switched to or removed meanwhile: nothing was saved.
+            Ok(false) => (relay::Phase::Skipped, None),
+            Err(e) => (relay::Phase::Failed, Some(e)),
+        };
+        relay::SLOT.finish(&step, phase, error);
+    });
+    relay::SLOT.wait_page(&step, Duration::from_secs(40)).await.map_or_else(|| Err("relay_step_unknown".into()), to_value)
+}
+
 /// A one-time login owns its own refresh-token chain; it never changes the active CLI.
 #[tauri::command]
 async fn connect_monitoring(app: AppHandle, provider: Provider, id: String) -> Result<(), String> {
     let key = format!("{}:{id}", provider.name());
     auto_monitor_saved(&app, |t| t.manual(&key, true));
-    start_monitoring_login(app, provider, id, false, None).await.map(|_| ())
+    start_monitoring_login(app, provider, id, false, None, None).await.map(|_| ())
 }
 
 /// Connect monitoring's sign-in, started by the user or on its own (`auto`, see `auto_monitor`).
 /// One sign-in is open at a time across the app (`monitoring::SIGN_IN`); the returned task
-/// ends with its outcome once the user is done.
-async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, auto: bool, session: Option<Arc<signin::Session>>) -> Result<tauri::async_runtime::JoinHandle<Result<(), String>>, String> {
+/// ends with its outcome once the user is done. With `relay` (a nonce), another computer completes
+/// it in its own browser and no profile opens here (see `relay_start`).
+async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, auto: bool, session: Option<Arc<signin::Session>>, relay: Option<String>) -> Result<tauri::async_runtime::JoinHandle<Result<(), String>>, String> {
     let operation = app.state::<AppState>().account_operations.begin(provider, &id)?;
     let sign_in = app.state::<AppState>().account_operations.begin_key(monitoring::SIGN_IN)?;
     let open = app.state::<AppState>().sign_ins.open();
@@ -1080,9 +1305,13 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
     app.state::<AppState>().diagnostics.record(Some(provider), Some(&id), diagnostics::Event::Action { action: diagnostics::Action::ConnectStarted, code: diagnostics::Code::Ok, elapsed_ms: 0 });
     let found = app.state::<AppState>().sources.lock().unwrap().clone();
     let context = diagnostics::Context { recorder: app.state::<AppState>().diagnostics.clone(), provider, id: id.clone() };
-    // The email group's profile in "Sign in all accounts", else a fresh one of its own.
-    let session = session.or_else(|| signin_session(&app));
-    let options = signin_options(&app, expected.email.as_deref(), session.as_deref());
+    // The email group's profile in "Sign in all accounts", else a fresh one of its own; none for a
+    // page another computer opens.
+    let session = if relay.is_some() { None } else { session.or_else(|| signin_session(&app)) };
+    let options = match relay.as_deref() {
+        Some(nonce) => relay_options(expected.email.as_deref(), nonce),
+        None => signin_options(&app, expected.email.as_deref(), session.as_deref()),
+    };
     let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, Some(context), options)).await;
     let job = match job {
         Ok(Ok(job)) => job,
@@ -1191,7 +1420,7 @@ fn roster_run(b: &BulkConnect, at: chrono::DateTime<chrono::Utc>) -> roster::Run
     let word = |v: serde_json::Value| v.as_str().unwrap_or_default().to_string();
     roster::Run {
         revision: b.revision, at, total: b.total, done: b.done, emails: b.emails, email: b.email, finished: b.finished,
-        still_waiting: b.still_waiting, monitoring: b.monitoring, error: b.error.clone(),
+        still_waiting: b.still_waiting, monitoring: b.monitoring, error: b.error.clone(), everywhere: b.everywhere,
         steps: b.steps.iter().map(|s| roster::RunStep {
             provider: s.target.provider, account: s.target.account.clone(),
             kind: word(serde_json::json!(s.kind)), state: word(serde_json::json!(s.state)), error: s.error.clone(),
@@ -1223,7 +1452,7 @@ async fn wait_for_sign_in_change(app: &AppHandle, revision: u64, wait: Duration)
 async fn connect_all(app: &AppHandle) -> Result<Vec<bulk::Target>, String> {
     let groups = bulk::connect_plan(&app.state::<AppState>().snapshot.lock().unwrap());
     let targets = groups.iter().flat_map(|g| g.steps.iter().map(|s| s.target.clone())).collect();
-    run_sign_ins(app, groups, false, true)?;
+    run_sign_ins(app, groups, false, true, None)?;
     Ok(targets)
 }
 
@@ -1232,7 +1461,7 @@ async fn connect_all(app: &AppHandle) -> Result<Vec<bulk::Target>, String> {
 /// Returns the plan.
 async fn sign_in_all(app: &AppHandle, monitoring: bool) -> Result<Vec<bulk::Group>, String> {
     let groups = sign_in_plan(app, monitoring);
-    run_sign_ins(app, groups.clone(), true, monitoring)?;
+    run_sign_ins(app, groups.clone(), true, monitoring, None)?;
     Ok(groups)
 }
 
@@ -1244,6 +1473,12 @@ async fn retry_run(app: &AppHandle) -> Result<(), String> {
     stop_and_wait(app).await?;
     match last {
         Some(b) if !b.by_email => connect_all(app).await.map(|_| ()),
+        // Every computer again, those left out last time too, through the person's confirmation
+        // in Settings (what already worked is not asked for).
+        Some(b) if b.everywhere => {
+            confirm_everywhere_here(app, b.monitoring);
+            Ok(())
+        }
         Some(b) => sign_in_all(app, b.monitoring).await.map(|_| ()),
         None => sign_in_all(app, true).await.map(|_| ()),
     }
@@ -1322,11 +1557,16 @@ async fn page_opened(session: Option<&signin::Session>, since: std::time::System
 }
 
 /// What a sign-in is, as an email's page lists it: "Claude" (the account's own sign-in, new or
-/// made again), "Codex monitoring".
+/// made again), "Codex monitoring", "Claude for VIRTUAL-TEN" (another computer's, see `relay`).
 fn step_name(lang: &str, step: &bulk::Step) -> String {
     let provider = match step.target.provider { Provider::Claude => "Claude", Provider::Codex => "Codex" };
     let key = if step.kind == bulk::Kind::Connect { "signinPageStepConnect" } else { "signinPageStepAdd" };
-    crate::i18n::t(lang, key, &[("provider", provider)])
+    let name = crate::i18n::t(lang, key, &[("provider", provider)]);
+    // Another computer's sign-in names that computer: one email's page lists every computer's.
+    match &step.machine {
+        Some(machine) => for_machine(lang, &name, &machine.name),
+        None => name,
+    }
 }
 
 /// How long a sign-in may take to open its page (Codex's app server can be a cold start).
@@ -1337,7 +1577,7 @@ const STILL_WAITING: Duration = Duration::from_secs(5 * 60);
 /// Watches the open sign-in: resolves with `signin_no_page` when its page never opened in the
 /// email's profile (only a profile can tell), and, once it has waited long, asks the person at the
 /// desktop whether to retry it (and never resolves after that).
-async fn watch_step(app: &AppHandle, session: Option<&signin::Session>, since: std::time::SystemTime, account: &str) -> String {
+async fn watch_step(app: &AppHandle, session: Option<&signin::Session>, since: std::time::SystemTime, account: &str, browser: bool) -> String {
     let started = tokio::time::Instant::now();
     if let Some(session) = session {
         tokio::time::sleep(NO_PAGE_LIMIT).await;
@@ -1347,7 +1587,13 @@ async fn watch_step(app: &AppHandle, session: Option<&signin::Session>, since: s
     }
     tokio::time::sleep_until(started + STILL_WAITING).await;
     publish_bulk(app, |b| b.still_waiting = true);
-    sign_in_choice(app, "signInStillWaiting", &[("account", account)], true);
+    // Another computer's sign-in waits in a browser here, whatever the window setting says.
+    let place = browser.then(|| crate::i18n::t(&crate::i18n::resolve(&app.state::<AppState>().settings.lock().unwrap().language), "signInWhereBrowser", &[]));
+    let mut vars = vec![("account", account)];
+    if let Some(place) = place.as_deref() {
+        vars.insert(0, ("where", place));
+    }
+    sign_in_choice(app, "signInStillWaiting", &vars, true);
     std::future::pending().await
 }
 
@@ -1356,7 +1602,7 @@ async fn watch_step(app: &AppHandle, session: Option<&signin::Session>, since: s
 /// them; the profile's browser is closed and the profile deleted when the email's turn ends.
 /// Stops at the first that fails (the user closed it, closed the browser, signed in as another
 /// account, its page never opened, or Stop was pressed). Every step's outcome stays in `steps`.
-fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monitoring: bool) -> Result<(), String> {
+fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monitoring: bool, gathered: Option<Gathered>) -> Result<(), String> {
     let state = app.state::<AppState>();
     let total = groups.iter().map(|g| g.steps.len()).sum();
     let stop = Arc::new(tokio::sync::Notify::new());
@@ -1366,9 +1612,12 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
             return Err("monitor_busy".into());
         }
         let steps = groups.iter().flat_map(|g| g.steps.iter())
-            .map(|s| StepRecord { target: s.target.clone(), kind: s.kind, state: StepState::Pending, error: None, started_at: None, page_at: None, ended_at: None }).collect();
+            .map(|s| StepRecord { target: s.target.clone(), kind: s.kind, machine: s.machine.as_ref().map(|m| m.name.clone()), state: StepState::Pending,
+                error: None, started_at: None, page_at: None, ended_at: None }).collect();
+        let (left_out, in_use) = gathered.clone().map(|g| (g.left_out, g.in_use)).unwrap_or_default();
         *running = Some(BulkConnect { total, done: 0, current: None, kind: None, emails: if by_email { groups.len() } else { 0 }, email: 0,
-            finished: total == 0, error: None, steps, by_email, monitoring, still_waiting: false, revision: 0 });
+            finished: total == 0, error: None, steps, by_email, monitoring, still_waiting: false, revision: 0,
+            everywhere: gathered.is_some(), left_out, in_use });
         *state.bulk_stop.lock().unwrap() = Some(stop.clone());
     }
     publish_bulk(app, |_| {});
@@ -1395,6 +1644,10 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
         // Accounts this run signed in: one only just added has its monitoring sign-in next, though
         // the refresh that lists it may still be running.
         let mut added = std::collections::HashSet::new();
+        // Other computers left out as the run went (their remaining sign-ins too), and how many of
+        // each one's sign-ins failed on their own (see `relay::fault`).
+        let mut dropped: HashMap<String, String> = HashMap::new();
+        let mut strikes: HashMap<String, u32> = HashMap::new();
         'groups: for (index, group) in groups.iter().enumerate() {
             // Made at the email's first sign-in that still has to run, ended with its turn.
             let mut group_session: Option<Option<Arc<signin::Session>>> = None;
@@ -1416,6 +1669,106 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     b.still_waiting = false;
                 });
                 done += 1;
+                // Another computer's sign-in, completed here (see `relay`): that computer judges
+                // whether it is still needed, so none of the checks below applies to it.
+                if let Some(machine) = &step.machine {
+                    if let Some(reason) = dropped.get(&machine.id) {
+                        mark(at, StepState::Skipped, Some(reason.clone()));
+                        page.steps[in_group].1 = signin::PageStep::Left;
+                        continue;
+                    }
+                    // The page opens here: this computer's screen must be seen.
+                    if let Err(problem) = desktop_shown() {
+                        done -= 1;
+                        mark(at, StepState::Failed, Some(problem.clone()));
+                        error = Some(problem);
+                        break 'groups;
+                    }
+                    mark(at, StepState::Running, None);
+                    let free = async {
+                        while h.state::<AppState>().account_operations.busy(monitoring::SIGN_IN) {
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+                    };
+                    let stopped = tokio::select! {
+                        _ = free => false,
+                        _ = stop.notified() => true,
+                    };
+                    let session = relay_session(&h, &mut group_session, group.email.as_deref(), &lang);
+                    page.at = done;
+                    page.steps[in_group].1 = signin::PageStep::Opening;
+                    if let Some(s) = session.as_deref() {
+                        s.show(&page);
+                    }
+                    let account = for_machine(&lang, &target.account.clone().unwrap_or_default(), &machine.name);
+                    // Once per email: its page here lists every computer's sign-in as it goes. Always in a
+                    // browser here (never the terminal a sign-in here may open).
+                    if by_email && !stopped && in_group == 0 {
+                        let (g, e, i, n) = ((index + 1).to_string(), groups.len().to_string(), done.to_string(), total.to_string());
+                        let key = if step.kind == bulk::Kind::Connect { "signInAllConnecting" } else { "signInAllAdding" };
+                        let browser = crate::i18n::t(&lang, "signInWhereBrowser", &[]);
+                        sign_in_notice(&h, key, &[("where", &browser), ("g", &g), ("e", &e), ("i", &i), ("n", &n), ("account", &account)]);
+                    }
+                    let outcome = if stopped {
+                        Err("signin_stopped".to_string())
+                    } else {
+                        let opened = || {
+                            publish_bulk(&h, |b| if let Some(s) = b.steps.get_mut(at) { s.page_at = Some(chrono::Utc::now()) });
+                            page.steps[in_group].1 = signin::PageStep::Open;
+                            if let Some(s) = session.as_deref() {
+                                s.show(&page);
+                            }
+                        };
+                        relayed_turn(&h, step, machine, session.as_ref(), &stop, &account, opened).await
+                    };
+                    let left = |page: &mut signin::Progress| {
+                        page.steps[in_group].1 = signin::PageStep::Left;
+                        if let Some(s) = session.as_deref() {
+                            s.show(page);
+                        }
+                    };
+                    match outcome {
+                        Ok(true) => {
+                            mark(at, StepState::Done, None);
+                            page.steps[in_group].1 = signin::PageStep::Done;
+                            if let Some(s) = session.as_deref() {
+                                s.show(&page);
+                            }
+                        }
+                        Ok(false) => {
+                            mark(at, StepState::Skipped, None);
+                            page.steps[in_group].1 = signin::PageStep::Skipped;
+                            if let Some(s) = session.as_deref() {
+                                s.show(&page);
+                            }
+                        }
+                        Err(e) => match relay::fault(&e) {
+                            relay::Fault::StopRun => {
+                                done -= 1;
+                                mark(at, StepState::Failed, Some(e.clone()));
+                                error = Some(e);
+                                failed_provider = Some(target.provider);
+                                break 'groups;
+                            }
+                            fault => {
+                                // Left out: this sign-in alone, or its computer's from here on (also
+                                // once two of its sign-ins failed on their own).
+                                mark(at, StepState::Skipped, Some(e.clone()));
+                                left(&mut page);
+                                let strikes = strikes.entry(machine.id.clone()).or_default();
+                                *strikes += u32::from(fault == relay::Fault::SkipStep);
+                                let skipped = if fault == relay::Fault::DropComputer || *strikes >= 2 {
+                                    dropped.insert(machine.id.clone(), e.clone());
+                                    relay::Skipped::computer(&machine.name, &e)
+                                } else {
+                                    relay::Skipped { account: target.account.clone(), ..relay::Skipped::computer(&machine.name, &e) }
+                                };
+                                publish_bulk(&h, |b| b.left_out.push(skipped));
+                            }
+                        },
+                    }
+                    continue;
+                }
                 // Done (or removed) since the queue started: nothing to do.
                 let still = {
                     let state = h.state::<AppState>();
@@ -1488,12 +1841,12 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     match step.kind {
                         // A new CLI sign-in saved in the vault: a pending account's, or one for an
                         // account whose saved sign-in ended or ends soon.
-                        bulk::Kind::Add | bulk::Kind::Renew => add_expected(&h, step, session.as_deref()).await,
+                        bulk::Kind::Add | bulk::Kind::Renew => add_expected(&h, step, session.as_deref(), None).await,
                         bulk::Kind::Connect => {
                             // The user asked for these, so they count as manual starts, never automatic ones.
                             let key = format!("{}:{}", target.provider.name(), target.id);
                             auto_monitor_saved(&h, |t| t.manual(&key, true));
-                            match start_monitoring_login(h.clone(), target.provider, target.id.clone(), false, session.clone()).await {
+                            match start_monitoring_login(h.clone(), target.provider, target.id.clone(), false, session.clone(), None).await {
                                 // Stopping drops this future, and with it the sign-in.
                                 Ok(task) => AbortOnDrop(task).await.unwrap_or_else(|_| Err("monitor_login_failed".into())).map(|()| true),
                                 Err(e) => Err(e),
@@ -1518,7 +1871,7 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     Err("signin_stopped".into())
                 } else {
                     let closed = browser_closed(session.as_deref());
-                    let watch = watch_step(&h, session.as_deref(), since, &account);
+                    let watch = watch_step(&h, session.as_deref(), since, &account, false);
                     let opened = page_opened(session.as_deref(), since);
                     tokio::pin!(closed, watch, opened);
                     let mut opening = true;
@@ -1584,7 +1937,29 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                         _ if known => crate::i18n::t(&lang, e, &[]),
                         _ => e.clone(),
                     };
-                    sign_in_choice(&h, "bulkConnectStopped", &[("done", &done.to_string()), ("n", &total.to_string()), ("error", &reason)], false);
+                    // A sitting counts what it made, and names who it left out.
+                    let (made, left) = if gathered.is_some() {
+                        let state = h.state::<AppState>();
+                        let run = state.bulk_connect.lock().unwrap();
+                        let made = run.as_ref().map_or(0, |b| b.steps.iter().filter(|s| s.state == StepState::Done).count());
+                        (made, run.as_ref().map(|b| left_out_text(&lang, &b.left_out)).unwrap_or_default())
+                    } else {
+                        (done, String::new())
+                    };
+                    let reason = if left.is_empty() { reason } else { format!("{reason} {}", crate::i18n::t(&lang, "signInLeftOut", &[("list", &left)])) };
+                    sign_in_choice(&h, "bulkConnectStopped", &[("done", &made.to_string()), ("n", &total.to_string()), ("error", &reason)], false);
+                }
+                None if gathered.is_some() => {
+                    // Counted as the person sees it: the sign-ins made, and who was left out.
+                    let (made, left) = {
+                        let state = h.state::<AppState>();
+                        let run = state.bulk_connect.lock().unwrap();
+                        let made = run.as_ref().map_or(0, |b| b.steps.iter().filter(|s| s.state == StepState::Done).count());
+                        (made, run.as_ref().map(|b| b.left_out.clone()).unwrap_or_default())
+                    };
+                    let left = left_out_text(&lang, &left);
+                    let key = if left.is_empty() { "signInEverywhereDone" } else { "signInEverywhereDoneLeft" };
+                    sign_in_notice(&h, key, &[("n", &made.to_string()), ("left", &left)]);
                 }
                 None => sign_in_notice(&h, "signInAllDone", &[("n", &total.to_string())]),
             }
@@ -1603,6 +1978,323 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
 
 /// How long a sign-in may go on finishing after its browser window was closed.
 const SIGN_IN_GRACE: Duration = Duration::from_secs(120);
+
+// ---------------------------------------------------------------------------------------------
+// "Sign in all your computers from here" (see `relay`)
+
+/// What gathering every computer's plan found besides the plan itself.
+#[derive(Clone, Default)]
+struct Gathered {
+    left_out: Vec<relay::Skipped>,
+    in_use: Vec<relay::InUse>,
+}
+
+/// A sitting's plan as gathered (see `gather_everywhere`): kept for 10 minutes so the person's OK
+/// runs exactly what was shown.
+#[derive(Clone, Serialize)]
+struct Everywhere {
+    id: String,
+    #[serde(skip)]
+    at: Instant,
+    monitoring: bool,
+    /// The sign-ins by email, this computer's first in each; another computer's name theirs.
+    groups: Vec<bulk::Group>,
+    /// Each computer with sign-ins in it, by machine id: its name, the SSH host that reaches it,
+    /// its sign-ins and their emails (see `relay::computers`).
+    computers: Vec<relay::Computer>,
+    /// This computer's machine id, so the confirmation can mark it.
+    here: String,
+    left_out: Vec<relay::Skipped>,
+    in_use: Vec<relay::InUse>,
+}
+
+/// How long a gathered plan may be started.
+const EVERYWHERE_FRESH: Duration = Duration::from_secs(600);
+
+/// The `Host` names in the user's ~/.ssh/config, lowercased, without patterns: another computer
+/// the roster names but nothing here remembers a host for is tried at its name when one matches.
+fn ssh_aliases() -> HashSet<String> {
+    let text = dirs::home_dir().and_then(|h| std::fs::read_to_string(h.join(".ssh").join("config")).ok()).unwrap_or_default();
+    text.lines().filter_map(|l| {
+        let l = l.trim();
+        let (word, rest) = l.split_once(char::is_whitespace)?;
+        word.eq_ignore_ascii_case("host").then_some(rest)
+    }).flat_map(|names| names.split_whitespace().map(str::to_lowercase).collect::<Vec<_>>())
+        .filter(|n| !n.contains(['*', '?', '!']) && pairing::valid_host(n)).collect()
+}
+
+/// Gathers "Sign in all your computers from here": this computer's "Sign in all accounts" plan and
+/// every other computer's (`relay::ask`), merged by email (`bulk::everywhere`). The other computers
+/// are those paired or checked from here (at the SSH host remembered for each) and the roster's,
+/// tried at their name when ~/.ssh/config has it (remembered once one answers as that machine).
+/// Their steps are kept only for accounts this computer knows (its own, or a roster's, with the
+/// same email), so another computer can never have pages for someone else's accounts opened here;
+/// and their monitoring sign-ins only where they read usage for themselves (automatic switching, a
+/// rotation threshold) or this computer's shared readings would not cover them there (it does not
+/// read that account, does not share readings, or that computer does not read its roster). Kept as
+/// the plan the person's OK starts (see `start_everywhere`).
+async fn gather_everywhere(app: &AppHandle, monitoring: bool) -> Result<Everywhere, String> {
+    let state = app.state::<AppState>();
+    let (here_id, here_name) = presence::identity().map(|(id, name)| (id.to_string(), name.to_string())).ok_or("relay_failed")?;
+    let snapshot = state.snapshot.lock().unwrap().clone();
+    let peers = state.roster_seen.lock().unwrap().peers.clone();
+    let dir = settings::app_dir();
+    let paired = dir.as_deref().map(pairing::paired).unwrap_or_default();
+    let aliases = tauri::async_runtime::spawn_blocking(ssh_aliases).await.unwrap_or_default();
+    let mut hosts: Vec<(String, Option<String>)> = paired.iter().filter(|(id, _)| *id != here_id).map(|(id, host)| (host.clone(), Some(id.clone()))).collect();
+    let mut left_out = Vec::new();
+    let mut by_name = Vec::new();
+    for peer in peers.iter().filter(|p| p.machine_id != here_id && !paired.iter().any(|(id, _)| *id == p.machine_id)) {
+        let alias = peer.machine.trim().to_lowercase();
+        if aliases.contains(&alias) {
+            hosts.push((alias.clone(), Some(peer.machine_id.clone())));
+            by_name.push((peer.machine_id.clone(), alias));
+        } else {
+            left_out.push(relay::Skipped::computer(&relay::shown_name(&peer.machine, &peer.machine_id), "no_ssh_host"));
+        }
+    }
+    let asking = hosts.clone();
+    let here = here_id.clone();
+    let asked = tauri::async_runtime::spawn_blocking(move || relay::ask_all(Arc::new(pairing::Ssh), &asking, &here, monitoring, relay::ASK_LIMIT))
+        .await.map_err(|_| "relay_failed".to_string())?;
+    // Accounts this computer knows: its own and those the encrypted rosters name.
+    let mut known: Vec<(Provider, String, Option<String>)> = snapshot.accounts.iter().map(|a| (a.provider, a.id.clone(), a.email.clone())).collect();
+    for peer in &peers {
+        known.extend(peer.accounts.iter().map(|e| (e.provider, e.id.clone(), e.email.clone())));
+    }
+    let reads_here = |provider: Provider, id: &str| snapshot.accounts.iter().any(|a| a.provider == provider && a.id == id && !a.id.starts_with("token:"));
+    let name_here = |provider: Provider, id: &str| snapshot.accounts.iter().find(|a| a.provider == provider && a.id == id)
+        .and_then(|a| a.alias.clone().or_else(|| a.email.clone()));
+    // This computer's readings reach another only through the encrypted rosters: with readings
+    // shared here, to a computer whose roster this one reads (so it reads this one's).
+    let settings = state.settings.lock().unwrap().clone();
+    let shares = settings.account_roster && settings.share_readings;
+    let mut in_use: Vec<relay::InUse> = in_use_ending(&snapshot, chrono::Utc::now()).into_iter().map(|u| relay::InUse { machine: here_name.clone(), ..u }).collect();
+    let mut others = Vec::new();
+    let mut seen = HashSet::new();
+    for answer in asked {
+        match answer {
+            relay::Asked::Here => {}
+            relay::Asked::Skipped(skipped) => left_out.push(skipped),
+            relay::Asked::Offer(offer) => {
+                if !seen.insert(offer.machine.id.clone()) {
+                    continue;
+                }
+                if let (Some(dir), Some((_, alias))) = (dir.as_deref(), by_name.iter().find(|(id, _)| *id == offer.machine.id)) {
+                    pairing::remember_new_host(dir, &offer.machine.id, alias);
+                }
+                // Only accounts this computer knows are named to the person, as it knows them.
+                in_use.extend(relay::known_in_use(&offer.in_use, &known));
+                let shares_with_it = shares && peers.iter().any(|p| p.machine_id == offer.machine.id);
+                let mut kept = Vec::new();
+                for step in offer.plan.iter().flat_map(|g| g.steps.iter()) {
+                    match relay::keep(step, &offer, &known, reads_here, shares_with_it) {
+                        // Named as this computer names the account (its alias), else by its email.
+                        relay::Keep::Yes => kept.push(bulk::Step { target: bulk::Target { account: name_here(step.target.provider, &step.target.id)
+                            .or_else(|| step.email.clone()), ..step.target.clone() }, ..step.clone() }),
+                        relay::Keep::Unknown => left_out.push(relay::Skipped {
+                            account: step.target.account.as_deref().map(|a| relay::shown_name(a, "?")),
+                            ..relay::Skipped::computer(&offer.machine.name, "relay_unknown_account") }),
+                        relay::Keep::Covered => {}
+                    }
+                }
+                others.push((offer.machine, vec![bulk::Group { email: None, steps: kept }]));
+            }
+        }
+    }
+    others.sort_by(|(a, _), (b, _)| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    let groups = bulk::everywhere(sign_in_plan(app, monitoring), others);
+    let computers = relay::computers(&groups, (&here_id, &here_name));
+    let plan = Everywhere { id: uuid::Uuid::new_v4().simple().to_string(), at: Instant::now(), monitoring, groups, computers, here: here_id, left_out, in_use };
+    *state.everywhere.lock().unwrap() = Some(plan.clone());
+    Ok(plan)
+}
+
+/// Starts a gathered sitting (see `gather_everywhere`) as one run of "Sign in all accounts" whose
+/// other computers' sign-ins are completed here (see `relayed_turn`).
+fn start_everywhere(app: &AppHandle, plan: Everywhere) -> Result<(), String> {
+    desktop_shown()?;
+    run_sign_ins(app, plan.groups, true, plan.monitoring, Some(Gathered { left_out: plan.left_out, in_use: plan.in_use }))
+}
+
+/// An agent's confirm (`sign_in_all` with `everywhere`): a notification asks the person at this
+/// screen to review the sitting; Review (or the notification itself) opens Settings > Accounts with
+/// the same confirmation the person's own click shows (see `confirm_everywhere_here`), so no agent
+/// relays pages without someone here agreeing to exactly what each computer will sign in. False
+/// when the notification could not be shown.
+fn ask_everywhere(app: &AppHandle, plan: &Everywhere) -> bool {
+    let n: usize = plan.computers.iter().map(|c| c.steps).sum();
+    let settings = app.state::<AppState>().settings.lock().unwrap().clone();
+    let lang = crate::i18n::resolve(&settings.language);
+    let list = plan.computers.iter().map(|c| format!("{} ({})", c.name, c.steps)).collect::<Vec<_>>().join(", ");
+    let title = crate::i18n::t(&lang, "signInEverywhere", &[]);
+    let body = crate::i18n::t(&lang, "signInEverywhereAsk", &[("n", &n.to_string()), ("list", &list)]);
+    let buttons = vec![(crate::i18n::t(&lang, "signInEverywhereStart", &[]), "review")];
+    let (h, monitoring) = (app.clone(), plan.monitoring);
+    notify::notify_choice(app.clone(), title, body, buttons, move |action| match action {
+        Some("review") | None => confirm_everywhere_here(&h, monitoring),
+        Some(_) => {}
+    }).is_ok()
+}
+
+/// Opens Settings > Accounts on "Sign in all your computers from here"'s confirmation: it checks
+/// every computer again and shows what each will sign in, and starts only on the person's OK. How
+/// an agent's request and Retry of such a sitting start, so every sitting is one the person saw.
+fn confirm_everywhere_here(app: &AppHandle, monitoring: bool) {
+    // Read by the page as it loads, or at once by one already open.
+    *app.state::<AppState>().everywhere_ask.lock().unwrap() = Some((monitoring, Instant::now()));
+    let _ = app.emit_to(SETTINGS_LABEL, "sign-in-everywhere-ask", ());
+    show_settings_page(app, Some("accounts".into()));
+}
+
+/// Settings > Accounts asks whether a sitting waits for the person's confirmation (see
+/// `confirm_everywhere_here`): its monitoring switch, once, while the ask is fresh (an ask left
+/// from long ago never opens a confirmation by surprise).
+#[tauri::command]
+fn take_everywhere_ask(state: tauri::State<AppState>) -> Option<bool> {
+    state.everywhere_ask.lock().unwrap().take().filter(|(_, at)| at.elapsed() < EVERYWHERE_FRESH).map(|(monitoring, _)| monitoring)
+}
+
+/// Where a relayed sign-in's page opens here: the email's fresh profile (made now if its turn has
+/// none yet), or a private window when the user chose those; never the everyday browser, whose
+/// history would keep the provider's answer to the page.
+fn relay_session(app: &AppHandle, group_session: &mut Option<Option<Arc<signin::Session>>>, email: Option<&str>, lang: &str) -> Option<Arc<signin::Session>> {
+    if let Some(Some(session)) = group_session {
+        return Some(session.clone());
+    }
+    if app.state::<AppState>().settings.lock().unwrap().signin_window == signin::Window::Private {
+        return None;
+    }
+    let session = signin::Session::create().map(Arc::new);
+    if let (Some(s), Some(email)) = (session.as_deref(), email) {
+        s.label(email, lang);
+    }
+    *group_session = Some(session.clone());
+    session
+}
+
+/// "{what} for {machine}": a sign-in of another computer's, as notifications and pages name it.
+fn for_machine(lang: &str, what: &str, machine: &str) -> String {
+    crate::i18n::t(lang, "signInFor", &[("what", what), ("machine", machine)])
+}
+
+/// The computers (and sign-ins) left out, in words: "PC-MINI1 (not reachable over SSH)".
+fn left_out_text(lang: &str, left: &[relay::Skipped]) -> String {
+    left.iter().map(|s| {
+        let why = crate::i18n::t(lang, s.why, &[]);
+        match &s.account {
+            Some(account) => format!("{} ({}: {why})", s.machine, account),
+            None => format!("{} ({why})", s.machine),
+        }
+    }).collect::<Vec<_>>().join(", ")
+}
+
+/// This computer as `relay::drive` uses it: the user's own SSH to the other computer, the tunnel,
+/// and this computer's browser in the email's window.
+struct AppDesk {
+    target: signin::Target,
+}
+
+impl relay::Desk for AppDesk {
+    fn call(&self, host: &str, request: &door::Request, wait: Duration) -> Result<serde_json::Value, String> {
+        pairing::relay_call(&pairing::Ssh, host, request, wait)
+    }
+
+    fn tunnel(&self, host: &str, page: &relay::Page) -> Result<Box<dyn relay::Hold>, relay::Unheld> {
+        relay::Tunnel::open(&pairing::Ssh::exe(), host, page).map(|t| Box::new(t) as Box<dyn relay::Hold>)
+    }
+
+    fn open(&self, url: &str) -> Result<(), String> {
+        signin::open(url, &self.target)
+    }
+}
+
+/// One sign-in of another computer's (see `relay`), completed in this computer's browser: in the
+/// email's fresh profile (`relay_session`), or a private window when the user chose those. It
+/// starts there, its page opens here once that computer's CLI hands it over and a tunnel for its
+/// port is up (`opened` then), and it is followed until it ends. Stop, closing the browser and the
+/// long-wait notice work as for a sign-in here; dropping it closes the tunnel at once and asks that
+/// computer to stop. This computer holds its one sign-in (`monitoring::SIGN_IN`) and the open
+/// sign-in's mark, which puts updates off, while it runs. Returns as `relay::drive` does.
+async fn relayed_turn(h: &AppHandle, step: &bulk::Step, machine: &bulk::Machine, session: Option<&Arc<signin::Session>>, stop: &tokio::sync::Notify,
+    account: &str, mut opened: impl FnMut()) -> Result<bool, String> {
+    let window = h.state::<AppState>().settings.lock().unwrap().signin_window;
+    let target = match (window, session) {
+        (signin::Window::Private, _) => signin::Target::Private,
+        (_, Some(s)) => s.target(),
+        (_, None) => return Err("signin_profile_storage".into()),
+    };
+    let from = presence::identity().map(|(id, _)| id.to_string()).ok_or("relay_failed")?;
+    // This computer's one sign-in: waited for (another may have started since the run's own wait),
+    // never a reason to leave that computer out; Stop ends the wait.
+    let _sign_in = loop {
+        if let Ok(held) = h.state::<AppState>().account_operations.begin_key(monitoring::SIGN_IN) {
+            break held;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            _ = stop.notified() => return Err("signin_stopped".into()),
+        }
+    };
+    let _open = h.state::<AppState>().sign_ins.open();
+    let stopper: Arc<dyn Fn(&str, &str) + Send + Sync> = Arc::new(|host: &str, step: &str| {
+        let (host, step) = (host.to_owned(), step.to_owned());
+        std::thread::spawn(move || {
+            let _ = pairing::relay_call(&pairing::Ssh, &host, &door::Request::RelayStop { step }, Duration::ZERO);
+        });
+    });
+    let relayed = relay::Relayed::new(&machine.host, stopper);
+    let (shared, host, ids, owned) = (relayed.shared.clone(), machine.host.clone(), relay::Ids { from, machine: machine.id.clone() }, step.clone());
+    let page = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = page.clone();
+    let desk = AppDesk { target };
+    let task = tauri::async_runtime::spawn_blocking(move || relay::drive(&desk, &host, &ids, &owned, &shared, &|| seen.store(true, std::sync::atomic::Ordering::SeqCst)));
+    let mut run = Box::pin(async move { task.await.unwrap_or_else(|_| Err("relay_failed".into())) });
+    if let Some(s) = session {
+        s.rearm();
+    }
+    let closed = browser_closed(session.map(|s| &**s));
+    // No page limit here: the other computer has its own (`relay::PAGE_LIMIT`).
+    let watch = watch_step(h, None, std::time::SystemTime::now(), account, true);
+    let page_open = async {
+        while !page.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
+    tokio::pin!(closed, watch, page_open);
+    let mut opening = true;
+    let outcome = loop {
+        tokio::select! {
+            outcome = &mut run => break outcome,
+            _ = stop.notified() => break Err("signin_stopped".into()),
+            // As for a sign-in here: the provider's "done" page closed while the other computer saves.
+            _ = &mut closed => break tokio::time::timeout(SIGN_IN_GRACE, &mut run).await.unwrap_or_else(|_| Err("signin_window_closed".into())),
+            e = &mut watch => break Err(e),
+            _ = &mut page_open, if opening => {
+                opening = false;
+                opened();
+            }
+        }
+    };
+    // Closes the tunnel, and stops the step there unless it ended there by itself.
+    drop(relayed);
+    outcome
+}
+
+/// Settings > Accounts, "Sign in all your computers from here": what it would run (see
+/// `gather_everywhere`), for the person's OK.
+#[tauri::command]
+async fn plan_sign_in_everywhere(app: AppHandle, monitoring: bool) -> Result<Everywhere, String> {
+    gather_everywhere(&app, monitoring).await
+}
+
+/// The person's OK on that plan: runs exactly it, while it is fresh, and once.
+#[tauri::command]
+fn start_sign_in_everywhere(app: AppHandle, id: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let plan = state.everywhere.lock().unwrap().take_if(|p| p.id == id && p.at.elapsed() < EVERYWHERE_FRESH).ok_or("signin_plan_expired")?;
+    start_everywhere(&app, plan)
+}
 
 /// The notification text for the person at this desktop during "Sign in all accounts", in the
 /// words Settings > Accounts uses: (title, body, language).
@@ -1663,6 +2355,8 @@ fn bulk_status(state: tauri::State<AppState>) -> serde_json::Value {
         "sign_in": bulk::sign_in_plan(&snapshot, &pending_accounts(&state, &snapshot), true),
         "roster_waiting": roster_waiting(&state, &snapshot).len(),
         "signin_profiles": signin::count(),
+        // Other computers "Sign in all your computers from here" can ask (see `relay`).
+        "other_computers": other_computers(&state),
     })
 }
 
@@ -3422,6 +4116,9 @@ async fn readiness(app: &AppHandle) -> serde_json::Value {
         // Pass as `since` with `wait_seconds` to hear of the next change.
         "sign_in_revision": state.bulk_revision.load(std::sync::atomic::Ordering::SeqCst),
         "ready_for_sign_in": ready, "problems": problems, "next": next,
+        // Another computer can complete this one's sign-ins in its own browser (`relay_start`):
+        // the version of that protocol this app speaks, and whether one is open now.
+        "relay": relay::VERSION, "relay_open": relay::SLOT.busy(),
     })
 }
 
@@ -3580,7 +4277,7 @@ fn auto_connect_tick(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let key = format!("{}:{id}", provider.name());
-        if let Err(e) = start_monitoring_login(app.clone(), provider, id, true, None).await {
+        if let Err(e) = start_monitoring_login(app.clone(), provider, id, true, None, None).await {
             // Someone else started on it meanwhile: no reason to wait a day.
             let ok = e == "monitor_busy";
             auto_monitor_saved(&app, |t| t.finished(&key, ok, chrono::Utc::now()));
@@ -3648,7 +4345,7 @@ mod sign_in_tests {
     #[test]
     fn a_run_reports_every_step() {
         let step = StepRecord { target: bulk::Target { provider: Provider::Codex, id: "synthetic-id".into(), account: Some("synthetic@example.invalid".into()), ended: None },
-            kind: bulk::Kind::Connect, state: StepState::Failed, error: Some("signin_no_page".into()), started_at: None, page_at: None, ended_at: None };
+            kind: bulk::Kind::Connect, machine: None, state: StepState::Failed, error: Some("signin_no_page".into()), started_at: None, page_at: None, ended_at: None };
         let v = serde_json::to_value(&step).unwrap();
         assert_eq!(v["provider"], "codex");
         assert_eq!(v["id"], "synthetic-id");
@@ -3659,7 +4356,7 @@ mod sign_in_tests {
         assert!(serde_json::to_value(&done).unwrap().get("error").is_none());
         // The same run as the roster carries it to the other computers.
         let bulk = BulkConnect { total: 2, done: 1, current: None, kind: None, emails: 1, email: 1, finished: true, error: Some("signin_no_page".into()),
-            steps: vec![done, step], by_email: true, monitoring: true, still_waiting: false, revision: 9 };
+            steps: vec![done, step], by_email: true, monitoring: true, still_waiting: false, revision: 9, everywhere: false, left_out: vec![], in_use: vec![] };
         let run = roster_run(&bulk, "2026-10-23T12:00:00Z".parse().unwrap());
         assert_eq!((run.revision, run.finished, run.error.as_deref()), (9, true, Some("signin_no_page")));
         assert_eq!(run.steps.iter().map(|s| (s.kind.as_str(), s.state.as_str())).collect::<Vec<_>>(), [("connect", "done"), ("connect", "failed")]);
@@ -3669,7 +4366,7 @@ mod sign_in_tests {
     #[test]
     fn retry_from_another_computer_is_opt_in() {
         let plain: crate::door::Request = serde_json::from_value(serde_json::json!({ "op": "sign_in_all", "confirm": true })).unwrap();
-        assert!(matches!(plain, crate::door::Request::SignInAll { confirm: true, monitoring: true, retry: false }));
+        assert!(matches!(plain, crate::door::Request::SignInAll { confirm: true, monitoring: true, retry: false, everywhere: false }));
         let retry: crate::door::Request = serde_json::from_value(serde_json::json!({ "op": "sign_in_all", "confirm": true, "retry": true })).unwrap();
         assert!(matches!(retry, crate::door::Request::SignInAll { retry: true, .. }));
     }
@@ -3759,6 +4456,8 @@ pub fn run() {
         sharing_setup: Mutex::default(),
         sharing_cancel: Arc::default(),
         sharing_tunnel: Mutex::default(),
+        everywhere: Mutex::default(),
+        everywhere_ask: Mutex::default(),
     };
     tauri::Builder::default()
         // Must come first: a second launch hands over to the running instance and exits.
@@ -3778,6 +4477,9 @@ pub fn run() {
             None,
         ))
         .invoke_handler(tauri::generate_handler![
+            plan_sign_in_everywhere,
+            start_sign_in_everywhere,
+            take_everywhere_ask,
             get_usage,
             get_health,
             restart_app,

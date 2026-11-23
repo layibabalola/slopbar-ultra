@@ -43,6 +43,9 @@ pub enum Window {
 pub enum Target {
     Profile(PathBuf),
     Private,
+    /// Nowhere here: the page goes to the computer completing this sign-in in its own browser
+    /// (see `relay`), handed over under this nonce.
+    Relay(String),
 }
 
 impl Target {
@@ -64,6 +67,7 @@ impl Target {
                 s.push(dir);
                 s
             }
+            Self::Relay(nonce) => format!("relay:{nonce}").into(),
         }
     }
 
@@ -71,6 +75,9 @@ impl Target {
         let value = value.to_str()?;
         if value == "private" {
             return Some(Self::Private);
+        }
+        if let Some(nonce) = value.strip_prefix("relay:") {
+            return (!nonce.is_empty() && nonce.chars().all(|c| c.is_ascii_hexdigit())).then(|| Self::Relay(nonce.to_owned()));
         }
         Some(Self::Profile(PathBuf::from(value.strip_prefix("profile:")?)))
     }
@@ -428,6 +435,8 @@ pub enum PageStep {
     Done,
     /// Already done when its turn came.
     Skipped,
+    /// Left for later: its computer could not take it (see `relay`).
+    Left,
 }
 
 /// An email's turn, for its page (see [`Session::show`]).
@@ -457,7 +466,7 @@ fn page_title(account: &str, lang: &str, progress: Option<&Progress>) -> String 
     let title = crate::i18n::t(lang, "signinPageTitle", &[("account", account)]);
     match progress {
         Some(p) => {
-            let done = p.steps.iter().filter(|(_, s)| matches!(s, PageStep::Done | PageStep::Skipped)).count();
+            let done = p.steps.iter().filter(|(_, s)| matches!(s, PageStep::Done | PageStep::Skipped | PageStep::Left)).count();
             format!("{done}/{} \u{b7} {title}", p.steps.len())
         }
         None => title,
@@ -476,6 +485,7 @@ fn progress_html(account: &str, lang: &str, progress: &Progress) -> String {
             PageStep::Open => ("open", "&#10140;", t("signinPageOpen", &[("account", account)])),
             PageStep::Done => ("done", "&#10003;", t("signinPageDone", &[])),
             PageStep::Skipped => ("done", "&#10003;", t("signinPageSkipped", &[])),
+            PageStep::Left => ("left", "&#8722;", t("signinPageLeft", &[])),
         };
         html += &format!("<li class=\"{class}\"><span class=\"mark\">{mark}</span><span class=\"name\">{}</span><span class=\"note\">{note}</span></li>", esc(name));
     }
@@ -504,7 +514,7 @@ fn label_page(account: &str, lang: &str, progress: Option<&Progress>, revision: 
          .keep{{font-weight:600;padding:10px 14px;border-left:4px solid var(--warn);background:color-mix(in srgb,var(--warn) 12%,transparent)}}\
          .overall{{margin-bottom:.3em;opacity:.75}}ol{{list-style:none;padding:0;margin-top:0}}\
          li{{display:flex;gap:.6em;align-items:baseline;padding:.3em 0}}.mark{{width:1.2em;text-align:center;flex:none}}\
-         .name{{font-weight:600}}.note{{opacity:.8}}.pending{{opacity:.55}}.done .mark{{color:var(--ok)}}\
+         .name{{font-weight:600}}.note{{opacity:.8}}.pending{{opacity:.55}}.left{{opacity:.7}}.done .mark{{color:var(--ok)}}\
          .spin{{display:inline-block;width:.8em;height:.8em;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-.1em}}\
          @keyframes spin{{to{{transform:rotate(1turn)}}}}@media (prefers-reduced-motion:reduce){{.spin{{animation-duration:2.4s}}}}\
          </style></head><body><h1>{heading}</h1><p class=\"keep\">{keep}</p><div id=\"progress\" aria-live=\"polite\">{section}</div>\
@@ -569,6 +579,8 @@ pub fn browser_args(kind: Kind, target: &Target, url: &str) -> Vec<OsString> {
             args.push(match kind { Kind::Chrome => "--incognito", Kind::Edge => "--inprivate" }.into());
             args.push("--new-window".into());
         }
+        // Never opened here (see `open`).
+        Target::Relay(_) => {}
     }
     // A profile's later pages open as tabs in its one window (the first opens the window), so an
     // email's sign-ins stay together instead of stacking windows.
@@ -577,9 +589,14 @@ pub fn browser_args(kind: Kind, target: &Target, url: &str) -> Vec<OsString> {
 }
 
 /// Opens a provider's sign-in page in `target`. A profile must be a session's folder that exists.
+/// A relayed sign-in's page opens nowhere here: it is handed to this app's relay slot, where the
+/// computer completing it takes it (see `relay`), when it passes the relay's checks.
 pub fn open(url: &str, target: &Target) -> Result<(), String> {
     if !allowed_url(url) {
         return Err("signin_url_rejected".into());
+    }
+    if let Target::Relay(nonce) = target {
+        return if crate::relay::SLOT.deposit(nonce, url) { Ok(()) } else { Err("signin_url_rejected".into()) };
     }
     if let Target::Profile(dir) = target {
         if !session_folder(dir) {
@@ -659,7 +676,9 @@ fn short_path(_: &Path) -> Option<PathBuf> {
 }
 
 /// `slopbar.exe <url>` started by a CLI through `BROWSER`, with [`TARGET_ENV`] set: opens the
-/// page and returns the exit code, before any of the app starts. `None`: not such a start.
+/// page and returns the exit code, before any of the app starts. `None`: not such a start. A
+/// relayed sign-in's page is handed to the running app through its door, which keeps it for the
+/// computer completing the sign-in (see `relay`); this process keeps nothing.
 pub fn launch_from_env(args: &[OsString]) -> Option<i32> {
     let target = std::env::var_os(TARGET_ENV)?;
     if args.len() != 2 {
@@ -667,6 +686,12 @@ pub fn launch_from_env(args: &[OsString]) -> Option<i32> {
     }
     let Some(target) = Target::decode(&target) else { return Some(2) };
     let url = args[1].to_str()?;
+    if let Target::Relay(nonce) = target {
+        // The app checks the page against the sign-in it started (`relay::Slot::deposit`).
+        let handed = allowed_url(url)
+            && crate::door::call(&crate::door::pipe_name(), &crate::door::Request::RelayPage { nonce, url: url.to_owned() }).is_ok();
+        return Some(if handed { 0 } else { 1 });
+    }
     Some(if open(url, &target).is_ok() { 0 } else { 1 })
 }
 
@@ -992,10 +1017,14 @@ mod tests {
     #[test]
     fn the_target_survives_the_environment() {
         let dir = PathBuf::from(r"C:\Users\Some One\AppData\Local\dev.thelio.slopbar\signin-sessions\0011223344556677");
-        for t in [Target::Private, Target::Profile(dir)] {
+        for t in [Target::Private, Target::Profile(dir), Target::Relay("0123456789abcdef0123456789abcdef".into())] {
             assert_eq!(Target::decode(&t.encode()), Some(t));
         }
         assert_eq!(Target::decode("C:\\elsewhere".as_ref()), None);
+        // A relayed sign-in's nonce is plain hex, never a path or anything a shell could read.
+        for bad in ["relay:", "relay:..\\x", "relay:ab cd", "relay:ab&calc"] {
+            assert_eq!(Target::decode(bad.as_ref()), None, "{bad}");
+        }
         assert_eq!(Target::choose(Window::System, None), None);
         assert_eq!(Target::choose(Window::Private, None), Some(Target::Private));
     }
@@ -1009,6 +1038,8 @@ mod tests {
             assert_eq!(open("https://claude.ai/oauth", &deleted), Err("signin_profile_storage".into()), "never recreated, so never reused");
         }
         assert_eq!(open("https://example.invalid/", &Target::Private), Err("signin_url_rejected".into()));
+        // A relayed page goes to the relay slot only with a nonce it expects, never to a browser.
+        assert_eq!(open("https://claude.ai/oauth/authorize", &Target::Relay("00".into())), Err("signin_url_rejected".into()));
     }
 
     /// The real sign-in pages in fresh profiles, for `scripts/test-signin-window.ps1`, which

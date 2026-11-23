@@ -724,7 +724,7 @@ mod tests {
         // A run going on elsewhere: the read that finds it, then the live pace, which downloads only
         // what changed too.
         let run = |at: DateTime<Utc>| Some(crate::roster::Run { revision: 1, at, total: 1, done: 0, emails: 1, email: 1,
-            finished: false, still_waiting: false, monitoring: true, error: None, steps: vec![] });
+            finished: false, still_waiting: false, monitoring: true, everywhere: false, error: None, steps: vec![] });
         peer_writes(&store, &key, BUSY, "BUSY-PC", 30.0, at(min(33)), run(at(min(33))));
         assert_eq!(cats(&mut me, min(42), false, false), 1);
         assert_eq!(cats(&mut me, min(42) + 15, false, false), 0, "read at the live pace: nothing changed");
@@ -829,7 +829,7 @@ mod tests {
         // Measured an hour after the app started, so its first read and write are behind it.
         me.sync(&store, &passphrase, (ME, "DESK-1"), &[read_at("synthetic-a:org", 1.0, at(-3600))], at(-3600), false, false);
         let run = |s: i64| Some(crate::roster::Run { revision: s.max(1) as u64, at: at(s), total: 9, done: 0, emails: 3, email: 1,
-            finished: false, still_waiting: false, monitoring: true, error: None, steps: vec![] });
+            finished: false, still_waiting: false, monitoring: true, everywhere: false, error: None, steps: vec![] });
         let mut ran = [0; 3];
         // Every minute: a refresh every 5, and with Settings open on Accounts, its poll every minute.
         for s in (-3540..=3600i64).step_by(60) {

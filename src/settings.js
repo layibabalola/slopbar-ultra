@@ -1222,6 +1222,7 @@ function fixButton(fix, i, count) {
       const n = (bulk.sign_in ?? []).reduce((total, g) => total + g.steps.length, 0) || count;
       return n ? `${t("signInAllButton")} (${n})` : t("signInAllButton");
     },
+    sign_in_everywhere: () => t("signInEverywhereButton"),
     refresh: () => t("healthFixRefresh"),
     restart_app: () => t("healthFixRestart"),
     open_settings: () => `${t("healthFixOpen")} ${t(FIX_PAGES[fix.page] ?? "settings")}`,
@@ -1267,6 +1268,10 @@ $("health").addEventListener("click", async (e) => {
       await invoke("sign_in_all_accounts", { monitoring: true });
       document.querySelector('.nav[data-page="accounts"]')?.click();
       loadBulk();
+    } else if (fix.action === "sign_in_everywhere") {
+      // With monitoring, as Health's Sign in all: the Accounts page asks for the OK and follows it.
+      document.querySelector('.nav[data-page="accounts"]')?.click();
+      await signInEverywhere(true);
     } else if (fix.action === "refresh") {
       snapshot = await invoke("refresh");
       renderAccounts();
@@ -1493,7 +1498,7 @@ for (const h of HOTKEYS) {
 // or one that ended, was refused or ends soon), one sign-in at a time, and removing accounts whose
 // plan has ended.
 
-let bulk = { to_connect: [], lapsed: { remove: [], in_use: [] }, connecting: null, sign_in: [], signin_profiles: 0 };
+let bulk = { to_connect: [], lapsed: { remove: [], in_use: [] }, connecting: null, sign_in: [], signin_profiles: 0, other_computers: 0 };
 const who = (target) => target.account || t("unknownAccount");
 
 /** "Sign in all accounts" as it would run now: its groups (one per email) and sign-ins. */
@@ -1508,6 +1513,8 @@ function signInPlan() {
 }
 
 function renderBulk() {
+  // An event before the page has loaded its settings: drawn once it has.
+  if (!settings) return;
   const c = bulk.connecting;
   const running = c && !c.finished;
   const plan = signInPlan();
@@ -1525,22 +1532,112 @@ function renderBulk() {
     ? t("bulkRemoveHint", { list: bulk.lapsed.remove.map(who).join(", ") })
     : bulk.lapsed.in_use.length ? t("bulkRemoveInUse", { list: bulk.lapsed.in_use.map(who).join(", ") }) : t("bulkRemoveNone");
   const status = $("bulk-status");
-  const where = settings.signin_window === "system" ? t("signInWhereTerminal") : t("signInWhereBrowser");
+  // Another computer's sign-in (see `relay`): named with its computer, and always in a browser here.
+  const open = c?.steps?.find((s) => s.state === "running");
+  const where = settings.signin_window === "system" && !open?.machine ? t("signInWhereTerminal") : t("signInWhereBrowser");
+  const account = c?.current ? (open?.machine ? t("signInFor", { what: who(c.current), machine: open.machine }) : who(c.current)) : "";
   if (running && c.current && c.still_waiting) {
-    status.textContent = t("signInStillWaiting", { account: who(c.current), where });
+    status.textContent = t("signInStillWaiting", { account, where });
   } else if (running && c.current && c.emails) {
     status.textContent = t(c.kind === "connect" ? "signInAllConnecting" : "signInAllAdding",
-      { g: c.email, e: c.emails, i: c.done + 1, n: c.total, account: who(c.current), where });
-  } else if (running && c.current) status.textContent = t("bulkConnecting", { i: c.done + 1, n: c.total, account: who(c.current) });
+      { g: c.email, e: c.emails, i: c.done + 1, n: c.total, account, where });
+  } else if (running && c.current) status.textContent = t("bulkConnecting", { i: c.done + 1, n: c.total, account });
   else if (c?.finished && c.error) {
     const failed = c.steps?.find((s) => s.state === "failed");
-    status.textContent = t("bulkConnectStopped", { done: c.done, n: c.total, error: errorText(providerName(failed?.provider), c.error) });
+    // A sitting counts the sign-ins it made (not those it left out), and names who it left out.
+    const done = c.everywhere ? c.steps.filter((s) => s.state === "done").length : c.done;
+    const left = c.everywhere ? leftOut(c.left_out) : "";
+    status.textContent = [t("bulkConnectStopped", { done, n: c.total, error: errorText(providerName(failed?.provider), c.error) }),
+      left ? t("signInLeftOut", { list: left }) : ""].filter(Boolean).join(" ");
+  }
+  else if (c?.finished && c.everywhere) {
+    // Counted as done only what was signed in, then who was left out and why.
+    const made = c.steps.filter((s) => s.state === "done").length;
+    const left = leftOut(c.left_out);
+    status.textContent = [left ? t("signInEverywhereDoneLeft", { n: made, left }) : t("signInEverywhereDone", { n: made }), inUseText(c.in_use)].filter(Boolean).join(" ");
   }
   else if (c?.finished && c.total) status.textContent = t(c.emails ? "signInAllDone" : "bulkConnectDone", { n: c.total });
-  status.hidden = !(running || (c?.finished && c.total)) || !status.textContent;
-  // A stopped or failed run, or a sign-in left waiting: Retry runs it again with what is still missing.
-  $("bulk-retry-row").hidden = !((c?.finished && c.error) || (running && c.still_waiting));
+  status.hidden = !(running || (c?.finished && (c.total || c.everywhere))) || !status.textContent;
+  // A stopped or failed run, a sign-in left waiting, or computers left out: Retry runs it again with
+  // what is still missing (every computer, for an everywhere run).
+  $("bulk-retry-row").hidden = !((c?.finished && (c.error || (c.everywhere && c.left_out?.length))) || (running && c.still_waiting));
+  // Another computer can be asked once this one knows one (paired or checked over SSH, or in the roster).
+  $("sign-in-everywhere-row").hidden = !bulk.other_computers;
+  $("sign-in-everywhere").textContent = t(running ? "signInAllStop" : "signInEverywhereButton");
 }
+
+/** The computers (and sign-ins) a sitting left out, in words: "PC-MINI1 (not reachable over SSH)". */
+function leftOut(list) {
+  return (list ?? []).map((s) => s.account ? `${s.machine} (${s.account}: ${t(s.why)})` : `${s.machine} (${t(s.why)})`).join(", ");
+}
+
+/** Accounts in use whose CLI sign-in ends, which no sitting renews. */
+function inUseText(list) {
+  return list?.length ? t("signInInUse", { list: list.map((u) => `${u.machine}: ${u.email ?? u.id}`).join(", ") }) : "";
+}
+
+/**
+ * "Sign in all your computers from here" (see `relay`): checks every computer, asks for the OK on
+ * exactly what each will sign in (its name, SSH host, sign-ins and emails), then runs it.
+ */
+async function signInEverywhere(monitoring = $("sign-in-all-monitoring").checked) {
+  const button = $("sign-in-everywhere");
+  const status = $("bulk-status");
+  // A run goes: never stopped from here (the button's own click stops it), and no sitting meanwhile.
+  if (stopping()) {
+    status.textContent = t("signin_busy");
+    status.hidden = false;
+    return;
+  }
+  button.disabled = true;
+  status.textContent = t("signInEverywhereChecking");
+  status.hidden = false;
+  // What to say once the redraw below is done (it shows the last run's state, not this check's).
+  let message = "";
+  try {
+    const plan = await invoke("plan_sign_in_everywhere", { monitoring });
+    const n = plan.computers.reduce((total, c) => total + c.steps, 0);
+    const left = plan.left_out.length ? ` ${t("signInLeftOut", { list: leftOut(plan.left_out) })}` : "";
+    const inuse = plan.in_use.length ? ` ${inUseText(plan.in_use)}` : "";
+    if (!n) {
+      message = t("signInEverywhereNone", { left, inuse });
+      return;
+    }
+    // One line per computer, by machine id: this one marked, another with the SSH host that
+    // reaches it, its sign-ins and the emails they sign in as.
+    const list = plan.computers.map((c) => {
+      const name = c.id === plan.here ? t("thisPc", { machine: c.name }) : `${c.name} [${c.host}]`;
+      const who = [...c.emails, ...(c.unnamed ? [t("signInUnnamed", { n: c.unnamed })] : [])];
+      return `${name} (${c.steps}): ${who.join(", ")}`;
+    }).join("; ");
+    if (!confirm(t("signInEverywhereConfirm", { n, e: plan.groups.length, list, left, inuse }))) {
+      status.hidden = true;
+      return;
+    }
+    await invoke("start_sign_in_everywhere", { id: plan.id });
+  } catch (err) {
+    message = errorText("", String(err));
+  } finally {
+    button.disabled = false;
+    await loadBulk();
+    if (message) {
+      status.textContent = message;
+      status.hidden = false;
+    }
+  }
+}
+
+/** A sitting waiting for the person's confirmation (an agent's request, or Retry): asked here,
+ * once the page has loaded (it asks again as it finishes loading). */
+async function everywhereAsked() {
+  if (!settings) return;
+  const monitoring = await invoke("take_everywhere_ask").catch(() => null);
+  if (monitoring === null || monitoring === undefined) return;
+  document.querySelector('.nav[data-page="accounts"]')?.click();
+  await loadBulk();
+  signInEverywhere(monitoring);
+}
+listen("sign-in-everywhere-ask", everywhereAsked);
 async function loadBulk() {
   bulk = await invoke("bulk_status").catch(() => bulk);
   renderBulk();
@@ -1553,7 +1650,11 @@ $("sign-in-all").addEventListener("click", async () => {
   loadBulk();
 });
 $("sign-in-all-monitoring").addEventListener("change", renderBulk);
+// The button stops a run that goes (as the other two do); only its own click does.
+$("sign-in-everywhere").addEventListener("click", () => stopping() ? void invoke("stop_sign_ins").finally(loadBulk) : signInEverywhere());
 $("bulk-retry").addEventListener("click", async () => {
+  const c = bulk.connecting;
+  if (c?.everywhere && c.finished) return void signInEverywhere(c.monitoring);
   $("bulk-retry").disabled = true;
   try { await invoke("retry_sign_ins"); } catch (err) { alert(errorText("", String(err))); }
   finally { $("bulk-retry").disabled = false; }
@@ -1609,12 +1710,17 @@ function peerRunLines(p) {
   const r = p.run;
   const machine = p.machine;
   const current = r.steps.find((s) => s.state === "running");
+  // Its sitting for every computer (pages open there, no Retry from here): what it made.
+  if (r.everywhere && r.finished) {
+    const made = r.steps.filter((s) => s.state === "done").length;
+    return [r.error ? t("bulkConnectStopped", { done: made, n: r.total, error: errorText("", r.error) }) : t("signInEverywhereDone", { n: made }), ""];
+  }
   if (r.finished && r.error) {
     return [t("bulkConnectStopped", { done: r.done, n: r.total, error: errorText("", r.error) }), t("peerSignInStoppedHint", { machine })];
   }
   if (r.finished) return [t(r.total ? "signInAllDone" : "signInAllNone", { n: r.total }), ""];
   const step = !current ? t("peerSignInStarting")
-    : r.still_waiting ? t("peerSignInWaiting", { machine, account: who(current) })
+    : r.still_waiting && !r.everywhere ? t("peerSignInWaiting", { machine, account: who(current) })
     : t(current.kind === "connect" ? "signInAllConnecting" : "signInAllAdding",
       { g: r.email, e: r.emails, i: r.done + 1, n: r.total, account: who(current), where: t("signInWhereMachine", { machine }) });
   const quiet = Math.max(1, Math.round((Date.now() - new Date(p.written_at)) / 60000));
@@ -1639,7 +1745,7 @@ function renderPeerRuns() {
       card.append(line);
     }
     const r = p.run;
-    if ((r.finished && r.error) || r.still_waiting || p.quiet) {
+    if (!r.everywhere && ((r.finished && r.error) || r.still_waiting || p.quiet)) {
       if (p.reachable) {
         const retry = document.createElement("button");
         retry.className = "btn";
@@ -1650,7 +1756,7 @@ function renderPeerRuns() {
         peerNotes[p.machine_id] ??= t("peerSignInNotPaired", { machine: p.machine });
       }
     }
-    if (peerNotes[p.machine_id]) {
+    if (!r.everywhere && peerNotes[p.machine_id]) {
       const note = document.createElement("p");
       note.className = "dim";
       note.textContent = peerNotes[p.machine_id];
@@ -1794,3 +1900,5 @@ if (page === "usage") loadUsage();
 // Another computer's sign-ins are read from its roster, which can be slow: waited for briefly.
 await Promise.race([firstPeerRuns, new Promise((done) => setTimeout(done, 4000))]);
 delete document.documentElement.dataset.loading;
+// A sitting asked for while this window was being created (see `confirm_everywhere_here`).
+everywhereAsked();

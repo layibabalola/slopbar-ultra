@@ -12,7 +12,8 @@
 //! `--call` runs one tool and prints its result, which is how another computer reaches this one
 //! over SSH, `--pair-receive` takes a pairing key on standard input (see `pairing`), and
 //! `--sharing-state` hands another computer the state of a waiting Dropbox sign-in (see
-//! `sharing_setup`).
+//! `sharing_setup`), and `--relay` lets another computer complete this one's sign-ins in its own
+//! browser (see `relay`).
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -23,6 +24,7 @@ fn main() {
         Some("--call" | "--call-b64") => std::process::exit(slopbar_lib::call_cli(&args)),
         Some("--pair-receive") => std::process::exit(slopbar_lib::pair_receive()),
         Some("--sharing-state") => std::process::exit(slopbar_lib::sharing_state(&args)),
+        Some("--relay") => std::process::exit(slopbar_lib::relay_cli(&args)),
         _ => std::process::exit(if slopbar_lib::serve_mcp().is_ok() { 0 } else { 1 }),
     }
 }
