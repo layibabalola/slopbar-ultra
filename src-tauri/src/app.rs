@@ -4583,7 +4583,7 @@ async fn retry_peer_sign_in(app: AppHandle, machine_id: String, going: bool, sta
         (Some(next), ..) => next,
         (None, Some(started_at), Some(at)) => {
             let (host, arguments) = (host.clone(), serde_json::json!({ "step": at, "run_started_at": started_at }));
-            let answer = tauri::async_runtime::spawn_blocking(move || pairing::remote_call(&pairing::Ssh, &host, "restart_sign_in", &arguments))
+            let answer = tauri::async_runtime::spawn_blocking(move || pairing::remote_call(&pairing::Ssh, &host, "restart_sign_in", &arguments).map_err(String::from))
                 .await.map_err(|_| "ssh_failed".to_string())?;
             after_peer_restart(answer).map_err(card_error)?
         }
@@ -4595,7 +4595,7 @@ async fn retry_peer_sign_in(app: AppHandle, machine_id: String, going: bool, sta
             let monitoring = app.state::<AppState>().roster_seen.lock().unwrap().peers.iter()
                 .find(|p| p.machine_id == machine_id).and_then(|p| p.run.as_ref()).is_none_or(|r| r.monitoring);
             let arguments = whole_run_arguments(monitoring, stop);
-            let ran = tauri::async_runtime::spawn_blocking(move || pairing::remote_call(&pairing::Ssh, &host, "sign_in_all", &arguments))
+            let ran = tauri::async_runtime::spawn_blocking(move || pairing::remote_call(&pairing::Ssh, &host, "sign_in_all", &arguments).map_err(String::from))
                 .await.map_err(|_| "ssh_failed".to_string())?;
             after_whole_run(ran, stop)?
         }
