@@ -1290,6 +1290,10 @@ mod tests {
             billing: crate::model::BillingHints { tier: Some(canary.into()), billing_type: Some(canary.into()), ..Default::default() },
             remote: vec![crate::model::RemoteSeat { machine: canary.into(), where_: vec![canary.into()], seen_at: chrono::Utc::now(), live: true }],
             overlap: vec![canary.into(), canary.into()],
+            // Another computer's reading is never this computer's diagnostics: neither its name nor its numbers.
+            shared: Some(crate::model::SharedReading { machine: canary.into(), taken_at: chrono::Utc::now(),
+                windows: vec![crate::model::UsageWindow { kind: canary.into(), used_percent: 61.25, window_seconds: None, resets_at: None }] }),
+            covered_by: Some(canary.into()),
             used_outside: true,
             runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None, desktop: false, seats: None,
         };
@@ -1317,6 +1321,7 @@ mod tests {
         assert!(!report.contains(canary));
         assert!(!report.contains(&dir.0.to_string_lossy().to_string()));
         assert!(report.contains("87.0"));
+        assert!(!report.contains("61.25"), "another computer's reading is not exported");
         assert!(report.contains("\"account\": 1"));
         let json: serde_json::Value = serde_json::from_str(&report).unwrap();
         assert_eq!(json["current"][0]["event"]["code"], "other");

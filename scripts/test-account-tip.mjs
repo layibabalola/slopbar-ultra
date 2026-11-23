@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 
 // i18n.js sets the page language on load.
 globalThis.document ??= { documentElement: {} };
-const { t, setLanguage, setThisMachine, setSharing, windowResetText, placesText, compactPlaces, overlapText } = await import("../src/i18n.js");
+const { t, setLanguage, setThisMachine, setSharing, windowResetText, placesText, compactPlaces, overlapText, shownReading, duration, currentWindows, coveredMonitoring } = await import("../src/i18n.js");
 const { accountTip, accountTipLines, adviceText } = await import("../src/accounttext.js");
 const { sparkline, sparklineText } = await import("../src/sparkline.js");
 setLanguage("en");
@@ -244,6 +244,47 @@ test("a monitoring renewal the network's proxy stopped says it was monitoring", 
   // A usage error (a read, or a renewal with nothing to fall back on) is the proxy's words alone.
   const usage = accountTipLines({ ...account, error: "proxy_script", monitor_error: "proxy_script", stale: true }, { now }).flat();
   assert.ok(usage.includes(script) && !usage.includes(t("monitorProxy", { reason: script })), usage.join("\n"));
+});
+
+test("another computer's reading shows while this one has none fresh, marked with whose and how old", () => {
+  const shared = { machine: "LAPTOP-2", taken_at: iso(now - 12 * 60000),
+    windows: [{ kind: "weekly", window_seconds: null, used_percent: 61, resets_at: iso(now + 50 * HOUR) }] };
+  const ended = { ...account, error: "monitor_reconnect", stale: true, fetched_at: iso(now - 72 * HOUR), shared };
+  const reading = shownReading(ended, now);
+  assert.equal(reading.from, t("readOn", { machine: "LAPTOP-2", t: duration(12) }));
+  assert.deepEqual([reading.windows, reading.at, reading.stale], [shared.windows, shared.taken_at, false], "its reset is as of that reading");
+  const lines = accountTipLines(ended, { now }).flat();
+  assert.ok(lines.some((l) => l.startsWith(`${t("weekly")}: 61% ${t("used")} · `)), lines.join("\n"));
+  assert.ok(!lines.some((l) => l.startsWith(`${t("weekly")}: ${Math.round(account.windows.find((w) => w.kind === "weekly")?.used_percent ?? -1)}%`)), "not this computer's old numbers");
+  assert.ok(lines.includes(reading.from), "whose it is and how old");
+  assert.ok(lines.includes(`${t("lastObservedHere", { t: duration(72 * 60) })} · ${t("lastReading")}`), "this computer's own reading stays said, as its own");
+  assert.ok(lines.includes(t("monitor_reconnect", { provider: "Claude Code" })), "and its error");
+  // No shared reading: this computer's own, unmarked.
+  assert.deepEqual(shownReading(account, now), { windows: account.windows, at: account.fetched_at, stale: account.stale, from: "", shared: false });
+  assert.ok(accountTipLines(account, { now }).flat().includes(t("lastObserved", { t: duration(3) })));
+});
+
+test("a window of another computer's reading that has reset since keeps its numbers and says so", () => {
+  const session = { kind: "session", window_seconds: null, used_percent: 80, resets_at: iso(now - HOUR) };
+  const weekly = { kind: "weekly", window_seconds: null, used_percent: 40, resets_at: iso(now + 50 * HOUR) };
+  const shared = { machine: "LAPTOP-2", taken_at: iso(now - 3 * HOUR), windows: [session, weekly] };
+  const a = { ...account, error: "monitor_reconnect", stale: true, shared };
+  const reading = shownReading(a, now);
+  assert.deepEqual(currentWindows(reading, now), [weekly], "the headline comes from windows that have not reset");
+  assert.equal(windowResetText(session, false, reading.at, true), t("resetSinceReading", { d: windowResetText(session, true).replace(/^.*: /, "") }));
+  const lines = accountTipLines(a, { now }).flat();
+  assert.ok(lines.some((l) => l.startsWith(`${t("session")}: 80% ${t("used")} · ${t("resetSinceReading", { d: "" }).split("(")[0]}`)), lines.join(" | "));
+  // All reset since: no number at all.
+  assert.deepEqual(currentWindows(shownReading({ ...a, shared: { ...shared, windows: [session] } }, now), now), []);
+  // This computer's own windows are never filtered.
+  assert.equal(currentWindows(shownReading({ ...account, windows: [session] }, now), now).length, 1);
+});
+
+test("a monitoring sign-in another computer covers is no problem mark", () => {
+  assert.equal(coveredMonitoring({ ...account, covered_by: "LAPTOP-2", monitor_renewal: "ended" }), true);
+  assert.equal(coveredMonitoring({ ...account, covered_by: "LAPTOP-2", monitor_connected: false }), true);
+  assert.equal(coveredMonitoring({ ...account, covered_by: "LAPTOP-2", monitor_renewal: null }), false, "nothing to make here");
+  assert.equal(coveredMonitoring({ ...account, covered_by: null, monitor_renewal: "ended" }), false);
 });
 
 console.log(`${passed} account tooltip and sparkline checks passed`);

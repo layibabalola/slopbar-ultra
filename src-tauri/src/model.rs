@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::accounts::Provider;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct UsageWindow {
     /// "session", "weekly", "weekly_opus", "weekly_sonnet" or "window"; translated by the frontend.
     pub kind: String,
@@ -64,6 +64,18 @@ pub struct AccountUsage {
     /// one of them out.
     #[serde(default)]
     pub overlap: Vec<String>,
+    /// Another of the user's computers' reading of this account, newer than this computer's own,
+    /// while this computer has no fresh reading of its own (see `roster::apply_readings`). Shown
+    /// only: switching, alerts, history, forecasts and freshness go by `windows`, `stale` and
+    /// `fetched_at`, which stay this computer's own readings.
+    #[serde(default)]
+    pub shared: Option<SharedReading>,
+    /// The other computer whose reading of this account is under `roster::COVERED_HOURS` old (and
+    /// seen to move forward that recently here), whether or not this computer reads it too: its
+    /// monitoring sign-in covers this one's, so Health calls this one's ending a warning, not a
+    /// problem, and the flyout does not count it among the sign-ins to reconnect.
+    #[serde(default)]
+    pub covered_by: Option<String>,
     /// Usage kept rising while the account was signed in nowhere SlopBar can see: another
     /// machine, the web or the desktop app.
     #[serde(default)]
@@ -148,6 +160,19 @@ pub struct UnexpectedUse {
     /// When the user was last notified about it (at most once every six hours); a new value
     /// means a new notification is due.
     pub alert_at: Option<DateTime<Utc>>,
+}
+
+/// An account's usage as another of the user's computers last read it from the provider itself,
+/// carried by that computer's encrypted roster (see `roster::Reading`). Advisory: the roster's key
+/// is shared by all the user's computers and the name is the one that computer gives itself.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct SharedReading {
+    /// That computer's name.
+    pub machine: String,
+    /// When it read it, by its clock: never later than it wrote its roster, than this computer
+    /// first saw it, nor than now.
+    pub taken_at: DateTime<Utc>,
+    pub windows: Vec<UsageWindow>,
 }
 
 /// Where another machine has an account signed in.

@@ -1,4 +1,4 @@
-import { t, windowResetText, windowLabel, errorText, accountErrorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, duration, resetText, groupResets, visibleResetWindows, placesText, compactPlaces, overlapText, seatsText } from "./i18n.js";
+import { t, windowResetText, windowLabel, errorText, accountErrorText, creditsText, time, dayTime, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, duration, resetText, groupResets, visibleResetWindows, placesText, compactPlaces, overlapText, seatsText, shownReading, resetSince, currentWindows, coveredMonitoring } from "./i18n.js";
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { creditAdviceText } from "./alerts.js";
@@ -154,14 +154,18 @@ function resetLines(a) {
     `<div class="reset-grant ${r.usable ? "usable" : ""}"><span>↺</span>${esc(resetText(r))}</div>`).join("");
 }
 
+// The reading shown (`shownReading`): this computer's own, or another's newer one while this one
+// has no fresh reading, its bars marked as that computer's. A window of that reading which has
+// reset since keeps its old numbers, dimmed, and says so: never a 0% nobody measured.
 function bars(a) {
-  const resetWindows = new Set(visibleResetWindows(a.windows));
-  return a.windows.map((w) => `
-    <div class="win">
+  const r = shownReading(a);
+  const resetWindows = new Set(visibleResetWindows(r.windows));
+  return r.windows.map((w) => `
+    <div class="win ${r.from ? "shared" : ""} ${resetSince(r, w) ? "passed" : ""}">
       <div class="row"><span>${esc(windowLabel(w))}</span><b>${Math.round(w.used_percent)}%</b></div>
       <div class="bar" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(Math.min(100, w.used_percent))}"
-        aria-label="${esc(`${windowLabel(w)} ${t("used")}`)}"><div style="width:${Math.min(100, w.used_percent)}%;background:${color(w.used_percent)}"></div></div>
-      ${resetWindows.has(w) && !a.stale ? `<div class="reset" title="${esc(w.resets_at)}">${esc(windowResetText(w, false, a.fetched_at))}</div>` : ""}
+        aria-label="${esc([`${windowLabel(w)} ${t("used")}`, r.from].filter(Boolean).join(", "))}"><div style="width:${Math.min(100, w.used_percent)}%;background:${color(w.used_percent)}"></div></div>
+      ${resetWindows.has(w) && !r.stale ? `<div class="reset" title="${esc(w.resets_at)}">${esc(windowResetText(w, false, r.at, r.shared))}</div>` : ""}
     </div>`).join("");
 }
 
@@ -187,21 +191,24 @@ function renderDetails(snap) {
     <section>
       <div class="acc-head"><span class="logo ${provider}">${MARK[provider]}</span><span class="name">${PROVIDER_NAME[provider]}</span></div>
       ${list.map((a) => {
-        const stale = a.stale && a.fetched_at
+        // Whose reading the bars show and how old, when not this computer's fresh one.
+        const stale = shownReading(a).from || (a.stale && a.fetched_at
           ? t("lastObserved", { t: duration(Math.max(1, Math.round((Date.now() - new Date(a.fetched_at)) / 60000))) })
-          : "";
+          : "");
         // Every row has one detail line, whatever its state, so switching doesn't change heights.
         // Where it's in use: here and on the user's other computers (shared via a synced folder).
         const places = placesText(a);
         const meta = [places.inUse || (a.alias ? a.email : ""), ...places.seen, a.leased ? t("leased", { purpose: a.leased }) : "", a.used_outside ? t("usedOutside") : "", a.org, stale]
           .filter(Boolean).join(" · ") || " ";
+        // This computer's own trail ends where its readings stopped: not beside another's numbers.
+        const trail = shownReading(a).shared ? null : trails[`${provider}:${a.id}`];
         return `
         <div class="acct ${a.active ? "active" : ""}" data-key="${provider}:${esc(a.id)}">
           <div class="acct-head">
             <span class="provider-mark ${provider}" title="${PROVIDER_NAME[provider]}">${MARK[provider]}</span>
             <span class="who">${esc(accountName(a))}</span>
             ${a.plan ? `<span class="plan">${esc(a.plan)}</span>` : ""}
-            ${sparkline(trails[`${provider}:${a.id}`])}
+            ${sparkline(trail)}
             ${a.active
               ? `<span class="in-use ${a.pending ? "pending" : ""}">${t("inUse")}</span>`
               : `<button class="use" data-provider="${provider}" data-id="${esc(a.id)}">${t("use")}</button>`}
@@ -209,7 +216,7 @@ function renderDetails(snap) {
           ${seatsLine(a)}
           ${overlapLine(a)}
           <div class="acc-meta" title="${esc([meta, a.leased ? t("leasedHint") : "", a.used_outside ? t("usedOutsideHint") : ""].filter(Boolean).join("\n"))}">${esc(meta)}</div>
-          ${a.error || a.monitor_error ? `<div class="error">${esc(accountErrorText(PROVIDER_NAME[provider], a))}</div>` : ""}
+          ${a.error || a.monitor_error ? `<div class="error ${coveredMonitoring(a) ? "covered" : ""}">${esc(accountErrorText(PROVIDER_NAME[provider], a))}</div>` : ""}
           ${!a.monitor_connected || a.monitor_renewal || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account", "monitor_network", "monitor_uncertain"].includes(a.monitor_error ?? a.error)
             ? `<button class="monitor" data-provider="${provider}" data-id="${esc(a.id)}">${t(a.monitor_connected ? "monitorReconnect" : "monitorConnect")}</button>` : ""}
           ${a.monitor_connected ? `<button class="monitor" data-disconnect="true" data-provider="${provider}" data-id="${esc(a.id)}">${t("monitorDisconnect")}</button>` : ""}
@@ -230,10 +237,14 @@ function renderCompactList(snap) {
   const list = ["claude", "codex"].flatMap((p) => snap.accounts.filter((a) => a.provider === p));
   patch($accounts, `<div class="compact-list" role="list" aria-label="${esc(t("title"))}">${list.map((a, i) => {
     const key = `${a.provider}:${a.id}`;
-    const w = a.stale || a.error ? null : peak(a);
-    const problem = accountErrorText(PROVIDER_NAME[a.provider], a);
+    // Another computer's newer reading while this one has none fresh, marked as such: its number
+    // from the windows that have not reset since it was taken.
+    const r = shownReading(a);
+    const w = r.shared ? peak({ windows: currentWindows(r) }) : a.stale || a.error ? null : peak(a);
+    // While another computer covers it, a monitoring sign-in to make here is no "!" (Health: a warning).
+    const problem = coveredMonitoring(a) ? "" : accountErrorText(PROVIDER_NAME[a.provider], a);
     const used = w ? `${Math.round(w.used_percent)}%` : "—";
-    const usedText = w ? `${windowLabel(w)}: ${used} ${t("used")}` : t("usageUnknown");
+    const usedText = w ? [`${windowLabel(w)}: ${used} ${t("used")}`, r.from].filter(Boolean).join(", ") : t("usageUnknown");
     const tip = accountTip(a, { sub: subs[key], trail: trails[key], creditAdvice: creditAdvice[key] });
     // Named machines only: a bare "this PC" would repeat "In use". Two in full, then how many more.
     const where = compactPlaces(a);
@@ -245,8 +256,8 @@ function renderCompactList(snap) {
           ? `<small class="where"><span class="glyph" aria-hidden="true">\uE977</span>${esc(where)}</small>` : ""}</span>
         ${problem ? `<span class="problem" role="img" aria-label="${esc(problem)}">!</span>` : ""}
         ${overlapBadge(a)}
-        ${sparkline(trails[key], { tooltip: false })}
-        <b class="pct" style="color:${w ? color(w.used_percent) : "var(--text-2)"}" aria-label="${esc(usedText)}">${used}</b>
+        ${sparkline(r.shared ? null : trails[key], { tooltip: false })}
+        <b class="pct ${r.shared ? "shared" : ""}" style="color:${w ? color(w.used_percent) : "var(--text-2)"}" aria-label="${esc(usedText)}">${r.shared && w ? `<span class="glyph" aria-hidden="true">\uE977</span>` : ""}${used}</b>
         ${a.active
           ? `<span class="in-use ${a.pending ? "pending" : ""}">${t("inUse")}</span>`
           : `<button class="use" data-provider="${a.provider}" data-id="${esc(a.id)}" aria-label="${esc(`${t("use")} ${accountName(a)}`)}">${t("use")}</button>`}
@@ -350,7 +361,8 @@ function layout() {
 const $monitorRenew = document.getElementById("monitor-renew");
 const WARN_MS = 3 * 86_400_000;
 function renderRenewLine(snap) {
-  const due = (snap?.accounts ?? []).filter((a) => a.monitor_renewal
+  // Not one another computer's recent reading covers (`covered_by`): Health calls those a warning.
+  const due = (snap?.accounts ?? []).filter((a) => a.monitor_renewal && !a.covered_by
     && (a.monitor_renewal !== "ending" || new Date(a.monitor_ends_at) - Date.now() <= WARN_MS)).length;
   $monitorRenew.hidden = !due;
   $monitorRenew.textContent = due ? t("monitorRenewDue", { n: due }) : "";

@@ -2,7 +2,7 @@
 // the plan's renewal, verdict and advice (from get_subscriptions), and the flyout's full tooltip,
 // which carries everything the full card shows for an account in the one-line layout.
 import { t, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows,
-  placesText, overlapText, seatsText, accountErrorText, creditsText, groupResets, resetText } from "./i18n.js";
+  placesText, overlapText, seatsText, accountErrorText, creditsText, groupResets, resetText, shownReading } from "./i18n.js";
 import { sparklineText } from "./sparkline.js";
 
 export const money = (v) => (v == null ? "" : `$${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`);
@@ -79,19 +79,23 @@ export function accountTipLines(a, { sub = null, trail = null, creditAdvice = ""
     a.leased ? t("leased", { purpose: a.leased }) : "",
   ]);
 
-  // Every window with its reset, model-specific ones included, worded as on the full card.
-  const timed = new Set(visibleResetWindows(a.windows ?? []));
+  // Every window with its reset, model-specific ones included, worded as on the full card: of the
+  // reading shown, which is another computer's while this one has no fresh reading of its own.
+  const reading = shownReading(a, now);
+  const timed = new Set(visibleResetWindows(reading.windows));
   const week = sub?.this_week;
   groups.push([
-    ...(a.windows ?? []).map((w) => `${windowLabel(w)}: ${Math.round(w.used_percent)}% ${t("used")}`
-      + (timed.has(w) ? ` · ${windowResetText(w, a.stale, a.fetched_at)}` : "")),
+    ...reading.windows.map((w) => `${windowLabel(w)}: ${Math.round(w.used_percent)}% ${t("used")}`
+      + (timed.has(w) ? ` · ${windowResetText(w, reading.stale, reading.at, reading.shared)}` : "")),
     a.runs_out_at && !a.stale ? t("runsOut", { at: dayTime(a.runs_out_at) }) : "",
     week?.pace_percent != null && !a.stale ? t("tipPace", { p: Math.round(week.pace_percent) }) : "",
     trail?.length ? sparklineText(trail) : "",
   ]);
 
   groups.push([
-    a.fetched_at ? t("lastObserved", { t: ago(a.fetched_at, now) }) + (a.stale ? ` · ${t("lastReading")}` : "") : "",
+    reading.from,
+    // This computer's own reading, said to be its own while another's shows.
+    a.fetched_at ? t(reading.shared ? "lastObservedHere" : "lastObserved", { t: ago(a.fetched_at, now) }) + (a.stale ? ` · ${t("lastReading")}` : "") : "",
     accountErrorText(provider, a),
     t(a.monitor_connected ? "tipMonitorOn" : "tipMonitorOff"),
   ]);

@@ -599,7 +599,7 @@ mod tests {
             monitor_ends_at: None,
             monitor_renewal: None,
             billing: Default::default(),
-            remote: vec![], overlap: vec![],
+            remote: vec![], overlap: vec![], shared: None, covered_by: None,
             used_outside: false,
             runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None, desktop: false, seats: None,
         }

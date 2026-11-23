@@ -21,6 +21,13 @@
 //! (`Run`), rewritten at every step, so the user's other computers can follow it and offer Retry
 //! (Settings > Accounts, "Signing in on <machine>"). It names accounts too, so it goes inside the
 //! same encrypted file, never beside it in the clear.
+//!
+//! It also carries each account's latest usage reading taken on that machine (`Reading`), so a
+//! machine whose own monitoring sign-in for an account ended, or was never connected, still shows
+//! a recent reading of it, marked as the other machine's (`apply_readings`). Claude ends every
+//! sign-in about 30 days after it is made, so this lets one machine's sign-ins cover the others.
+//! Only readings a machine took itself are written, never one it was given, and only when one
+//! changed (coalesced, see `READINGS_GAP_MINUTES`) or to re-date them now and then.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::accounts::Provider;
 use crate::backup::{OpenError, Passphrase, SealKey};
 use crate::bulk::Pending;
-use crate::model::AccountUsage;
+use crate::model::{AccountUsage, SharedReading, UsageWindow};
 
 pub const FORMAT: &str = "slopbar-roster";
 const VERSION: u32 = 1;
@@ -62,6 +69,35 @@ const READ_SOON_SECONDS: i64 = 30;
 const EXPECT_MINUTES: i64 = 2;
 /// A run's steps beyond this many are not kept (they come from other machines).
 const MAX_STEPS: usize = 200;
+/// A changed usage reading is written at most this long after the last write: the first refresh
+/// after it carries every change since, so an account in use costs a write per gap, not per poll.
+const READINGS_GAP_MINUTES: i64 = 15;
+/// Readings that have not changed are written again this often, newly dated, so the other
+/// machines can tell a reading that still holds from one this machine stopped taking.
+const READINGS_HEARTBEAT_HOURS: i64 = 6;
+/// The usage windows the providers give (see `providers`); a reading's others are dropped.
+const WINDOW_KINDS: [&str; 5] = ["session", "weekly", "weekly_opus", "weekly_sonnet", "window"];
+/// Windows beyond this many per reading are not kept (they come from other machines).
+const MAX_WINDOWS: usize = 8;
+/// A window longer than this is not one the providers give: its length is dropped, and so is a
+/// reset further than this from when the reading was taken.
+const MAX_WINDOW_SECONDS: i64 = 31 * 86_400;
+/// Another machine's reading older than this is not shown: every limit it describes has reset since.
+const SHARED_MAX_DAYS: i64 = 7;
+/// Another machine's reading stands in for an account's own (`SharedReading::covered`) while it is
+/// this recent and this machine saw it move forward this recently, by its own clock: one
+/// machine's rewrites every `READINGS_HEARTBEAT_HOURS` keep it covering, and a reading that stops
+/// moving, however it is dated, stops after this.
+pub const COVERED_HOURS: i64 = 12;
+/// A roster's plain text is padded to a whole number of these, so the file's size does not follow
+/// its readings' digits.
+const PAD: usize = 1024;
+/// This machine's roster stays under this once sealed, well inside `MAX_FILE`, which every
+/// SlopBar's reader (older ones too) holds rosters to: its oldest readings go first.
+const WRITE_LIMIT: u64 = 192 * 1024;
+/// Another machine's roster missing from one read (a sync app between versions, a download that
+/// failed) is kept from the read before for this long, so its readings do not blink out.
+const KEEP_MISSING_MINUTES: i64 = 2 * READ_EVERY_MINUTES;
 const PASSPHRASE_FILE: &str = "roster-passphrase.bin";
 const MAX_PASSPHRASE: usize = 1024;
 
@@ -84,6 +120,28 @@ pub struct Roster {
     /// "Sign in all accounts" as it runs there, or last ran since SlopBar started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<Run>,
+    /// Each account's latest usage reading taken there. A roster from a SlopBar without readings
+    /// opens with none, and one without them ignores these. Read one by one: one this SlopBar
+    /// cannot read (a provider it does not know, say) is dropped, not the roster.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "each_reading")]
+    pub readings: Vec<Reading>,
+}
+
+fn each_reading<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Reading>, D::Error> {
+    let raw = serde_json::Value::deserialize(d)?;
+    Ok(raw.as_array().into_iter().flatten().take(2 * MAX_ACCOUNTS).filter_map(|v| Reading::deserialize(v).ok()).collect())
+}
+
+/// One account's usage as the machine that wrote the roster last read it from the provider
+/// itself (`AccountUsage::windows` and `fetched_at` there): never a reading it was given, so none
+/// goes round. Only the windows: no credits, resets held, billing, errors or sign-in data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reading {
+    pub provider: Provider,
+    pub id: String,
+    /// When that machine read it, by its clock.
+    pub taken_at: DateTime<Utc>,
+    pub windows: Vec<UsageWindow>,
 }
 
 /// "Sign in all accounts" on the machine that wrote the roster, as Settings > Accounts shows it
@@ -127,7 +185,54 @@ pub fn own(machine_id: &str, machine: &str, accounts: &[AccountUsage], now: Date
         .collect();
     list.sort_by(|a, b| (a.provider.key(), &a.id).cmp(&(b.provider.key(), &b.id)));
     list.dedup_by(|a, b| a.provider == b.provider && a.id == b.id);
-    Roster { v: VERSION, machine_id: machine_id.into(), machine: machine.into(), written_at: now, accounts: list, run: None }
+    Roster { v: VERSION, machine_id: machine_id.into(), machine: machine.into(), written_at: now, accounts: list, run: None, readings: vec![] }
+}
+
+/// This machine's own readings: each account's last successful read here, from its `windows` and
+/// `fetched_at`, never `shared`, which another machine took. Not one older than `SHARED_MAX_DAYS`,
+/// which no other machine would show, nor of an account known only by its token (`token:` ids
+/// hash each machine's own sign-in, so no other machine has the same one).
+pub fn readings(accounts: &[AccountUsage], now: DateTime<Utc>) -> Vec<Reading> {
+    let mut list: Vec<Reading> = accounts.iter()
+        .filter(|a| !a.windows.is_empty() && !a.id.starts_with("token:"))
+        .filter_map(|a| Some(Reading { provider: a.provider, id: a.id.clone(), taken_at: a.fetched_at?, windows: a.windows.clone() }))
+        .filter(|r| now - r.taken_at <= Duration::days(SHARED_MAX_DAYS))
+        .collect();
+    list.sort_by(|a, b| (a.provider.key(), &a.id).cmp(&(b.provider.key(), &b.id)));
+    list.dedup_by(|a, b| a.provider == b.provider && a.id == b.id);
+    list
+}
+
+/// Whether two machines' worth of readings show the same: the same accounts and windows, each
+/// window's percent the same once rounded, as the flyout shows it, and its reset within a minute.
+/// When they were taken does not count: re-dating alone is the heartbeat's job. Nor does the reset
+/// of a window that has not started: Codex gives it as one window length after the request, a
+/// time that moves with every read.
+fn same_readings(a: &[Reading], b: &[Reading]) -> bool {
+    let near = |x: Option<DateTime<Utc>>, y: Option<DateTime<Utc>>| match (x, y) {
+        (Some(x), Some(y)) => (x - y).num_seconds().abs() < 60,
+        (x, y) => x.is_none() && y.is_none(),
+    };
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| {
+        x.provider == y.provider && x.id == y.id && x.windows.len() == y.windows.len()
+            && x.windows.iter().zip(&y.windows).all(|(v, w)| v.kind == w.kind && v.window_seconds == w.window_seconds
+                && v.used_percent.round() == w.used_percent.round()
+                && (near(v.resets_at, w.resets_at) || not_started(v, x.taken_at) && not_started(w, y.taken_at)))
+    })
+}
+
+/// A window not used since it last reset, whose reset the provider gives as one window length
+/// after the read (`notStarted` in i18n.js, `subscriptions::idle_now`).
+fn not_started(w: &UsageWindow, taken_at: DateTime<Utc>) -> bool {
+    let length = w.window_seconds.or(match w.kind.as_str() {
+        "session" => Some(5 * 3600),
+        "weekly" | "weekly_opus" | "weekly_sonnet" => Some(7 * 86_400),
+        _ => None,
+    });
+    w.used_percent <= 0.0 && match (length, w.resets_at) {
+        (Some(length), Some(at)) => ((at - taken_at).num_seconds() - length).abs() <= 15 * 60,
+        _ => false,
+    }
 }
 
 /// The file name for a machine id: its hex digits and dashes only.
@@ -136,9 +241,38 @@ pub fn file_name(machine_id: &str) -> Option<String> {
     (!safe.is_empty()).then(|| format!("{safe}.{EXTENSION}"))
 }
 
+/// Seals a roster, its plain text padded to a whole number of `PAD` bytes. One that would pass
+/// `WRITE_LIMIT` (hundreds of accounts) goes without its oldest readings: a roster over `MAX_FILE`
+/// is skipped by every reader, accounts and all.
 pub fn seal(roster: &Roster, key: &SealKey) -> Result<Vec<u8>, String> {
-    let plain = serde_json::to_vec(roster).map_err(|_| "roster_unwritable")?;
-    crate::backup::seal_bytes(FORMAT, &plain, key)
+    let padded = |r: &Roster| -> Result<Vec<u8>, String> {
+        let mut plain = serde_json::to_vec(r).map_err(|_| "roster_unwritable")?;
+        // `{…}` becomes `{…,"pad":"   "}`; readers ignore the field.
+        if plain.pop() != Some(b'}') {
+            return Err("roster_unwritable".into());
+        }
+        let field: &[u8] = b",\"pad\":\"";
+        let spaces = (PAD - (plain.len() + field.len() + 2) % PAD) % PAD;
+        plain.extend_from_slice(field);
+        plain.resize(plain.len() + spaces, b' ');
+        plain.extend_from_slice(b"\"}");
+        crate::backup::seal_bytes(FORMAT, &plain, key)
+    };
+    let sealed = padded(roster)?;
+    if sealed.len() as u64 <= WRITE_LIMIT || roster.readings.is_empty() {
+        return Ok(sealed);
+    }
+    let mut newest = roster.readings.clone();
+    newest.sort_by(|a, b| b.taken_at.cmp(&a.taken_at));
+    loop {
+        newest.truncate(newest.len() * 3 / 4);
+        let mut readings = newest.clone();
+        readings.sort_by(|a, b| (a.provider.key(), &a.id).cmp(&(b.provider.key(), &b.id)));
+        let sealed = padded(&Roster { readings, ..roster.clone() })?;
+        if sealed.len() as u64 <= WRITE_LIMIT || newest.is_empty() {
+            return Ok(sealed);
+        }
+    }
 }
 
 /// Opens a roster. `keys` keeps every key derived so far by salt, so each machine's roster costs
@@ -161,7 +295,7 @@ pub fn open(bytes: &[u8], passphrase: &Passphrase, keys: &mut HashMap<String, [u
     let fits = |s: &String| s.len() <= FIELD_MAX && !s.chars().any(char::is_control);
     roster.accounts.retain(|e| fits(&e.id) && !e.id.is_empty() && e.email.as_ref().is_none_or(fits) && e.plan.as_ref().is_none_or(fits));
     roster.accounts.truncate(MAX_ACCOUNTS);
-    roster.machine = roster.machine.chars().filter(|c| !c.is_control()).take(63).collect();
+    roster.machine = roster.machine.chars().filter(|c| !c.is_control() && !invisible(*c)).take(63).collect();
     if let Some(run) = roster.run.as_mut() {
         let one_of = |s: &String, words: &[&str]| words.contains(&s.as_str());
         let code = |s: &String| s.len() <= 200 && !s.chars().any(char::is_control);
@@ -172,7 +306,34 @@ pub fn open(bytes: &[u8], passphrase: &Passphrase, keys: &mut HashMap<String, [u
             run.error = Some("unknown".into());
         }
     }
+    // Readings: only of accounts the roster lists, one each, with windows the providers give.
+    for r in roster.readings.iter_mut() {
+        r.windows.retain(|w| WINDOW_KINDS.contains(&w.kind.as_str()) && w.used_percent.is_finite() && (0.0..=1000.0).contains(&w.used_percent));
+        r.windows.truncate(MAX_WINDOWS);
+        let taken = r.taken_at;
+        for w in r.windows.iter_mut() {
+            if w.window_seconds.is_some_and(|s| !(1..=MAX_WINDOW_SECONDS).contains(&s)) {
+                w.window_seconds = None;
+            }
+            if w.resets_at.is_some_and(|at| (at - taken).num_seconds().abs() > MAX_WINDOW_SECONDS) {
+                w.resets_at = None;
+            }
+        }
+    }
+    let accounts = &roster.accounts;
+    roster.readings.retain(|r| !r.windows.is_empty() && accounts.iter().any(|e| e.provider == r.provider && e.id == r.id));
+    roster.readings.sort_by(|a, b| (a.provider.key(), &a.id, b.taken_at).cmp(&(b.provider.key(), &b.id, a.taken_at)));
+    roster.readings.dedup_by(|a, b| a.provider == b.provider && a.id == b.id);
+    roster.readings.truncate(MAX_ACCOUNTS);
     Ok(roster)
+}
+
+/// Characters that change how a name shows without showing themselves (zero-width, direction
+/// marks and their kin, Unicode's format characters): a name from another machine loses them, so
+/// "DESK-1" with one added cannot pass for this PC's "DESK-1".
+fn invisible(c: char) -> bool {
+    matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -299,6 +460,21 @@ pub struct Peer {
     pub written_at: DateTime<Utc>,
     pub accounts: Vec<Entry>,
     pub run: Option<Run>,
+    /// Its readings, none later than `written_at`.
+    #[serde(skip)]
+    pub readings: Vec<Received>,
+    /// When a read last found its roster, by this machine's clock (`KEEP_MISSING_MINUTES`).
+    #[serde(skip)]
+    pub listed_at: DateTime<Utc>,
+}
+
+/// Another machine's reading as this one received it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Received {
+    pub reading: Reading,
+    /// When this machine first saw it taken at that time, by its own clock: a reading that stops
+    /// moving forward stops covering an account however it is dated (`COVERED_HOURS`).
+    pub seen_at: DateTime<Utc>,
 }
 
 impl Peer {
@@ -346,7 +522,8 @@ impl Seen {
 pub struct Syncer {
     keys: HashMap<String, [u8; 32]>,
     seal: Option<SealKey>,
-    written: Option<(Vec<Entry>, DateTime<Utc>)>,
+    /// The accounts and readings last written, and when.
+    written: Option<(Vec<Entry>, Vec<Reading>, DateTime<Utc>)>,
     /// This machine's run, newest revision (see `offer_run`), and the one last written.
     run: Option<Run>,
     written_run: Option<Run>,
@@ -357,6 +534,14 @@ pub struct Syncer {
     started: bool,
     /// Machines sent a Retry: until when their news is expected, and their run's time then.
     expecting: HashMap<String, (DateTime<Utc>, Option<DateTime<Utc>>)>,
+    /// When each of the other machines' readings was first seen taken at its time (`Received`).
+    first_seen: HashMap<(String, Provider, String), (DateTime<Utc>, DateTime<Utc>)>,
+    /// When a write for readings alone was last tried, whether or not it worked: the next waits
+    /// out the gap either way, so a sharing location that is down costs one try per gap.
+    readings_tried: Option<DateTime<Utc>>,
+    /// Settings: "Share usage readings" is off, so this machine's roster carries none (and is
+    /// rewritten without them at once).
+    pub withhold_readings: bool,
     pub seen: Seen,
 }
 
@@ -384,8 +569,10 @@ impl Syncer {
     }
 
     /// One refresh's turn: writes this machine's roster when its accounts or its run changed (or a
-    /// day passed, or a few minutes while its run goes on), then reads every roster when due, or
-    /// at once with `force`. With `soon`, Settings is watching, so rosters are read more often.
+    /// day passed, or a few minutes while its run goes on), or a reading changed and the last write
+    /// is `READINGS_GAP_MINUTES` old (or `READINGS_HEARTBEAT_HOURS`, to re-date readings taken
+    /// since), then reads every roster when due, or at once with `force`. With `soon`, Settings is
+    /// watching, so rosters are read more often.
     #[allow(clippy::too_many_arguments)]
     pub fn sync(&mut self, store: &dyn RosterStore, passphrase: &Passphrase, me: (&str, &str), accounts: &[AccountUsage], now: DateTime<Utc>, force: bool, soon: bool) {
         let Some(name) = file_name(me.0) else { return };
@@ -403,20 +590,36 @@ impl Syncer {
         }
         let mut mine = own(me.0, me.1, accounts, now);
         mine.run = self.run.clone();
-        let accounts_due = force || self.written.as_ref().is_none_or(|(list, at)| *list != mine.accounts || now - *at >= Duration::hours(REWRITE_AFTER_HOURS));
+        if !self.withhold_readings {
+            mine.readings = readings(accounts, now);
+        }
+        let accounts_due = force || self.written.as_ref().is_none_or(|(list, _, at)| *list != mine.accounts || now - *at >= Duration::hours(REWRITE_AFTER_HOURS));
         let run_due = mine.run != self.written_run
             || mine.run.as_ref().is_some_and(|r| !r.finished) && self.seen.written_at.is_none_or(|at| now - at >= Duration::minutes(RUN_HEARTBEAT_MINUTES));
+        // Every write carries the readings as they are. Readings that changed wait out the gap since
+        // the last write or try; readings only taken since (unchanged numbers, newer times) wait for
+        // the heartbeat; readings no longer shared go at once.
+        let readings_due = self.written.as_ref().is_some_and(|(_, written, at)| {
+            let waited = |gap: Duration| now - (*at).max(self.readings_tried.unwrap_or(*at)) >= gap;
+            let newer = mine.readings.iter().any(|r| written.iter().find(|w| w.provider == r.provider && w.id == r.id).is_none_or(|w| r.taken_at > w.taken_at));
+            self.withhold_readings && !written.is_empty()
+                || !same_readings(written, &mine.readings) && waited(Duration::minutes(READINGS_GAP_MINUTES))
+                || newer && waited(Duration::hours(READINGS_HEARTBEAT_HOURS))
+        });
         let mut wrote = false;
-        if accounts_due || run_due {
+        if accounts_due || run_due || readings_due {
             if self.seal.is_none() {
                 self.seal = SealKey::new(passphrase).ok();
+            }
+            if !(accounts_due || run_due) {
+                self.readings_tried = Some(now);
             }
             let put = self.seal.as_ref().and_then(|key| seal(&mine, key).ok()).map(|bytes| store.put(&name, &bytes));
             let ok = matches!(put, Some(Ok(())));
             self.seen.wrote = Some(ok);
             self.seen.write_error = put.and_then(Result::err).as_ref().and_then(crate::proxy::refusal_code);
             if ok {
-                self.written = Some((mine.accounts.clone(), now));
+                self.written = Some((mine.accounts.clone(), mine.readings.clone(), now));
                 self.written_run = mine.run.clone();
                 self.seen.written_at = Some(now);
                 // A change of accounts is worth reading back; a step of a run is not.
@@ -439,7 +642,7 @@ impl Syncer {
         // Just read before the write: not again (what was written is what a read-back would find).
         if read_first {
             if wrote {
-                self.seen.own_accounts = self.written.as_ref().map(|(list, _)| list.len());
+                self.seen.own_accounts = self.written.as_ref().map(|(list, _, _)| list.len());
             }
             return;
         }
@@ -476,23 +679,50 @@ impl Syncer {
                 Err(_) => { unsupported += 1; continue; }
             };
             // A clock running ahead is not trusted: the storage's time is used instead.
-            let written_at = if roster.written_at > now + Duration::minutes(5) { modified.unwrap_or(now).min(now) } else { roster.written_at };
+            let ahead = roster.written_at > now + Duration::minutes(5);
+            let written_at = if ahead { modified.unwrap_or(now).min(now) } else { roster.written_at };
             if roster.machine_id == own_id || name == own_name {
                 own_accounts = Some(roster.accounts.len());
                 own_run = roster.run;
                 continue;
             }
+            // Each machine writes under its own id's name (`file_name`): another file claiming it,
+            // a sync app's conflicted copy say, does not stand in for it.
+            if file_name(&roster.machine_id).as_deref() != Some(name.as_str()) {
+                continue;
+            }
             if now - written_at > Duration::days(IGNORE_AFTER_DAYS) {
                 continue;
             }
-            let peer = Peer { machine_id: roster.machine_id.clone(), machine: roster.machine, written_at, accounts: roster.accounts, run: roster.run };
+            // A reading cannot have been taken after its roster was written. A roster dated ahead
+            // of this clock gets the storage's time, which would date its readings now at every
+            // read: they are not taken at all.
+            let readings = if ahead { vec![] } else { roster.readings };
+            let readings = readings.into_iter().map(|mut reading| {
+                reading.taken_at = reading.taken_at.min(written_at);
+                let seen_at = match self.first_seen.get(&(roster.machine_id.clone(), reading.provider, reading.id.clone())) {
+                    Some((taken, seen)) if *taken == reading.taken_at => *seen,
+                    _ => now,
+                };
+                Received { reading, seen_at }
+            }).collect();
+            let peer = Peer { machine_id: roster.machine_id.clone(), machine: roster.machine, written_at, accounts: roster.accounts, run: roster.run, readings, listed_at: now };
             match peers.get(&roster.machine_id) {
                 Some(p) if p.written_at >= peer.written_at => {}
                 _ => { peers.insert(roster.machine_id, peer); }
             }
         }
+        // A machine missing from this read that the last ones found is kept a while.
+        for p in &self.seen.peers {
+            if !peers.contains_key(&p.machine_id) && now - p.listed_at < Duration::minutes(KEEP_MISSING_MINUTES) {
+                peers.insert(p.machine_id.clone(), p.clone());
+            }
+        }
         let mut peers: Vec<Peer> = peers.into_values().collect();
         peers.sort_by(|a, b| b.written_at.cmp(&a.written_at).then_with(|| a.machine.cmp(&b.machine)));
+        self.first_seen = peers.iter()
+            .flat_map(|p| p.readings.iter().map(|r| ((p.machine_id.clone(), r.reading.provider, r.reading.id.clone()), (r.reading.taken_at, r.seen_at))))
+            .collect();
         self.seen = Seen { own_accounts, peers, unreadable, unsupported, ..self.seen.clone() };
         own_run
     }
@@ -544,6 +774,34 @@ pub fn waiting(seen: &Seen, here: &[AccountUsage]) -> Vec<Pending> {
         }
     }
     out
+}
+
+/// Another machine's newest reading of each account, from the rosters last read: shown for an
+/// account without a fresh reading here when it is newer than this machine's own by more than
+/// `margin` (a refresh: so a reading here that failed once does not swap in another for a moment)
+/// and under `SHARED_MAX_DAYS` old (`AccountUsage::shared`), and naming the machine covering the
+/// account while it is under `COVERED_HOURS` old (`covered_by`), fresh here or not. A fresh
+/// reading here always wins, and nothing else here goes by another machine's. Each is dated from
+/// when this machine first saw it at the latest, so one that stops moving ages here, however it
+/// is dated. `me` is this machine's name: a machine going by it is left out, since its reading
+/// would pass for this machine's own.
+pub fn apply_readings(list: &mut [AccountUsage], seen: &Seen, me: &str, margin: Duration, now: DateTime<Utc>) {
+    for a in list.iter_mut() {
+        a.shared = None;
+        a.covered_by = None;
+        let newest = seen.peers.iter()
+            .filter(|p| me.is_empty() || !p.machine.eq_ignore_ascii_case(me))
+            .flat_map(|p| p.readings.iter().filter(|r| r.reading.provider == a.provider && r.reading.id == a.id).map(move |r| (p, r)))
+            .map(|(p, r)| (p, r, r.reading.taken_at.min(r.seen_at).min(now)))
+            .max_by_key(|(p, _, at)| (*at, p.written_at));
+        let Some((p, r, at)) = newest.filter(|(_, _, at)| now - *at <= Duration::days(SHARED_MAX_DAYS)) else { continue };
+        if now - at <= Duration::hours(COVERED_HOURS) {
+            a.covered_by = Some(p.machine.clone());
+        }
+        if a.stale && a.fetched_at.is_none_or(|own| at > own + margin) {
+            a.shared = Some(SharedReading { machine: p.machine.clone(), taken_at: at, windows: r.reading.windows.clone() });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -814,7 +1072,7 @@ mod tests {
     #[test]
     fn a_run_whose_machine_went_quiet_says_so() {
         let peer = |written: i64, finished: bool| Peer { machine_id: MACHINE_A.into(), machine: "TARGET".into(),
-            written_at: now() - Duration::minutes(written), accounts: vec![], run: Some(run(1, finished, "running")) };
+            written_at: now() - Duration::minutes(written), accounts: vec![], run: Some(run(1, finished, "running")), readings: vec![], listed_at: now() };
         let seen = |p: Peer| Seen { peers: vec![p], ..Seen::default() };
         assert!(!peer_runs(&seen(peer(1, false)), now())[0].quiet);
         assert!(peer_runs(&seen(peer(QUIET_MINUTES + 1, false)), now())[0].quiet, "no word for a while");
@@ -838,6 +1096,378 @@ mod tests {
         plain.as_object_mut().unwrap().remove("run");
         let bytes = crate::backup::seal_bytes(FORMAT, &serde_json::to_vec(&plain).unwrap(), &key).unwrap();
         assert!(open(&bytes, &pass("synthetic roster passphrase"), &mut HashMap::new()).unwrap().run.is_none());
+    }
+
+    /// An account as a refresh leaves it: read at `at` (minutes from `now()`) with its weekly
+    /// window at `percent`, or never read; `stale` when this refresh's read failed.
+    fn reading(provider: &str, id: &str, percent: f64, at: Option<i64>, stale: bool) -> AccountUsage {
+        let mut a = account(provider, id);
+        a.windows = vec![UsageWindow { kind: "weekly".into(), window_seconds: None, used_percent: percent, resets_at: Some("2026-10-27T09:00:00Z".parse().unwrap()) }];
+        a.fetched_at = at.map(|m| now() + Duration::minutes(m));
+        if at.is_none() {
+            a.windows.clear();
+        }
+        a.stale = stale;
+        a
+    }
+
+    fn shared_percent(a: &AccountUsage) -> Option<(String, f64)> {
+        a.shared.as_ref().map(|s| (s.machine.clone(), s.windows[0].used_percent))
+    }
+
+    fn roster_file(dir: &TempDir, machine_id: &str) -> PathBuf {
+        dir.0.join("SlopBar").join("roster").join(file_name(machine_id).unwrap())
+    }
+
+    /// A refresh: another machine's reading must be newer than this one's own by more than this.
+    fn margin() -> Duration { Duration::minutes(5) }
+
+    #[test]
+    fn a_reading_reaches_the_other_machines_encrypted_and_is_never_passed_on() {
+        let shared = TempDir::new();
+        let store = Folder(shared.0.clone());
+        let p = pass("synthetic roster passphrase");
+        // A reads both accounts itself.
+        let mut a = Syncer::default();
+        a.sync(&store, &p, (MACHINE_A, "DESK-A"), &[reading("claude", "cl-one", 37.0, Some(0), false), reading("codex", "cx-one", 81.0, Some(0), false)], now(), false, false);
+        let bytes = std::fs::read(roster_file(&shared, MACHINE_A)).unwrap();
+        for plain in ["weekly", "used_percent", "37.0", "taken_at"] {
+            assert!(!String::from_utf8_lossy(&bytes).contains(plain), "{plain}: readings are inside the encrypted roster");
+        }
+        // B's monitoring for cl-one ended days ago: it shows A's reading, marked as A's. cx-one is
+        // in use on B and read through its CLI: B's own reading shows, and A's still covers it.
+        let mut here = vec![reading("claude", "cl-one", 12.0, Some(-3 * 24 * 60), true), reading("codex", "cx-one", 80.0, Some(1), false)];
+        let mut b = Syncer::default();
+        b.sync(&store, &p, (MACHINE_B, "LAPTOP-B"), &here, now() + Duration::minutes(2), false, false);
+        apply_readings(&mut here, &b.seen, "LAPTOP-B", margin(), now() + Duration::minutes(2));
+        assert_eq!(shared_percent(&here[0]), Some(("DESK-A".into(), 37.0)));
+        assert_eq!(here[0].shared.as_ref().unwrap().taken_at, now());
+        assert_eq!(here[0].windows[0].used_percent, 12.0, "its own reading stays its own");
+        assert!(here[0].stale, "and still stale: shown only");
+        assert!(here[1].shared.is_none(), "a fresh reading here always wins");
+        assert_eq!((here[0].covered_by.as_deref(), here[1].covered_by.as_deref()), (Some("DESK-A"), Some("DESK-A")), "covered either way");
+        // B writes its roster with the shared reading in its snapshot: only its own readings go.
+        let mut again = Syncer::default();
+        let mut only_shared = reading("claude", "cl-two", 0.0, None, true);
+        only_shared.shared = here[0].shared.clone();
+        again.sync(&store, &p, (MACHINE_B, "LAPTOP-B"), &[here[0].clone(), here[1].clone(), only_shared], now() + Duration::minutes(3), true, false);
+        let written = open(&std::fs::read(roster_file(&shared, MACHINE_B)).unwrap(), &p, &mut HashMap::new()).unwrap();
+        assert_eq!(written.readings.iter().map(|r| (r.id.as_str(), r.windows[0].used_percent, r.taken_at)).collect::<Vec<_>>(),
+            [("cl-one", 12.0, now() - Duration::days(3)), ("cx-one", 80.0, now() + Duration::minutes(1))],
+            "A's reading is not passed on as B's, and an account with only A's reading has none to give");
+        // With sharing readings off, B's roster goes without them, at once; A's are still shown.
+        let mut off = Syncer { withhold_readings: true, ..Syncer::default() };
+        off.sync(&store, &p, (MACHINE_B, "LAPTOP-B"), &here, now() + Duration::minutes(4), true, false);
+        assert!(open(&std::fs::read(roster_file(&shared, MACHINE_B)).unwrap(), &p, &mut HashMap::new()).unwrap().readings.is_empty());
+        let mut shown = here.clone();
+        apply_readings(&mut shown, &off.seen, "LAPTOP-B", margin(), now() + Duration::minutes(4));
+        assert_eq!(shared_percent(&shown[0]), Some(("DESK-A".into(), 37.0)));
+    }
+
+    fn received(percent: f64, taken: DateTime<Utc>, seen: DateTime<Utc>) -> Received {
+        Received {
+            reading: Reading { provider: Provider::Claude, id: "cl-one".into(), taken_at: taken,
+                windows: vec![UsageWindow { kind: "weekly".into(), window_seconds: None, used_percent: percent, resets_at: None }] },
+            seen_at: seen,
+        }
+    }
+
+    fn peer_with(id: &str, machine: &str, readings: Vec<Received>) -> Peer {
+        let written_at = readings.iter().map(|r| r.reading.taken_at).max().unwrap_or(now());
+        Peer { machine_id: id.into(), machine: machine.into(), written_at, accounts: vec![], run: None, readings, listed_at: now() }
+    }
+
+    #[test]
+    fn the_newest_reading_wins_and_never_one_not_newer_than_this_machines_own() {
+        let at = |m: i64| now() + Duration::minutes(m);
+        let seen = Seen { peers: vec![peer_with(MACHINE_A, "OLDER", vec![received(20.0, at(5), at(6))]), peer_with(MACHINE_B, "NEWER", vec![received(30.0, at(10), at(11))])], ..Seen::default() };
+        let mut list = [reading("claude", "cl-one", 10.0, None, true), reading("claude", "cl-one", 10.0, Some(4), true), reading("claude", "cl-one", 10.0, Some(6), true),
+            reading("claude", "cl-one", 10.0, Some(12), true), reading("claude", "cl-one", 10.0, Some(0), false), reading("claude", "cl-two", 10.0, None, true)];
+        apply_readings(&mut list, &seen, "HERE", margin(), at(15));
+        assert_eq!(list.iter().map(shared_percent).collect::<Vec<_>>(), [
+            Some(("NEWER".into(), 30.0)), // never read here
+            Some(("NEWER".into(), 30.0)), // read here a refresh and more before
+            None,                         // read here under a refresh before: its own stays
+            None,                         // read here after both, though it failed since
+            None,                         // read here just now, though older than both
+            None,                         // no other machine has read it
+        ]);
+        assert_eq!(list.iter().map(|a| a.covered_by.as_deref()).collect::<Vec<_>>(),
+            [Some("NEWER"), Some("NEWER"), Some("NEWER"), Some("NEWER"), Some("NEWER"), None], "covered whatever its own reading");
+        // Under the same name as this machine, a reading would pass for its own: not shown.
+        apply_readings(&mut list, &seen, "newer", margin(), at(15));
+        assert_eq!(shared_percent(&list[0]), Some(("OLDER".into(), 20.0)));
+        // A week old: shown no more, nor covering.
+        apply_readings(&mut list, &seen, "HERE", margin(), at(10) + Duration::days(SHARED_MAX_DAYS) + Duration::minutes(1));
+        assert!(list.iter().all(|a| a.shared.is_none() && a.covered_by.is_none()));
+    }
+
+    #[test]
+    fn a_reading_that_stops_moving_ages_here_and_stops_covering() {
+        let shared = TempDir::new();
+        let store = Folder(shared.0.clone());
+        let p = pass("synthetic roster passphrase");
+        let hours = |h: i64| now() + Duration::hours(h);
+        // A machine that stopped reading (its own sign-in ended, or it is off): its last reading
+        // covers for COVERED_HOURS, then ages on.
+        let key = SealKey::new(&p).unwrap();
+        let mut frozen = own(MACHINE_A, "DESK-A", &[account("claude", "cl-one")], hours(0));
+        frozen.readings = vec![Reading { provider: Provider::Claude, id: "cl-one".into(), taken_at: hours(0),
+            windows: vec![UsageWindow { kind: "weekly".into(), window_seconds: None, used_percent: 5.0, resets_at: None }] }];
+        store.put(&file_name(MACHINE_A).unwrap(), &seal(&frozen, &key).unwrap()).unwrap();
+        let mut b = Syncer::default();
+        let mut here = vec![reading("claude", "cl-one", 50.0, None, true)];
+        let check = |b: &mut Syncer, here: &mut Vec<AccountUsage>, at: DateTime<Utc>| {
+            b.sync(&store, &p, (MACHINE_B, "LAPTOP-B"), here, at, true, false);
+            apply_readings(here, &b.seen, "LAPTOP-B", margin(), at);
+            (here[0].covered_by.is_some(), here[0].shared.as_ref().map(|s| s.taken_at))
+        };
+        assert_eq!(check(&mut b, &mut here, hours(1)), (true, Some(hours(0))));
+        assert_eq!(check(&mut b, &mut here, hours(COVERED_HOURS) + Duration::minutes(1)), (false, Some(hours(0))), "not moved for 12 hours: covers no more");
+        // A roster dated ahead of this clock: its readings are not taken at all (the storage's
+        // time would date them now at every read), its accounts are.
+        let ahead = Roster { written_at: hours(48), ..frozen.clone() };
+        store.put(&file_name(MACHINE_A).unwrap(), &seal(&ahead, &key).unwrap()).unwrap();
+        let mut c = Syncer::default();
+        let mut there = vec![reading("claude", "cl-one", 50.0, None, true)];
+        assert_eq!(check(&mut c, &mut there, hours(1)), (false, None));
+        assert_eq!(c.seen.peers[0].accounts.len(), 1);
+        // A reading that moves on covers again, dated as it says.
+        let moved = Roster { written_at: hours(14), readings: vec![Reading { taken_at: hours(14), ..frozen.readings[0].clone() }], ..frozen };
+        store.put(&file_name(MACHINE_A).unwrap(), &seal(&moved, &key).unwrap()).unwrap();
+        assert_eq!(check(&mut b, &mut here, hours(14) + Duration::minutes(2)), (true, Some(hours(14))));
+    }
+
+    #[test]
+    fn another_file_cannot_stand_in_for_a_machine_nor_a_name_hide_characters() {
+        let shared = TempDir::new();
+        let store = Folder(shared.0.clone());
+        let p = pass("synthetic roster passphrase");
+        let key = SealKey::new(&p).unwrap();
+        let mut a = own(MACHINE_A, "DESK\u{200B}-A\u{202E}", &[account("claude", "cl-one")], now());
+        a.readings = vec![Reading { provider: Provider::Claude, id: "cl-one".into(), taken_at: now(),
+            windows: vec![UsageWindow { kind: "weekly".into(), window_seconds: None, used_percent: 5.0, resets_at: None }] }];
+        store.put(&file_name(MACHINE_A).unwrap(), &seal(&a, &key).unwrap()).unwrap();
+        // A second file claiming A's id, newer, as a forger or a sync app's conflicted copy would leave.
+        let forged = Roster { written_at: now() + Duration::minutes(1), readings: vec![Reading { taken_at: now() + Duration::minutes(1), ..a.readings[0].clone() }], ..a.clone() };
+        store.put(&format!("{MACHINE_A} (conflicted copy).roster"), &seal(&forged, &key).unwrap()).unwrap();
+        let mut b = Syncer::default();
+        b.sync(&store, &p, (MACHINE_B, "LAPTOP-B"), &[], now() + Duration::minutes(2), false, false);
+        assert_eq!(b.seen.peers.len(), 1);
+        assert_eq!((b.seen.peers[0].machine.as_str(), b.seen.peers[0].readings[0].reading.taken_at), ("DESK-A", now()), "its own file, its name cleaned");
+    }
+
+    #[test]
+    fn a_machine_missing_from_one_read_is_kept_a_while() {
+        let shared = TempDir::new();
+        let store = Folder(shared.0.clone());
+        let p = pass("synthetic roster passphrase");
+        let mut a = Syncer::default();
+        a.sync(&store, &p, (MACHINE_A, "DESK-A"), &[reading("claude", "cl-one", 37.0, Some(0), false)], now(), false, false);
+        let mut b = Syncer::default();
+        let minutes = |m: i64| now() + Duration::minutes(m);
+        b.sync(&store, &p, (MACHINE_B, "LAPTOP-B"), &[], minutes(1), false, false);
+        let file = roster_file(&shared, MACHINE_A);
+        let bytes = std::fs::read(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        b.sync(&store, &p, (MACHINE_B, "LAPTOP-B"), &[], minutes(12), true, false);
+        assert_eq!(b.seen.peers.len(), 1, "one read without it: kept");
+        assert_eq!(b.seen.peers[0].readings.len(), 1);
+        b.sync(&store, &p, (MACHINE_B, "LAPTOP-B"), &[], minutes(1 + KEEP_MISSING_MINUTES), true, false);
+        assert!(b.seen.peers.is_empty(), "gone for longer: dropped");
+        // Back after it was dropped: seen anew.
+        std::fs::write(&file, bytes).unwrap();
+        b.sync(&store, &p, (MACHINE_B, "LAPTOP-B"), &[], minutes(30), true, false);
+        assert_eq!(b.seen.peers[0].readings[0].seen_at, minutes(30));
+    }
+
+    #[test]
+    fn readings_are_written_when_they_change_at_most_every_gap_and_redated_by_the_heartbeat() {
+        let shared = TempDir::new();
+        let store = Counting(Folder(shared.0.clone()), Default::default());
+        let writes = || store.1.load(std::sync::atomic::Ordering::SeqCst);
+        let p = pass("synthetic roster passphrase");
+        let mut sync = Syncer::default();
+        let at = |m: i64| now() + Duration::minutes(m);
+        let read = |percent: f64, m: i64| [reading("claude", "cl-one", percent, Some(m), false)];
+        sync.sync(&store, &p, (MACHINE_A, "A"), &read(10.0, 0), at(0), false, false);
+        assert_eq!(writes(), 1);
+        // Read again unchanged, or changed by less than the flyout shows: nothing to write.
+        sync.sync(&store, &p, (MACHINE_A, "A"), &read(10.2, 5), at(5), false, false);
+        let mut moved = read(10.0, 20);
+        moved[0].windows[0].resets_at = moved[0].windows[0].resets_at.map(|t| t + Duration::seconds(30));
+        sync.sync(&store, &p, (MACHINE_A, "A"), &moved, at(20), false, false);
+        assert_eq!(writes(), 1, "the same reading, newly dated, waits for the heartbeat");
+        // A change waits out the gap since the last write, then carries every change since.
+        sync.sync(&store, &p, (MACHINE_A, "A"), &read(14.0, 21), at(21), false, false);
+        assert_eq!(writes(), 2);
+        assert_eq!(sync.seen.read_at, Some(at(20)), "a write of readings alone is not read back");
+        sync.sync(&store, &p, (MACHINE_A, "A"), &read(15.0, 26), at(26), false, false);
+        sync.sync(&store, &p, (MACHINE_A, "A"), &read(16.0, 31), at(31), false, false);
+        assert_eq!(writes(), 2, "coalesced: not a write per poll");
+        sync.sync(&store, &p, (MACHINE_A, "A"), &read(17.0, 36), at(21 + READINGS_GAP_MINUTES), false, false);
+        assert_eq!(writes(), 3);
+        let mut keys = HashMap::new();
+        let file = || std::fs::read(roster_file(&shared, MACHINE_A)).unwrap();
+        let back = open(&file(), &p, &mut keys).unwrap();
+        assert_eq!((back.readings[0].windows[0].used_percent, back.readings[0].taken_at), (17.0, at(36)));
+        // Unchanged for hours: re-dated by the heartbeat, so the others can tell it still holds.
+        sync.sync(&store, &p, (MACHINE_A, "A"), &read(17.0, 300), at(300), false, false);
+        assert_eq!(writes(), 3);
+        let beat = 36 + READINGS_HEARTBEAT_HOURS * 60;
+        sync.sync(&store, &p, (MACHINE_A, "A"), &read(17.0, beat), at(beat), false, false);
+        assert_eq!(writes(), 4);
+        assert_eq!(open(&file(), &p, &mut keys).unwrap().readings[0].taken_at, at(beat));
+        // Readings no longer taken here (its own sign-in ended too): nothing to re-date.
+        sync.sync(&store, &p, (MACHINE_A, "A"), &read(17.0, beat), at(beat + 2 * READINGS_HEARTBEAT_HOURS * 60), false, false);
+        assert_eq!(writes(), 4);
+        // No readings at all (nothing read yet): no heartbeat either.
+        let mut empty = Syncer::default();
+        let dir = TempDir::new();
+        let other = Counting(Folder(dir.0.clone()), Default::default());
+        empty.sync(&other, &p, (MACHINE_A, "A"), &[account("claude", "cl-one")], at(0), false, false);
+        empty.sync(&other, &p, (MACHINE_A, "A"), &[account("claude", "cl-one")], at(0) + Duration::hours(REWRITE_AFTER_HOURS - 1), false, false);
+        assert_eq!(other.1.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A store whose writes fail, counting them.
+    struct Failing(std::sync::atomic::AtomicUsize);
+
+    impl RosterStore for Failing {
+        fn list(&self) -> std::io::Result<Vec<(String, Vec<u8>, Option<DateTime<Utc>>)>> { Ok(vec![]) }
+        fn put(&self, _: &str, _: &[u8]) -> std::io::Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(std::io::Error::other("synthetic failure"))
+        }
+        fn remove(&self, _: &str) -> std::io::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn a_failed_write_of_readings_alone_waits_out_the_gap() {
+        let shared = TempDir::new();
+        let p = pass("synthetic roster passphrase");
+        let at = |m: i64| now() + Duration::minutes(m);
+        let read = |percent: f64, m: i64| [reading("claude", "cl-one", percent, Some(m), false)];
+        let mut sync = Syncer::default();
+        sync.sync(&Folder(shared.0.clone()), &p, (MACHINE_A, "A"), &read(10.0, 0), at(0), false, false);
+        let failing = Failing(Default::default());
+        let tries = || failing.0.load(std::sync::atomic::Ordering::SeqCst);
+        for m in [READINGS_GAP_MINUTES, READINGS_GAP_MINUTES + 5, READINGS_GAP_MINUTES + 10] {
+            sync.sync(&failing, &p, (MACHINE_A, "A"), &read(20.0 + m as f64, m), at(m), false, false);
+        }
+        assert_eq!(tries(), 1, "one try per gap, not one per refresh");
+        sync.sync(&failing, &p, (MACHINE_A, "A"), &read(40.0, 2 * READINGS_GAP_MINUTES), at(2 * READINGS_GAP_MINUTES), false, false);
+        assert_eq!(tries(), 2);
+        // Accounts that changed are written at once, failure or not, as before.
+        sync.sync(&failing, &p, (MACHINE_A, "A"), &[read(40.0, 31)[0].clone(), account("codex", "cx-one")], at(31), false, false);
+        sync.sync(&failing, &p, (MACHINE_A, "A"), &[read(40.0, 32)[0].clone(), account("codex", "cx-one")], at(32), false, false);
+        assert_eq!(tries(), 4);
+    }
+
+    #[test]
+    fn a_day_of_codex_windows_not_started_costs_a_few_writes_and_one_in_use_a_write_per_gap() {
+        // An idle Codex account: both windows unused, each reset one window length after the read,
+        // a time that moves with every read. Polled every 5 minutes for a day.
+        let unused = |m: i64| {
+            let mut a = account("codex", "cx-idle");
+            let read_at = now() + Duration::minutes(m);
+            a.windows = vec![
+                UsageWindow { kind: "session".into(), window_seconds: Some(18_000), used_percent: 0.0, resets_at: Some(read_at + Duration::seconds(18_000)) },
+                UsageWindow { kind: "weekly".into(), window_seconds: Some(604_800), used_percent: 0.0, resets_at: Some(read_at + Duration::seconds(604_800)) },
+            ];
+            a.fetched_at = Some(read_at);
+            a
+        };
+        let p = pass("synthetic roster passphrase");
+        let day = |accounts: &dyn Fn(i64) -> Vec<AccountUsage>| {
+            let shared = TempDir::new();
+            let store = Counting(Folder(shared.0.clone()), Default::default());
+            let mut sync = Syncer::default();
+            for m in (0..24 * 60).step_by(5) {
+                sync.sync(&store, &p, (MACHINE_A, "A"), &accounts(m as i64), now() + Duration::minutes(m as i64), false, false);
+            }
+            store.1.load(std::sync::atomic::Ordering::SeqCst)
+        };
+        let idle = day(&|m| vec![unused(m)]);
+        assert!(idle <= 5, "{idle} writes for a day of nothing changing");
+        let busy = day(&|m| vec![unused(m), reading("claude", "cl-busy", (m / 5) as f64 % 100.0, Some(m), false)]);
+        assert!((90..=97).contains(&busy), "{busy} writes for a day of use, one per gap");
+    }
+
+    #[test]
+    fn a_roster_stays_under_the_limit_dropping_its_oldest_readings_and_is_padded() {
+        let key = SealKey::new(&pass("synthetic roster passphrase")).unwrap();
+        // The file's size does not follow its readings' digits.
+        let sized = |percent: f64| seal(&Roster { readings: readings(&[reading("claude", "cl-one", percent, Some(0), false)], now()), ..own(MACHINE_A, "A", &[account("claude", "cl-one")], now()) }, &key).unwrap().len();
+        assert_eq!(sized(1.0), sized(12.345678));
+        // 500 accounts with four windows each: too many readings for the limit; the oldest go.
+        let many: Vec<AccountUsage> = (0..MAX_ACCOUNTS).map(|i| {
+            let mut a = reading("claude", &format!("cl-{i:03}-{}", "x".repeat(60)), 50.0, Some(-(i as i64)), false);
+            a.windows = ["session", "weekly", "weekly_opus", "weekly_sonnet"].iter()
+                .map(|k| UsageWindow { kind: (*k).into(), window_seconds: None, used_percent: 50.0, resets_at: Some(now() + Duration::days(3)) }).collect();
+            a
+        }).collect();
+        let mut roster = own(MACHINE_A, "A", &many, now());
+        roster.readings = readings(&many, now());
+        let bytes = seal(&roster, &key).unwrap();
+        assert!(bytes.len() as u64 <= WRITE_LIMIT, "{}", bytes.len());
+        let back = open(&bytes, &pass("synthetic roster passphrase"), &mut HashMap::new()).unwrap();
+        assert_eq!(back.accounts.len(), MAX_ACCOUNTS, "every account stays");
+        assert!(!back.readings.is_empty() && back.readings.len() < MAX_ACCOUNTS);
+        let oldest_kept = back.readings.iter().map(|r| r.taken_at).min().unwrap();
+        assert!(many.iter().filter(|a| a.fetched_at.unwrap() > oldest_kept).all(|a| back.readings.iter().any(|r| r.id == a.id)), "the newest are kept");
+        // Readings older than a week, and of accounts known by their token, are not written.
+        let token = reading("claude", "token:abc", 5.0, Some(0), false);
+        let old = reading("claude", "cl-old", 5.0, Some(-(SHARED_MAX_DAYS * 24 * 60) - 1), false);
+        assert!(readings(&[token, old], now()).is_empty());
+    }
+
+    #[test]
+    fn readings_from_others_are_trimmed_to_windows_the_providers_give() {
+        let window = |kind: &str, percent: f64, seconds: Option<i64>| UsageWindow { kind: kind.into(), window_seconds: seconds, used_percent: percent, resets_at: None };
+        let mut roster = own(MACHINE_A, "A", &[account("claude", "cl-one"), account("codex", "cx-one")], now());
+        let taken = |m: i64| now() - Duration::minutes(m);
+        roster.readings = vec![
+            Reading { provider: Provider::Claude, id: "cl-one".into(), taken_at: taken(5), windows: vec![
+                window("session", 12.0, None), window("<img src=x>", 50.0, None), window("constructor", 50.0, None), window("weekly", 5000.0, None), window("weekly", -1.0, None),
+                window("window", 40.0, Some(-5)), window("window", 41.0, Some(18_000)), window("window", 42.0, Some(MAX_WINDOW_SECONDS + 1)),
+                UsageWindow { resets_at: Some(taken(5) + Duration::days(40)), ..window("weekly", 43.0, None) },
+            ] },
+            // An older duplicate, a reading of an account the roster does not list, and one with no window left.
+            Reading { provider: Provider::Claude, id: "cl-one".into(), taken_at: taken(50), windows: vec![window("session", 99.0, None)] },
+            Reading { provider: Provider::Claude, id: "cl-unlisted".into(), taken_at: taken(5), windows: vec![window("session", 1.0, None)] },
+            Reading { provider: Provider::Codex, id: "cx-one".into(), taken_at: taken(5), windows: vec![window("bogus", 1.0, None)] },
+        ];
+        roster.readings.extend((0..MAX_WINDOWS + 3).map(|_| Reading { provider: Provider::Codex, id: "cx-one".into(), taken_at: taken(60), windows: vec![window("session", 3.0, None); MAX_WINDOWS + 3] }));
+        let key = SealKey::new(&pass("synthetic roster passphrase")).unwrap();
+        let back = open(&seal(&roster, &key).unwrap(), &pass("synthetic roster passphrase"), &mut HashMap::new()).unwrap();
+        let summary: Vec<_> = back.readings.iter().map(|r| (r.id.as_str(), r.taken_at, r.windows.iter().map(|w| (w.kind.as_str(), w.used_percent, w.window_seconds, w.resets_at)).collect::<Vec<_>>())).collect();
+        assert_eq!(summary[0], ("cl-one", taken(5), vec![("session", 12.0, None, None), ("window", 40.0, None, None), ("window", 41.0, Some(18_000), None),
+            ("window", 42.0, None, None), ("weekly", 43.0, None, None)]));
+        assert_eq!((summary[1].0, summary[1].1, summary[1].2.len()), ("cx-one", taken(60), MAX_WINDOWS), "the newest with windows left, cut to the limit");
+        assert_eq!(summary.len(), 2);
+        // A reading this SlopBar cannot read (another provider, a number where text goes) is
+        // dropped, not the roster with it.
+        let mut odd: serde_json::Value = serde_json::to_value(&roster).unwrap();
+        odd["readings"].as_array_mut().unwrap().insert(0, serde_json::json!({ "provider": "gemini", "id": "cl-one", "taken_at": taken(1), "windows": [] }));
+        odd["readings"][1]["windows"][0]["used_percent"] = serde_json::json!("lots");
+        let bytes = crate::backup::seal_bytes(FORMAT, &serde_json::to_vec(&odd).unwrap(), &key).unwrap();
+        let back = open(&bytes, &pass("synthetic roster passphrase"), &mut HashMap::new()).unwrap();
+        assert_eq!((back.accounts.len(), back.readings.iter().map(|r| (r.id.as_str(), r.taken_at)).collect::<Vec<_>>()), (2, vec![("cl-one", taken(50)), ("cx-one", taken(60))]));
+        // A reading dated after its roster was written is dated when the roster was.
+        let shared = TempDir::new();
+        let store = Folder(shared.0.clone());
+        let mut later = own(MACHINE_A, "A", &[account("claude", "cl-one")], now());
+        later.readings = vec![Reading { provider: Provider::Claude, id: "cl-one".into(), taken_at: now() + Duration::days(30), windows: vec![window("weekly", 1.0, None)] }];
+        store.put(&file_name(MACHINE_A).unwrap(), &seal(&later, &key).unwrap()).unwrap();
+        let mut b = Syncer::default();
+        b.sync(&store, &pass("synthetic roster passphrase"), (MACHINE_B, "B"), &[], now() + Duration::minutes(1), false, false);
+        assert_eq!(b.seen.peers[0].readings[0].reading.taken_at, now());
+        // A roster with fields from a newer SlopBar still opens; one without readings has none.
+        let mut future: serde_json::Value = serde_json::to_value(own(MACHINE_A, "A", &[], now())).unwrap();
+        future.as_object_mut().unwrap().insert("something_new".into(), serde_json::json!([1, 2]));
+        let bytes = crate::backup::seal_bytes(FORMAT, &serde_json::to_vec(&future).unwrap(), &key).unwrap();
+        assert!(open(&bytes, &pass("synthetic roster passphrase"), &mut HashMap::new()).unwrap().readings.is_empty());
     }
 
     #[test]

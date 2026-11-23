@@ -201,6 +201,8 @@ const MESSAGES = {
     monitor_login_failed: "Monitoring sign-in did not complete. Try connecting again.",
     monitor_busy: "Another monitoring action is in progress for this account.",
     lastObserved: "Last confirmed {t} ago", lastReading: "Last reading", usageUnknown: "Usage unavailable",
+    lastObservedHere: "Last confirmed here {t} ago", resetSinceReading: "Reset since this reading ({d})", shareReadings: "Share usage readings", shareReadingsHint: "Adds each account's latest usage reading taken here (percent used, reset times and when) to the encrypted account list, so another computer whose monitoring sign-in ended shows it. Written when a reading changes, at most every 15 minutes.",
+    readOn: "Reading from {machine}, {t} ago",
     manualUpdates: "Manual updates only for this build.",
     used: "used", modelUsageUnavailable: "Model-specific usage unavailable from this source",
     resetUnknown: "Reset · type unknown", resetWeekly: "Weekly reset", resetNotUsableNow: "not usable now",
@@ -336,6 +338,7 @@ const MESSAGES = {
     monitor_login_failed: "O login de monitoramento não foi concluído. Tente conectar novamente.",
     monitor_busy: "Outra ação de monitoramento está em andamento para esta conta.",
     lastObserved: "Última confirmação há {t}",
+    readOn: "Leitura de {machine}, há {t}", lastObservedHere: "Última confirmação aqui há {t}", resetSinceReading: "Reiniciado desde esta leitura ({d})", shareReadings: "Compartilhar leituras de uso", shareReadingsHint: "Adiciona à lista de contas criptografada a leitura de uso mais recente de cada conta feita aqui (porcentagem usada, horários de reinício e quando), para que outro computador cujo login de monitoramento terminou a mostre. Gravada quando uma leitura muda, no máximo a cada 15 minutos.",
     lastReading: "Última leitura",
     usageUnknown: "Uso indisponível",
     manualUpdates: "Esta versão só recebe atualizações manuais.",
@@ -508,6 +511,7 @@ const MESSAGES = {
     monitor_login_failed: "No se completó el inicio de sesión para supervisión. Intenta conectar de nuevo.",
     monitor_busy: "Hay otra acción de supervisión en curso para esta cuenta.",
     lastObserved: "Última confirmación hace {t}",
+    readOn: "Lectura de {machine}, hace {t}", lastObservedHere: "Última confirmación aquí hace {t}", resetSinceReading: "Reiniciado desde esta lectura ({d})", shareReadings: "Compartir lecturas de uso", shareReadingsHint: "Añade a la lista de cuentas cifrada la lectura de uso más reciente de cada cuenta tomada aquí (porcentaje usado, horas de reinicio y cuándo), para que otro equipo cuya sesión de supervisión terminó la muestre. Se escribe cuando cambia una lectura, como mucho cada 15 minutos.",
     lastReading: "Última lectura",
     usageUnknown: "Uso no disponible",
     manualUpdates: "Esta versión solo admite actualizaciones manuales.",
@@ -683,6 +687,7 @@ const MESSAGES = {
     monitor_login_failed: "La connexion pour le suivi n’a pas abouti. Réessayez.",
     monitor_busy: "Une autre action de suivi est en cours pour ce compte.",
     lastObserved: "Dernière confirmation il y a {t}",
+    readOn: "Mesure de {machine}, il y a {t}", lastObservedHere: "Dernière confirmation ici il y a {t}", resetSinceReading: "Réinitialisé depuis cette mesure ({d})", shareReadings: "Partager les mesures d'utilisation", shareReadingsHint: "Ajoute à la liste chiffrée des comptes la dernière mesure d'utilisation de chaque compte prise ici (pourcentage utilisé, heures de réinitialisation et date), pour qu'un autre ordinateur dont la session de suivi a pris fin l'affiche. Écrite quand une mesure change, au plus toutes les 15 minutes.",
     lastReading: "Dernière mesure",
     usageUnknown: "Utilisation indisponible",
     manualUpdates: "Mises à jour manuelles uniquement pour cette version.",
@@ -855,6 +860,7 @@ const MESSAGES = {
     monitor_login_failed: "Die Anmeldung für die Überwachung wurde nicht abgeschlossen. Versuche es erneut.",
     monitor_busy: "Für dieses Konto läuft bereits eine andere Überwachungsaktion.",
     lastObserved: "Zuletzt vor {t} bestätigt",
+    readOn: "Messung von {machine}, vor {t}", lastObservedHere: "Hier zuletzt vor {t} bestätigt", resetSinceReading: "Seit dieser Messung zurückgesetzt ({d})", shareReadings: "Nutzungsmessungen teilen", shareReadingsHint: "Legt die neueste hier gemessene Nutzung jedes Kontos (verbrauchter Anteil, Rücksetzzeiten und Zeitpunkt) in die verschlüsselte Kontenliste, damit ein anderer Computer, dessen Anmeldung für die Überwachung abgelaufen ist, sie anzeigt. Wird geschrieben, wenn sich eine Messung ändert, höchstens alle 15 Minuten.",
     lastReading: "Letzte Messung",
     usageUnknown: "Nutzung nicht verfügbar",
     manualUpdates: "Dieser Build erhält nur manuelle Updates.",
@@ -1028,6 +1034,7 @@ const MESSAGES = {
     monitor_login_failed: "L’accesso per il monitoraggio non è stato completato. Riprova a connetterti.",
     monitor_busy: "Un’altra azione di monitoraggio è in corso per questo account.",
     lastObserved: "Ultima conferma {t} fa",
+    readOn: "Lettura di {machine}, {t} fa", lastObservedHere: "Ultima conferma qui {t} fa", resetSinceReading: "Azzerato dopo questa lettura ({d})", shareReadings: "Condividi le letture di utilizzo", shareReadingsHint: "Aggiunge all'elenco cifrato degli account l'ultima lettura di utilizzo di ogni account fatta qui (percentuale usata, orari di azzeramento e quando), così un altro computer la cui sessione di monitoraggio è terminata la mostra. Scritta quando una lettura cambia, al massimo ogni 15 minuti.",
     lastReading: "Ultima lettura",
     usageUnknown: "Utilizzo non disponibile",
     manualUpdates: "Solo aggiornamenti manuali per questa versione.",
@@ -1200,6 +1207,7 @@ const MESSAGES = {
     monitor_login_failed: "監視用のサインインが完了しませんでした。もう一度接続してください。",
     monitor_busy: "このアカウントで別の監視操作が実行中です。",
     lastObserved: "最終確認: {t}前",
+    readOn: "{machine} の測定値（{t}前）", lastObservedHere: "このパソコンでの最終確認: {t}前", resetSinceReading: "この測定値の後にリセット済み（{d}）", shareReadings: "使用量の測定値を共有", shareReadingsHint: "このパソコンで取得した各アカウントの最新の使用量（使用率、リセット時刻、取得時刻）を暗号化されたアカウント一覧に追加し、監視用のサインインが終了した別のパソコンでも表示できるようにします。測定値が変わったときに書き込み、間隔は最短で15分です。",
     lastReading: "前回の測定値",
     usageUnknown: "使用状況を取得できません",
     manualUpdates: "このビルドは手動更新のみです。",
@@ -1370,6 +1378,7 @@ const MESSAGES = {
     monitor_login_failed: "监控登录未完成。请尝试重新连接。",
     monitor_busy: "此账户正在进行另一项监控操作。",
     lastObserved: "上次确认于 {t}前",
+    readOn: "来自 {machine} 的读数（{t}前）", lastObservedHere: "本机上次确认于 {t}前", resetSinceReading: "此读数之后已重置（{d}）", shareReadings: "共享用量读数", shareReadingsHint: "把本机读取的每个账号的最新用量（已用百分比、重置时间和读取时间）加入加密的账号列表，让监控登录已结束的其他电脑也能显示。读数变化时写入，最多每 15 分钟一次。",
     lastReading: "上次读数",
     usageUnknown: "用量不可用",
     manualUpdates: "此版本仅支持手动更新。",
@@ -1538,6 +1547,7 @@ const MESSAGES = {
     monitor_login_failed: "모니터링 로그인이 완료되지 않았습니다. 다시 연결하세요.",
     monitor_busy: "이 계정에서 다른 모니터링 작업이 진행 중입니다.",
     lastObserved: "마지막 확인: {t} 전",
+    readOn: "{machine}의 측정값 ({t} 전)", lastObservedHere: "이 컴퓨터에서 마지막 확인: {t} 전", resetSinceReading: "이 측정값 이후 초기화됨 ({d})", shareReadings: "사용량 측정값 공유", shareReadingsHint: "이 컴퓨터에서 읽은 각 계정의 최신 사용량(사용률, 초기화 시각, 읽은 시각)을 암호화된 계정 목록에 추가해, 모니터링 로그인이 끝난 다른 컴퓨터에서도 표시되게 합니다. 측정값이 바뀔 때 기록하며, 많아야 15분에 한 번입니다.",
     lastReading: "마지막 측정값",
     usageUnknown: "사용량을 확인할 수 없음",
     manualUpdates: "이 빌드는 수동 업데이트만 지원합니다.",
@@ -1706,6 +1716,7 @@ const MESSAGES = {
     monitor_login_failed: "Вход для мониторинга не завершён. Попробуйте подключиться ещё раз.",
     monitor_busy: "Для этого аккаунта уже выполняется другое действие мониторинга.",
     lastObserved: "Последнее подтверждение {t} назад",
+    readOn: "Измерение с {machine}, {t} назад", lastObservedHere: "Здесь последнее подтверждение {t} назад", resetSinceReading: "Сброшено после этого измерения ({d})", shareReadings: "Делиться измерениями использования", shareReadingsHint: "Добавляет в зашифрованный список аккаунтов последнее измерение использования каждого аккаунта, сделанное здесь (процент использования, время сброса и время измерения), чтобы другой компьютер, у которого закончился сеанс мониторинга, показывал его. Записывается при изменении измерения, не чаще раза в 15 минут.",
     lastReading: "Последнее измерение",
     usageUnknown: "Использование недоступно",
     manualUpdates: "В этой сборке доступны только ручные обновления.",
@@ -1957,6 +1968,31 @@ export function placesText(a) {
 }
 
 /**
+ * The reading an account shows: this computer's own, or, while it has no fresh one, another of the
+ * user's computers' newer reading (`shared`, which the app sets from that computer's encrypted
+ * account roster). `windows`, `at` (when it was read) and `stale` describe the reading shown;
+ * `from` says whose it is and how old ("Read on LAPTOP-2 12 min ago"), empty for this computer's.
+ */
+export function shownReading(a, now = Date.now()) {
+  const s = a.shared;
+  if (!s) return { windows: a.windows ?? [], at: a.fetched_at, stale: a.stale, from: "", shared: false };
+  const age = duration(Math.max(1, Math.round((now - new Date(s.taken_at)) / 60000)));
+  return { windows: s.windows ?? [], at: s.taken_at, stale: false, from: t("readOn", { machine: s.machine, t: age }), shared: true };
+}
+
+/** Whether a window of another computer's reading has reset since it was taken: its numbers are
+ *  of a limit that has reset since, to numbers not known here. Never for this computer's own. */
+export const resetSince = (r, w, now = Date.now()) => r.shared && !!w.resets_at && Date.parse(w.resets_at) <= now;
+
+/** The windows a headline number may come from: another computer's reading keeps only those that
+ *  have not reset since it was taken (none left: no number). */
+export const currentWindows = (r, now = Date.now()) => r.windows.filter((w) => !resetSince(r, w, now));
+
+/** An account whose monitoring sign-in needs making here while another computer's recent reading
+ *  covers it (`covered_by`, set by the app): Health calls that a warning, not a problem. */
+export const coveredMonitoring = (a) => !!a.covered_by && (!!a.monitor_renewal || !a.monitor_connected);
+
+/**
  * The line under an account's name in the compact flyout: two machines in full, then how many more
  * ("+1"; the row's tooltip names them all). This machine, listed with others, comes second there,
  * so that a narrow row cuts its "(this PC)" mark rather than another machine's name. Named
@@ -2072,13 +2108,14 @@ export function notStarted(w, fetchedAt) {
 }
 
 /** Provider-supplied reset time, with separate unknown, not-started, stale and elapsed states. */
-export function windowResetText(w, stale = false, fetchedAt = null) {
+export function windowResetText(w, stale = false, fetchedAt = null, shared = false) {
   const at = w.resets_at ? Date.parse(w.resets_at) : NaN;
   if (!Number.isFinite(at)) return t("resetTimeUnavailable");
   if (notStarted(w, fetchedAt)) return t("windowNotStarted");
   const date = resetDate(at);
   if (stale) return t("lastResetAt", { d: date });
-  if (at <= Date.now()) return t("resetAwaitingRefresh", { d: date });
+  // Another computer's reading: a refresh here would not bring a newer one, so none is promised.
+  if (at <= Date.now()) return t(shared ? "resetSinceReading" : "resetAwaitingRefresh", { d: date });
   return `${resetsIn(w.resets_at)} · ${date}`;
 }
 
