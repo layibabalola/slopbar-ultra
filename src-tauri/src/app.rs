@@ -1110,11 +1110,12 @@ async fn start_add_account(app: AppHandle, provider: Provider, pending: Option<m
 /// Where a sign-in's page opens: here, in `window`, the user's choice (see `signin`) as it was when
 /// the sign-in started or, in a run, when its email's turn did (see `EmailWindow`), in `session`'s
 /// profile when that is the choice; or in another computer's browser, which completes it, handed
-/// over under a nonce (see `relay_start`), with nothing opening here. Dropping the last handle of
+/// over under a nonce (see `relay_start`), with nothing opening here. That is where it is asked to
+/// open: each start says where it really does (`placed`, see `Placed`). Dropping the last handle of
 /// its profile closes that browser and deletes the profile.
 #[derive(Clone)]
 enum Opens {
-    Here { window: signin::Window, session: Option<Arc<signin::Session>> },
+    Here { window: signin::Window, session: Option<Arc<signin::Session>>, placed: Arc<Placed> },
     Relay(String),
 }
 
@@ -1125,14 +1126,24 @@ impl Opens {
     fn own(app: &AppHandle) -> Self {
         let window = app.state::<AppState>().settings.lock().unwrap().signin_window;
         let session = (window == signin::Window::Profile).then(signin::Session::create).flatten().map(Arc::new);
-        Self::Here { window, session }
+        Self::Here { window, session, placed: Arc::default() }
     }
 
-    /// The profile its page opens in, which a run watches (`watch_step`, `page_opened`,
-    /// `browser_closed`): none in a private window, the default browser or another computer's.
+    /// The profile its page is asked to open in, which a run watches (`watch_step`, `page_opened`,
+    /// `browser_closed`) as far as its start says the page opens there (see `Placed`): none in a
+    /// private window, the default browser or another computer's.
     fn session(&self) -> Option<&Arc<signin::Session>> {
         match self {
             Self::Here { session, .. } => session.as_ref(),
+            Self::Relay(_) => None,
+        }
+    }
+
+    /// Where each of its starts says its page really opens (see `Placed`): none for another
+    /// computer's, whose page opens there.
+    fn placed(&self) -> Option<&Arc<Placed>> {
+        match self {
+            Self::Here { placed, .. } => Some(placed),
             Self::Relay(_) => None,
         }
     }
@@ -1141,10 +1152,72 @@ impl Opens {
     /// the CLI's default browser (`signin::Target::choose`), or none here for another computer's.
     fn options(&self, email: Option<&str>) -> accounts::LoginOptions {
         let target = match self {
-            Self::Here { window, session } => signin::Target::choose(*window, session.as_deref()),
+            Self::Here { window, session, .. } => signin::Target::choose(*window, session.as_deref()),
             Self::Relay(nonce) => Some(signin::Target::Relay(nonce.clone())),
         };
         accounts::LoginOptions { email: email.map(str::to_owned), target }
+    }
+
+    /// Says where a start's page really opens, now that its CLI started (`opens_in`, see
+    /// `accounts::LoginJob::opens_in`): in its profile only when the CLI opens it there, never
+    /// because the profile was asked for.
+    fn started(&self, opens_in: Option<&signin::Target>) {
+        if let Self::Here { session: Some(session), placed, .. } = self {
+            placed.say(opens_in == Some(&session.target()));
+        }
+    }
+}
+
+/// Where a sign-in here really opens its page, as each start of it says once its CLI started
+/// (`Opens::started`): in the email's profile, or wherever the CLI opens its own browser, whatever
+/// window was asked for (a CLI run in WSL, a Codex that fell back to `codex login`; see
+/// `accounts::LoginJob::opens_in`). A run's watches on the profile follow it: a page is looked for
+/// there only from that CLI's start, and only when it opens there (`no_page`), and the profile's
+/// window closing counts only then too (`browser_closed`). Each sign-in has its own (with its
+/// `Opens`), cleared as "Retry this sign-in" starts it again.
+#[derive(Debug, Default)]
+struct Placed(std::sync::Mutex<Option<Placement>>);
+
+/// What a start said of its page (see `Placed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// It opens in the email's profile; its CLI started then.
+    Profile(tokio::time::Instant),
+    /// It opens wherever its CLI opens it, where no profile tells whether it opened or its window
+    /// closed: watched as the default browser is.
+    Elsewhere,
+}
+
+impl Placed {
+    /// A start says where its page opens, its CLI having started now.
+    fn say(&self, in_profile: bool) {
+        let said = if in_profile { Placement::Profile(tokio::time::Instant::now()) } else { Placement::Elsewhere };
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(said);
+    }
+
+    /// The next start (Retry this sign-in's) says anew.
+    fn clear(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// What the open start said, if it said yet.
+    fn said(&self) -> Option<Placement> {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether the open start said its page opens in the profile.
+    fn in_profile(&self) -> bool {
+        matches!(self.said(), Some(Placement::Profile(_)))
+    }
+
+    /// Resolves with what the open start says, once it says it.
+    async fn told(&self) -> Placement {
+        loop {
+            if let Some(said) = self.said() {
+                return said;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 }
 
@@ -1173,7 +1246,7 @@ impl EmailWindow {
             signin::Window::Profile => self.session.get_or_insert_with(make).clone(),
             signin::Window::Private | signin::Window::System => None,
         };
-        Opens::Here { window: self.window, session }
+        Opens::Here { window: self.window, session, placed: Arc::default() }
     }
 
     /// The profile another computer's sign-in opens its page in here (see `relay_target`): the
@@ -1253,6 +1326,8 @@ async fn add_expected(app: &AppHandle, expected: &bulk::Step, opens: &Opens) -> 
     let options = opens.options(expected.email.as_deref());
     let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, None, options))
         .await.map_err(|_| "monitor_login_failed".to_string())??;
+    // Where its page really opens, which a run's watches follow (see `Placed`).
+    opens.started(job.opens_in());
     let client = http_client();
     let login = job.wait_isolated(&client).await.map_err(String::from)?;
     // The slot id names the account and, for Claude, its organization (server-verified above).
@@ -1491,6 +1566,8 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
             });
         }
     };
+    // Where its page really opens, which a run's watches follow (see `Placed`).
+    opens.started(job.opens_in());
     if auto {
         let name = app.state::<AppState>().snapshot.lock().unwrap().accounts.iter()
             .find(|a| a.provider == provider && a.id == id).and_then(|a| a.alias.clone().or_else(|| a.email.clone()));
@@ -1708,10 +1785,13 @@ async fn stop_and_wait(app: &AppHandle) -> Result<(), String> {
 }
 
 /// Resolves once `session`'s browser, having opened for any of the email's sign-ins, is closed:
-/// the user closed the window, so the sign-in can no longer finish. Never resolves without one.
-async fn browser_closed(session: Option<&signin::Session>) {
+/// the user closed the window, so the sign-in can no longer finish. Never resolves without one, and
+/// for a sign-in here only once its start said its page opens there (`placed`, see `Placed`): not
+/// while it opens elsewhere, nor before the start said (a window closed meanwhile is opened again
+/// by the page, if it opens there). None: another computer's, whose page this app opens there itself.
+async fn browser_closed(session: Option<&signin::Session>, placed: Option<&Placed>) {
     let Some(session) = session else { return std::future::pending().await };
-    while !session.browser_closed() {
+    while placed.is_some_and(|p| !p.in_profile()) || !session.browser_closed() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
@@ -1737,31 +1817,51 @@ fn step_name(lang: &str, step: &bulk::Step) -> String {
     }
 }
 
-/// How long a sign-in may take to open its page (Codex's app server can be a cold start).
+/// How long a sign-in's page may take to open once its CLI started (Codex's app server hands its
+/// page over before it says it started, within its own limit, `codex_signin::START_LIMIT`).
 const NO_PAGE_LIMIT: Duration = Duration::from_secs(40);
 /// How long a sign-in may wait on the person before they are asked whether to retry it.
 const STILL_WAITING: Duration = Duration::from_secs(5 * 60);
 
+/// The page check of a sign-in here whose page is asked to open in `session`'s profile: resolves
+/// with `signin_no_page` when no page opened there within NO_PAGE_LIMIT of its CLI's start, once
+/// that start said the page opens there (`placed`; a page refused for its port, whose CLI starts
+/// again, counts the wait from then). Resolves with None once a page opened, as soon as the start
+/// says its page opens elsewhere (the profile cannot tell; see `Placed`), or at `until` when it said
+/// nothing by then: a CLI that never started opened no page here either, and the long wait's
+/// question follows.
+async fn no_page(session: &signin::Session, placed: &Placed, since: std::time::SystemTime, until: tokio::time::Instant) -> Option<String> {
+    let said = tokio::select! {
+        said = placed.told() => said,
+        _ = tokio::time::sleep_until(until) => return None,
+    };
+    let Placement::Profile(started) = said else { return None };
+    let mut waiting_from = started;
+    let mut refused = None;
+    loop {
+        tokio::time::sleep_until(waiting_from + NO_PAGE_LIMIT).await;
+        if session.page_opened_since(since) {
+            return None;
+        }
+        let last = session.page_refused_since(since);
+        if last.is_none() || last == refused {
+            return Some("signin_no_page".into());
+        }
+        refused = last;
+        waiting_from = tokio::time::Instant::now();
+    }
+}
+
 /// Watches the open sign-in (`turn`'s): resolves with `signin_no_page` when its page never opened
-/// in the email's profile (only a profile can tell; a page refused for its port, whose CLI starts
-/// again, counts the wait from then), and, once it has waited long, asks the person at the desktop
-/// whether to start it again, saying where it waits (`turn.place`), and never resolves after that.
-async fn watch_step(app: &AppHandle, session: Option<&signin::Session>, since: std::time::SystemTime, turn: &Turn<'_>) -> String {
+/// in the email's profile (`session`, as far as its start says the page opens there: see
+/// `no_page`; only a profile can tell), and, once it has waited long, asks the person at the
+/// desktop whether to start it again, saying where it waits (`turn.place`), and never resolves
+/// after that.
+async fn watch_step(app: &AppHandle, session: Option<(&signin::Session, &Placed)>, since: std::time::SystemTime, turn: &Turn<'_>) -> String {
     let started = tokio::time::Instant::now();
-    if let Some(session) = session {
-        let mut waiting_from = started;
-        let mut refused = None;
-        loop {
-            tokio::time::sleep_until(waiting_from + NO_PAGE_LIMIT).await;
-            if session.page_opened_since(since) {
-                break;
-            }
-            let last = session.page_refused_since(since);
-            if last.is_none() || last == refused {
-                return "signin_no_page".into();
-            }
-            refused = last;
-            waiting_from = tokio::time::Instant::now();
+    if let Some((session, placed)) = session {
+        if let Some(e) = no_page(session, placed, since, started + STILL_WAITING).await {
+            return e;
         }
     }
     tokio::time::sleep_until(started + STILL_WAITING).await;
@@ -2012,9 +2112,12 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     continue;
                 }
                 // The email's window, and its profile (made now at its first sign-in that opens in
-                // one), which the watches below follow: the page opens nowhere else.
+                // one), which the watches below follow as far as each start says its page really
+                // opens there (`placed`): a page its CLI opens in its own browser is watched as the
+                // default browser's is.
                 let opens = email_window.here(|| email_profile(group.email.as_deref(), &lang));
                 let session = opens.session().cloned();
+                let placed = opens.placed().cloned();
                 page.at = done;
                 page.steps[in_group].1 = signin::PageStep::Opening;
                 let show = |session: Option<&signin::Session>, page: &signin::Progress| if let Some(s) = session { s.show(page) };
@@ -2060,11 +2163,11 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                 let outcome = if stopped {
                     Err("signin_stopped".into())
                 } else {
-                    let closed = browser_closed(session.as_deref());
+                    let closed = browser_closed(session.as_deref(), placed.as_deref());
                     tokio::pin!(closed);
                     let turn = Turn { stop: &stop, restart: &restart, at, account: &account, place };
                     restart.begin();
-                    let mut watch = Box::pin(watch_step(&h, session.as_deref(), since, &turn));
+                    let mut watch = Box::pin(watch_step(&h, session.as_deref().zip(placed.as_deref()), since, &turn));
                     let mut opened = Box::pin(page_opened(session.as_deref(), since));
                     let mut opening = true;
                     loop {
@@ -2097,6 +2200,10 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                                 // of this computer's one sign-in and the account (a monitoring sign-in
                                 // does so a moment later), a new one opens its page in the same window.
                                 drop(std::mem::replace(&mut run, Box::pin(start())));
+                                // The new one says anew where its page opens; the old one, gone, says nothing more.
+                                if let Some(placed) = placed.as_deref() {
+                                    placed.clear();
+                                }
                                 let held = [monitoring::SIGN_IN.to_string(), format!("{}:{}", target.provider.name(), target.id),
                                     format!("{}:add-account", target.provider.name())];
                                 let free = async {
@@ -2110,7 +2217,7 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                                     _ = stop.notified() => break Err("signin_stopped".into()),
                                 }
                                 let since = std::time::SystemTime::now();
-                                watch = Box::pin(watch_step(&h, session.as_deref(), since, &turn));
+                                watch = Box::pin(watch_step(&h, session.as_deref().zip(placed.as_deref()), since, &turn));
                                 opened = Box::pin(page_opened(session.as_deref(), since));
                                 opening = true;
                                 publish_bulk(&h, |b| {
@@ -2497,7 +2604,9 @@ async fn relayed_turn(h: &AppHandle, step: &bulk::Step, machine: &bulk::Machine,
     if let Some(s) = session {
         s.rearm();
     }
-    let closed = browser_closed(session.map(|s| &**s));
+    // This app opens its page itself, where the email's window says (`relay_target`): no start
+    // here has anything to say of where it opens.
+    let closed = browser_closed(session.map(|s| &**s), None);
     tokio::pin!(closed);
     // No page limit here: the other computer has its own (`relay::PAGE_LIMIT`).
     turn.restart.begin();
@@ -4899,7 +5008,7 @@ mod sign_in_tests {
         for needle in ["if !restart.take(at) { continue; }", "drop(std::mem::replace(&mut run, Box::pin(start())));",
             "let held = [monitoring::SIGN_IN.to_string(), format!(\"{}:{}\", target.provider.name(), target.id),",
             "while held.iter().any(|key| h.state::<AppState>().account_operations.busy(key)) {",
-            "watch = Box::pin(watch_step(&h, session.as_deref(), since, &turn));", "opened = Box::pin(page_opened(session.as_deref(), since));"] {
+            "watch = Box::pin(watch_step(&h, session.as_deref().zip(placed.as_deref()), since, &turn));", "opened = Box::pin(page_opened(session.as_deref(), since));"] {
             assert!(crate::source_guard::has(arm, &crate::source_guard::tokens(needle)), "{needle}\n{arm}");
         }
         let (dropped, waited) = (crate::source_guard::find(arm, "drop(std::mem::replace").unwrap(), crate::source_guard::find(arm, "while held").unwrap());
@@ -4917,7 +5026,7 @@ mod sign_in_tests {
     /// reads the setting only for a sign-in of its own (`Opens::own`), at an email's turn, and for
     /// readiness's report of it; and makes a window of its own only for Add account and for a
     /// monitoring sign-in given none (outside a run). Each failure is a sign-in that could open its
-    /// page where its run does not watch for it (`signin_no_page` after 40 s), or in the everyday
+    /// page where its run does not watch for it, or in the everyday
     /// browser.
     #[test]
     fn a_run_reads_the_sign_in_window_once_per_email() {
@@ -5066,6 +5175,183 @@ mod sign_in_tests {
         let relay = Opens::Relay("0123abcd".into());
         assert!(relay.session().is_none());
         assert_eq!(target(&relay), Some(Target::Relay("0123abcd".into())));
+    }
+
+    /// A start says where its page really opens once its CLI started (`accounts::LoginJob::opens_in`):
+    /// in the email's profile only when the CLI opens it there. A CLI run in WSL, or a Codex
+    /// that fell back to `codex login`, opens its own browser whatever window was asked for; a run
+    /// that watched the profile for it stopped with `signin_no_page` after 40 s.
+    #[test]
+    fn a_start_says_where_its_page_really_opens() {
+        use signin::{Target, Window};
+        let root = crate::test_support::TempDir::new();
+        let make = || signin::Session::create_in(&root.0).ok().map(Arc::new);
+        let mut email = EmailWindow::new(Window::Profile);
+        let opens = email.here(make);
+        let session = opens.session().cloned().expect("the email's profile");
+        let placed = opens.placed().cloned().expect("a sign-in here says where its page opens");
+        assert_eq!(placed.said(), None, "nothing said before its CLI started");
+        // The CLI's own browser: no target was honoured.
+        opens.started(None);
+        assert_eq!(placed.said(), Some(Placement::Elsewhere));
+        assert!(!placed.in_profile());
+        // Retry this sign-in: a new start (with a clone of the step's `opens`) says anew, to the same step.
+        placed.clear();
+        assert_eq!(placed.said(), None);
+        assert!(!placed.in_profile(), "not before it said");
+        opens.clone().started(Some(&session.target()));
+        assert!(matches!(placed.said(), Some(Placement::Profile(_))) && placed.in_profile(), "{:?}", placed.said());
+        // Anywhere but this profile is elsewhere.
+        let other = signin::Session::create_in(&root.0).unwrap();
+        for target in [Target::Private, other.target(), Target::Relay("0123abcd".into())] {
+            opens.started(Some(&target));
+            assert_eq!(placed.said(), Some(Placement::Elsewhere), "{target:?}");
+        }
+        // Each sign-in of the email says for itself: the next one's starts unsaid, in the same profile.
+        let next = email.here(make);
+        assert!(next.session().is_some_and(|s| Arc::ptr_eq(s, &session)));
+        let told = next.placed().expect("the next sign-in's");
+        assert!(!Arc::ptr_eq(told, &placed) && told.said().is_none());
+        // No profile to watch (a private window, the default browser): nothing to say; nor for
+        // another computer's, whose page opens there.
+        for window in [Window::Private, Window::System] {
+            let opens = EmailWindow::new(window).here(make);
+            opens.started(None);
+            assert_eq!(opens.placed().and_then(|p| p.said()), None, "{window:?}");
+        }
+        let relay = Opens::Relay("0123abcd".into());
+        relay.started(None);
+        assert!(relay.placed().is_none());
+    }
+
+    /// The 40-second page check reads the profile only once the start said its page opens there,
+    /// and counts from its CLI's start, never from before the CLI was found or had handed its page
+    /// over (every WSL distro is asked for the CLI first, up to 15 s each; Codex's app server can
+    /// take 45 s, then fall back to `codex login`). A page refused for its port counts the wait
+    /// again from then, as before. A page said to open elsewhere is not looked for in the profile,
+    /// and nothing said by the long wait leaves it to the long wait's question. Every wait is
+    /// bounded, so a check that never ends fails rather than hangs.
+    #[tokio::test(start_paused = true)]
+    async fn a_page_is_looked_for_in_the_profile_only_from_its_cli_s_start_there() {
+        use tokio::time::{timeout, Instant};
+        let root = crate::test_support::TempDir::new();
+        let profile = || signin::Session::create_in(&root.0).unwrap();
+        let secs = Duration::from_secs;
+
+        // Its page opens elsewhere: no verdict from the profile, as soon as that is said.
+        let (session, placed, since, start) = (profile(), Placed::default(), std::time::SystemTime::now(), Instant::now());
+        placed.say(false);
+        assert_eq!(timeout(STILL_WAITING + secs(1), no_page(&session, &placed, since, start + STILL_WAITING)).await, Ok(None));
+        assert!(start.elapsed() < secs(1), "at once: {:?}", start.elapsed());
+
+        // Said a minute in (a slow start): no verdict before its CLI started, then 40 s from then.
+        let (session, placed, since, start) = (profile(), Placed::default(), std::time::SystemTime::now(), Instant::now());
+        let check = no_page(&session, &placed, since, start + STILL_WAITING);
+        tokio::pin!(check);
+        assert!(timeout(secs(60), &mut check).await.is_err(), "nothing said yet: no verdict at 40 s");
+        placed.say(true);
+        assert!(timeout(secs(39), &mut check).await.is_err(), "the CLI gets its 40 s");
+        assert_eq!(timeout(secs(2), &mut check).await, Ok(Some("signin_no_page".into())));
+        assert_eq!(start.elapsed(), secs(100), "40 s from the CLI's start, said at 60 s");
+
+        // Said at once, no page: the check as it was, 40 s on.
+        let (session, placed, since, start) = (profile(), Placed::default(), std::time::SystemTime::now(), Instant::now());
+        placed.say(true);
+        assert_eq!(timeout(STILL_WAITING + secs(1), no_page(&session, &placed, since, start + STILL_WAITING)).await, Ok(Some("signin_no_page".into())));
+        assert_eq!(start.elapsed(), NO_PAGE_LIMIT);
+
+        // Its page opened there: no verdict.
+        let (session, placed, since, start) = (profile(), Placed::default(), std::time::SystemTime::now(), Instant::now());
+        placed.say(true);
+        session.page_opened_now();
+        assert_eq!(timeout(STILL_WAITING + secs(1), no_page(&session, &placed, since, start + STILL_WAITING)).await, Ok(None));
+        assert_eq!(start.elapsed(), NO_PAGE_LIMIT, "no verdict, at the check");
+
+        // A page refused for its port (its CLI starts again): the wait counts again from the check
+        // that saw it, and the same refusal twice is no page.
+        let (session, placed, since, start) = (profile(), Placed::default(), std::time::SystemTime::now(), Instant::now());
+        placed.say(true);
+        let check = no_page(&session, &placed, since, start + STILL_WAITING);
+        tokio::pin!(check);
+        assert!(timeout(secs(30), &mut check).await.is_err());
+        session.page_refused_now();
+        assert!(timeout(secs(45), &mut check).await.is_err(), "refused at 30 s: waits again from 40 s");
+        assert_eq!(timeout(secs(10), &mut check).await, Ok(Some("signin_no_page".into())));
+        assert_eq!(start.elapsed(), secs(80));
+
+        // Nothing said by the long wait: left to its question.
+        let (session, placed, since, start) = (profile(), Placed::default(), std::time::SystemTime::now(), Instant::now());
+        assert_eq!(timeout(STILL_WAITING + secs(1), no_page(&session, &placed, since, start + STILL_WAITING)).await, Ok(None));
+        assert_eq!(start.elapsed(), STILL_WAITING);
+    }
+
+    /// The profile's window closing (an earlier sign-in's of the email, say) stops a sign-in here
+    /// only once its start said its page opens there: never while it opens elsewhere, nor before
+    /// the start said (one that then says elsewhere would be stopped for a window it never used). It
+    /// stops another computer's as ever, whose page this app opens there itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_profile_window_stops_nothing_while_the_page_opens_elsewhere() {
+        use tokio::time::timeout;
+        let root = crate::test_support::TempDir::new();
+        let session = signin::Session::create_in(&root.0).unwrap();
+        session.browser_seen_then_closed();
+        let (placed, long) = (Placed::default(), STILL_WAITING * 2);
+        assert!(timeout(long, browser_closed(Some(&session), Some(&placed))).await.is_err(), "nothing said yet");
+        placed.say(false);
+        assert!(timeout(long, browser_closed(Some(&session), Some(&placed))).await.is_err(), "its page opens elsewhere");
+        placed.say(true);
+        assert!(timeout(Duration::from_secs(5), browser_closed(Some(&session), Some(&placed))).await.is_ok(), "its page opens there");
+        placed.clear();
+        assert!(timeout(long, browser_closed(Some(&session), Some(&placed))).await.is_err(), "Retry's start has not said yet");
+        assert!(timeout(Duration::from_secs(5), browser_closed(Some(&session), None)).await.is_ok(), "another computer's");
+        assert!(timeout(long, browser_closed(None, Some(&placed))).await.is_err(), "no profile: nothing to close");
+    }
+
+    /// Each start of a run's sign-in (a restore's or renewal's, `add_expected`; a monitoring
+    /// sign-in's, `start_monitoring_login`) says where its page really opens as soon as its CLI
+    /// started, before anything waits on it; and the run's watches follow what it said, through the
+    /// step's `placed`, which Retry this sign-in clears as it starts the sign-in again, before the new
+    /// start's watches. Another computer's sign-in, whose page this app opens in the profile itself,
+    /// is watched as before.
+    #[test]
+    fn every_start_says_where_its_page_opens_and_the_run_watches_there() {
+        use crate::source_guard::{args, calls, count, find, function, has, tokens};
+        const T: &str = "app::sign_in_tests::every_start_says_where_its_page_opens_and_the_run_watches_there";
+        let code = tokens(include_str!("app.rs"));
+        for (signature, waits) in [("async fn add_expected(", "job.wait_isolated("), ("async fn start_monitoring_login(", "tauri::async_runtime::spawn(")] {
+            let body = function(&code, "app.rs", signature, T);
+            assert_eq!(count(body, ".started("), 1, "{signature} says once\n{body}");
+            let (cli, said, waited) = (find(body, "accounts::start_login_observed("), find(body, "opens.started(job.opens_in());"), find(body, waits));
+            assert!(matches!((cli, said, waited), (Some(c), Some(s), Some(w)) if c < s && s < w), "{signature}: said once its CLI started, before anything waits on it\n{body}");
+        }
+        let run = function(&code, "app.rs", "fn run_sign_ins(", T);
+        for needle in ["let session = opens.session().cloned(); let placed = opens.placed().cloned();",
+            "let closed = browser_closed(session.as_deref(), placed.as_deref());"] {
+            assert!(has(run, needle), "{needle}\n{run}");
+        }
+        // Only a start says where its page opens, and only of its own profile; only Retry clears it.
+        // One `Placed` for each sign-in, shared by its starts (clones of its `opens`) and its watches.
+        let product = &code[..find(&code, "#[cfg(test)] mod sign_in_tests {").expect("app.rs's sign-in tests")];
+        let says = function(&code, "app.rs", "fn started(&self, opens_in: Option<&signin::Target>)", T);
+        assert_eq!(says, tokens("fn started(&self, opens_in: Option<&signin::Target>) { if let Self::Here { session: Some(session), placed, .. } = self { placed.say(opens_in == Some(&session.target())); } }"));
+        assert_eq!((count(product, ".say("), count(product, ".clear()")), (1, 1),
+            "app.rs says where a page opens only in Opens::started, and clears it only in Retry's arm (another `.clear()` in app.rs: count it here)");
+        assert!(!has(run, "Here {") && !has(run, "Placed") && count(run, "opens.clone()") == 1, "the run's sign-in reports to its own `opens`\n{run}");
+        let watches = calls(run, "watch_step", T);
+        assert_eq!(watches.len(), 2, "the first start's watch and Retry's\n{run}");
+        assert!(watches.iter().all(|w| args(w).get(1).copied() == Some(&*tokens("session.as_deref().zip(placed.as_deref())"))), "{watches:?}");
+        let arm = &run[find(run, "_ = restart.notify.notified() => {").expect("the local sign-in's restart arm")..];
+        let (dropped, cleared, watched) = (find(arm, "drop(std::mem::replace(&mut run, Box::pin(start())));"),
+            find(arm, "if let Some(placed) = placed.as_deref() { placed.clear(); }"), find(arm, "watch = Box::pin(watch_step("));
+        assert!(matches!((dropped, cleared, watched), (Some(d), Some(c), Some(w)) if d < c && c < w), "the old start goes, then its word, then the new watch\n{arm}");
+        let watch = function(&code, "app.rs", "async fn watch_step(", T);
+        assert!(has(watch, "if let Some((session, placed)) = session { if let Some(e) = no_page(session, placed, since, started + STILL_WAITING).await { return e; } }"), "{watch}");
+        let closed = function(&code, "app.rs", "async fn browser_closed(", T);
+        assert!(has(closed, "while placed.is_some_and(|p| !p.in_profile()) || !session.browser_closed() {"), "{closed}");
+        let relayed = function(&code, "app.rs", "async fn relayed_turn(", T);
+        assert!(has(relayed, "let closed = browser_closed(session.map(|s| &**s), None);"), "{relayed}");
+        let relayed_watches = calls(relayed, "watch_step", T);
+        assert!(relayed_watches.len() == 2 && relayed_watches.iter().all(|w| args(w).get(1).copied() == Some("None")), "{relayed_watches:?}");
     }
 
     /// The run's notices say where a sign-in waits as its email's window has it, worded in the
