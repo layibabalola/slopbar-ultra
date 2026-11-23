@@ -1527,7 +1527,7 @@ mod http {
 fn renewal_tells_an_ended_sign_in_from_a_refused_or_ending_one() {
     use crate::health::MonitorState;
     let hours = |h: i64| now() + chrono::Duration::hours(h);
-    let state = |reconnect: bool, ends: Option<i64>| MonitorState { reconnect, ends_at: ends.map(hours) };
+    let state = |reconnect: bool, ends: Option<i64>| MonitorState { reconnect, uncertain: false, ends_at: ends.map(hours) };
     // Refused once the end the provider gave had passed, or up to EARLY_DAYS before it: its fixed
     // limit, not a fault.
     assert_eq!(renewal(Some(&state(true, Some(-2))), None, now()), Renewal::Ended(hours(-2)));
@@ -1539,7 +1539,12 @@ fn renewal_tells_an_ended_sign_in_from_a_refused_or_ending_one() {
     for e in SIGN_IN_ERRORS {
         assert_eq!(renewal(None, Some(e), now()), Renewal::Refused, "{e}");
     }
-    assert_eq!(renewal(Some(&state(false, Some(-1))), Some("monitor_uncertain"), now()), Renewal::Ended(hours(-1)));
+    // Two uncertain renewals stopped replay: as good as refused.
+    let uncertain = MonitorState { uncertain: true, ..state(false, Some(-1)) };
+    assert_eq!(renewal(Some(&uncertain), None, now()), Renewal::Ended(hours(-1)));
+    // A saved state wins over the last refresh's error, which outlives a sign-in until the next
+    // refresh: a just-reconnected account is fine, not refused.
+    assert_eq!(renewal(Some(&state(false, Some(24 * 30))), Some("monitor_reconnect"), now()), Renewal::Fine);
     // Ending within RENEW_DAYS is due; later, or with no end, is fine.
     assert_eq!(renewal(Some(&state(false, Some(24 * RENEW_DAYS))), None, now()), Renewal::Ending(hours(24 * RENEW_DAYS)));
     assert_eq!(renewal(Some(&state(false, Some(24 * RENEW_DAYS + 1))), None, now()), Renewal::Fine);
@@ -1580,4 +1585,19 @@ async fn a_sign_in_s_end_only_moves_earlier_and_survives_renewals_that_give_none
     monitor.token_with(&cli(), &renew("access-4", "refresh-4", None), None, later).await.unwrap();
     assert_eq!(ends_at(&monitor).await, Some(days(20)), "a renewal that gives none keeps it");
     assert_eq!(ends_at(&Monitor::new(dir.0.clone())).await, Some(days(20)), "and so does a restart");
+}
+
+#[test]
+fn an_end_the_provider_renewed_past_gives_way_and_only_claude_s_end_is_kept() {
+    let at = |d: i64| Some(now() + chrono::Duration::days(d));
+    assert_eq!(next_end(Provider::Claude, at(20), at(40), now()), at(20), "a later end does not move it");
+    assert_eq!(next_end(Provider::Claude, at(20), at(10), now()), at(10), "an earlier one does");
+    assert_eq!(next_end(Provider::Claude, at(20), None, now()), at(20), "a reply without one keeps it");
+    assert_eq!(next_end(Provider::Claude, None, at(30), now()), at(30));
+    // Renewed on or after the end it had: that end was not the provider's.
+    assert_eq!(next_end(Provider::Claude, at(-1), at(29), now()), at(29));
+    assert_eq!(next_end(Provider::Claude, at(-1), None, now()), None);
+    // Codex: whatever its latest reply said, if it ever says.
+    assert_eq!(next_end(Provider::Codex, at(20), at(40), now()), at(40));
+    assert_eq!(next_end(Provider::Codex, at(20), None, now()), None);
 }
