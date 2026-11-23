@@ -332,12 +332,18 @@ struct FakeDesk {
     opened: Mutex<Vec<String>>,
     /// Stopped here while its start is on the way.
     cancel_on_start: Mutex<Option<Arc<Shared>>>,
+    /// "Retry this sign-in" pressed here during the state call of this number (1 for the first), as
+    /// `Relayed::restart` does it: asked, and the tunnel closed.
+    restart_on_state: Mutex<Option<(usize, Arc<Shared>)>>,
+    /// The same, pressed while the first tunnel opens.
+    restart_on_tunnel: Mutex<Option<Arc<Shared>>>,
 }
 
 impl FakeDesk {
     fn new(answers: Vec<Result<serde_json::Value, String>>) -> Self {
         FakeDesk { answers: Mutex::new(answers.into()), calls: Mutex::default(), tunnels: Mutex::default(), tunnel_fails: Mutex::default(),
-            lives: Arc::default(), opened: Mutex::default(), cancel_on_start: Mutex::default() }
+            lives: Arc::default(), opened: Mutex::default(), cancel_on_start: Mutex::default(), restart_on_state: Mutex::default(),
+            restart_on_tunnel: Mutex::default() }
     }
 
     fn ops(&self) -> Vec<String> {
@@ -365,6 +371,14 @@ impl Desk for FakeDesk {
                 shared.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
+        if request["op"] == "relay_state" {
+            let states = self.calls.lock().unwrap().iter().filter(|c| c["op"] == "relay_state").count();
+            if let Some((at, shared)) = self.restart_on_state.lock().unwrap().as_ref().filter(|(at, _)| *at == states) {
+                let _ = at;
+                shared.restart.store(true, std::sync::atomic::Ordering::SeqCst);
+                shared.tunnel.lock().unwrap().take();
+            }
+        }
         let step = request["step"].as_str().unwrap().to_string();
         let mut answer = self.answers.lock().unwrap().pop_front().unwrap_or(Err("ssh_timeout".into()))?;
         // Answers name the step asked about.
@@ -375,6 +389,9 @@ impl Desk for FakeDesk {
     fn tunnel(&self, _host: &str, page: &Page) -> Result<Box<dyn Hold>, Unheld> {
         if let Some(e) = self.tunnel_fails.lock().unwrap().pop_front() {
             return Err(e);
+        }
+        if let Some(shared) = self.restart_on_tunnel.lock().unwrap().take() {
+            shared.restart.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         self.tunnels.lock().unwrap().push(page.port);
         Ok(Box::new(FakeTunnel(self.lives.clone())))
@@ -460,12 +477,98 @@ fn a_port_this_computer_cannot_use_starts_the_sign_in_again_for_another() {
     let desk = FakeDesk::new(vec![state("page", Some(CODEX), 2)]);
     desk.tunnel_fails.lock().unwrap().push_back("relay_port_unusable");
     assert_eq!(run(&desk, Provider::Codex, &Shared::default()).0, Err("relay_port_unusable".to_string()));
-    // Three times for Claude, then it gives up.
-    let desk = FakeDesk::new(vec![state("page", Some(CLAUDE), 2), state("page", Some(CLAUDE), 2), state("page", Some(CLAUDE), 2)]);
-    for _ in 0..3 {
+    // PORT_TRIES times for Claude, then it gives up.
+    let desk = FakeDesk::new((0..PORT_TRIES).map(|_| state("page", Some(CLAUDE), 2)).collect());
+    for _ in 0..PORT_TRIES {
         desk.tunnel_fails.lock().unwrap().push_back("relay_port_unusable");
     }
     assert_eq!(run(&desk, Provider::Claude, &Shared::default()).0, Err("relay_port_unusable".to_string()));
+    assert_eq!(desk.ops().iter().filter(|op| *op == "relay_start").count(), PORT_TRIES as usize);
+}
+
+#[test]
+fn a_port_browsers_refuse_is_never_opened_and_the_sign_in_starts_again_for_another() {
+    // Windows hands out ports in order: 6667, then 6668 (refused too), then 6670.
+    let pages = [6667, 6668, 6670].map(|port| CLAUDE.replace("7925", &port.to_string()));
+    let desk = FakeDesk::new(vec![state("page", Some(&pages[0]), 2), state("page", Some(&pages[1]), 2), state("page", Some(&pages[2]), 2),
+        state("done", None, 3)]);
+    let (outcome, opened) = run(&desk, Provider::Claude, &Shared::default());
+    assert_eq!((outcome, opened), (Ok(true), 1));
+    assert_eq!(desk.tunnels.lock().unwrap().clone(), [6670], "no tunnel for a port no page here could come back to");
+    assert_eq!(desk.opened.lock().unwrap().clone(), [pages[2].clone()], "and only the last page opened");
+    assert_eq!(desk.ops(), ["relay_start", "relay_stop", "relay_start", "relay_stop", "relay_start", "relay_state"]);
+    let calls = desk.calls.lock().unwrap().clone();
+    assert_eq!((&calls[1]["step"], &calls[3]["step"]), (&calls[0]["step"], &calls[2]["step"]), "each refused sign-in is stopped there");
+    assert!(calls[0]["step"] != calls[2]["step"] && calls[2]["step"] != calls[4]["step"], "and a new one started under a new id");
+    // Every try refused: this sign-in alone is left out, and says why.
+    let desk = FakeDesk::new((0..PORT_TRIES).map(|_| state("page", Some(&pages[0]), 2)).collect());
+    assert_eq!(run(&desk, Provider::Claude, &Shared::default()), (Err("relay_port_refused".to_string()), 0));
+    assert!(desk.tunnels.lock().unwrap().is_empty());
+    assert_eq!((fault("relay_port_refused"), why("relay_port_refused"), known("relay_port_refused")), (Fault::SkipStep, "leftPortRefused", "relay_port_refused".to_string()));
+    assert_eq!((fault("signin_port_refused"), why("signin_port_refused")), (Fault::SkipStep, "leftPortRefused"));
+    // Codex's port is fixed: starting again would not change it.
+    let desk = FakeDesk::new(vec![state("page", Some(&CODEX.replace("1455", "6667")), 2)]);
+    assert_eq!(run(&desk, Provider::Codex, &Shared::default()).0, Err("relay_port_refused".to_string()));
+    assert_eq!(desk.ops(), ["relay_start"]);
+}
+
+#[test]
+fn retry_starts_the_relayed_sign_in_again_with_a_new_page() {
+    // Pressed while the page waits: the one there is stopped, a new one starts, its page opens here.
+    let shared = Arc::new(Shared::default());
+    let desk = FakeDesk::new(vec![state("page", Some(CLAUDE), 2), state("page", None, 3), state("page", Some(&CLAUDE.replace("7925", "7926")), 2),
+        state("done", None, 3)]);
+    *desk.restart_on_state.lock().unwrap() = Some((1, shared.clone()));
+    let (outcome, opened) = run(&desk, Provider::Claude, &shared);
+    assert_eq!((outcome, opened), (Ok(true), 2), "two pages opened here, one per sign-in there");
+    assert_eq!(desk.tunnels.lock().unwrap().clone(), [7925, 7926]);
+    assert_eq!(desk.ops(), ["relay_start", "relay_state", "relay_stop", "relay_start", "relay_state"]);
+    let calls = desk.calls.lock().unwrap().clone();
+    assert_eq!(calls[2]["step"], calls[0]["step"], "the first is stopped there");
+    assert_ne!(calls[3]["step"], calls[0]["step"], "and a new one started");
+    assert!(!shared.restart.load(std::sync::atomic::Ordering::SeqCst), "the ask is taken");
+    // Its own stop came back first (Stopped there): still a start again, never `relay_stopped_there`.
+    let shared = Arc::new(Shared::default());
+    let desk = FakeDesk::new(vec![state("page", Some(CLAUDE), 2), failed("signin_stopped"), state("page", Some(CLAUDE), 2), state("done", None, 3)]);
+    *desk.restart_on_state.lock().unwrap() = Some((1, shared.clone()));
+    assert_eq!(run(&desk, Provider::Claude, &shared), (Ok(true), 2));
+    assert_eq!(desk.ops(), ["relay_start", "relay_state", "relay_start", "relay_state"], "an ended one is not stopped again");
+    // The one there finished as it was pressed: done, nothing starts again.
+    let shared = Arc::new(Shared::default());
+    let desk = FakeDesk::new(vec![state("page", Some(CLAUDE), 2), state("done", None, 3)]);
+    *desk.restart_on_state.lock().unwrap() = Some((1, shared.clone()));
+    assert_eq!(run(&desk, Provider::Claude, &shared), (Ok(true), 1));
+    assert_eq!(desk.ops(), ["relay_start", "relay_state"]);
+    // The old one may hold that computer's one sign-in a moment as it ends: its start waits.
+    let shared = Arc::new(Shared::default());
+    let desk = FakeDesk::new(vec![state("page", Some(CLAUDE), 2), failed("signin_stopped"), Err("signin_busy".into()), state("page", Some(CLAUDE), 2),
+        state("done", None, 3)]);
+    *desk.restart_on_state.lock().unwrap() = Some((1, shared.clone()));
+    assert_eq!(run(&desk, Provider::Claude, &shared), (Ok(true), 2));
+    // A first start that finds it busy is not waited for: another sitting or sign-in holds it.
+    let desk = FakeDesk::new(vec![Err("signin_busy".into()), state("page", Some(CLAUDE), 2)]);
+    assert_eq!(run(&desk, Provider::Claude, &Shared::default()).0, Err("signin_busy".to_string()));
+    // Pressed while the old page's tunnel opened: that page never opens, the new one does.
+    let shared = Arc::new(Shared::default());
+    let desk = FakeDesk::new(vec![state("page", Some(CLAUDE), 2), state("page", Some(&CLAUDE.replace("7925", "7926")), 2), state("done", None, 3)]);
+    *desk.restart_on_tunnel.lock().unwrap() = Some(shared.clone());
+    assert_eq!(run(&desk, Provider::Claude, &shared), (Ok(true), 1));
+    assert_eq!(desk.tunnels.lock().unwrap().clone(), [7925, 7926]);
+    assert_eq!(desk.opened.lock().unwrap().clone(), [CLAUDE.replace("7925", "7926")], "only the new page opened");
+    assert_eq!(desk.ops(), ["relay_start", "relay_stop", "relay_start", "relay_state"]);
+}
+
+#[test]
+fn retry_closes_the_tunnel_at_once_and_stops_the_one_there() {
+    let stops: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let seen = stops.clone();
+    let relayed = Relayed::new("desk", Arc::new(move |host: &str, step: &str| seen.lock().unwrap().push((host.into(), step.into()))));
+    *relayed.shared.step.lock().unwrap() = Some("s1".into());
+    *relayed.shared.tunnel.lock().unwrap() = Some(Box::new(FakeTunnel(Arc::default())));
+    relayed.restart();
+    assert!(relayed.shared.restart.load(std::sync::atomic::Ordering::SeqCst) && !relayed.shared.cancelled(), "asked again, not stopped");
+    assert!(relayed.shared.tunnel.lock().unwrap().is_none(), "no answer from the old page reaches the old sign-in");
+    assert_eq!(stops.lock().unwrap().clone(), [("desk".to_string(), "s1".to_string())], "and the one there is asked to stop now");
 }
 
 #[test]
