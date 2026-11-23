@@ -127,6 +127,20 @@ The agent should:
    not shown, nothing starts and the agent hears why.
 7. Follow progress with `run_on_machine` → `get_roster` or `get_usage`.
 
+## Every month: renew every computer's sign-ins from one desk
+
+Claude ends every sign-in about 30 days after it is made, on every computer. Once a computer is
+paired or checked from here (or named by the shared account list and reachable at its name in
+`~/.ssh/config`), its renewals can be made from whichever computer you sit at: Settings → Accounts →
+**Sign in all your computers from here**, or ask the agent there to call `sign_in_all` with
+`everywhere: true` (it shows the plan; with `confirm: true` it raises a notification you start
+yourself). Each other computer runs its CLI's sign-in with no window; its page opens in this
+computer's browser through an SSH tunnel for the one port that page names, and the provider's answer
+goes back through the tunnel to that computer's CLI. Their screens can stay locked. A computer is left
+out, and named with the reason, when SSH can't reach it, SlopBar isn't running there (nobody signed in
+to Windows), its SlopBar is older (it updates itself), a sign-in is already open there, or its SSH
+server starts Windows PowerShell (run the OpenSSH block above there).
+
 ## Without an MCP client
 
 `slopbar-mcp.exe` runs one tool from a shell and prints one JSON line (`{"ok": …}` or

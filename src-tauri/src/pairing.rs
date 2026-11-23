@@ -197,6 +197,19 @@ pub fn remember_host(dir: &std::path::Path, machine_id: &str, host: &str) {
     let _ = crate::private_store::write(&dir.join(HOSTS_FILE), &serde_json::to_vec_pretty(&map).unwrap_or_default());
 }
 
+/// Every computer paired or checked from here: its machine id and the SSH host it answered on.
+pub fn paired(dir: &std::path::Path) -> Vec<(String, String)> {
+    hosts(dir).into_iter().filter_map(|(id, host)| Some((id, host.as_str().filter(|h| valid_host(h))?.to_owned()))).collect()
+}
+
+/// Notes that the computer `machine_id` answers on `host`, only when no host is noted for it yet:
+/// a host found by name (see `relay`) never re-points one that was paired or checked.
+pub fn remember_new_host(dir: &std::path::Path, machine_id: &str, host: &str) {
+    if host_for(dir, machine_id).is_none() {
+        remember_host(dir, machine_id, host);
+    }
+}
+
 /// The SSH host `machine_id` last answered on here, if it was ever checked or paired from here.
 pub fn host_for(dir: &std::path::Path, machine_id: &str) -> Option<String> {
     hosts(dir).get(machine_id).and_then(Value::as_str).filter(|h| valid_host(h)).map(str::to_owned)
@@ -227,6 +240,12 @@ impl Door for LocalDoor {
 pub trait Remote {
     /// Runs `command` on `host` with `input` as its standard input; returns its standard output.
     fn run(&self, host: &str, command: &str, input: &[u8]) -> Result<Vec<u8>, String>;
+
+    /// `run`, given up after `limit` (and, over SSH, on a connection that stops answering).
+    fn run_within(&self, host: &str, command: &str, input: &[u8], limit: Duration) -> Result<Vec<u8>, String> {
+        let _ = limit;
+        self.run(host, command, input)
+    }
 }
 
 /// The system's OpenSSH client, with the user's own keys and ~/.ssh/config (Tailscale SSH works
@@ -242,59 +261,69 @@ impl Ssh {
 
 impl Remote for Ssh {
     fn run(&self, host: &str, command: &str, input: &[u8]) -> Result<Vec<u8>, String> {
-        use std::process::{Command, Stdio};
-        if !valid_host(host) {
-            return Err("bad_ssh_host".into());
-        }
-        let mut cmd = Command::new(Self::exe());
-        cmd.args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15", "-T", host, command])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: this server has no console.
-        }
-        let mut child = cmd.spawn().map_err(|_| "ssh_missing".to_string())?;
-        let mut stdin = child.stdin.take().ok_or("ssh_failed")?;
-        let mut input = input.to_vec();
-        // The input may be a pairing key: this copy is wiped once sent, a best effort like `pair`'s
-        // and `receive`'s wipes (other copies of a key stay in memory until reused).
-        let writer = std::thread::spawn(move || {
-            let _ = stdin.write_all(&input);
-            input.iter_mut().for_each(|b| *b = 0);
-        });
-        let mut stdout = child.stdout.take().ok_or("ssh_failed")?;
-        let mut stderr = child.stderr.take().ok_or("ssh_failed")?;
-        let (send, receive) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut out = Vec::new();
-            let _ = (&mut stdout).take(MAX_ANSWER).read_to_end(&mut out);
-            let _ = send.send(out);
-        });
-        let errors = std::thread::spawn(move || {
-            let mut err = Vec::new();
-            let _ = (&mut stderr).take(16 * 1024).read_to_end(&mut err);
-            err
-        });
-        let Ok(out) = receive.recv_timeout(SSH_TIMEOUT) else {
-            let _ = child.kill();
-            return Err("ssh_timeout".into());
-        };
-        let _ = writer.join();
-        // Standard output closed (or hit its bound): the exit follows at once, or never.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-                _ => {
-                    let _ = child.kill();
-                    return Err("ssh_timeout".into());
-                }
-            }
-        };
-        finished(out, status.code(), &errors.join().unwrap_or_default())
+        ssh_run(host, command, input, SSH_TIMEOUT, &[])
     }
+
+    fn run_within(&self, host: &str, command: &str, input: &[u8], limit: Duration) -> Result<Vec<u8>, String> {
+        // A connection that stops answering is given up in 15 seconds, not at the limit.
+        ssh_run(host, command, input, limit, &["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"])
+    }
+}
+
+/// The system's `ssh` running `command` on `host`, given up after `limit`; `options` go before the host.
+fn ssh_run(host: &str, command: &str, input: &[u8], limit: Duration, options: &[&str]) -> Result<Vec<u8>, String> {
+    use std::process::{Command, Stdio};
+    if !valid_host(host) {
+        return Err("bad_ssh_host".into());
+    }
+    let mut cmd = Command::new(Ssh::exe());
+    cmd.args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15"]).args(options).args(["-T", host, command])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: this server has no console.
+    }
+    let mut child = cmd.spawn().map_err(|_| "ssh_missing".to_string())?;
+    let mut stdin = child.stdin.take().ok_or("ssh_failed")?;
+    let mut input = input.to_vec();
+    // The input may be a pairing key: this copy is wiped once sent, a best effort like `pair`'s
+    // and `receive`'s wipes (other copies of a key stay in memory until reused).
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+        input.iter_mut().for_each(|b| *b = 0);
+    });
+    let mut stdout = child.stdout.take().ok_or("ssh_failed")?;
+    let mut stderr = child.stderr.take().ok_or("ssh_failed")?;
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = (&mut stdout).take(MAX_ANSWER).read_to_end(&mut out);
+        let _ = send.send(out);
+    });
+    let errors = std::thread::spawn(move || {
+        let mut err = Vec::new();
+        let _ = (&mut stderr).take(16 * 1024).read_to_end(&mut err);
+        err
+    });
+    let Ok(out) = receive.recv_timeout(limit) else {
+        let _ = child.kill();
+        return Err("ssh_timeout".into());
+    };
+    let _ = writer.join();
+    // Standard output closed (or hit its bound): the exit follows at once, or never.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                return Err("ssh_timeout".into());
+            }
+        }
+    };
+    finished(out, status.code(), &errors.join().unwrap_or_default())
 }
 
 /// What a finished `ssh` gives: the command's output, or ssh's own failure.
@@ -311,6 +340,25 @@ fn finished(out: Vec<u8>, code: Option<i32>, err: &[u8]) -> Result<Vec<u8>, Stri
 /// Runs one of the target's tools through its `slopbar-mcp --call`; its answer or its error.
 pub fn remote_call(remote: &dyn Remote, host: &str, tool: &str, arguments: &Value) -> Result<Value, String> {
     answer(&run_there(remote, host, &["--call-b64", &asking(tool, arguments)], b"")?)
+}
+
+/// How long a relay call may take over SSH beyond the waiting it asks the target to do.
+const RELAY_MARGIN: Duration = Duration::from_secs(25);
+
+/// Sends one relay request (`RelayPlan`, `RelayStart`, `RelayState` or `RelayStop`) to the
+/// target's `slopbar-mcp --relay` (see `relay`), allowing `wait` for the waiting it asks for; its
+/// answer or its error code as the target gave it. PowerShell 7 only: a sitting makes dozens of
+/// these calls, and Windows PowerShell 5.1 started over SSH can outlive its session
+/// (`no_pwsh_over_ssh` instead). The request names accounts and ids, never a secret (a command line
+/// is visible to every process there).
+pub fn relay_call(remote: &dyn Remote, host: &str, request: &Request, wait: Duration) -> Result<Value, String> {
+    let text = serde_json::to_string(request).map_err(|e| e.to_string())?;
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, text);
+    let out = remote.run_within(host, &remote_command(&["--relay", &encoded]), b"", wait + RELAY_MARGIN)?;
+    if !String::from_utf8_lossy(&out).contains(STARTED) {
+        return Err("no_pwsh_over_ssh".into());
+    }
+    answer(&out)
 }
 
 /// `--call-b64`'s argument: the tool and its arguments, as base64 JSON.

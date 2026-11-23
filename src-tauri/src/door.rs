@@ -205,7 +205,49 @@ pub enum Request {
         /// Stop a run still going first (Retry from another computer).
         #[serde(default)]
         retry: bool,
+        /// Also every other computer of the user's this one reaches over SSH, their pages opening
+        /// here (see `relay`): without `confirm` the plan, with it a notification here asking the
+        /// person at this screen to start it.
+        #[serde(default)]
+        everywhere: bool,
     },
+    /// `slopbar-mcp --relay` only, never an MCP tool: another of the user's computers asking what
+    /// this one's "Sign in all accounts" would run now, for completing it in its own browser (see
+    /// `relay`): who this computer is, the plan (with monitoring sign-ins when `monitoring`), which
+    /// accounts it reads usage for itself, its accounts in use whose sign-ins end, and whether a
+    /// sign-in is open here.
+    RelayPlan {
+        #[serde(default)]
+        monitoring: bool,
+    },
+    /// `slopbar-mcp --relay` only: computer `from` starts sign-in `kind` of this computer's plan
+    /// for the account, under its id `step`, with no window or browser here. `machine` is the id it
+    /// expects this computer to have. Answers the step's state once its page is ready or it ended
+    /// (waiting a while for that), or `signin_busy`; the same step again starts nothing.
+    RelayStart {
+        step: String,
+        from: String,
+        machine: String,
+        kind: crate::bulk::Kind,
+        provider: Provider,
+        id: String,
+        #[serde(default)]
+        email: Option<String>,
+    },
+    /// `slopbar-mcp --relay` only: relayed sign-in `step`'s state (with its page while it waits),
+    /// after waiting up to `wait_seconds` (at most 40) for a change after `since`. Asking keeps it
+    /// going (see `relay::UNHEARD_LIMIT`).
+    RelayState {
+        step: String,
+        #[serde(default)]
+        since: u64,
+        #[serde(default)]
+        wait_seconds: u32,
+    },
+    /// `slopbar-mcp --relay` only: stops relayed sign-in `step`.
+    RelayStop { step: String },
+    /// The CLI's `BROWSER` start for a relayed sign-in (see `signin::launch_from_env`): its page.
+    RelayPage { nonce: String, url: String },
     /// Remove every account whose plan has ended (see `bulk::lapsed`). Without `confirm` only
     /// says which accounts that would be.
     RemoveLapsedAccounts {

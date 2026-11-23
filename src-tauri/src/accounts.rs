@@ -910,6 +910,12 @@ pub fn start_login_observed(provider: Provider, sources: &[Source], diagnostics:
     let source = login_source(provider, sources);
     if let Some(d) = &diagnostics { d.login(LoginStage::CliDiscovery, source.is_some(), source.is_some_and(|s| s.distro.is_some()), None, 0); }
     let source = source.ok_or("CLI not found")?.clone();
+    // A relayed sign-in's page must reach the computer completing it, which only a Windows CLI here
+    // hands over: in WSL the CLI opens its own browser.
+    let relayed = matches!(options.target, Some(crate::signin::Target::Relay(_)));
+    if relayed && source.distro.is_some() {
+        return Err("relay_unsupported".into());
+    }
     static LOGIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = format!(".slopbar-login-{}-{}-{}", std::process::id(), chrono::Utc::now().timestamp_millis(), LOGIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let target = options.target.filter(|_| source.distro.is_none());
@@ -958,16 +964,31 @@ pub fn start_login_observed(provider: Provider, sources: &[Source], diagnostics:
             if let Some(d) = &diagnostics { d.login(LoginStage::ProcessStart, true, false, None, 0); }
             return Ok(LoginJob { provider, source: login, dir, native, started: Instant::now(), child, tree: Some(tree), rpc: Some(rpc), diagnostics, finished: false });
         }
+        // `codex login` would open this computer's own browser, where nobody completes it.
+        if relayed {
+            if let Some(d) = &diagnostics { d.login(LoginStage::ProcessStart, false, false, None, 0); }
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err("relay_unsupported".into());
+        }
     }
-    let mut term = crate::login::command(provider, &source, &dir, &native, cmd, true);
+    let visible = console(target.as_ref());
+    let mut term = crate::login::command(provider, &source, &dir, &native, cmd, visible);
+    if !visible {
+        term.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    }
     let mut breakaway = false;
     if let (Provider::Claude, Some(target)) = (provider, &target) {
         if let Some(env) = crate::signin::claude_browser_env(target) {
             term.envs(env);
-            breakaway = true;
+            // The browser it opens outlives the sign-in; a relayed page opens no browser here.
+            breakaway = !relayed;
+        } else if relayed {
+            // Without `BROWSER` the CLI would open this computer's own browser, where nobody is.
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err("relay_unsupported".into());
         }
     }
-    let (child, tree) = match crate::login::ProcessTree::spawn_with(&mut term, true, breakaway) {
+    let (child, tree) = match crate::login::ProcessTree::spawn_with(&mut term, visible, breakaway) {
         Ok(process) => process,
         Err(_) => {
             if let Some(d) = &diagnostics { d.login(LoginStage::ProcessStart, false, source.distro.is_some(), None, 0); }
@@ -977,6 +998,13 @@ pub fn start_login_observed(provider: Provider, sources: &[Source], diagnostics:
     };
     if let Some(d) = &diagnostics { d.login(LoginStage::ProcessStart, true, source.distro.is_some(), None, 0); }
     Ok(LoginJob { provider, source: login, dir, native, started: Instant::now(), child, tree: Some(tree), rpc: None, diagnostics, finished: false })
+}
+
+/// Whether a CLI sign-in gets a console window of its own: it does (its terminal says what to do
+/// when the page does not open), except a relayed one, which runs where nobody looks and hands its
+/// page to the computer completing it (see `relay`).
+fn console(target: Option<&crate::signin::Target>) -> bool {
+    !matches!(target, Some(crate::signin::Target::Relay(_)))
 }
 
 /// Starts Codex's app server hidden in the sign-in folder and opens its sign-in page in `target`.
@@ -1191,6 +1219,28 @@ mod login_source_tests {
         assert_eq!(label(pick_login_source(&[(&other, false), (&windows, false)], windows_signed_in)), Some("Windows".into()));
         assert_eq!(label(pick_login_source(&[(&other, false)], |_| false)), Some("WSL: Debian".into()));
         assert_eq!(label(pick_login_source(&[], |_| true)), None);
+    }
+
+    /// A sign-in another computer completes (see `relay`) runs where nobody looks: no console
+    /// window of its own, and it never falls back to the CLI opening a browser here (`codex login`,
+    /// a CLI in WSL), which would open a page on this computer's screen.
+    #[test]
+    fn a_relayed_sign_in_gets_no_window_and_never_falls_back_to_a_browser_here() {
+        use crate::signin::Target;
+        assert!(console(None) && console(Some(&Target::Private)), "a sign-in here keeps its terminal");
+        assert!(!console(Some(&Target::Relay("00".into()))));
+        let code = crate::source_guard::tokens(include_str!("accounts.rs"));
+        let start = crate::source_guard::function(&code, "accounts.rs", "pub fn start_login_observed(", "accounts::login_source_tests (src-tauri/src/accounts.rs)");
+        for (needle, why) in [
+            ("if relayed && source.distro.is_some() { return Err(\"relay_unsupported\".into()); }", "a CLI in WSL opens its own browser"),
+            ("if relayed { if let Some(d) = &diagnostics { d.login(LoginStage::ProcessStart, false, false, None, 0); } let _ = std::fs::remove_dir_all(&dir); return Err(\"relay_unsupported\".into()); }",
+                "codex login opens this computer's browser"),
+            ("let visible = console(target.as_ref()); let mut term = crate::login::command(provider, &source, &dir, &native, cmd, visible);", "the terminal follows `console`"),
+            ("breakaway = !relayed;", "a relayed page opens no browser here to outlive the sign-in"),
+            ("} else if relayed { let _ = std::fs::remove_dir_all(&dir); return Err(\"relay_unsupported\".into()); }", "without BROWSER the CLI opens a browser here"),
+        ] {
+            assert!(crate::source_guard::has(start, &crate::source_guard::tokens(needle)), "{why}: {needle}\n{start}");
+        }
     }
 }
 

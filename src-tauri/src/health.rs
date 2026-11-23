@@ -38,6 +38,9 @@ pub enum Fix {
     /// "Sign in all accounts": among its sign-ins, a new CLI sign-in for every account not in use
     /// whose saved one ended or ends soon, one email at a time.
     SignInAll,
+    /// "Sign in all your computers from here" (see `relay`): the same for this computer and every
+    /// other one it reaches over SSH, their pages opening here, after the person's OK.
+    SignInEverywhere,
     Refresh,
     RestartApp,
     OpenSettings { page: &'static str },
@@ -182,6 +185,9 @@ pub struct Inputs<'a> {
     pub disk: Option<Disk>,
     /// How the last refresh went with WSL (see `sources::wsl_status`).
     pub wsl: crate::sources::WslStatus,
+    /// The user's other computers this one knows (paired or checked over SSH, or in the roster):
+    /// with any, the renewal summaries' fix signs them in from here too.
+    pub other_computers: usize,
 }
 
 fn place_set(sharing: &Sharing) -> bool {
@@ -368,6 +374,16 @@ struct SignIns {
     limited: Option<Provider>,
 }
 
+/// A renewal summary's reason and fix once the user has other computers: "Sign in all your
+/// computers from here" renews theirs in the same sitting, their pages opening here (`relay`).
+fn everywhere(reason: String, fix: Fix, other_computers: usize) -> (String, Fix) {
+    if other_computers == 0 || !matches!(fix, Fix::SignInAll | Fix::ConnectMonitoringAll) {
+        return (reason, fix);
+    }
+    let others = if other_computers == 1 { "your other computer's".to_string() } else { format!("your {other_computers} other computers'") };
+    (format!("{reason} Signing in from here does the same for {others} sign-ins in one sitting, their pages opening on this computer, after you confirm."), Fix::SignInEverywhere)
+}
+
 /// Whether "Sign in all accounts" makes the account a new CLI sign-in, by `now`'s dates as
 /// `bulk::needs_cli_sign_in` goes by the snapshot's: its saved one ended or ends within
 /// `RENEW_DAYS`, or the provider rejected it, and it is not in use; never a token-only account.
@@ -381,7 +397,7 @@ fn cli_due(a: &AccountUsage, now: DateTime<Utc>) -> bool {
 /// switched to it, and automatic switching never is. The account in use is a problem once its
 /// sign-in ended, since the CLI stops (an agent running it never sees the CLI's own notice), but
 /// SlopBar never signs it in: the CLI manages that sign-in.
-fn cli_sign_ins(accounts: &[AccountUsage], now: DateTime<Utc>) -> Vec<Check> {
+fn cli_sign_ins(accounts: &[AccountUsage], other_computers: usize, now: DateTime<Utc>) -> Vec<Check> {
     use crate::model::RenewalKind;
     let mut rows = vec![];
     let (mut ended, mut ending) = (0, 0);
@@ -437,7 +453,8 @@ fn cli_sign_ins(accounts: &[AccountUsage], now: DateTime<Utc>) -> Vec<Check> {
         if ending > 0 { parts.push(format!("{ending} {} soon", if ending == 1 { "ends" } else { "end" })); }
         let reason = format!("{} No setting makes it permanent. Sign in all accounts signs in the {queued} accounts not in use that need it one after another, including any ending within {RENEW_DAYS} days, so they next end together. It switches nothing, and with monitoring on it renews their monitoring sign-ins in the same sitting.",
             limited.map(sign_in_limit).unwrap_or_default());
-        let mut summary = check(CLI_RENEWAL_SUMMARY, Status::Warning, format!("CLI sign-ins: {}", parts.join(", ")), reason, Some(Fix::SignInAll));
+        let (reason, fix) = everywhere(reason, Fix::SignInAll, other_computers);
+        let mut summary = check(CLI_RENEWAL_SUMMARY, Status::Warning, format!("CLI sign-ins: {}", parts.join(", ")), reason, Some(fix));
         summary.count = Some(queued);
         rows.insert(0, summary);
     }
@@ -567,6 +584,7 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         } else {
             Fix::ConnectMonitoringAll
         };
+        let (reason, fix) = everywhere(reason, fix, inputs.other_computers);
         let mut summary = check(RENEWAL_SUMMARY, status, format!("Monitoring sign-ins: {}{covered}", parts.join(", ")), reason, Some(fix));
         summary.count = Some(sign_ins.queued);
         monitoring.insert(0, summary);
@@ -592,7 +610,7 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         checks.push(check(format!("cli:{}:{}", a.provider.key(), a.id), status, format!("{}: CLI sign-in rejected", name(a)),
             format!("The provider no longer accepts the CLI's saved sign-in for this account. {how}"), Some(fix)));
     }
-    checks.extend(cli_sign_ins(inputs.accounts, now));
+    checks.extend(cli_sign_ins(inputs.accounts, inputs.other_computers, now));
     if inputs.vault_plaintext > 0 {
         checks.push(check("vault", Status::Warning, "Saved sign-ins",
             format!("{} saved sign-in(s) could not be encrypted yet and are still stored as plaintext; SlopBar retries at each start. Check disk space and file access.", inputs.vault_plaintext),
@@ -797,6 +815,7 @@ mod tests {
         processes: Option<crate::instance::Processes>,
         disk: Option<Disk>,
         wsl: crate::sources::WslStatus,
+        other_computers: usize,
     }
 
     impl Case {
@@ -815,13 +834,14 @@ mod tests {
                 processes: Some(crate::instance::Processes { instances: 1, mcp_servers: 3 }),
                 disk: None,
                 wsl: Default::default(),
+                other_computers: 0,
             }
         }
 
         fn run(&self) -> Report {
             checks(&Inputs { accounts: &self.accounts, monitoring: &self.monitoring, refresh_minutes: 5, last_success: self.last_success,
                 door: self.door, sharing: &self.sharing, roster: self.roster, journal: self.journal, notifications: self.notifications, auto_connect: self.auto_connect,
-                vault_plaintext: self.vault_plaintext, processes: self.processes, disk: self.disk, wsl: self.wsl.clone() }, now())
+                vault_plaintext: self.vault_plaintext, processes: self.processes, disk: self.disk, wsl: self.wsl.clone(), other_computers: self.other_computers }, now())
         }
     }
 
@@ -1057,6 +1077,34 @@ mod tests {
         let r = later.run();
         assert!(r.checks.iter().all(|c| c.id != CLI_RENEWAL_SUMMARY), "one row alone needs no summary");
         assert_eq!(find(&r, "cli_signin:claude:c").status, Status::Warning);
+    }
+
+    #[test]
+    fn with_other_computers_the_renewal_summaries_sign_them_in_from_here_too() {
+        let mut case = Case::healthy();
+        case.accounts[0].cli_ends_at = Some(now() - Duration::days(2));
+        case.accounts[1].cli_ends_at = Some(now() + Duration::hours(30));
+        for id in ["a", "b"] {
+            case.monitoring.insert(format!("Claude:{id}"), MonitorState { reconnect: true, uncertain: false, ends_at: Some(now() - Duration::hours(3)) });
+        }
+        case.other_computers = 2;
+        let r = case.run();
+        for id in [CLI_RENEWAL_SUMMARY, RENEWAL_SUMMARY] {
+            let s = find(&r, id);
+            assert_eq!(s.fix, Some(Fix::SignInEverywhere), "{id}");
+            assert!(s.reason.contains("your 2 other computers' sign-ins in one sitting, their pages opening on this computer, after you confirm"), "{}", s.reason);
+        }
+        assert_eq!(find(&r, "cli_signin:claude:a").fix, Some(Fix::SignInAll), "an account's own row stays this computer's");
+        assert_eq!(serde_json::to_value(Fix::SignInEverywhere).unwrap(), serde_json::json!({ "action": "sign_in_everywhere" }));
+        case.other_computers = 1;
+        assert!(find(&case.run(), CLI_RENEWAL_SUMMARY).reason.contains("your other computer's sign-ins"));
+        // Monitoring alone, with another computer: from here as well.
+        let mut alone = Case::healthy();
+        for id in ["a", "b"] {
+            alone.monitoring.insert(format!("Claude:{id}"), MonitorState { reconnect: true, uncertain: false, ends_at: Some(now() - Duration::hours(3)) });
+        }
+        alone.other_computers = 1;
+        assert_eq!(find(&alone.run(), RENEWAL_SUMMARY).fix, Some(Fix::SignInEverywhere));
     }
 
     #[test]
