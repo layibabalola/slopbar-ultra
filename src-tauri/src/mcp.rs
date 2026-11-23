@@ -430,6 +430,46 @@ fn sanitize(value: Value) -> Value {
     }
 }
 
+/// The most characters a name (an account's email or alias, a computer, a WSL distro) takes in a
+/// sentence SlopBar words for an agent: an alias's own limit.
+pub(crate) const NAME_ROOM: usize = 64;
+/// The most characters `listed` takes for a list of names.
+pub(crate) const LIST_ROOM: usize = 120;
+
+/// `text` in at most `max` characters, the last one "…" when it was cut. For a value SlopBar words
+/// into a string an agent gets ahead of its own advice, which `sanitize` must then never cut.
+pub(crate) fn clipped(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut short: String = text.chars().take(max.saturating_sub(1)).collect();
+    short.push('…');
+    short
+}
+
+/// `names` joined with ", " in at most `LIST_ROOM` characters: each clipped to `NAME_ROOM`, as many
+/// as fit, then "and N more". For a list SlopBar words into a string an agent gets ahead of its
+/// own advice, as `clipped` is for one name.
+pub(crate) fn listed<S: AsRef<str>>(names: &[S]) -> String {
+    let mut out = String::new();
+    for (i, name) in names.iter().enumerate() {
+        let piece = format!("{}{}", if i == 0 { "" } else { ", " }, clipped(name.as_ref(), NAME_ROOM));
+        let after = names.len() - i - 1;
+        let more = if after == 0 { 0 } else { format!(" and {after} more").chars().count() };
+        // The first always fits (NAME_ROOM and the longest "and N more" are under LIST_ROOM), and
+        // each one added leaves room to say how many did not fit after it.
+        if i > 0 && out.chars().count() + piece.chars().count() + more > LIST_ROOM {
+            out.push_str(&format!(" and {} more", names.len() - i));
+            break;
+        }
+        out.push_str(&piece);
+    }
+    out
+}
+
 /// `sanitize` for one request's answer: inspect_window's `text` keeps its line breaks and the
 /// larger `WINDOW_TEXT` bound, and stays plain data; every other string is capped as usual.
 fn sanitize_answer(request: &crate::door::Request, value: Value) -> Value {
@@ -468,7 +508,7 @@ fn explain(error: &str) -> String {
         "signin_no_page" => "The sign-in page never opened (the CLI did not start its sign-in, or no browser window could open there). Check get_machine_readiness, then retry with sign_in_all.".into(),
         "CLI not found" => {
             let [claude, codex] = crate::accounts::Provider::ALL.map(crate::cli::install_hint);
-            format!("That provider's CLI is not on this computer: not on PATH (as Windows has it now), not in its installers' usual folders, and for Claude Code not in the Claude desktop app's own copy either. Ask the user to install it from PowerShell ({}: `{}`; {}: `{}`), then try again; SlopBar needs no restart for it. If the installer says its folder is not on PATH, SlopBar still finds it there; the folder belongs on the user PATH only to run the CLI in a terminal (slopbar-run included).",
+            format!("That provider's CLI is not on PATH, in its installers' usual folders or, for Claude Code, in the Claude desktop app. Have the user install it from PowerShell ({}: `{}`; {}: `{}`) and try again; SlopBar needs no restart. If the installer says its folder is not on PATH, SlopBar still finds it; only terminals need it on the user PATH (slopbar-run too).",
                 claude.0, claude.1, codex.0, codex.1)
         }
         "desktop_locked" => "Nothing was started: this computer's desktop is locked, so nobody would see the sign-in windows. Ask the user to unlock it at the screen, then try again.".into(),
@@ -1009,6 +1049,54 @@ mod tests {
         assert!(!org.chars().any(char::is_control));
         assert_eq!(org.chars().count(), MAX_TEXT);
         assert_eq!(explain("weird\nerror"), "weirderror");
+    }
+
+    /// Every text `explain` gives fits under MAX_TEXT, so it reaches the agent whole even from another
+    /// computer (run_on_machine, pair_machine, setup_sharing with ssh_host): that computer prints the
+    /// explained text, and this one's `explain` passes it on through its last arm, which cuts at the cap.
+    #[test]
+    fn every_explained_error_reaches_the_agent_whole_from_any_computer() {
+        let source = include_str!("mcp.rs").replace("\r\n", "\n");
+        let body = &source[source.find("fn explain(error: &str) -> String {").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let codes: Vec<&str> = body.lines().map(str::trim).filter(|l| l.starts_with('"') && l.contains(" => "))
+            .flat_map(|l| l.split(" => ").next().unwrap().split('|').map(|c| c.trim().trim_matches('"')))
+            .collect();
+        assert!(codes.len() > 40 && codes.contains(&"CLI not found") && codes.contains(&"not_running"), "{codes:?}");
+        // The codes that carry text, at their longest: ssh's reason (kept to 200 characters) and an
+        // rclone remote's name (64 at most, `rclone::valid_remote`).
+        let longest = [format!("ssh_failed: {}", "s".repeat(300)), format!("remote_missing_here: {}", "r".repeat(64))];
+        for code in codes.iter().map(|c| c.to_string()).chain(longest) {
+            let text = explain(&code);
+            assert!(text.chars().count() <= MAX_TEXT, "{code}: {} characters", text.chars().count());
+            // As another computer prints it and this one explains it again: nothing is cut.
+            assert_eq!(explain(&text), text, "{code}");
+        }
+    }
+
+    /// A name or a list SlopBar words ahead of its advice keeps to its room, whatever its length,
+    /// and a list counts the names it leaves out.
+    #[test]
+    fn names_and_lists_keep_to_their_room() {
+        assert_eq!(clipped("DESK-1", NAME_ROOM), "DESK-1");
+        assert_eq!((clipped("DESK-1", 6), clipped("DESK-1", 5), clipped("DESK-1", 1), clipped("DESK-1", 0)), ("DESK-1".into(), "DESK…".into(), "…".into(), String::new()));
+        let long = clipped(&"x".repeat(300), NAME_ROOM);
+        assert!(long.chars().count() == NAME_ROOM && long.ends_with('…'), "{long}");
+        assert_eq!(listed(&["DESK-1", "LAPTOP-2"]), "DESK-1, LAPTOP-2");
+        assert_eq!(listed::<&str>(&[]), "");
+        for count in [1, 2, 3, 7, 50, 1000] {
+            for len in [1, 15, 63, 64, 65, 300] {
+                let names: Vec<String> = (0..count).map(|i| format!("{i}{}", "n".repeat(len))).collect();
+                let list = listed(&names);
+                assert!(list.chars().count() <= LIST_ROOM, "{count} x {len}: {} characters", list.chars().count());
+                let (shown, more) = match list.rsplit_once(" and ") {
+                    Some((shown, more)) => (shown, more.strip_suffix(" more").unwrap().parse::<usize>().unwrap()),
+                    None => (list.as_str(), 0),
+                };
+                assert_eq!(shown.split(", ").count() + more, count, "{list}");
+                assert!(list.starts_with(&clipped(&names[0], NAME_ROOM)), "the first is always named: {list}");
+            }
+        }
     }
 
     #[test]

@@ -613,7 +613,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             let snapshot = app.state::<AppState>().snapshot.lock().unwrap().clone();
             for key in next.aliases.keys().filter(|k| !current.aliases.contains_key(*k)) {
                 if !snapshot.accounts.iter().any(|a| format!("{}:{}", a.provider.name(), a.id) == *key) {
-                    return Err(format!("no account {key:?}; alias keys are \"provider:id\" from get_usage"));
+                    return Err(no_alias_account(key));
                 }
             }
             if store_settings(&app, held, next.clone())? {
@@ -2534,6 +2534,12 @@ async fn prune_leases(app: &AppHandle) {
     if ended { leases_changed(app).await; }
 }
 
+/// update_settings' error for an alias of no account: the key the agent sent last, so a long one
+/// cuts only itself where agents read it (`mcp::MAX_TEXT`), never what to do.
+fn no_alias_account(key: &str) -> String {
+    format!("alias keys are \"provider:id\" from get_usage; no account has the key {key:?}")
+}
+
 /// Leases account `id` (else the recommended one among those nobody leased) for `purpose`, and
 /// says how to run on it: `config_dir` is its project profile, or null while it is the CLI's
 /// current sign-in.
@@ -4396,6 +4402,13 @@ mod everywhere_text_tests {
             assert!(n <= crate::mcp::MAX_TEXT, "{n} characters: {text}");
             assert!(!text.contains("  "), "one space between words: {text}");
         }
+    }
+
+    #[test]
+    fn an_alias_for_no_account_says_what_to_do_before_the_key() {
+        // However long the key an agent sent, the advice before it reaches the agent (mcp::MAX_TEXT).
+        let said = super::no_alias_account(&"k".repeat(2000));
+        assert!(said.starts_with("alias keys are \"provider:id\" from get_usage; no account has the key \"kkk"), "{}", &said[..80]);
     }
 }
 
