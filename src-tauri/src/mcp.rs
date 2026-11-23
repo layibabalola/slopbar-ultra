@@ -272,7 +272,7 @@ fn catalog() -> Vec<Tool> {
         tool("setup_sharing", "Set up sharing with Dropbox", "Connects in-use sharing to the user's Dropbox, so each of their computers sees which accounts the others use: gets rclone if no recent one (v1.60 or later) is installed (a fixed, checksum-verified download from rclone's own site, or its GitHub release when that site is down, into SlopBar's folder, never another installer; an rclone that Windows or security software will not run ends the setup instead), runs rclone's own Dropbox sign-in (rclone keeps the token in its own config; SlopBar and agents never see it), turns sharing on with that rclone remote and lists the other computers sharing there. A remote of that name that already works is used as it is; one whose access ended is signed in again, and so is one with reconnect: true (to use another Dropbox account). Only when the user asked to set up sharing: without confirm: true nothing starts and the answer says what would happen. The user signs in and clicks Allow on dropbox.com themselves (never click Allow, sign in or approve for them). rclone's access covers their whole Dropbox; SlopBar only uses its SlopBar folder there. Refused on a computer that shares through a folder (uses_folder). Answers at once: follow it with get_sharing_setup. Dropbox's page opens on the computer being set up, in its own default browser with a notification there (refused while its desktop is locked or not shown). With ssh_host, sets up that computer from this one: its SlopBar gets rclone and opens the page on its screen, so the user signs in there; the token stays with that computer's rclone, and it takes this computer's remote name when this one shares through a Dropbox remote. Only when the user asks for the page on this computer because that computer's screen is out of reach, open_here: true opens it in this computer's browser instead, through an SSH tunnel to that computer's rclone (the token still goes straight to that computer's rclone); if that computer is still getting rclone after about 150 seconds, the call answers with its state, and calling again with open_here: true joins the same setup. cancel stops a running setup (with ssh_host, that computer's).",
             schema(json!({
                 "confirm": { "type": "boolean", "description": "true to start; without it nothing starts and the answer says what would happen." },
-                "ssh_host": { "type": "string", "description": "Set up this other computer instead, as ssh reaches it; the sign-in page opens here." },
+                "ssh_host": { "type": "string", "description": "Set up this other computer instead, as ssh reaches it; Dropbox's page opens on its screen (with open_here, in this computer's browser)." },
                 "remote": { "type": "string", "description": "The rclone remote to create or use. Default: the one this computer shares through already (with ssh_host: this computer's Dropbox remote), else \"dropbox\". Keep the same name on every computer." },
                 "open_here": { "type": "boolean", "description": "With ssh_host: open Dropbox's page in this computer's browser through an SSH tunnel, instead of on that computer's screen. Only when the user asks for it." },
                 "reconnect": { "type": "boolean", "description": "Sign in to Dropbox again even when the remote works, to use another Dropbox account (the one the user's other computers use)." },
@@ -549,7 +549,7 @@ pub(crate) fn explain(error: &str) -> String {
         "sharing_setup_busy" => "A sharing setup is already running on this computer: follow it with get_sharing_setup, or stop it with setup_sharing cancel: true.".into(),
         "update_slopbar_there" => "The other computer's SlopBar predates the guided sharing setup: update it there (with automatic updates on, it updates itself), then try again.".into(),
         "tunnel_failed" => "The SSH tunnel for the Dropbox sign-in (open_here) did not open: port 53682 is in use on this computer (another rclone sign-in is waiting), or SSH could not connect. The setup on the other computer was stopped; try again once the port is free.".into(),
-        "tunnel_failed_joined" => "The SSH tunnel for the Dropbox sign-in (open_here) did not open: port 53682 is in use on this computer (another rclone sign-in is waiting), or SSH could not connect. The setup already running on the other computer goes on; once the port is free, call setup_sharing again with that ssh_host, open_here: true and confirm: true, or cancel: true to stop it.".into(),
+        "tunnel_failed_joined" => "The SSH tunnel for the Dropbox sign-in (open_here) did not open: port 53682 is in use on this computer (another rclone sign-in is waiting), or SSH could not connect. The setup already running on the other computer goes on; once the port is free, call setup_sharing again with that ssh_host, open_here: true and confirm: true. Stop it with cancel: true only if the user wants that setup stopped.".into(),
         "bad_state" | "no_sign_in_waiting" => "No Dropbox sign-in is waiting (it finished, failed or was cancelled): see get_sharing_setup.".into(),
         "not_from_a_remote_call" => "A computer reached over SSH cannot reach on to another one.".into(),
         "signin_busy" => "A sign-in is already open (or another computer is completing one of this computer's): try again when it ends.".into(),
@@ -1104,6 +1104,31 @@ mod tests {
             // As another computer prints it and this one explains it again: nothing is cut.
             assert_eq!(explain(&text), text, "{code}");
         }
+    }
+
+    /// What each `slopbar-mcp` entry that another computer reads prints when it fails: a tool's
+    /// outcome as words with its code beside them (`print_explained`, through `error_line`), the
+    /// door's own codes raw for the computer that reads them so (`print_answer`). A test of
+    /// `error_line` alone passes with the printers swapped, and the busy refusal's words would
+    /// still be recognized (`pairing::EARLIER_WORDS`) until they are reworded.
+    #[test]
+    fn each_entry_another_computer_reads_prints_as_that_computer_expects() {
+        use crate::source_guard::{calls, function, tokens};
+        let test = "each_entry_another_computer_reads_prints_as_that_computer_expects";
+        let code = tokens(include_str!("mcp.rs"));
+        for (signature, printer, never) in [
+            ("pub fn call_cli(", "print_explained", "print_answer"),
+            ("pub fn pair_receive(", "print_explained", "print_answer"),
+            ("pub fn sharing_state(", "print_answer", "print_explained"),
+            ("pub fn relay_cli(", "print_answer", "print_explained"),
+        ] {
+            let body = function(&code, "mcp.rs", signature, test);
+            assert_eq!((calls(body, printer, test).len(), calls(body, never, test).len()), (1, 0), "{signature} prints with {printer} only");
+        }
+        let explained = function(&code, "mcp.rs", "fn print_explained(", test);
+        assert_eq!(calls(explained, "error_line", test).len(), 1, "{explained}");
+        let raw = function(&code, "mcp.rs", "fn print_answer(", test);
+        assert!(calls(raw, "error_line", test).is_empty() && calls(raw, "explain", test).is_empty(), "{raw}");
     }
 
     /// Every code `explain` words, read from its source.
