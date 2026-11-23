@@ -114,6 +114,37 @@ impl Slot {
             Provider::Codex => false,
         }
     }
+
+    /// When this saved sign-in ends: the date the provider set when it was made, which renewing
+    /// never moves (Claude ends every sign-in about 30 days after it is made; Claude Code saves the
+    /// date as `refreshTokenExpiresAt`). None when the login does not say: Codex, or a login saved
+    /// by an older Claude Code.
+    pub fn ends_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self.provider {
+            Provider::Claude => self.data["credentials"]["claudeAiOauth"]["refreshTokenExpiresAt"]
+                .as_i64()
+                .and_then(chrono::DateTime::from_timestamp_millis),
+            Provider::Codex => None,
+        }
+    }
+}
+
+/// Whether an account's saved CLI sign-in, which ends at `ends` (`Slot::ends_at`), needs a new
+/// one: it ended, so switching the CLI to it would stop the CLI until it signs in again, or it ends
+/// within `monitoring::RENEW_DAYS`, so sign-ins ending a few days apart are made again in one
+/// sitting. None while the account is in use (`active`): the CLI manages that sign-in, renews it
+/// and says itself when to sign in again. SlopBar never renews a saved CLI sign-in (its refresh
+/// token never goes to a token endpoint), so there is no refusal to go by, only the date.
+pub fn cli_renewal(ends: Option<chrono::DateTime<chrono::Utc>>, active: bool, now: chrono::DateTime<chrono::Utc>) -> Option<crate::model::RenewalKind> {
+    use crate::model::RenewalKind;
+    let at = ends.filter(|_| !active)?;
+    if at <= now {
+        Some(RenewalKind::Ended)
+    } else if at <= now + chrono::Duration::days(crate::monitoring::RENEW_DAYS) {
+        Some(RenewalKind::Ending)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -359,10 +390,38 @@ fn load_slots_in(dir: &Path) -> Vec<Slot> {
     slots
 }
 
-/// Saves a login from `LoginJob::wait_isolated` in the vault, as `LoginJob::wait` does.
+/// Saves a login from `LoginJob::wait_isolated` in the vault, as `LoginJob::wait` does. A new
+/// sign-in for an account the vault already has replaces its saved login, keeping the account
+/// details only the old one carried (`keep_details`).
 pub fn store_login(slot: &Slot) -> std::io::Result<()> {
     let _guard = VAULT.lock().unwrap();
-    save_slot(slot)
+    let vault = vault_dir().ok_or_else(|| std::io::Error::other("no config dir"))?;
+    store_login_in(&vault, slot)
+}
+
+fn store_login_in(vault: &Path, slot: &Slot) -> std::io::Result<()> {
+    let mut slot = slot.clone();
+    if let Some(old) = load_slots_in(vault).into_iter().find(|s| s.provider == slot.provider && s.id == slot.id) {
+        keep_details(&mut slot, &old);
+    }
+    save_slot_in(vault, &slot)
+}
+
+/// A new Claude sign-in's account record comes from the profile API, which returns fewer fields
+/// than Claude Code saves (billingType and subscriptionCreatedAt, which `Slot::billing` reads,
+/// among them): the old login's record fills in what the new one lacks, for the same account only.
+/// The new record's own fields win. Claude Code replaces the whole record once the account is in
+/// use again.
+fn keep_details(new: &mut Slot, old: &Slot) {
+    if new.provider != Provider::Claude || new.provider != old.provider || new.id != old.id {
+        return;
+    }
+    let same = new.data["oauth_account"]["accountUuid"].as_str().is_some_and(|u| Some(u) == old.data["oauth_account"]["accountUuid"].as_str());
+    if let (true, Some(fresh), Some(saved)) = (same, new.data["oauth_account"].as_object_mut(), old.data["oauth_account"].as_object()) {
+        for (key, value) in saved {
+            fresh.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
 }
 
 fn save_slot(slot: &Slot) -> std::io::Result<()> {
@@ -1098,6 +1157,56 @@ mod profile_tests {
 
     fn stored(vault: &Path, slot: &Slot) -> Option<String> {
         load_slots_in(vault).into_iter().find(|s| s.id == slot.id).and_then(|s| refresh_token(&s).map(String::from))
+    }
+
+    /// A Claude login that says when its sign-in ends, as Claude Code 2.1.330 saves it.
+    fn ending(refresh: &str, expires: i64, ends: i64) -> Slot {
+        let mut slot = claude(refresh, expires);
+        slot.data["credentials"]["claudeAiOauth"]["refreshTokenExpiresAt"] = json!(ends);
+        slot
+    }
+
+    #[test]
+    fn a_saved_cli_sign_in_says_when_it_ends_and_whether_it_needs_a_new_one() {
+        use crate::model::RenewalKind;
+        let now = chrono::Utc::now();
+        let at = |days: i64| now + chrono::Duration::days(days);
+        let end = at(3).timestamp_millis();
+        assert_eq!(ending("r", 1, end).ends_at().map(|t| t.timestamp_millis()), Some(end));
+        assert_eq!(claude("r", 1).ends_at(), None, "a login saved by an older Claude Code says nothing");
+        assert_eq!(codex("r", "2026-10-01T00:00:00Z").ends_at(), None, "Codex gives no end");
+        assert_eq!(cli_renewal(Some(at(-1)), false, now), Some(RenewalKind::Ended));
+        assert_eq!(cli_renewal(Some(now), false, now), Some(RenewalKind::Ended), "it ends at its end");
+        assert_eq!(cli_renewal(Some(at(6)), false, now), Some(RenewalKind::Ending), "within RENEW_DAYS");
+        assert_eq!(cli_renewal(Some(at(8)), false, now), None);
+        assert_eq!(cli_renewal(None, false, now), None);
+        assert_eq!(cli_renewal(Some(at(-1)), true, now), None, "the CLI manages the sign-in in use");
+    }
+
+    #[test]
+    fn a_new_cli_sign_in_replaces_the_saved_one_and_keeps_details_only_the_old_one_had() {
+        let vault = TempDir::new();
+        let mut old = ending("r-old", 1_000, 1_000_000);
+        old.data["oauth_account"]["billingType"] = json!("stripe_subscription");
+        old.data["oauth_account"]["emailAddress"] = json!("old@example.invalid");
+        save_slot_in(&vault.0, &old).unwrap();
+        // Another account's saved login, which nothing here touches.
+        let other = claude_slot(json!({ "claudeAiOauth": { "accessToken": "at-x", "refreshToken": "r-x" }, "organizationUuid": "org-1" }),
+            Some(json!({ "accountUuid": "user-9", "organizationUuid": "org-1", "billingType": "apple" }))).unwrap();
+        save_slot_in(&vault.0, &other).unwrap();
+
+        let new = ending("r-new", 2_000, 9_000_000);
+        store_login_in(&vault.0, &new).unwrap();
+        let saved = load_slots_in(&vault.0).into_iter().find(|s| s.id == new.id).unwrap();
+        assert_eq!((refresh_token(&saved), saved.ends_at().map(|t| t.timestamp_millis())), (Some("r-new"), Some(9_000_000)));
+        assert_eq!(saved.billing().billing_type.as_deref(), Some("stripe_subscription"), "kept: the profile API does not return it");
+        assert_eq!(saved.data["oauth_account"]["emailAddress"], "test@example.invalid", "the new login's own fields win");
+        assert_eq!(stored(&vault.0, &other).as_deref(), Some("r-x"));
+        assert_eq!(load_slots_in(&vault.0).len(), 2);
+        // A first sign-in, with nothing saved before it, is saved as it is.
+        let fresh = TempDir::new();
+        store_login_in(&fresh.0, &new).unwrap();
+        assert!(load_slots_in(&fresh.0)[0].data["oauth_account"].get("billingType").is_none());
     }
 
     fn in_profile(root: &Path, slot: &Slot) -> Option<String> {

@@ -100,6 +100,7 @@ pub async fn fetch_all(
         .zip(results)
         .map(|(slot, result)| {
             let sources = active.get(&(slot.provider, slot.id.clone())).cloned().unwrap_or_default();
+            let in_use = !sources.is_empty();
             let mut acc = AccountUsage {
                 id: slot.id.clone(),
                 provider: slot.provider,
@@ -123,6 +124,10 @@ pub async fn fetch_all(
                 remote: vec![], overlap: vec![],
                 used_outside: false,
                 runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None, desktop: false, seats: None,
+                // When the saved CLI sign-in ends, and whether it needs a new one while the
+                // account is not in use (the CLI manages the one in use).
+                cli_ends_at: slot.ends_at(),
+                cli_renewal: crate::accounts::cli_renewal(slot.ends_at(), in_use, now),
             };
             let entry = cache.entry(monitoring::key(slot)).or_default();
             match result {
@@ -482,6 +487,40 @@ mod tests {
         assert_eq!(by("soon:org").monitor_renewal, Some(RenewalKind::Ending), "ends within RENEW_DAYS");
         assert_eq!(by("later:org").monitor_renewal, None);
         assert_eq!(by("later:org").monitor_ends_at.map(|t| t.timestamp_millis()), Some(later.timestamp_millis()));
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_says_when_a_saved_cli_sign_in_ends_and_whether_one_not_in_use_needs_a_new_one() {
+        let dir = TempDir::new();
+        let monitor = Monitor::new(dir.0.clone());
+        let ended = Utc::now() - chrono::Duration::days(1);
+        let soon = Utc::now() + chrono::Duration::days(2);
+        let later = Utc::now() + chrono::Duration::days(20);
+        let (mut accounts, mut cache) = (vec![], Cache::new());
+        for (id, ends) in [("ended:org", Some(ended)), ("soon:org", Some(soon)), ("later:org", Some(later)), ("unknown:org", None), ("in-use:org", Some(ended))] {
+            let mut cli = slot(id, "cli-access", &format!("cli-refresh-{id}"), 0);
+            if let Some(t) = ends {
+                cli.data["credentials"]["claudeAiOauth"]["refreshTokenExpiresAt"] = serde_json::json!(t.timestamp_millis());
+            }
+            // Its last reading stands in for this refresh's: nothing goes to the network.
+            let mut entry = observed(10.0);
+            entry.blocked_until = Some(Utc::now() + chrono::Duration::hours(1));
+            cache.insert(monitoring::key(&cli), entry);
+            accounts.push(cli);
+        }
+        let mut active = Active::new();
+        active.insert((Provider::Claude, "in-use:org".to_string()), vec!["Windows".into()]);
+        let results = fetch_all(&crate::net::builder().build().unwrap(), &accounts, &active, &mut cache, &Settings::default(), &monitor).await;
+        let by = |id: &str| results.iter().find(|a| a.id == id).unwrap();
+        let ms = |t: Option<DateTime<Utc>>| t.map(|t| t.timestamp_millis());
+        use crate::model::RenewalKind;
+        assert_eq!((by("ended:org").cli_renewal, ms(by("ended:org").cli_ends_at)), (Some(RenewalKind::Ended), Some(ended.timestamp_millis())));
+        assert_eq!(by("soon:org").cli_renewal, Some(RenewalKind::Ending), "ends within RENEW_DAYS");
+        assert_eq!((by("later:org").cli_renewal, ms(by("later:org").cli_ends_at)), (None, Some(later.timestamp_millis())));
+        assert_eq!((by("unknown:org").cli_renewal, by("unknown:org").cli_ends_at), (None, None), "an older Claude Code saved no end");
+        let in_use = by("in-use:org");
+        assert!(in_use.active);
+        assert_eq!((in_use.cli_renewal, ms(in_use.cli_ends_at)), (None, Some(ended.timestamp_millis())), "the CLI manages the sign-in in use");
     }
 
     #[tokio::test]

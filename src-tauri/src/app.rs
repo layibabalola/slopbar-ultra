@@ -970,9 +970,11 @@ fn forget_pending(provider: Provider, id: &str) {
     }
 }
 
-/// Signs a restored account in again, as "Add account" does, but only as that account: a login
-/// of any other account is not saved and is revoked, the way monitoring rejects a wrong account.
-/// Returns once the user is done.
+/// Signs a restored account in again, or makes a new CLI sign-in for an account whose saved one
+/// ended or ends soon (`bulk::Kind::Renew`), as "Add account" does, but only as that account: a
+/// login of any other account is not saved and is revoked, the way monitoring rejects a wrong
+/// account. The new login replaces the vault's saved one; nothing is signed out, and the CLI's own
+/// files are never written. Returns once the user is done.
 async fn add_expected(app: &AppHandle, expected: &bulk::Step, session: Option<&signin::Session>) -> Result<(), String> {
     let provider = expected.target.provider;
     let _operation = app.state::<AppState>().account_operations.begin(provider, "add-account")?;
@@ -1119,6 +1121,16 @@ async fn monitor_held(app: &AppHandle, target: &bulk::Target) -> Option<health::
     app.state::<AppState>().monitor.health(&[(target.provider, target.id.clone())]).await.into_values().next()
 }
 
+/// Whether an account's saved CLI sign-in still needs a new one (`accounts::cli_renewal`), read
+/// from the vault itself, where a sign-in that finished shows at once, before any refresh does. Not
+/// once the account is in use: the CLI manages that sign-in.
+fn cli_sign_in_due(app: &AppHandle, target: &bulk::Target) -> bool {
+    let active = app.state::<AppState>().snapshot.lock().unwrap().accounts.iter()
+        .any(|a| a.provider == target.provider && a.id == target.id && a.active);
+    accounts::load_slots().into_iter().find(|s| s.provider == target.provider && s.id == target.id)
+        .is_some_and(|s| accounts::cli_renewal(s.ends_at(), active, chrono::Utc::now()).is_some())
+}
+
 /// Updates "Connect monitoring for all" and tells Settings.
 fn publish_bulk(app: &AppHandle, change: impl FnOnce(&mut BulkConnect)) {
     let state = app.state::<AppState>();
@@ -1181,7 +1193,7 @@ async fn wait_for_sign_in_change(app: &AppHandle, revision: u64, wait: Duration)
 /// Queues a monitoring sign-in for every account that needs one (`bulk::needs_sign_in`: none yet,
 /// or one ended, refused or ending soon; see `run_sign_ins`). Returns the queued accounts.
 async fn connect_all(app: &AppHandle) -> Result<Vec<bulk::Target>, String> {
-    let groups = bulk::sign_in_plan(&app.state::<AppState>().snapshot.lock().unwrap(), &[], true);
+    let groups = bulk::connect_plan(&app.state::<AppState>().snapshot.lock().unwrap());
     let targets = groups.iter().flat_map(|g| g.steps.iter().map(|s| s.target.clone())).collect();
     run_sign_ins(app, groups, false, true)?;
     Ok(targets)
@@ -1281,10 +1293,11 @@ async fn page_opened(session: Option<&signin::Session>, since: std::time::System
     }
 }
 
-/// What a sign-in is, as an email's page lists it: "Claude", "Codex monitoring".
+/// What a sign-in is, as an email's page lists it: "Claude" (the account's own sign-in, new or
+/// made again), "Codex monitoring".
 fn step_name(lang: &str, step: &bulk::Step) -> String {
     let provider = match step.target.provider { Provider::Claude => "Claude", Provider::Codex => "Codex" };
-    let key = if step.kind == bulk::Kind::Add { "signinPageStepAdd" } else { "signinPageStepConnect" };
+    let key = if step.kind == bulk::Kind::Connect { "signinPageStepConnect" } else { "signinPageStepAdd" };
     crate::i18n::t(lang, key, &[("provider", provider)])
 }
 
@@ -1382,6 +1395,8 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     let account = snapshot.accounts.iter().find(|a| a.provider == target.provider && a.id == target.id);
                     match step.kind {
                         bulk::Kind::Add => account.is_none(),
+                        // Never once the account is in use: the CLI manages that sign-in.
+                        bulk::Kind::Renew => account.is_some_and(bulk::needs_cli_sign_in),
                         bulk::Kind::Connect => account.map_or(added.contains(&(target.provider, &target.id)), bulk::needs_sign_in),
                     }
                 };
@@ -1420,6 +1435,13 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                         continue;
                     }
                 }
+                // Likewise a CLI sign-in made meanwhile (this run's or Add account's), which the
+                // vault holds at once, or a switch to the account, which the snapshot shows.
+                if !stopped && step.kind == bulk::Kind::Renew && !cli_sign_in_due(&h, target) {
+                    mark(at, StepState::Skipped, None);
+                    page.steps[in_group].1 = signin::PageStep::Skipped;
+                    continue;
+                }
                 let session = group_session.get_or_insert_with(|| {
                     let session = signin_session(&h);
                     if let (Some(s), Some(email)) = (session.as_deref(), group.email.as_deref()) {
@@ -1434,7 +1456,9 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                 let since = std::time::SystemTime::now();
                 let run = async {
                     match step.kind {
-                        bulk::Kind::Add => add_expected(&h, step, session.as_deref()).await,
+                        // A new CLI sign-in saved in the vault: a pending account's, or one for an
+                        // account whose saved sign-in ended or ends soon.
+                        bulk::Kind::Add | bulk::Kind::Renew => add_expected(&h, step, session.as_deref()).await,
                         bulk::Kind::Connect => {
                             // The user asked for these, so they count as manual starts, never automatic ones.
                             let key = format!("{}:{}", target.provider.name(), target.id);
@@ -1456,7 +1480,7 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                 let account = target.account.clone().unwrap_or_default();
                 if by_email && !stopped {
                     let (g, e, i, n) = ((index + 1).to_string(), groups.len().to_string(), done.to_string(), total.to_string());
-                    let key = if step.kind == bulk::Kind::Add { "signInAllAdding" } else { "signInAllConnecting" };
+                    let key = if step.kind == bulk::Kind::Connect { "signInAllConnecting" } else { "signInAllAdding" };
                     sign_in_notice(&h, key, &[("g", &g), ("e", &e), ("i", &i), ("n", &n), ("account", &account)]);
                 }
                 let mut run = Box::pin(run);

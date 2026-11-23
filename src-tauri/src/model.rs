@@ -80,6 +80,19 @@ pub struct AccountUsage {
     /// soon as that login is renewed or works again; the CLI signs in again on its own.
     #[serde(default)]
     pub cli_rejected: bool,
+    /// When the account's saved CLI sign-in (its vault slot) ends: the date the provider set when
+    /// it was made (Claude: about 30 days later; Claude Code saves it as `refreshTokenExpiresAt`).
+    /// Renewing never moves it; only a new sign-in does. None when the saved login does not say
+    /// (Codex, or a login saved by an older Claude Code).
+    #[serde(default)]
+    pub cli_ends_at: Option<DateTime<Utc>>,
+    /// The saved CLI sign-in of an account not in use needs a new sign-in (see
+    /// `accounts::cli_renewal`): it "ended", so switching the CLI to it would stop the CLI until it
+    /// signs in again, or is "ending" (within `monitoring::RENEW_DAYS`, at `cli_ends_at`). "Sign in
+    /// all accounts" signs it in again as a new CLI login for the same account. Never set for the
+    /// account in use: the CLI manages that sign-in.
+    #[serde(default)]
+    pub cli_renewal: Option<RenewalKind>,
     /// Claude: pay-as-you-go use beyond the plan's limits this month, when the usage endpoint
     /// reported it (see `providers::claude::extra_usage`).
     #[serde(default)]
@@ -98,7 +111,9 @@ pub struct AccountUsage {
     pub seats: Option<SeatDrift>,
 }
 
-/// Why a connected account's monitoring needs a new sign-in (`AccountUsage::monitor_renewal`).
+/// Why a sign-in needs a new one: a connected account's monitoring sign-in
+/// (`AccountUsage::monitor_renewal`), or the saved CLI sign-in of an account not in use
+/// (`AccountUsage::cli_renewal`, which is never `Refused`: SlopBar never renews that sign-in).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RenewalKind {

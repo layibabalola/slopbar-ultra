@@ -43,6 +43,14 @@ pub fn to_connect(snapshot: &Snapshot) -> Vec<Target> {
     snapshot.accounts.iter().filter(|a| needs_sign_in(a)).map(|a| target(a, None)).collect()
 }
 
+/// Whether an account's saved CLI sign-in needs a new one that "Sign in all accounts" makes: it
+/// ended or ends within `monitoring::RENEW_DAYS` (`AccountUsage::cli_renewal`), and the account is
+/// not in use, whose sign-in the CLI manages. Never one known only by a token hash (`token:` ids):
+/// there is no account to check a new sign-in against, so it would only fail and stop the queue.
+pub fn needs_cli_sign_in(a: &AccountUsage) -> bool {
+    a.cli_renewal.is_some() && !a.active && !a.id.starts_with("token:")
+}
+
 /// The day an account's plan ended, if it has: the user's last paid day is past, or the provider
 /// said the plan would not renew and its end has passed.
 pub fn ended(a: &AccountUsage, settings: &Settings, now: DateTime<Utc>) -> Option<NaiveDate> {
@@ -92,11 +100,13 @@ pub fn add_pending(list: &mut Vec<Pending>, restored: impl IntoIterator<Item = P
 }
 
 /// One sign-in of "Sign in all accounts": `Add` saves a pending account's login in the vault (the
-/// account appears), `Connect` gives an account its monitoring sign-in.
+/// account appears), `Renew` saves a new CLI login for an account whose saved one ended or ends soon
+/// (`needs_cli_sign_in`) the same way, and `Connect` gives an account its monitoring sign-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Add,
+    Renew,
     Connect,
 }
 
@@ -117,7 +127,8 @@ pub struct Group {
     pub steps: Vec<Step>,
 }
 
-/// What "Sign in all accounts" does: every pending account signed in again, and, with
+/// What "Sign in all accounts" does: every pending account signed in again, a new CLI sign-in for
+/// each account not in use whose saved one ended or ends soon (`needs_cli_sign_in`), and, with
 /// `monitoring`, a monitoring sign-in for each account that needs one (`needs_sign_in`: none yet,
 /// or one ended, refused or ending soon), grouped by email in the order the emails first appear.
 /// Within an email: Claude before Codex, each account's own sign-in before its monitoring one. An
@@ -134,11 +145,27 @@ pub fn sign_in_plan(snapshot: &Snapshot, pending: &[Pending], monitoring: bool) 
             steps.push(Step { kind: Kind::Connect, target, email: p.email.clone() });
         }
     }
-    if monitoring {
-        for a in snapshot.accounts.iter().filter(|a| needs_sign_in(a)) {
+    for a in &snapshot.accounts {
+        if needs_cli_sign_in(a) {
+            steps.push(Step { kind: Kind::Renew, target: target(a, None), email: a.email.clone() });
+        }
+        if monitoring && needs_sign_in(a) {
             steps.push(Step { kind: Kind::Connect, target: target(a, None), email: a.email.clone() });
         }
     }
+    by_email(steps)
+}
+
+/// What "Connect monitoring for all" does: a monitoring sign-in for each account that needs one
+/// (`needs_sign_in`), grouped as `sign_in_plan` groups them. Never a CLI sign-in: that is "Sign in
+/// all accounts".
+pub fn connect_plan(snapshot: &Snapshot) -> Vec<Group> {
+    by_email(snapshot.accounts.iter().filter(|a| needs_sign_in(a))
+        .map(|a| Step { kind: Kind::Connect, target: target(a, None), email: a.email.clone() }).collect())
+}
+
+/// Steps grouped by email in the order the emails first appear, Claude before Codex within one.
+fn by_email(steps: Vec<Step>) -> Vec<Group> {
     let key = |s: &Step| s.email.as_deref().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty())
         .unwrap_or_else(|| format!("\0{}:{}", s.target.provider.key(), s.target.id));
     let mut groups: Vec<(String, Group)> = Vec::new();
@@ -288,6 +315,39 @@ mod tests {
             (Some("refused@example.invalid"), vec!["Connect codex refused".to_string()]),
         ]);
         assert!(sign_in_plan(&snapshot, &[], false).is_empty(), "without monitoring, nothing to sign in");
+    }
+
+    #[test]
+    fn a_saved_cli_sign_in_that_ended_or_ends_soon_is_signed_in_again_before_its_monitoring() {
+        use crate::model::RenewalKind;
+        let mut ended = account("ended", false, true);
+        ended.cli_renewal = Some(RenewalKind::Ended);
+        ended.monitor_renewal = Some(RenewalKind::Ended);
+        // The same email's Codex account, listed first: Claude's sign-ins still come first.
+        let mut codex = account("cx", false, false);
+        codex.provider = Provider::Codex;
+        codex.email = ended.email.clone();
+        let mut ending = account("ending", false, true);
+        ending.cli_renewal = Some(RenewalKind::Ending);
+        // Never set for the account in use (`accounts::cli_renewal`); were it set, still never touched.
+        let mut in_use = account("in-use", true, true);
+        in_use.cli_renewal = Some(RenewalKind::Ended);
+        let mut token = account("token:abc", false, true);
+        token.cli_renewal = Some(RenewalKind::Ended);
+        let snapshot = Snapshot { accounts: vec![codex, ended, ending, in_use, token, account("fine", false, true)], updated_at: None };
+        assert_eq!(summary(&sign_in_plan(&snapshot, &[], true)), [
+            (Some("ended@example.invalid"), vec!["Renew claude ended".to_string(), "Connect claude ended".into(), "Connect codex cx".into()]),
+            (Some("ending@example.invalid"), vec!["Renew claude ending".to_string()]),
+        ], "the account in use and a token-only account are never signed in again");
+        assert_eq!(summary(&sign_in_plan(&snapshot, &[], false)), [
+            (Some("ended@example.invalid"), vec!["Renew claude ended".to_string()]),
+            (Some("ending@example.invalid"), vec!["Renew claude ending".to_string()]),
+        ], "a CLI sign-in is not monitoring: it is made without the monitoring box too");
+        assert_eq!(summary(&connect_plan(&snapshot)), [
+            (Some("ended@example.invalid"), vec!["Connect claude ended".to_string(), "Connect codex cx".into()]),
+        ], "Connect monitoring for all never makes a CLI sign-in");
+        assert_eq!(serde_json::to_value(Kind::Renew).unwrap(), "renew");
+        assert!(needs_cli_sign_in(&snapshot.accounts[1]) && !needs_cli_sign_in(&snapshot.accounts[3]) && !needs_cli_sign_in(&snapshot.accounts[4]));
     }
 
     #[test]

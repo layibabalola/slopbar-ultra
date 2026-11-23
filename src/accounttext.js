@@ -55,6 +55,19 @@ const PROVIDER_NAME = { claude: "Claude", codex: "Codex" };
 const ago = (iso, now) => duration(Math.max(1, Math.round((now - new Date(iso)) / 60000)));
 
 /**
+ * The saved CLI sign-in of an account not in use that ended, or ends within 7 days
+ * (`cli_renewal`, from `accounts::cli_renewal`): a short label and the hint that says why using it
+ * would stop the CLI and what signs it in again. Null when there is nothing to say.
+ */
+export function cliSignInText(a, now = Date.now()) {
+  if (!a.cli_renewal || !a.cli_ends_at) return null;
+  const d = shortDate(a.cli_ends_at);
+  if (a.cli_renewal === "ended") return { ended: true, label: t("cliSignInEnded"), hint: t("cliSignInEndedHint", { d }) };
+  const left = duration(Math.max(1, Math.round((new Date(a.cli_ends_at) - now) / 60000)));
+  return { ended: false, label: t("cliSignInEnding", { t: left }), hint: t("cliSignInEndingHint", { d }) };
+}
+
+/**
  * Everything known about an account, as groups of lines (empty groups and fields left out):
  * who it is, where it is in use, each usage window with its reset, the forecast, how current the
  * reading is and whether monitoring works, credits and resets held, and the plan's renewal,
@@ -90,10 +103,12 @@ export function accountTipLines(a, { sub = null, trail = null, creditAdvice = ""
     trail?.length ? sparklineText(trail) : "",
   ]);
 
+  const cli = cliSignInText(a, now);
   groups.push([
     a.fetched_at ? t("lastObserved", { t: ago(a.fetched_at, now) }) + (a.stale ? ` · ${t("lastReading")}` : "") : "",
     accountErrorText(provider, a),
     t(a.monitor_connected ? "tipMonitorOn" : "tipMonitorOff"),
+    cli ? `${cli.label}: ${cli.hint}` : "",
   ]);
 
   groups.push([

@@ -165,7 +165,7 @@ pub fn open(bytes: &[u8], passphrase: &Passphrase, keys: &mut HashMap<String, [u
     if let Some(run) = roster.run.as_mut() {
         let one_of = |s: &String, words: &[&str]| words.contains(&s.as_str());
         let code = |s: &String| s.len() <= 200 && !s.chars().any(char::is_control);
-        run.steps.retain(|s| one_of(&s.kind, &["add", "connect"]) && one_of(&s.state, &["pending", "running", "done", "skipped", "failed"])
+        run.steps.retain(|s| one_of(&s.kind, &["add", "renew", "connect"]) && one_of(&s.state, &["pending", "running", "done", "skipped", "failed"])
             && s.account.as_ref().is_none_or(fits) && s.error.as_ref().is_none_or(code));
         run.steps.truncate(MAX_STEPS);
         if run.error.as_ref().is_some_and(|e| !code(e)) {

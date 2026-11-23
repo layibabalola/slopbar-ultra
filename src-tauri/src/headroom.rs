@@ -277,6 +277,10 @@ fn name(label: &Option<String>, id: &str) -> String {
 
 /// Why an account cannot take a job, or None when it can be ranked.
 fn exclusion(acc: &AccountUsage, settings: &Settings, now: DateTime<Utc>) -> Option<String> {
+    // Switching the CLI to it would stop the CLI until it signs in again (`accounts::cli_renewal`).
+    if crate::accounts::cli_renewal(acc.cli_ends_at, acc.active, now) == Some(crate::model::RenewalKind::Ended) {
+        return Some("its saved CLI sign-in ended: the CLI would stop until it signs in again (Sign in all accounts renews it)".into());
+    }
     if acc.error.is_some() { return Some("its last reading failed".into()); }
     if stale(acc, settings, now) { return Some("its reading is stale".into()); }
     if acc.windows.is_empty() { return Some("no usage measured yet".into()); }
@@ -413,7 +417,7 @@ mod tests {
             id: id.into(), provider: Provider::Claude, email: Some(format!("{id}@example.invalid")), alias: None, plan: Some("max".into()), org: None,
             active, sources: vec![], windows: vec![window("session", 10.0, 3), window("weekly", weekly, weekly_resets_in_hours)],
             credits: None, resets: vec![], error: None, monitor_error: None, stale: false,
-            fetched_at: Some(at(NOW) - Duration::minutes(2)), monitor_connected: true, monitor_ends_at: None, monitor_renewal: None, billing: Default::default(), remote: vec![], overlap: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None, desktop: false, seats: None,
+            fetched_at: Some(at(NOW) - Duration::minutes(2)), monitor_connected: true, monitor_ends_at: None, monitor_renewal: None, billing: Default::default(), remote: vec![], overlap: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None,
         }
     }
 
@@ -477,6 +481,25 @@ mod tests {
         acc.fetched_at = Some(now);
         recent.record(&[acc.clone()], now);
         assert_eq!(recent.pace(&acc, "weekly", now), None);
+    }
+
+    #[test]
+    fn an_account_whose_saved_cli_sign_in_ended_is_never_switched_to() {
+        let now = at(NOW);
+        let settings = Settings::default();
+        let mut current = account("current", true, 96.0, 120);
+        // The CLI manages the sign-in in use, so its own end never excludes it.
+        current.cli_ends_at = Some(now - Duration::days(1));
+        let mut ended = account("ended", false, 5.0, 20);
+        ended.cli_ends_at = Some(now - Duration::hours(1));
+        let mut soon = account("soon", false, 10.0, 30);
+        soon.cli_ends_at = Some(now + Duration::days(2));
+        let rec = recommend(&[current, ended, soon], &settings, Provider::Claude, None, None, now);
+        let left_out = rec.excluded.iter().find(|e| e.id == "ended").unwrap();
+        assert!(left_out.reason.starts_with("its saved CLI sign-in ended"), "{}", left_out.reason);
+        assert!(rec.excluded.iter().all(|e| e.id != "current" && e.id != "soon"), "one in use, or still working, stays a candidate");
+        assert_eq!(rec.recommended.as_deref(), Some("soon"));
+        assert!(rec.ranking.iter().all(|c| c.id != "ended"), "automatic switching picks from the ranking");
     }
 
     #[test]
