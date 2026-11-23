@@ -61,8 +61,9 @@ MEGA, S3, WebDAV, SFTP and the other rclone backends. rclone keeps its own confi
   The account roster (`SlopBar/roster`, `roster::Syncer`) uses the same three calls. On Dropbox,
   Google Drive, OneDrive and Box its listing adds `--hash`: those clouds list each file's content
   hash with no extra request (rclone would compute it by reading every file elsewhere, so other
-  remotes are not asked). A roster listed with the same hash and size as the copy the last read
-  kept is not downloaded again, at any pace, so a read costs the listing and one `cat` per roster
+  remotes are not asked). A roster listed with the same strong hash (Dropbox's, MD5, SHA-1 or
+  SHA-256; not OneDrive's quickxor, which other bytes can be made to match) and size as the copy
+  the last read kept is not downloaded again, at any pace, so a read costs the listing and one `cat` per roster
   that changed; a forced read (`sync_roster`) downloads every file. Modelled for a machine with two
   others, refreshing every 5 minutes (`rclone::tests::an_hour_of_roster_reads_over_rclone_starts_fewer_processes`),
   roster processes an hour go from 24 to 6 when nothing changes, 28 to 18 when readings change all

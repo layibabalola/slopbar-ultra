@@ -479,10 +479,15 @@ struct Entry {
     hashes: std::collections::BTreeMap<String, String>,
 }
 
+/// The hash kinds a file is known by: ones nobody can match with other bytes of the same size.
+/// OneDrive's quickxor (all OneDrive Business lists) is not one: whoever can write to the folder
+/// could make other bytes list as a kept file, and the reader would keep the copy it has.
+const STRONG_HASHES: [&str; 7] = ["blake3", "dropbox", "md5", "sha1", "sha256", "sha512", "whirlpool"];
+
 impl Entry {
-    /// Its hashes as one string, in kind order; none when the listing gave none.
+    /// Its strong hashes as one string, in kind order; none when the listing gave none.
     fn hash(&self) -> Option<String> {
-        let all: Vec<String> = self.hashes.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| format!("{k}:{v}")).collect();
+        let all: Vec<String> = self.hashes.iter().filter(|(k, v)| STRONG_HASHES.contains(&k.as_str()) && !v.is_empty()).map(|(k, v)| format!("{k}:{v}")).collect();
         (!all.is_empty()).then(|| all.join(","))
     }
 }
@@ -516,8 +521,8 @@ mod tests {
     struct Fake {
         files: Mutex<BTreeMap<String, Vec<u8>>>,
         /// The remote's kind (`Runner::kind`): one of `cloud`'s known kinds lists content hashes
-        /// with `--hash` (a SHA-256 of the bytes, as Dropbox's is one of blocks of them), except for
-        /// the files in `hashless`.
+        /// with `--hash` (a SHA-256 of the bytes, as Dropbox's is one of blocks of them; OneDrive's a
+        /// quickxor), except for the files in `hashless`.
         kind: Option<String>,
         hashless: Mutex<Vec<String>>,
         /// Each upload's modification time, in seconds after a fixed time: every upload takes the
@@ -563,7 +568,8 @@ mod tests {
                             if hashes {
                                 use sha2::{Digest, Sha256};
                                 let hash: String = Sha256::digest(v).iter().map(|b| format!("{b:02x}")).collect();
-                                entry["Hashes"] = if hashless.contains(k) { serde_json::json!({}) } else { serde_json::json!({ "dropbox": hash }) };
+                                let kind = if self.kind.as_deref() == Some("onedrive") { "quickxor" } else { "dropbox" };
+                                entry["Hashes"] = if hashless.contains(k) { serde_json::json!({}) } else { serde_json::json!({ kind: hash }) };
                             }
                             entry
                         }))
@@ -749,16 +755,19 @@ mod tests {
         assert_eq!(cats(&mut me, min(104), false, false), 1, "listed with a hash again: read once more (nothing was kept of it without one), then known");
         assert_eq!(cats(&mut me, min(114), false, false), 0);
         // A remote whose listing carries no hashes (S3, WebDAV, SFTP, local: rclone would compute
-        // them by reading every file) is not asked for them, and every file is downloaded.
-        let plain = Rclone::with("cloud", Fake { kind: Some("sftp".into()), ..Fake::default() });
-        peer_writes(&plain, &key, IDLE, "IDLE-PC", 20.0, at(0), None);
-        let mut other = Syncer::default();
-        for m in [0, 10, 20] {
-            other.sync(&plain, &passphrase, (ME, "DESK-1"), &mine, at(min(m)), false, false);
+        // them by reading every file) is not asked for them, and every file is downloaded; nor does a
+        // weak hash (OneDrive's quickxor, which other bytes can be made to match) stand for a file.
+        for (kind, asked) in [("sftp", false), ("onedrive", true)] {
+            let plain = Rclone::with("cloud", Fake { kind: Some(kind.into()), ..Fake::default() });
+            peer_writes(&plain, &key, IDLE, "IDLE-PC", 20.0, at(0), None);
+            let mut other = Syncer::default();
+            for m in [0, 10, 20] {
+                other.sync(&plain, &passphrase, (ME, "DESK-1"), &mine, at(min(m)), false, false);
+            }
+            let calls = plain.runner.calls.lock().unwrap().clone();
+            assert!(calls.iter().filter(|c| c.starts_with("lsjson ")).all(|c| c.contains("--hash") == asked), "{kind}: {calls:?}");
+            assert_eq!(calls.iter().filter(|c| c.starts_with("cat ")).count(), 1 + 2 + 2, "{kind}: {calls:?}");
         }
-        let calls = plain.runner.calls.lock().unwrap().clone();
-        assert!(calls.iter().filter(|c| c.starts_with("lsjson ")).all(|c| !c.contains("--hash")), "{calls:?}");
-        assert_eq!(calls.iter().filter(|c| c.starts_with("cat ")).count(), 1 + 2 + 2, "{calls:?}");
     }
 
     /// This machine's own roster as the cloud has it: an older copy put back at the same size is
