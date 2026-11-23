@@ -1092,11 +1092,12 @@ pub struct LoginJob {
 }
 
 impl LoginJob {
-    /// Where its page opens: the target it was given when its CLI hands the page to SlopBar there
-    /// (Codex's app server, or Claude Code's `BROWSER`), so it also does when started again; None
-    /// when the CLI opens its own browser, whatever window was asked for (a CLI found only in WSL,
-    /// a Codex that fell back to `codex login`, no `BROWSER` to give). A run's watches follow this,
-    /// never the window it asked for (see `app::Placed`).
+    /// Where its page opens: the target it was given when its CLI hands the page to SlopBar to open
+    /// there (Codex's app server, whose page SlopBar opened before the job was made; Claude Code
+    /// given `BROWSER`, which hands it over once the CLI is up, also when started again); None when
+    /// the CLI opens its own browser, whatever window was asked for (a CLI run in WSL, a Codex
+    /// that fell back to `codex login`, no `BROWSER` to give). A run's watches follow this, never the
+    /// window it asked for (see `app::Placed`).
     pub fn opens_in(&self) -> Option<&crate::signin::Target> {
         self.opens_in.as_ref()
     }
@@ -1403,7 +1404,7 @@ mod login_source_tests {
     /// A started sign-in says where its page really opens (`LoginJob::opens_in`), whatever window it
     /// was asked for: in that target only when its CLI hands the page to SlopBar there (Codex's app
     /// server, or Claude Code given `BROWSER`), and so again when it starts again; never through a
-    /// CLI found only in WSL, which is given no target and opens its own browser, nor through
+    /// CLI run in WSL, which is given no target and opens its own browser, nor through
     /// `codex login`, which ignores `BROWSER`. A run watches the email's profile by what this says,
     /// never by what it asked for (see `app::Placed`): a run that did stopped with `signin_no_page`
     /// after 40 s while the page waited in the default browser.
@@ -1417,8 +1418,11 @@ mod login_source_tests {
         assert_eq!(count(start, "opens_in"), 3, "each says where its page opens, once\n{start}");
         for (needle, why) in [
             ("let target = options.target.filter(|_| source.distro.is_none());", "a CLI in WSL is given no target"),
+            ("if let Ok((child, tree, rpc)) = start_codex_app(&source, &dir, &native, target) {", "the app server's page opens in the target it says"),
             ("return Ok(LoginJob { provider, source: login, dir, native, started: Instant::now(), child, tree: Some(tree), rpc: Some(rpc), again: None, diagnostics, finished: false, opens_in: Some(target.clone()) });",
                 "Codex's app server hands its page to SlopBar, which opens it in the target"),
+            ("if let (Provider::Claude, Some(target)) = (provider, &target) { if let Some(env) = crate::signin::claude_browser_env(target) { start.env = Some(env);",
+                "only Claude Code is given `BROWSER`: `codex login` ignores it, so its page opens in the default browser"),
             ("let opens_in = start.env.as_ref().and(target); let again = start.env.is_some().then_some(start);",
                 "the CLI itself opens its page in the target only through `BROWSER`"),
             ("Ok(LoginJob { provider, source: login, dir, native, started: Instant::now(), child, tree: Some(tree), rpc: None, again, diagnostics, finished: false, opens_in })",
@@ -1426,6 +1430,7 @@ mod login_source_tests {
         ] {
             assert!(has(start, needle), "{why}: {needle}\n{start}");
         }
+        assert_eq!(count(start, "start.env ="), 1, "`BROWSER` is given in one place, Claude Code's\n{start}");
         // Started again for another port, it opens where it did: through the same `BROWSER`.
         let again = function(&code, "accounts.rs", "fn start_again(&mut self)", T);
         assert!(!has(again, "opens_in"), "{again}");
