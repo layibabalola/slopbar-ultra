@@ -178,6 +178,11 @@ struct BulkConnect {
     left_out: Vec<relay::Skipped>,
     /// Accounts in use on a computer whose CLI sign-in ended or ends soon: no sitting renews them.
     in_use: Vec<relay::InUse>,
+    /// While the run goes, the window the current email's sign-ins open in here, read as its turn
+    /// started (see `EmailWindow`), which the setting no longer says once changed; another
+    /// computer's sign-ins open in a browser window here whatever it is. None once the run ends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window: Option<signin::Window>,
 }
 
 /// "Retry this sign-in" for a run's open sign-in (Settings > Accounts, or Retry on the
@@ -689,10 +694,8 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             let held = state.settings_lock.lock().await;
             let current = app.state::<AppState>().settings.lock().unwrap().clone();
             let next = settings::patched(&current, &patch, updates_enabled())?;
-            // A run reads the sign-in window again at each sign-in (see `settings::while_signing_in`).
-            if state.bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished) {
-                settings::while_signing_in(&current, &next)?;
-            }
+            // The sign-in window may change while a run goes, as in Settings: the run reads it once
+            // per email (see `EmailWindow`), so the change takes effect from its next email.
             let snapshot = app.state::<AppState>().snapshot.lock().unwrap().clone();
             for key in next.aliases.keys().filter(|k| !current.aliases.contains_key(*k)) {
                 if !snapshot.accounts.iter().any(|a| format!("{}:{}", a.provider.name(), a.id) == *key) {
@@ -1102,16 +1105,16 @@ async fn start_add_account(app: AppHandle, provider: Provider, pending: Option<m
     };
     // Open from before its page can open until the account is saved or the sign-in ends otherwise.
     let pending = (pending, app.state::<AppState>().sign_ins.open());
-    // A fresh profile of its own (who signs in is not known yet), held until the sign-in ends.
-    let session = signin_session(&app);
-    let options = signin_options(&app, None, session.as_deref());
+    // A window of its own (who signs in is not known yet), its profile held until the sign-in ends.
+    let opens = Opens::own(&app);
+    let options = opens.options(None);
     // Looking for the CLI runs wsl.exe and reads the registry and disk; keep it off the async runtime.
     let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, None, options))
         .await
         .map_err(|e| e.to_string())??;
     tauri::async_runtime::spawn(async move {
         let added = job.wait(&http_client()).await;
-        drop(session);
+        drop(opens);
         // The provider is free for another sign-in before anything waits for a refresh.
         drop(pending);
         if let Some(slot) = added {
@@ -1123,24 +1126,120 @@ async fn start_add_account(app: AppHandle, provider: Provider, pending: Option<m
     Ok(())
 }
 
-/// A brand-new browser profile for a sign-in, or for an email's run of them, when the user chose
-/// those (see `signin::Session`). Dropping the last handle closes its browser and deletes it.
-fn signin_session(app: &AppHandle) -> Option<Arc<signin::Session>> {
-    let window = app.state::<AppState>().settings.lock().unwrap().signin_window;
-    (window == signin::Window::Profile).then(signin::Session::create).flatten().map(Arc::new)
+/// Where a sign-in's page opens: here, in `window`, the user's choice (see `signin`) as it was when
+/// the sign-in started or, in a run, when its email's turn did (see `EmailWindow`), in `session`'s
+/// profile when that is the choice; or in another computer's browser, which completes it, handed
+/// over under a nonce (see `relay_start`), with nothing opening here. Dropping the last handle of
+/// its profile closes that browser and deletes the profile.
+#[derive(Clone)]
+enum Opens {
+    Here { window: signin::Window, session: Option<Arc<signin::Session>> },
+    Relay(String),
 }
 
-/// Where a sign-in as `email` opens its page, from the user's choice (see `signin`): `session`'s
-/// profile, a private window, or the CLI's default browser.
-fn signin_options(app: &AppHandle, email: Option<&str>, session: Option<&signin::Session>) -> accounts::LoginOptions {
-    let window = app.state::<AppState>().settings.lock().unwrap().signin_window;
-    accounts::LoginOptions { email: email.map(str::to_owned), target: signin::Target::choose(window, session) }
+impl Opens {
+    /// A sign-in's own window, outside a run: the user's choice as it is now, with a brand-new
+    /// profile of its own when that is the choice. With `EmailWindow::new`'s, the one place a
+    /// sign-in reads the setting: it never reads it again, whatever the user changes meanwhile.
+    fn own(app: &AppHandle) -> Self {
+        let window = app.state::<AppState>().settings.lock().unwrap().signin_window;
+        let session = (window == signin::Window::Profile).then(signin::Session::create).flatten().map(Arc::new);
+        Self::Here { window, session }
+    }
+
+    /// The profile its page opens in, which a run watches (`watch_step`, `page_opened`,
+    /// `browser_closed`): none in a private window, the default browser or another computer's.
+    fn session(&self) -> Option<&Arc<signin::Session>> {
+        match self {
+            Self::Here { session, .. } => session.as_ref(),
+            Self::Relay(_) => None,
+        }
+    }
+
+    /// The CLI's options for a sign-in as `email` that opens here: its profile, a private window,
+    /// the CLI's default browser (`signin::Target::choose`), or none here for another computer's.
+    fn options(&self, email: Option<&str>) -> accounts::LoginOptions {
+        let target = match self {
+            Self::Here { window, session } => signin::Target::choose(*window, session.as_deref()),
+            Self::Relay(nonce) => Some(signin::Target::Relay(nonce.clone())),
+        };
+        accounts::LoginOptions { email: email.map(str::to_owned), target }
+    }
 }
 
-/// A sign-in another computer completes in its own browser (see `relay_start`): its page is handed
-/// over under `nonce`, and nothing opens here.
-fn relay_options(email: Option<&str>, nonce: &str) -> accounts::LoginOptions {
-    accounts::LoginOptions { email: email.map(str::to_owned), target: Some(signin::Target::Relay(nonce.to_owned())) }
+/// One email's window in a run (see `run_sign_ins`): the user's choice, read once as the email's
+/// turn starts, and the brand-new profile its sign-ins share, made at the first that opens in one.
+/// Every sign-in of the email opens where this says (as it starts, as Retry this sign-in starts it
+/// again, and another computer's, relayed here), never where the setting says by then, which the
+/// run's watches would not follow: a change during a run takes effect from the next email.
+struct EmailWindow {
+    window: signin::Window,
+    /// None until a sign-in of the email first needs a profile; then the one made, or None when
+    /// none could be (no data folder).
+    session: Option<Option<Arc<signin::Session>>>,
+}
+
+impl EmailWindow {
+    fn new(window: signin::Window) -> Self {
+        Self { window, session: None }
+    }
+
+    /// Where a sign-in here opens: the email's window, in its profile when that is a profile (made
+    /// with `make` at the email's first such sign-in; one that could not be made is not tried
+    /// again, so the email's sign-ins here then all open in the CLI's default browser).
+    fn here(&mut self, make: impl FnOnce() -> Option<Arc<signin::Session>>) -> Opens {
+        let session = match self.window {
+            signin::Window::Profile => self.session.get_or_insert_with(make).clone(),
+            signin::Window::Private | signin::Window::System => None,
+        };
+        Opens::Here { window: self.window, session }
+    }
+
+    /// The profile another computer's sign-in opens its page in here (see `relay_target`): the
+    /// email's, made now with `make` if it has none yet, even when the email's sign-ins here open
+    /// in the default browser, whose history would keep the provider's answer to the page; none
+    /// when the email's window is a private one.
+    fn relayed(&mut self, make: impl FnOnce() -> Option<Arc<signin::Session>>) -> Option<Arc<signin::Session>> {
+        if self.window == signin::Window::Private {
+            return None;
+        }
+        if let Some(Some(session)) = &self.session {
+            return Some(session.clone());
+        }
+        let session = make();
+        self.session = Some(session.clone());
+        session
+    }
+}
+
+/// A brand-new profile for the sign-ins of `email` (None: an account without one), named after it
+/// in `lang` (see `signin::Session::label`). Dropping the last handle closes its browser and
+/// deletes it.
+fn email_profile(email: Option<&str>, lang: &str) -> Option<Arc<signin::Session>> {
+    let session = signin::Session::create().map(Arc::new);
+    if let (Some(s), Some(email)) = (session.as_deref(), email) {
+        s.label(email, lang);
+    }
+    session
+}
+
+/// Where another computer's sign-in opens its page here, from its email's window (see
+/// `EmailWindow::relayed`): a private window, or the email's profile; with no profile to open it
+/// in (no data folder), `signin_profile_storage`, never the everyday browser.
+fn relay_target(window: signin::Window, session: Option<&signin::Session>) -> Result<signin::Target, String> {
+    match (window, session) {
+        (signin::Window::Private, _) => Ok(signin::Target::Private),
+        (_, Some(s)) => Ok(s.target()),
+        (_, None) => Err("signin_profile_storage".into()),
+    }
+}
+
+/// Where a run's notices say a sign-in waits for the person (the key of its words, which
+/// `sign_in_text` puts in the notice's language): another computer's (`relayed`) in a browser
+/// window here, else as its email's window has it: the terminal that opened, whose CLI opens the
+/// default browser, or the browser window that opened.
+fn place_key(window: signin::Window, relayed: bool) -> &'static str {
+    if window == signin::Window::System && !relayed { "signInWhereTerminal" } else { "signInWhereBrowser" }
 }
 
 /// A restored account that is signed in again is no longer pending.
@@ -1158,9 +1257,10 @@ fn forget_pending(provider: Provider, id: &str) {
 /// login of any other account is not saved and is revoked, the way monitoring rejects a wrong
 /// account. The new login replaces the vault's saved one; nothing is signed out, and the CLI's own
 /// files are never written. Returns once the user is done: whether a login was saved (a renewal is
-/// not, once the account is in use or was removed meanwhile; see `accounts::store_renewal`). With
-/// `relay` (a nonce), another computer completes it in its own browser (see `relay_start`).
-async fn add_expected(app: &AppHandle, expected: &bulk::Step, session: Option<&signin::Session>, relay: Option<&str>) -> Result<bool, String> {
+/// not, once the account is in use or was removed meanwhile; see `accounts::store_renewal`). Its
+/// page opens where `opens` says: in its email's window in a run, or in another computer's browser,
+/// which completes it (see `relay_start`).
+async fn add_expected(app: &AppHandle, expected: &bulk::Step, opens: &Opens) -> Result<bool, String> {
     let provider = expected.target.provider;
     let id = expected.target.id.clone();
     let _operation = app.state::<AppState>().account_operations.begin(provider, "add-account")?;
@@ -1169,10 +1269,7 @@ async fn add_expected(app: &AppHandle, expected: &bulk::Step, session: Option<&s
     let _sign_in = app.state::<AppState>().account_operations.begin_key(monitoring::SIGN_IN)?;
     let _open = app.state::<AppState>().sign_ins.open();
     let found = app.state::<AppState>().sources.lock().unwrap().clone();
-    let options = match relay {
-        Some(nonce) => relay_options(expected.email.as_deref(), nonce),
-        None => signin_options(app, expected.email.as_deref(), session),
-    };
+    let options = opens.options(expected.email.as_deref());
     let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, None, options))
         .await.map_err(|_| "monitor_login_failed".to_string())??;
     let client = http_client();
@@ -1332,14 +1429,16 @@ async fn relay_start(app: &AppHandle, step: String, from: String, machine: Strin
         // However this task ends, the slot is never left held.
         let _end = relay::EndGuard { slot: &relay::SLOT, step: step.clone() };
         let expected = bulk::Step { kind, target, email, machine: None };
+        // Its page goes to that computer under the nonce: nothing opens here.
+        let opens = Opens::Relay(nonce.clone());
         let run = async {
             match kind {
-                bulk::Kind::Add | bulk::Kind::Renew => add_expected(&h, &expected, None, Some(&nonce)).await,
+                bulk::Kind::Add | bulk::Kind::Renew => add_expected(&h, &expected, &opens).await,
                 bulk::Kind::Connect => {
                     // Asked for by the user, at the other computer: a manual start, never an automatic one.
                     let key = format!("{}:{}", provider.name(), id);
                     auto_monitor_saved(&h, |t| t.manual(&key, true));
-                    match start_monitoring_login(h.clone(), provider, id.clone(), false, None, Some(nonce.clone())).await {
+                    match start_monitoring_login(h.clone(), provider, id.clone(), false, Some(opens.clone())).await {
                         // Stopping drops this future, and with it the sign-in.
                         Ok(task) => AbortOnDrop(task).await.unwrap_or_else(|_| Err("monitor_login_failed".into())).map(|()| true),
                         Err(e) => Err(e),
@@ -1375,14 +1474,15 @@ async fn relay_start(app: &AppHandle, step: String, from: String, machine: Strin
 async fn connect_monitoring(app: AppHandle, provider: Provider, id: String) -> Result<(), String> {
     let key = format!("{}:{id}", provider.name());
     auto_monitor_saved(&app, |t| t.manual(&key, true));
-    start_monitoring_login(app, provider, id, false, None, None).await.map(|_| ())
+    start_monitoring_login(app, provider, id, false, None).await.map(|_| ())
 }
 
 /// Connect monitoring's sign-in, started by the user or on its own (`auto`, see `auto_monitor`).
 /// One sign-in is open at a time across the app (`monitoring::SIGN_IN`); the returned task
-/// ends with its outcome once the user is done. With `relay` (a nonce), another computer completes
-/// it in its own browser and no profile opens here (see `relay_start`).
-async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, auto: bool, session: Option<Arc<signin::Session>>, relay: Option<String>) -> Result<tauri::async_runtime::JoinHandle<Result<(), String>>, String> {
+/// ends with its outcome once the user is done. Its page opens where `opens` says (its email's
+/// window in a run, or another computer's browser, see `relay_start`); None: in a window of its
+/// own, as the user chose it now (`Opens::own`).
+async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, auto: bool, opens: Option<Opens>) -> Result<tauri::async_runtime::JoinHandle<Result<(), String>>, String> {
     let operation = app.state::<AppState>().account_operations.begin(provider, &id)?;
     let sign_in = app.state::<AppState>().account_operations.begin_key(monitoring::SIGN_IN)?;
     let open = app.state::<AppState>().sign_ins.open();
@@ -1393,13 +1493,10 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
     app.state::<AppState>().diagnostics.record(Some(provider), Some(&id), diagnostics::Event::Action { action: diagnostics::Action::ConnectStarted, code: diagnostics::Code::Ok, elapsed_ms: 0 });
     let found = app.state::<AppState>().sources.lock().unwrap().clone();
     let context = diagnostics::Context { recorder: app.state::<AppState>().diagnostics.clone(), provider, id: id.clone() };
-    // The email group's profile in "Sign in all accounts", else a fresh one of its own; none for a
-    // page another computer opens.
-    let session = if relay.is_some() { None } else { session.or_else(|| signin_session(&app)) };
-    let options = match relay.as_deref() {
-        Some(nonce) => relay_options(expected.email.as_deref(), nonce),
-        None => signin_options(&app, expected.email.as_deref(), session.as_deref()),
-    };
+    // The email's window in "Sign in all accounts" (its profile, if any, held until the sign-in
+    // ends), else a window of its own; nothing here for a page another computer opens.
+    let opens = opens.unwrap_or_else(|| Opens::own(&app));
+    let options = opens.options(expected.email.as_deref());
     let job = tauri::async_runtime::spawn_blocking(move || accounts::start_login_observed(provider, &found, Some(context), options)).await;
     let job = match job {
         Ok(Ok(job)) => job,
@@ -1438,7 +1535,7 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
             }
             Err(e) => Err(e.into()),
         };
-        drop(session);
+        drop(opens);
         drop(operation);
         drop(sign_in);
         drop(open);
@@ -1667,8 +1764,8 @@ const STILL_WAITING: Duration = Duration::from_secs(5 * 60);
 /// Watches the open sign-in (`turn`'s): resolves with `signin_no_page` when its page never opened
 /// in the email's profile (only a profile can tell; a page refused for its port, whose CLI starts
 /// again, counts the wait from then), and, once it has waited long, asks the person at the desktop
-/// whether to start it again (and never resolves after that).
-async fn watch_step(app: &AppHandle, session: Option<&signin::Session>, since: std::time::SystemTime, browser: bool, turn: &Turn<'_>) -> String {
+/// whether to start it again, saying where it waits (`turn.place`), and never resolves after that.
+async fn watch_step(app: &AppHandle, session: Option<&signin::Session>, since: std::time::SystemTime, turn: &Turn<'_>) -> String {
     let started = tokio::time::Instant::now();
     if let Some(session) = session {
         let mut waiting_from = started;
@@ -1688,19 +1785,15 @@ async fn watch_step(app: &AppHandle, session: Option<&signin::Session>, since: s
     }
     tokio::time::sleep_until(started + STILL_WAITING).await;
     publish_bulk(app, |b| b.still_waiting = true);
-    // Another computer's sign-in waits in a browser here, whatever the window setting says.
-    let place = browser.then(|| crate::i18n::t(&crate::i18n::resolve(&app.state::<AppState>().settings.lock().unwrap().language), "signInWhereBrowser", &[]));
-    let mut vars = vec![("account", turn.account)];
-    if let Some(place) = place.as_deref() {
-        vars.insert(0, ("where", place));
-    }
-    still_waiting_choice(app, &vars, turn.restart, turn.at);
+    still_waiting_choice(app, turn.place, &[("account", turn.account)], turn.restart, turn.at);
     std::future::pending().await
 }
 
 /// Runs the sign-ins one terminal at a time, each started once the previous one finished, an
 /// email's sign-ins back to back in one fresh browser profile so Google is asked once for all of
-/// them; the profile's browser is closed and the profile deleted when the email's turn ends.
+/// them; the profile's browser is closed and the profile deleted when the email's turn ends. The
+/// sign-in window is read once per email, as its turn starts (see `EmailWindow`): a change made
+/// meanwhile takes effect from the next email.
 /// Stops at the first that fails (the user closed it, closed the browser, signed in as another
 /// account, its page never opened, or Stop was pressed). Every step's outcome stays in `steps`.
 fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monitoring: bool, gathered: Option<Gathered>) -> Result<(), String> {
@@ -1719,7 +1812,7 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
         let (left_out, in_use) = gathered.clone().map(|g| (g.left_out, g.in_use)).unwrap_or_default();
         *running = Some(BulkConnect { run_started_at: chrono::SubsecRound::trunc_subsecs(chrono::Utc::now(), 3), total, done: 0, current: None, kind: None, emails: if by_email { groups.len() } else { 0 }, email: 0,
             finished: total == 0, error: None, steps, by_email, monitoring, still_waiting: false, revision: 0,
-            everywhere: gathered.is_some(), left_out, in_use });
+            everywhere: gathered.is_some(), left_out, in_use, window: None });
         *state.bulk_stop.lock().unwrap() = Some(stop.clone());
         *state.bulk_restart.lock().unwrap() = Some(restart.clone());
     }
@@ -1756,8 +1849,10 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
         let mut dropped: HashMap<String, String> = HashMap::new();
         let mut strikes: HashMap<String, u32> = HashMap::new();
         'groups: for (index, group) in groups.iter().enumerate() {
-            // Made at the email's first sign-in that still has to run, ended with its turn.
-            let mut group_session: Option<Option<Arc<signin::Session>>> = None;
+            // Where the email's sign-ins open: the setting, read once now, for every one of them. Its
+            // profile is made at its first sign-in that still has to run and opens in one, and ended
+            // with its turn.
+            let mut email_window = EmailWindow::new(h.state::<AppState>().settings.lock().unwrap().signin_window);
             // What the email's page shows of its turn (see `signin::Session::show`).
             let mut page = signin::Progress {
                 steps: group.steps.iter().map(|s| (step_name(&lang, s), signin::PageStep::Pending)).collect(),
@@ -1774,6 +1869,7 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     b.kind = by_email.then_some(step.kind);
                     b.email = if by_email { index + 1 } else { 0 };
                     b.still_waiting = false;
+                    b.window = Some(email_window.window);
                 });
                 done += 1;
                 // Another computer's sign-in, completed here (see `relay`): that computer judges
@@ -1801,20 +1897,20 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                         _ = free => false,
                         _ = stop.notified() => true,
                     };
-                    let session = relay_session(&h, &mut group_session, group.email.as_deref(), &lang);
+                    let session = email_window.relayed(|| email_profile(group.email.as_deref(), &lang));
                     page.at = done;
                     page.steps[in_group].1 = signin::PageStep::Opening;
                     if let Some(s) = session.as_deref() {
                         s.show(&page);
                     }
                     let account = for_machine(&lang, &target.account.clone().unwrap_or_default(), &machine.name);
-                    // Once per email: its page here lists every computer's sign-in as it goes. Always in a
-                    // browser here (never the terminal a sign-in here may open).
+                    // Always in a browser here (never the terminal a sign-in here may open).
+                    let place = place_key(email_window.window, true);
+                    // Once per email: its page here lists every computer's sign-in as it goes.
                     if by_email && !stopped && in_group == 0 {
                         let (g, e, i, n) = ((index + 1).to_string(), groups.len().to_string(), done.to_string(), total.to_string());
                         let key = if step.kind == bulk::Kind::Connect { "signInAllConnecting" } else { "signInAllAdding" };
-                        let browser = crate::i18n::t(&lang, "signInWhereBrowser", &[]);
-                        sign_in_notice(&h, key, &[("where", &browser), ("g", &g), ("e", &e), ("i", &i), ("n", &n), ("account", &account)]);
+                        sign_in_notice(&h, key, Some(place), &[("g", &g), ("e", &e), ("i", &i), ("n", &n), ("account", &account)]);
                     }
                     let outcome = if stopped {
                         Err("signin_stopped".to_string())
@@ -1827,8 +1923,8 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                                 s.show(&page);
                             }
                         };
-                        let turn = Turn { stop: &stop, restart: &restart, at, account: &account };
-                        relayed_turn(&h, step, machine, session.as_ref(), &turn, on_page).await
+                        let turn = Turn { stop: &stop, restart: &restart, at, account: &account, place };
+                        relayed_turn(&h, step, machine, email_window.window, session.as_ref(), &turn, on_page).await
                     };
                     let left = |page: &mut signin::Progress| {
                         page.steps[in_group].1 = signin::PageStep::Left;
@@ -1934,32 +2030,29 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     page.steps[in_group].1 = signin::PageStep::Skipped;
                     continue;
                 }
-                let session = group_session.get_or_insert_with(|| {
-                    let session = signin_session(&h);
-                    if let (Some(s), Some(email)) = (session.as_deref(), group.email.as_deref()) {
-                        s.label(email, &lang);
-                    }
-                    session
-                }).clone();
+                // The email's window, and its profile (made now at its first sign-in that opens in
+                // one), which the watches below follow: the page opens nowhere else.
+                let opens = email_window.here(|| email_profile(group.email.as_deref(), &lang));
+                let session = opens.session().cloned();
                 page.at = done;
                 page.steps[in_group].1 = signin::PageStep::Opening;
                 let show = |session: Option<&signin::Session>, page: &signin::Progress| if let Some(s) = session { s.show(page) };
                 show(session.as_deref(), &page);
                 let since = std::time::SystemTime::now();
-                // One go at the sign-in. "Retry this sign-in" drops it, and its CLI with it,
-                // and makes another.
+                // One go at the sign-in, in the email's window. "Retry this sign-in" drops it, and its
+                // CLI with it, and makes another there.
                 let start = || {
-                    let (h, session) = (&h, session.clone());
+                    let (h, opens) = (&h, opens.clone());
                     async move {
                         match step.kind {
                             // A new CLI sign-in saved in the vault: a pending account's, or one for an
                             // account whose saved sign-in ended or ends soon.
-                            bulk::Kind::Add | bulk::Kind::Renew => add_expected(h, step, session.as_deref(), None).await,
+                            bulk::Kind::Add | bulk::Kind::Renew => add_expected(h, step, &opens).await,
                             bulk::Kind::Connect => {
                                 // The user asked for these, so they count as manual starts, never automatic ones.
                                 let key = format!("{}:{}", target.provider.name(), target.id);
                                 auto_monitor_saved(h, |t| t.manual(&key, true));
-                                match start_monitoring_login(h.clone(), target.provider, target.id.clone(), false, session.clone(), None).await {
+                                match start_monitoring_login(h.clone(), target.provider, target.id.clone(), false, Some(opens)).await {
                                     // Stopping drops this future, and with it the sign-in.
                                     Ok(task) => AbortOnDrop(task).await.unwrap_or_else(|_| Err("monitor_login_failed".into())).map(|()| true),
                                     Err(e) => Err(e),
@@ -1974,12 +2067,13 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     s.rearm();
                 }
                 // Whoever sits at this desktop (often brought here by an agent on another
-                // computer) is told which account and which page comes next.
+                // computer) is told which account and which page comes next, and where.
                 let account = target.account.clone().unwrap_or_default();
+                let place = place_key(email_window.window, false);
                 if by_email && !stopped {
                     let (g, e, i, n) = ((index + 1).to_string(), groups.len().to_string(), done.to_string(), total.to_string());
                     let key = if step.kind == bulk::Kind::Connect { "signInAllConnecting" } else { "signInAllAdding" };
-                    sign_in_notice(&h, key, &[("g", &g), ("e", &e), ("i", &i), ("n", &n), ("account", &account)]);
+                    sign_in_notice(&h, key, Some(place), &[("g", &g), ("e", &e), ("i", &i), ("n", &n), ("account", &account)]);
                 }
                 let mut run = Box::pin(run);
                 let outcome = if stopped {
@@ -1987,9 +2081,9 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                 } else {
                     let closed = browser_closed(session.as_deref());
                     tokio::pin!(closed);
-                    let turn = Turn { stop: &stop, restart: &restart, at, account: &account };
+                    let turn = Turn { stop: &stop, restart: &restart, at, account: &account, place };
                     restart.begin();
-                    let mut watch = Box::pin(watch_step(&h, session.as_deref(), since, false, &turn));
+                    let mut watch = Box::pin(watch_step(&h, session.as_deref(), since, &turn));
                     let mut opened = Box::pin(page_opened(session.as_deref(), since));
                     let mut opening = true;
                     loop {
@@ -2035,7 +2129,7 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                                     _ = stop.notified() => break Err("signin_stopped".into()),
                                 }
                                 let since = std::time::SystemTime::now();
-                                watch = Box::pin(watch_step(&h, session.as_deref(), since, false, &turn));
+                                watch = Box::pin(watch_step(&h, session.as_deref(), since, &turn));
                                 opened = Box::pin(page_opened(session.as_deref(), since));
                                 opening = true;
                                 publish_bulk(&h, |b| {
@@ -2076,14 +2170,15 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                         error = Some(e);
                         failed_provider = Some(target.provider);
                         drop(run);
-                        drop(group_session);
+                        drop(email_window);
+                        drop(opens);
                         drop(session);
                         break 'groups;
                     }
                 }
             }
             // The last handle: closes the browser and deletes the profile (see `signin::Session`).
-            drop(group_session);
+            drop(email_window);
         }
         if by_email && total > 0 {
             match &error {
@@ -2119,9 +2214,9 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     };
                     let left = left_out_text(&lang, &left);
                     let key = if left.is_empty() { "signInEverywhereDone" } else { "signInEverywhereDoneLeft" };
-                    sign_in_notice(&h, key, &[("n", &made.to_string()), ("left", &left)]);
+                    sign_in_notice(&h, key, None, &[("n", &made.to_string()), ("left", &left)]);
                 }
-                None => sign_in_notice(&h, "signInAllDone", &[("n", &total.to_string())]),
+                None => sign_in_notice(&h, "signInAllDone", None, &[("n", &total.to_string())]),
             }
         }
         publish_bulk(&h, |b| {
@@ -2131,6 +2226,7 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
             b.finished = true;
             b.error = error;
             b.still_waiting = false;
+            b.window = None;
         });
     });
     Ok(())
@@ -2328,24 +2424,6 @@ fn take_everywhere_ask(state: tauri::State<AppState>) -> Option<bool> {
     state.everywhere_ask.lock().unwrap().take().filter(|(_, at)| at.elapsed() < EVERYWHERE_FRESH).map(|(monitoring, _)| monitoring)
 }
 
-/// Where a relayed sign-in's page opens here: the email's fresh profile (made now if its turn has
-/// none yet), or a private window when the user chose those; never the everyday browser, whose
-/// history would keep the provider's answer to the page.
-fn relay_session(app: &AppHandle, group_session: &mut Option<Option<Arc<signin::Session>>>, email: Option<&str>, lang: &str) -> Option<Arc<signin::Session>> {
-    if let Some(Some(session)) = group_session {
-        return Some(session.clone());
-    }
-    if app.state::<AppState>().settings.lock().unwrap().signin_window == signin::Window::Private {
-        return None;
-    }
-    let session = signin::Session::create().map(Arc::new);
-    if let (Some(s), Some(email)) = (session.as_deref(), email) {
-        s.label(email, lang);
-    }
-    *group_session = Some(session.clone());
-    session
-}
-
 /// "{what} for {machine}": a sign-in of another computer's, as notifications and pages name it.
 fn for_machine(lang: &str, what: &str, machine: &str) -> String {
     crate::i18n::t(lang, "signInFor", &[("what", what), ("machine", machine)])
@@ -2383,31 +2461,29 @@ impl relay::Desk for AppDesk {
 }
 
 /// What a run's turn at one sign-in answers to: Stop, "Retry this sign-in" (the run's own,
-/// asked for its `at`th sign-in), and the account its notifications name.
+/// asked for its `at`th sign-in), the account its notifications name, and where they say it waits
+/// (`place_key`).
 struct Turn<'a> {
     stop: &'a tokio::sync::Notify,
     restart: &'a Arc<StepRestart>,
     at: usize,
     account: &'a str,
+    place: &'static str,
 }
 
-/// One sign-in of another computer's (see `relay`), completed in this computer's browser: in the
-/// email's fresh profile (`relay_session`), or a private window when the user chose those. It
+/// One sign-in of another computer's (see `relay`), completed in this computer's browser, as its
+/// email's `window` has it (see `EmailWindow::relayed`): in the email's fresh profile `session`,
+/// or a private window when that is the email's window, whatever the setting says by then. It
 /// starts there, its page opens here once that computer's CLI hands it over and a tunnel for its
 /// port is up (`on_page(true)` then), and it is followed until it ends. Stop, closing the browser
 /// and the long-wait notice work as for a sign-in here, and so does "Retry this sign-in" (the
 /// one there stops, a new one starts, `on_page(false)`); dropping it closes the tunnel at once and
 /// asks that computer to stop. This computer holds its one sign-in (`monitoring::SIGN_IN`) and the
 /// open sign-in's mark, which puts updates off, while it runs. Returns as `relay::drive` does.
-async fn relayed_turn(h: &AppHandle, step: &bulk::Step, machine: &bulk::Machine, session: Option<&Arc<signin::Session>>, turn: &Turn<'_>,
+async fn relayed_turn(h: &AppHandle, step: &bulk::Step, machine: &bulk::Machine, window: signin::Window, session: Option<&Arc<signin::Session>>, turn: &Turn<'_>,
     mut on_page: impl FnMut(bool)) -> Result<bool, String> {
     let stop = turn.stop;
-    let window = h.state::<AppState>().settings.lock().unwrap().signin_window;
-    let target = match (window, session) {
-        (signin::Window::Private, _) => signin::Target::Private,
-        (_, Some(s)) => s.target(),
-        (_, None) => return Err("signin_profile_storage".into()),
-    };
+    let target = relay_target(window, session.map(|s| &**s))?;
     let from = presence::identity().map(|(id, _)| id.to_string()).ok_or("relay_failed")?;
     // This computer's one sign-in: waited for (another may have started since the run's own wait),
     // never a reason to leave that computer out; Stop ends the wait.
@@ -2444,7 +2520,7 @@ async fn relayed_turn(h: &AppHandle, step: &bulk::Step, machine: &bulk::Machine,
     tokio::pin!(closed);
     // No page limit here: the other computer has its own (`relay::PAGE_LIMIT`).
     turn.restart.begin();
-    let mut watch = Box::pin(watch_step(h, None, std::time::SystemTime::now(), true, turn));
+    let mut watch = Box::pin(watch_step(h, None, std::time::SystemTime::now(), turn));
     // The pages shown open so far.
     let mut shown = 0;
     let outcome = loop {
@@ -2480,7 +2556,7 @@ async fn relayed_turn(h: &AppHandle, step: &bulk::Step, machine: &bulk::Machine,
                 relayed.restart();
                 shown = pages.load(std::sync::atomic::Ordering::SeqCst);
                 on_page(false);
-                watch = Box::pin(watch_step(h, None, std::time::SystemTime::now(), true, turn));
+                watch = Box::pin(watch_step(h, None, std::time::SystemTime::now(), turn));
                 publish_bulk(h, |b| b.still_waiting = false);
                 if let Some(s) = session {
                     s.rearm();
@@ -2510,26 +2586,28 @@ fn start_sign_in_everywhere(app: AppHandle, id: String) -> Result<(), String> {
 }
 
 /// The notification text for the person at this desktop during "Sign in all accounts", in the
-/// words Settings > Accounts uses: (title, body, language).
-fn sign_in_text(app: &AppHandle, key: &str, vars: &[(&str, &str)]) -> (String, String, String) {
-    let settings = app.state::<AppState>().settings.lock().unwrap().clone();
-    let lang = crate::i18n::resolve(&settings.language);
-    let place = if settings.signin_window == signin::Window::System { "signInWhereTerminal" } else { "signInWhereBrowser" };
-    let place = crate::i18n::t(&lang, place, &[]);
+/// words Settings > Accounts uses: (title, body, language). `place` says where the sign-in waits
+/// (`place_key`, from its email's window, never from the setting, which may have changed since
+/// that email's turn started), put in the notice's language as its `where`.
+fn sign_in_text(app: &AppHandle, key: &str, place: Option<&str>, vars: &[(&str, &str)]) -> (String, String, String) {
+    let lang = crate::i18n::resolve(&app.state::<AppState>().settings.lock().unwrap().language);
+    let place = place.map(|place| crate::i18n::t(&lang, place, &[]));
     let mut vars = vars.to_vec();
-    vars.push(("where", &place));
+    if let Some(place) = place.as_deref() {
+        vars.push(("where", place));
+    }
     (crate::i18n::t(&lang, "signInAll", &[]), crate::i18n::t(&lang, key, &vars), lang)
 }
 
 /// A notification for the person at this desktop; clicking it opens Settings > Accounts.
-fn sign_in_notice(app: &AppHandle, key: &str, vars: &[(&str, &str)]) {
-    let (title, body, _) = sign_in_text(app, key, vars);
+fn sign_in_notice(app: &AppHandle, key: &str, place: Option<&str>, vars: &[(&str, &str)]) {
+    let (title, body, _) = sign_in_text(app, key, place, vars);
     let _ = notify::notify(app.clone(), title, body, Some("accounts".into()), None);
 }
 
 /// The same for a run that stopped, with a Retry button (see `retry_run`).
 fn sign_in_choice(app: &AppHandle, key: &str, vars: &[(&str, &str)]) {
-    let (title, body, lang) = sign_in_text(app, key, vars);
+    let (title, body, lang) = sign_in_text(app, key, None, vars);
     let buttons = vec![(crate::i18n::t(&lang, "signInRetry", &[]), "retry")];
     let h = app.clone();
     let _ = notify::notify_choice(app.clone(), title, body, buttons, move |action| match action {
@@ -2547,8 +2625,8 @@ fn sign_in_choice(app: &AppHandle, key: &str, vars: &[(&str, &str)]) {
 /// The notification that run `run`'s open sign-in (its `at`th) still waits on the person: Retry
 /// starts that sign-in again in the same window (see `StepRestart`), as its text says, and the run
 /// goes on; Stop ends the run.
-fn still_waiting_choice(app: &AppHandle, vars: &[(&str, &str)], run: &Arc<StepRestart>, at: usize) {
-    let (title, body, lang) = sign_in_text(app, "signInStillWaiting", vars);
+fn still_waiting_choice(app: &AppHandle, place: &str, vars: &[(&str, &str)], run: &Arc<StepRestart>, at: usize) {
+    let (title, body, lang) = sign_in_text(app, "signInStillWaiting", Some(place), vars);
     let buttons = vec![(crate::i18n::t(&lang, "signInRetry", &[]), "retry"), (crate::i18n::t(&lang, "signInAllStop", &[]), "stop")];
     let (h, run) = (app.clone(), run.clone());
     let _ = notify::notify_choice(app.clone(), title, body, buttons, move |action| match action {
@@ -4719,7 +4797,7 @@ fn auto_connect_tick(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let key = format!("{}:{id}", provider.name());
-        if let Err(e) = start_monitoring_login(app.clone(), provider, id, true, None, None).await {
+        if let Err(e) = start_monitoring_login(app.clone(), provider, id, true, None).await {
             // Someone else started on it meanwhile: no reason to wait a day.
             let ok = e == "monitor_busy";
             auto_monitor_saved(&app, |t| t.finished(&key, ok, chrono::Utc::now()));
@@ -4799,7 +4877,11 @@ mod sign_in_tests {
         // The same run as the roster carries it to the other computers.
         let started: chrono::DateTime<chrono::Utc> = "2026-10-23T11:58:00.123Z".parse().unwrap();
         let bulk = BulkConnect { run_started_at: started, total: 2, done: 1, current: None, kind: None, emails: 1, email: 1, finished: true, error: Some("signin_no_page".into()),
-            steps: vec![done, step], by_email: true, monitoring: true, still_waiting: false, revision: 9, everywhere: false, left_out: vec![], in_use: vec![] };
+            steps: vec![done, step], by_email: true, monitoring: true, still_waiting: false, revision: 9, everywhere: false, left_out: vec![], in_use: vec![],
+            window: Some(signin::Window::Private) };
+        // Settings says where the open sign-in waits from its email's window, not from the setting.
+        assert_eq!(serde_json::to_value(&bulk).unwrap()["window"], "private");
+        assert!(serde_json::to_value(BulkConnect { window: None, ..bulk.clone() }).unwrap().get("window").is_none(), "none before an email's turn");
         let run = roster_run(&bulk, "2026-10-23T12:00:00Z".parse().unwrap());
         assert_eq!((run.revision, run.finished, run.error.as_deref()), (9, true, Some("signin_no_page")));
         // The roster names the run as readiness does, so a card's Retry can name it back; readiness
@@ -4842,12 +4924,194 @@ mod sign_in_tests {
         for needle in ["if !restart.take(at) { continue; }", "drop(std::mem::replace(&mut run, Box::pin(start())));",
             "let held = [monitoring::SIGN_IN.to_string(), format!(\"{}:{}\", target.provider.name(), target.id),",
             "while held.iter().any(|key| h.state::<AppState>().account_operations.busy(key)) {",
-            "watch = Box::pin(watch_step(&h, session.as_deref(), since, false, &turn));", "opened = Box::pin(page_opened(session.as_deref(), since));"] {
+            "watch = Box::pin(watch_step(&h, session.as_deref(), since, &turn));", "opened = Box::pin(page_opened(session.as_deref(), since));"] {
             assert!(crate::source_guard::has(arm, &crate::source_guard::tokens(needle)), "{needle}\n{arm}");
         }
         let (dropped, waited) = (crate::source_guard::find(arm, "drop(std::mem::replace").unwrap(), crate::source_guard::find(arm, "while held").unwrap());
         assert!(dropped < waited, "the old sign-in goes before the wait for it");
-        assert!(!arm.contains("group_session") && !arm.contains("drop(session"), "the email's window stays");
+        // `start` makes the new one in the email's window (see `a_run_reads_the_sign_in_window_once_per_email`).
+        for kept in ["email_window", "drop(session", "drop(opens", "let opens", "Opens::"] {
+            assert!(!arm.contains(kept), "the email's window stays: `{kept}`\n{arm}");
+        }
+    }
+
+    /// A run reads the sign-in window once per email, as the email's turn starts, and every sign-in
+    /// of the email opens there, whatever the setting says by then: its start and Retry this
+    /// sign-in's (`start`, with the email's `opens`, never a window of its own), and another
+    /// computer's (`relayed_turn`, with the email's window and profile). The closed sets: app.rs
+    /// reads the setting only for a sign-in of its own (`Opens::own`), at an email's turn, and for
+    /// readiness's report of it; and makes a window of its own only for Add account and for a
+    /// monitoring sign-in given none (outside a run). Each failure is a sign-in that could open its
+    /// page where its run does not watch for it (`signin_no_page` after 40 s), or in the everyday
+    /// browser.
+    #[test]
+    fn a_run_reads_the_sign_in_window_once_per_email() {
+        use crate::source_guard::{args, calls, count, find, function, has, places, tokens, words};
+        const T: &str = "app::sign_in_tests::a_run_reads_the_sign_in_window_once_per_email";
+        let code = tokens(include_str!("app.rs"));
+        let word = |c: char| c.is_alphanumeric() || c == '_';
+        let reads = places(&code, ".signin_window").into_iter().filter(|&at| !code[at + ".signin_window".len()..].starts_with(word)).count();
+        let own = "let window = app.state::<AppState>().settings.lock().unwrap().signin_window;";
+        let email = "let mut email_window = EmailWindow::new(h.state::<AppState>().settings.lock().unwrap().signin_window);";
+        let report = "let signin_window = state.settings.lock().unwrap().signin_window;";
+        for (signature, read) in [("fn own(app: &AppHandle) -> Self {", own), ("fn run_sign_ins(", email), ("async fn readiness(", report)] {
+            let body = function(&code, "app.rs", signature, T);
+            assert_eq!(count(body, read), 1, "{signature} reads the setting once: {read}\n{body}");
+        }
+        assert_eq!(reads, 3, "app.rs reads the sign-in window only in Opens::own, at an email's turn in run_sign_ins, and for readiness: \
+            a sign-in reads it once, as it starts, and never again");
+        // Nor through a destructured or matched Settings: the name stands alone only in those three
+        // reads and readiness's report (`let signin_window = …` and its `"signin_window": signin_window`).
+        assert_eq!(words(&code, "signin_window"), 5, "app.rs names the setting only where it reads it (see above)");
+        // A window of its own only outside a run: Add account's, and a monitoring sign-in's given none.
+        assert_eq!(places(&code, "Opens::own(").len(), 2, "Opens::own is called only by Add account and by a monitoring sign-in given no window");
+        let add = function(&code, "app.rs", "async fn start_add_account(", T);
+        assert!(has(add, "let opens = Opens::own(&app);"), "{add}");
+        let monitoring = function(&code, "app.rs", "async fn start_monitoring_login(", T);
+        assert!(has(monitoring, "let opens = opens.unwrap_or_else(|| Opens::own(&app));"), "{monitoring}");
+        let restore = function(&code, "app.rs", "async fn add_expected(", T);
+        for body in [monitoring, restore] {
+            assert_eq!(count(body, ".options("), 1, "{body}");
+            assert!(has(body, "let options = opens.options(expected.email.as_deref());"), "the page opens where it was given: {body}");
+        }
+        let relay = function(&code, "app.rs", "async fn relay_start(", T);
+        assert!(has(relay, "let opens = Opens::Relay(nonce.clone());"), "another computer's page goes there: {relay}");
+        let run = function(&code, "app.rs", "fn run_sign_ins(", T);
+        // Read in each email's turn (inside the loop over emails, before any of its sign-ins), and its
+        // window and profile ended with that turn.
+        let (groups, read, steps) = (find(run, "'groups: for (index, group) in groups.iter().enumerate() {"), find(run, email),
+            find(run, "for (in_group, step) in group.steps.iter().enumerate() {"));
+        assert!(matches!((groups, read, steps), (Some(g), Some(r), Some(s)) if g < r && r < s), "read as each email's turn starts, before any of its sign-ins\n{run}");
+        assert!(has(run, "drop(email_window); } if by_email && total > 0 {"), "the email's window ends with its turn\n{run}");
+        // A sign-in here: in the email's window and its profile, which the watches follow.
+        for needle in ["let opens = email_window.here(|| email_profile(group.email.as_deref(), &lang));", "let session = opens.session().cloned();",
+            "let (h, opens) = (&h, opens.clone());", "let place = place_key(email_window.window, false);",
+            // Another computer's: in the email's window and its profile, in a browser here.
+            "let session = email_window.relayed(|| email_profile(group.email.as_deref(), &lang));", "let place = place_key(email_window.window, true);"] {
+            assert!(has(run, needle), "{needle}\n{run}");
+        }
+        let starts = [("add_expected", 2, "&opens"), ("start_monitoring_login", 4, "Some(opens)"), ("relayed_turn", 3, "email_window.window"),
+            ("relayed_turn", 4, "session.as_ref()")];
+        for (name, at, given) in starts {
+            let made = calls(run, name, T);
+            assert_eq!(made.len(), 1, "run_sign_ins starts {name} in one place\n{run}");
+            assert_eq!(args(made[0]).get(at).copied(), Some(given), "{name} opens in the email's window: {}", made[0]);
+        }
+        // Where the run's notices say a sign-in waits: its email's window, never the setting.
+        let notices = calls(run, "sign_in_notice", T).into_iter().filter(|c| has(c, "(\"account\",&account)")).collect::<Vec<_>>();
+        assert_eq!(notices.len(), 2, "a notice for each sign-in here and another computer's\n{run}");
+        assert!(notices.iter().all(|n| args(n).get(2).copied() == Some("Some(place)")), "{notices:?}");
+        let watch = function(&code, "app.rs", "async fn watch_step(", T);
+        assert!(has(watch, "still_waiting_choice(app, turn.place, &[(\"account\", turn.account)], turn.restart, turn.at);"), "{watch}");
+        // The relayed one opens where its email's window says (`relay_target`), never where the setting does now.
+        let relayed = function(&code, "app.rs", "async fn relayed_turn(", T);
+        assert!(has(relayed, "let target = relay_target(window, session.map(|s| &**s))?;"), "{relayed}");
+        // Settings > Accounts says where the open sign-in waits from its email's window too, while the
+        // run goes (`window` is None once it ends).
+        assert!(has(run, "b.window = Some(email_window.window);") && has(run, "b.window = None;"), "{run}");
+        // settings.js's renderBulk, its comment lines left out (JS is not read as tokens: its quotes
+        // are not Rust's).
+        let js = include_str!("../../src/settings.js").replace("\r\n", "\n");
+        let bulk = js.split("\nfunction renderBulk() {\n").nth(1).and_then(|rest| rest.split("\nfunction ").next()).expect("settings.js's renderBulk");
+        let bulk = bulk.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        assert!(bulk.contains("  const emailWindow = c?.window ?? settings.signin_window;\n")
+            && bulk.contains("  const where = emailWindow === \"system\" && !open?.machine ? t(\"signInWhereTerminal\") : t(\"signInWhereBrowser\");\n"), "{bulk}");
+    }
+
+    /// Each email's sign-ins open where its window, read as its turn started, says: every one of them
+    /// (its first, the next, Retry this sign-in's) in the same place, the page where the run watches
+    /// for it, and the next email in the window it starts with.
+    #[test]
+    fn an_email_s_sign_ins_all_open_in_its_window() {
+        use signin::{Target, Window};
+        let root = crate::test_support::TempDir::new();
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            signin::Session::create_in(&root.0).ok().map(Arc::new)
+        };
+        let email = Some("synthetic.one@example.invalid");
+        let target = |opens: &Opens| opens.options(email).target;
+
+        // A fresh profile: made once, at the email's first sign-in; every sign-in of the email opens
+        // in it, another computer's too, whatever the setting says meanwhile.
+        let mut profile = EmailWindow::new(Window::Profile);
+        let first = profile.here(make);
+        let shared = first.session().cloned().expect("the email's profile");
+        let again = profile.here(make);
+        assert!(again.session().is_some_and(|s| Arc::ptr_eq(s, &shared)), "the next sign-in, or Retry's, opens in the same profile");
+        assert_eq!((target(&first), target(&again)), (Some(shared.target()), Some(shared.target())));
+        let relayed = profile.relayed(make).expect("the email's profile");
+        assert!(Arc::ptr_eq(&relayed, &shared), "another computer's sign-in opens there too");
+        assert_eq!(relay_target(profile.window, Some(&relayed)), Ok(shared.target()));
+        assert_eq!(relay_target(Window::Private, Some(&relayed)), Ok(Target::Private), "a private window never opens in a profile");
+        assert_eq!(made.get(), 1, "one profile for the email");
+        assert_eq!(first.options(email).email.as_deref(), email);
+
+        // A private window: no profile, and the run watches none; another computer's in private too.
+        let mut private = EmailWindow::new(Window::Private);
+        let here = private.here(make);
+        assert!(here.session().is_none());
+        assert_eq!(target(&here), Some(Target::Private));
+        assert!(private.relayed(make).is_none());
+        assert_eq!(relay_target(private.window, None), Ok(Target::Private));
+        assert_eq!(made.get(), 1, "nothing made for a private window");
+
+        // The default browser: the CLI opens it (no target, no profile to watch); another computer's
+        // sign-in gets a profile of the email's, never the everyday browser, and the email's own
+        // sign-ins here still open in the default browser after it.
+        let mut system = EmailWindow::new(Window::System);
+        assert!(system.here(make).session().is_none() && target(&system.here(make)).is_none());
+        let relayed = system.relayed(make).expect("a profile for another computer's sign-in");
+        assert_eq!(relay_target(system.window, Some(&relayed)), Ok(relayed.target()));
+        assert!(Arc::ptr_eq(&system.relayed(make).unwrap(), &relayed), "made once");
+        let after = system.here(make);
+        assert!(after.session().is_none() && target(&after).is_none(), "the CLI's browser still: the run watches no profile there");
+        assert_eq!(made.get(), 2);
+
+        // No profile could be made (no data folder): the email's sign-ins here open in the CLI's
+        // browser without trying again; another computer's tries once more, and without one it is
+        // refused rather than opened in the everyday browser.
+        let none = std::cell::Cell::new(0);
+        let fail = || {
+            none.set(none.get() + 1);
+            None
+        };
+        let mut nowhere = EmailWindow::new(Window::Profile);
+        for _ in 0..2 {
+            let opens = nowhere.here(fail);
+            assert!(opens.session().is_none() && target(&opens).is_none());
+        }
+        assert_eq!(none.get(), 1, "not tried again for the email's sign-ins here");
+        assert!(nowhere.relayed(fail).is_none());
+        assert_eq!(none.get(), 2);
+        assert_eq!(relay_target(nowhere.window, None), Err("signin_profile_storage".into()));
+
+        // Another computer completes it: nothing opens here.
+        let relay = Opens::Relay("0123abcd".into());
+        assert!(relay.session().is_none());
+        assert_eq!(target(&relay), Some(Target::Relay("0123abcd".into())));
+    }
+
+    /// The run's notices say where a sign-in waits as its email's window has it, worded in the
+    /// notice's own language (`sign_in_text`); another computer's always waits in a browser window
+    /// here.
+    #[test]
+    fn a_notice_says_where_the_email_s_window_is() {
+        use signin::Window;
+        assert_eq!(place_key(Window::System, false), "signInWhereTerminal");
+        for window in [Window::Profile, Window::Private] {
+            assert_eq!(place_key(window, false), "signInWhereBrowser", "{window:?}");
+        }
+        for window in [Window::Profile, Window::Private, Window::System] {
+            assert_eq!(place_key(window, true), "signInWhereBrowser", "another computer's, {window:?}");
+        }
+        let (terminal, browser) = (crate::i18n::t("en", "signInWhereTerminal", &[]), crate::i18n::t("en", "signInWhereBrowser", &[]));
+        assert!(terminal != browser && terminal != "signInWhereTerminal" && browser != "signInWhereBrowser", "both have words");
+        let code = crate::source_guard::tokens(include_str!("app.rs"));
+        let text = crate::source_guard::function(&code, "app.rs", "fn sign_in_text(", "app::sign_in_tests::a_notice_says_where_the_email_s_window_is");
+        assert!(crate::source_guard::has(text, "let place = place.map(|place| crate::i18n::t(&lang, place, &[]));")
+            && crate::source_guard::has(text, "vars.push((\"where\", place));"), "worded in the notice's language: {text}");
     }
 
     /// A run of three sign-ins whose second is open, as `restartable` judges it.
@@ -4856,7 +5120,7 @@ mod sign_in_tests {
             kind: bulk::Kind::Connect, machine: None, state, error: None, started_at: None, page_at: None, ended_at: None };
         BulkConnect { run_started_at: "2026-11-23T10:00:00.5Z".parse().unwrap(), total: 3, done: 1, current: None, kind: None, emails: 1, email: 1, finished: false, error: None,
             steps: vec![step(StepState::Done), step(StepState::Running), step(StepState::Pending)], by_email: true, monitoring: true, still_waiting,
-            revision: 4, everywhere: false, left_out: vec![], in_use: vec![] }
+            revision: 4, everywhere: false, left_out: vec![], in_use: vec![], window: Some(signin::Window::Profile) }
     }
 
     /// From elsewhere, only the open sign-in of the run named, once it has waited: never another
@@ -5014,18 +5278,6 @@ mod sign_in_tests {
         assert!(matches!(plain, crate::door::Request::SignInAll { confirm: true, monitoring: true, retry: false, everywhere: false }));
         let retry: crate::door::Request = serde_json::from_value(serde_json::json!({ "op": "sign_in_all", "confirm": true, "retry": true })).unwrap();
         assert!(matches!(retry, crate::door::Request::SignInAll { retry: true, .. }));
-    }
-
-    /// An agent's update_settings (here, or run_on_machine's from another computer) never changes
-    /// the sign-in window under a run: the patch is checked against a run going before it is saved.
-    #[test]
-    fn an_agent_s_window_change_waits_for_a_run_to_end() {
-        use crate::source_guard::{find, function, has, tokens};
-        let code = tokens(include_str!("app.rs"));
-        let door = function(&code, "app.rs", "async fn door_call(", "app::sign_in_tests");
-        let arm = &door[find(door, "R::UpdateSettings { patch } =>").expect("update_settings' arm")..];
-        let arm = &arm[..find(arm, "store_settings(&app, held, next.clone())").expect("where the arm saves")];
-        assert!(has(arm, "if state.bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished) { settings::while_signing_in(&current, &next)?; }"), "{arm}");
     }
 
     #[test]

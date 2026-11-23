@@ -146,7 +146,7 @@ fn every_sign_in_holds_its_mark_until_it_ends() {
         let marks = places(body, ".sign_ins.open()");
         assert_eq!(marks.len(), 1, "{}", fail("the sign-in takes one mark, `.sign_ins.open()`"));
         let mark = marks[0];
-        for first in ["start_login_observed(", "signin_session(", "signin_options("] {
+        for first in ["start_login_observed(", "Opens::own(", ".options("] {
             assert!(find(body, first).map_or(true, |at| mark < at), "{}", fail(&format!("the mark is taken before `{first}`")));
         }
         let word = |c: char| c.is_alphanumeric() || c == '_';
@@ -198,7 +198,7 @@ fn each_sign_in_holds_its_mark_past_its_last_save() {
 
     let add = function(&app, "app.rs", "async fn start_add_account(", SAVE);
     let held = task(add, "start_add_account");
-    let saved = "async move { let added = job.wait(&http_client()).await; drop(session); drop(pending); if let Some(slot) = added {";
+    let saved = "async move { let added = job.wait(&http_client()).await; drop(opens); drop(pending); if let Some(slot) = added {";
     assert!(held.starts_with(&tokens(saved)), "Add account's task holds `pending`, and the mark in it, until `job.wait` has saved the account. {}\n{held}",
         lost("start_add_account's task in app.rs", saved, SAVE));
     assert_eq!(words(add, "pending"), 4, "`pending` is the parameter, rebound once with the mark and let go of once, in the task: nowhere else. {}\n{add}", update(SAVE));
@@ -216,7 +216,7 @@ fn each_sign_in_holds_its_mark_past_its_last_save() {
     let outcome = statement(held, "let outcome =").unwrap_or_else(|| panic!("{}", lost("start_monitoring_login's task in app.rs", "let outcome =", SAVE)));
     assert!(has(outcome, ".connect_replacing("), "the outcome is where the new monitoring sign-in is stored. {}\n{outcome}", update(SAVE));
     let after = &held[outcome.as_ptr() as usize - held.as_ptr() as usize + outcome.len()..];
-    let drops = "drop(session); drop(operation); drop(sign_in); drop(open);";
+    let drops = "drop(opens); drop(operation); drop(sign_in); drop(open);";
     assert!(after.starts_with(&tokens(drops)), "the task lets go of all three together, right after the outcome is stored. {}\n{held}",
         lost("start_monitoring_login's task in app.rs", drops, SAVE));
     for name in ["operation", "sign_in", "open"] {

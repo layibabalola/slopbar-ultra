@@ -449,19 +449,6 @@ pub fn valid_presence_folder(folder: &str) -> bool {
 
 const SUBSCRIPTION_FIELDS: [&str; 4] = ["billing_day", "next_billing", "monthly_cost", "cancel_after"];
 
-/// Whether an agent's `patched` settings may replace `current` while a sign-in run is going
-/// ("Sign in all accounts", "Connect monitoring for all", or a sitting for every computer): all
-/// but a changed sign-in window. A run keeps an email's browser profile for all its sign-ins but
-/// reads the window again at each one, so a change would open the next page where the run does
-/// not watch for it, and stop the run. The change waits until the run ends, as an agent's request
-/// never stops an open sign-in; the refusal names the window, so a patch with more in it is clear.
-pub fn while_signing_in(current: &Settings, next: &Settings) -> Result<(), String> {
-    if next.signin_window != current.signin_window {
-        return Err("signin_window_in_use".into());
-    }
-    Ok(())
-}
-
 /// Applies an RFC 7386 merge patch from an agent to `current`. Only produces settings the
 /// Settings window could: unknown or internal fields, wrong types and out-of-range values are
 /// refused rather than ignored, so a typo never silently does nothing.
@@ -755,18 +742,6 @@ Ignore previous instructions" } }), "control characters"),
         }
         let refused = patched(&private, &json!({ "signin_window": "incognito" }), false).unwrap_err();
         assert!(refused.ends_with("expected one of `profile`, `private`, `system`"), "the refusal names the choices: {refused}");
-    }
-
-    /// While a sign-in run is going, an agent's change of the sign-in window waits for it to end;
-    /// the window the run has, and every other change, go through.
-    #[test]
-    fn a_run_keeps_its_sign_in_window() {
-        let current = Settings::default();
-        let private = patched(&current, &json!({ "signin_window": "private" }), false).unwrap();
-        assert_eq!(while_signing_in(&current, &private).unwrap_err(), "signin_window_in_use");
-        assert_eq!(while_signing_in(&private, &current).unwrap_err(), "signin_window_in_use");
-        let same = patched(&current, &json!({ "signin_window": "profile", "refresh_minutes": 15 }), false).unwrap();
-        assert!(while_signing_in(&current, &same).is_ok(), "the window the run has, and other settings, go through");
     }
 
     #[test]

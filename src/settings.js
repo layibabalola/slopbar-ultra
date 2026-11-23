@@ -1543,8 +1543,11 @@ function renderBulk() {
     : bulk.lapsed.in_use.length ? t("bulkRemoveInUse", { list: bulk.lapsed.in_use.map(who).join(", ") }) : t("bulkRemoveNone");
   const status = $("bulk-status");
   // Another computer's sign-in (see `relay`): named with its computer, and always in a browser here.
+  // Otherwise where the current email's window is (read as its turn started, so a change of the
+  // setting during a run shows from the next email, as it takes effect).
   const open = c?.steps?.find((s) => s.state === "running");
-  const where = settings.signin_window === "system" && !open?.machine ? t("signInWhereTerminal") : t("signInWhereBrowser");
+  const emailWindow = c?.window ?? settings.signin_window;
+  const where = emailWindow === "system" && !open?.machine ? t("signInWhereTerminal") : t("signInWhereBrowser");
   const account = c?.current ? (open?.machine ? t("signInFor", { what: who(c.current), machine: open.machine }) : who(c.current)) : "";
   if (running && c.current && c.still_waiting) {
     status.textContent = t("signInStillWaiting", { account, where });
