@@ -415,6 +415,37 @@ pub struct InUse {
     pub ends_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// What becomes of one of another computer's sign-ins in a sitting (see [`keep`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keep {
+    Yes,
+    /// An account this computer does not know (its own, or a roster's, with the same email): its
+    /// page is never opened here, whatever that computer says.
+    Unknown,
+    /// A monitoring sign-in that computer need not make: this computer's shared readings cover it.
+    Covered,
+}
+
+/// Whether `step`, one of computer `offer`'s sign-ins, is part of a sitting here. `known` are the
+/// accounts this computer knows (provider, id, email); `reads_here` whether this computer reads an
+/// account's usage itself; `shares_with_it` whether this computer's readings reach that computer
+/// (readings shared here, and that computer reads this one's roster).
+pub fn keep(step: &crate::bulk::Step, offer: &Offer, known: &[(Provider, String, Option<String>)], reads_here: impl Fn(Provider, &str) -> bool, shares_with_it: bool) -> Keep {
+    let (provider, id) = (step.target.provider, step.target.id.as_str());
+    let same = |a: &Option<String>| match (a, &step.email) {
+        (Some(a), Some(b)) => a.trim().eq_ignore_ascii_case(b.trim()),
+        (None, None) => true,
+        _ => false,
+    };
+    if !known.iter().any(|(p, i, e)| *p == provider && i == id && same(e)) {
+        return Keep::Unknown;
+    }
+    if step.kind == crate::bulk::Kind::Connect && shares_with_it && reads_here(provider, id) && !offer.own.uses(provider, id) {
+        return Keep::Covered;
+    }
+    Keep::Yes
+}
+
 /// What another computer's `RelayPlan` answers (see `app::relay_plan`).
 #[derive(Debug, Clone, Deserialize)]
 struct PlanAnswer {
@@ -831,6 +862,8 @@ pub struct Shared {
     tunnel: std::sync::Mutex<Option<Box<dyn Hold>>>,
     cancel: std::sync::atomic::AtomicBool,
     step: std::sync::Mutex<Option<String>>,
+    /// The other computer said the step ended (done, not needed or failed there): nothing to stop.
+    ended_there: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {
@@ -877,6 +910,9 @@ fn drive_timed(desk: &dyn Desk, host: &str, ids: &Ids, step: &crate::bulk::Step,
         loop {
             if shared.cancelled() {
                 return Err("signin_stopped".into());
+            }
+            if state.phase.ended() {
+                shared.ended_there.store(true, std::sync::atomic::Ordering::SeqCst);
             }
             match state.phase {
                 Phase::Done => return Ok(true),
@@ -957,25 +993,20 @@ fn start_there(desk: &dyn Desk, host: &str, start: &Request, shared: &Shared, ti
     }
 }
 
-/// A relayed sign-in started with [`drive`] on a thread of its own: dropping it (Stop, the browser
-/// closed, this app quitting) closes its tunnel at once and asks the other computer to stop.
+/// A relayed sign-in started with [`drive`] on a thread of its own. Dropping it (when it ended,
+/// or on Stop, the browser closed, this app quitting) closes its tunnel at once and, unless the
+/// other computer said the step ended there, asks it to stop: a step left open there would keep
+/// that computer's one sign-in for minutes (see [`UNHEARD_LIMIT`]).
 pub struct Relayed {
     pub shared: std::sync::Arc<Shared>,
     host: String,
     stop: std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>,
-    ended: bool,
 }
 
 impl Relayed {
     /// `stop(host, step)` asks the other computer to stop step `step` (on a thread of its own).
     pub fn new(host: &str, stop: std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>) -> Self {
-        Relayed { shared: Default::default(), host: host.to_owned(), stop, ended: false }
-    }
-
-    /// The sign-in ended by itself (done, not needed or failed there): nothing to stop.
-    pub fn ended(&mut self) {
-        self.ended = true;
-        self.shared.tunnel.lock().unwrap_or_else(|e| e.into_inner()).take();
+        Relayed { shared: Default::default(), host: host.to_owned(), stop }
     }
 }
 
@@ -983,7 +1014,7 @@ impl Drop for Relayed {
     fn drop(&mut self) {
         self.shared.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         self.shared.tunnel.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if !self.ended {
+        if !self.shared.ended_there.load(std::sync::atomic::Ordering::SeqCst) {
             if let Some(step) = self.shared.step.lock().unwrap_or_else(|e| e.into_inner()).clone() {
                 (self.stop)(&self.host, &step);
             }

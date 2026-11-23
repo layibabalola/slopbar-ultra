@@ -490,14 +490,18 @@ fn stopping_a_relayed_sign_in_closes_its_tunnel_at_once_and_stops_it_there() {
     drop(relayed);
     assert!(shared.cancelled() && shared.tunnel.lock().unwrap().is_none(), "the tunnel goes at once");
     assert_eq!(stops.lock().unwrap().clone(), [("desk".to_string(), "s1".to_string())], "and that computer is asked to stop the step");
-    // A sign-in that ended by itself there needs no stop.
-    let stops: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
-    let seen = stops.clone();
-    let mut relayed = Relayed::new("desk", Arc::new(move |host: &str, step: &str| seen.lock().unwrap().push((host.into(), step.into()))));
-    *relayed.shared.step.lock().unwrap() = Some("s1".into());
-    relayed.ended();
-    drop(relayed);
-    assert!(stops.lock().unwrap().is_empty());
+    // A sign-in that ended there (as drive saw it) needs no stop; one this computer gave up on does.
+    for (answers, stopped) in [(vec![state("page", Some(CLAUDE), 2), state("done", None, 3)], false),
+        (vec![state("page", Some(&CLAUDE.replace("client_id=9d1c250a", "client_id=0d1c250a")), 2)], true)] {
+        let stops: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let seen = stops.clone();
+        let relayed = Relayed::new("desk", Arc::new(move |host: &str, step: &str| seen.lock().unwrap().push((host.into(), step.into()))));
+        let desk = FakeDesk::new(answers);
+        let _ = run(&desk, Provider::Claude, &relayed.shared);
+        let id = desk.calls.lock().unwrap()[0]["step"].as_str().unwrap().to_string();
+        drop(relayed);
+        assert_eq!(stops.lock().unwrap().clone(), if stopped { vec![("desk".to_string(), id)] } else { vec![] }, "stopped there: {stopped}");
+    }
     // Asked to stop mid-way, drive ends with signin_stopped.
     let desk = FakeDesk::new(vec![state("starting", None, 1), state("starting", None, 1)]);
     let shared = Shared::default();
@@ -609,4 +613,33 @@ fn live_relay_against_another_computer() {
     }
     assert_eq!((ended.phase, ended.error.as_deref()), (Phase::Failed, Some("signin_stopped")), "stopped there, nothing saved");
     println!("stopped there: {:?}", ended.error);
+}
+
+#[test]
+fn only_accounts_this_computer_knows_are_relayed_and_covered_monitoring_is_left_to_shared_readings() {
+    let machine = crate::bulk::Machine { id: "id-desk".into(), name: "DESK".into(), host: "desk".into() };
+    let offer = Offer { machine, plan: vec![], own: OwnReadings { claude: false, codex: true, rotate: vec!["claude:rotated".into()] }, in_use: vec![] };
+    let step = |kind: crate::bulk::Kind, provider: Provider, id: &str, email: Option<&str>| crate::bulk::Step {
+        kind, target: crate::bulk::Target { provider, id: id.into(), account: email.map(Into::into), ended: None }, email: email.map(Into::into), machine: None,
+    };
+    let known = vec![(Provider::Claude, "a".to_string(), Some("A@example.invalid".to_string())), (Provider::Claude, "rotated".to_string(), None),
+        (Provider::Codex, "x".to_string(), Some("x@example.invalid".to_string())), (Provider::Claude, "far".to_string(), Some("far@example.invalid".to_string()))];
+    let reads_here = |_: Provider, id: &str| id != "far";
+    let renew = step(crate::bulk::Kind::Renew, Provider::Claude, "a", Some("a@example.invalid"));
+    assert_eq!(keep(&renew, &offer, &known, reads_here, true), Keep::Yes, "a known account, its email whatever the case");
+    for (why, s) in [("an account this computer does not know", step(crate::bulk::Kind::Renew, Provider::Claude, "zzz", Some("a@example.invalid"))),
+        ("a known account under another email", step(crate::bulk::Kind::Renew, Provider::Claude, "a", Some("other@example.invalid"))),
+        ("a known account with its email dropped", step(crate::bulk::Kind::Renew, Provider::Claude, "a", None)),
+        ("the same id of another provider", step(crate::bulk::Kind::Renew, Provider::Codex, "a", Some("a@example.invalid")))] {
+        assert_eq!(keep(&s, &offer, &known, reads_here, true), Keep::Unknown, "{why}");
+    }
+    let connect = step(crate::bulk::Kind::Connect, Provider::Claude, "a", Some("a@example.invalid"));
+    assert_eq!(keep(&connect, &offer, &known, reads_here, true), Keep::Covered, "this computer reads it and its readings reach that one");
+    assert_eq!(keep(&connect, &offer, &known, reads_here, false), Keep::Yes, "its readings do not reach that computer");
+    let far = step(crate::bulk::Kind::Connect, Provider::Claude, "far", Some("far@example.invalid"));
+    assert_eq!(keep(&far, &offer, &known, reads_here, true), Keep::Yes, "this computer does not read it");
+    let switching = step(crate::bulk::Kind::Connect, Provider::Codex, "x", Some("x@example.invalid"));
+    assert_eq!(keep(&switching, &offer, &known, reads_here, true), Keep::Yes, "that computer switches Codex accounts by its own readings");
+    let rotated = step(crate::bulk::Kind::Connect, Provider::Claude, "rotated", None);
+    assert_eq!(keep(&rotated, &offer, &known, reads_here, true), Keep::Yes, "that computer rotates that account by its own readings");
 }

@@ -1993,8 +1993,9 @@ fn ssh_aliases() -> HashSet<String> {
 /// Their steps are kept only for accounts this computer knows (its own, or a roster's, with the
 /// same email), so another computer can never have pages for someone else's accounts opened here;
 /// and their monitoring sign-ins only where they read usage for themselves (automatic switching, a
-/// rotation threshold) or this computer does not read that account: shared readings cover the
-/// rest. Kept as the plan the person's OK starts (see `start_everywhere`).
+/// rotation threshold) or this computer's shared readings would not cover them there (it does not
+/// read that account, does not share readings, or that computer does not read its roster). Kept as
+/// the plan the person's OK starts (see `start_everywhere`).
 async fn gather_everywhere(app: &AppHandle, monitoring: bool) -> Result<Everywhere, String> {
     let state = app.state::<AppState>();
     let (here_id, here_name) = presence::identity().map(|(id, name)| (id.to_string(), name.to_string())).ok_or("relay_failed")?;
@@ -2020,16 +2021,15 @@ async fn gather_everywhere(app: &AppHandle, monitoring: bool) -> Result<Everywhe
     let asked = tauri::async_runtime::spawn_blocking(move || relay::ask_all(Arc::new(pairing::Ssh), &asking, &here, monitoring, relay::ASK_LIMIT))
         .await.map_err(|_| "relay_failed".to_string())?;
     // Accounts this computer knows: its own and those the encrypted rosters name.
-    let same = |a: &Option<String>, b: &Option<String>| match (a, b) {
-        (Some(a), Some(b)) => a.trim().eq_ignore_ascii_case(b.trim()),
-        (None, None) => true,
-        _ => false,
-    };
     let mut known: Vec<(Provider, String, Option<String>)> = snapshot.accounts.iter().map(|a| (a.provider, a.id.clone(), a.email.clone())).collect();
     for peer in &peers {
         known.extend(peer.accounts.iter().map(|e| (e.provider, e.id.clone(), e.email.clone())));
     }
     let reads_here = |provider: Provider, id: &str| snapshot.accounts.iter().any(|a| a.provider == provider && a.id == id && !a.id.starts_with("token:"));
+    // This computer's readings reach another only through the encrypted rosters: with readings
+    // shared here, to a computer whose roster this one reads (so it reads this one's).
+    let settings = state.settings.lock().unwrap().clone();
+    let shares = settings.account_roster && settings.share_readings;
     let mut in_use: Vec<relay::InUse> = in_use_ending(&snapshot, chrono::Utc::now()).into_iter().map(|u| relay::InUse { machine: here_name.clone(), ..u }).collect();
     let mut others = Vec::new();
     let mut seen = HashSet::new();
@@ -2045,17 +2045,15 @@ async fn gather_everywhere(app: &AppHandle, monitoring: bool) -> Result<Everywhe
                     pairing::remember_new_host(dir, &offer.machine.id, alias);
                 }
                 in_use.extend(offer.in_use.clone());
+                let shares_with_it = shares && peers.iter().any(|p| p.machine_id == offer.machine.id);
                 let mut kept = Vec::new();
-                for step in offer.plan.into_iter().flat_map(|g| g.steps) {
-                    let (provider, id) = (step.target.provider, step.target.id.clone());
-                    if !known.iter().any(|(p, i, e)| *p == provider && *i == id && same(e, &step.email)) {
-                        left_out.push(relay::Skipped { account: step.target.account.clone(), ..relay::Skipped::computer(&offer.machine.name, "relay_unknown_account") });
-                        continue;
+                for step in offer.plan.iter().flat_map(|g| g.steps.iter()) {
+                    match relay::keep(step, &offer, &known, reads_here, shares_with_it) {
+                        relay::Keep::Yes => kept.push(step.clone()),
+                        relay::Keep::Unknown => left_out.push(relay::Skipped { account: step.target.account.clone(),
+                            ..relay::Skipped::computer(&offer.machine.name, "relay_unknown_account") }),
+                        relay::Keep::Covered => {}
                     }
-                    if step.kind == bulk::Kind::Connect && !offer.own.uses(provider, &id) && reads_here(provider, &id) {
-                        continue;
-                    }
-                    kept.push(step);
                 }
                 others.push((offer.machine, vec![bulk::Group { email: None, steps: kept }]));
             }
@@ -2099,13 +2097,16 @@ fn ask_everywhere(app: &AppHandle, plan: Everywhere) -> bool {
     let body = crate::i18n::t(&lang, "signInEverywhereAsk", &[("n", &n.to_string()), ("list", &list)]);
     let buttons = vec![(crate::i18n::t(&lang, "signInEverywhereStart", &[]), "start")];
     let h = app.clone();
-    notify::notify_choice(app.clone(), title, body, buttons, move |action| {
-        if action == Some("start") {
+    notify::notify_choice(app.clone(), title, body, buttons, move |action| match action {
+        Some("start") => {
             let fresh = h.state::<AppState>().everywhere.lock().unwrap().clone().filter(|p| p.id == plan.id && p.at.elapsed() < EVERYWHERE_FRESH);
             if let Some(plan) = fresh {
                 let _ = start_everywhere(&h, plan);
             }
         }
+        // The notification itself: Settings > Accounts, where the same sitting can be started.
+        None => show_settings_page(&h, Some("accounts".into())),
+        Some(_) => {}
     }).is_ok()
 }
 
@@ -2194,7 +2195,7 @@ async fn relayed_turn(h: &AppHandle, step: &bulk::Step, machine: &bulk::Machine,
             let _ = pairing::relay_call(&pairing::Ssh, &host, &door::Request::RelayStop { step }, Duration::ZERO);
         });
     });
-    let mut relayed = relay::Relayed::new(&machine.host, stopper);
+    let relayed = relay::Relayed::new(&machine.host, stopper);
     let (shared, host, ids, owned) = (relayed.shared.clone(), machine.host.clone(), relay::Ids { from, machine: machine.id.clone() }, step.clone());
     let page = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let seen = page.clone();
@@ -2214,25 +2215,20 @@ async fn relayed_turn(h: &AppHandle, step: &bulk::Step, machine: &bulk::Machine,
     };
     tokio::pin!(closed, watch, page_open);
     let mut opening = true;
-    let (outcome, ended_there) = loop {
+    let outcome = loop {
         tokio::select! {
-            outcome = &mut run => break (outcome, true),
-            _ = stop.notified() => break (Err("signin_stopped".into()), false),
+            outcome = &mut run => break outcome,
+            _ = stop.notified() => break Err("signin_stopped".into()),
             // As for a sign-in here: the provider's "done" page closed while the other computer saves.
-            _ = &mut closed => break match tokio::time::timeout(SIGN_IN_GRACE, &mut run).await {
-                Ok(outcome) => (outcome, true),
-                Err(_) => (Err("signin_window_closed".into()), false),
-            },
-            e = &mut watch => break (Err(e), false),
+            _ = &mut closed => break tokio::time::timeout(SIGN_IN_GRACE, &mut run).await.unwrap_or_else(|_| Err("signin_window_closed".into())),
+            e = &mut watch => break Err(e),
             _ = &mut page_open, if opening => {
                 opening = false;
                 opened();
             }
         }
     };
-    if ended_there {
-        relayed.ended();
-    }
+    // Closes the tunnel, and stops the step there unless it ended there by itself.
     drop(relayed);
     outcome
 }
