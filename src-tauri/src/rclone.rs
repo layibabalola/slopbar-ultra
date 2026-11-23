@@ -1024,13 +1024,25 @@ mod tests {
         crate::presence::peers(read.iter().cloned(), ME, now).into_iter().map(|p| (p.machine, p.seen_at, p.live, p.seats)).collect()
     }
 
+    /// A read's records as JSON, with their times, but for this machine's own: what `others` must give
+    /// where downloading every record (`list`) gives the same.
+    fn raw(read: &[(Presence, Option<DateTime<Utc>>)]) -> Vec<(String, Option<DateTime<Utc>>)> {
+        read.iter().filter(|(p, _)| p.machine_id != ME).map(|(p, at)| (serde_json::to_string(p).unwrap(), *at)).collect()
+    }
+
     /// A refresh's read never downloads this machine's own record (nothing reads it), and on Dropbox
     /// and Google Drive downloads a record again only when the cloud lists it with another content
     /// hash than the copy the last read kept: a machine that went to sleep is downloaded once. What
-    /// the read gives is what downloading every record gives.
+    /// the read gives, records and times, is what downloading every record gives.
     #[test]
     fn presence_reads_skip_this_machines_record_and_records_listed_unchanged() {
-        let store = Rclone::with("cloud", dropbox());
+        presence_reads_on(dropbox());
+        presence_reads_on(Fake { kind: Some("drive".into()), ..Fake::default() });
+    }
+
+    fn presence_reads_on(fake: Fake) {
+        let kind = fake.kind.clone();
+        let store = Rclone::with("cloud", fake);
         let kept = Kept::default();
         let t0: DateTime<Utc> = "2026-11-23T12:00:00Z".parse().unwrap();
         let at = |m: i64| t0 + chrono::Duration::minutes(m);
@@ -1042,9 +1054,11 @@ mod tests {
             let from = store.runner.count();
             let read = store.others(ME, &kept).unwrap();
             let calls = store.runner.calls.lock().unwrap()[from..].to_vec();
-            assert!(calls.iter().filter(|c| c.starts_with("lsjson ")).all(|c| c.contains(" --hash ")), "{calls:?}");
+            assert!(calls.iter().filter(|c| c.starts_with("lsjson ")).all(|c| c.contains(" --hash ")), "{kind:?}: {calls:?}");
             assert!(!calls.iter().any(|c| c.contains(ME)), "this machine's own record is never downloaded: {calls:?}");
-            assert_eq!(shown(&read, at(m)), shown(&store.list().unwrap(), at(m)), "the same peers as every record downloaded");
+            let every = store.list().unwrap();
+            assert_eq!(raw(&read), raw(&every), "{kind:?}: the records and times downloading every record gives");
+            assert_eq!(shown(&read, at(m)), shown(&every, at(m)), "{kind:?}: so the same peers");
             let cats: Vec<String> = calls.iter().filter_map(|c| c.strip_prefix("cat ")).map(String::from).collect();
             (read, cats)
         };
@@ -1066,6 +1080,13 @@ mod tests {
         let (read, cats) = refresh(15);
         assert_eq!((cats, read.iter().any(|(p, _)| p.machine == "IDLE-PD")), (vec![idle.clone()], true));
         assert!(refresh(20).1.is_empty());
+        // Its time moving while its bytes stay (the same bytes uploaded again): the listing's new time,
+        // with no download.
+        let moved = store.runner.times.lock().unwrap()[&idle] + 3600;
+        store.runner.times.lock().unwrap().insert(idle.clone(), moved);
+        let (read, cats) = refresh(22);
+        let base: DateTime<Utc> = "2026-10-21T07:00:00Z".parse().unwrap();
+        assert_eq!((cats, read.iter().find(|(p, _)| p.machine_id == IDLE).unwrap().1), (vec![], Some(base + chrono::Duration::seconds(moved))));
         // A record listed with no hash is downloaded at every read, and once more when it is listed
         // with one again (nothing was kept of it without one).
         store.runner.hashless.lock().unwrap().push(idle.clone());
@@ -1097,12 +1118,26 @@ mod tests {
         assert_eq!(refresh(70).1, [busy.clone()]);
         assert!(refresh(75).1.is_empty());
         // A listing that fails reads nothing and forgets nothing: the read after it still skips.
-        let failing = Rclone::with("cloud", Fake { fail: Some(1), ..dropbox() });
+        let failing = Rclone::with("cloud", Fake { fail: Some(1), kind: kind.clone(), ..Fake::default() });
         assert!(failing.others(ME, &kept).is_err());
         assert!(refresh(80).1.is_empty());
         // Records only: a file there that is not one is downloaded at every read, as it always was.
         store.runner.files.lock().unwrap().insert(path("junk"), b"not a record".to_vec());
         assert_eq!((refresh(85).1, refresh(90).1), (vec![path("junk")], vec![path("junk")]));
+    }
+
+    /// The file under this machine's name is not read, whatever it holds: only this machine writes
+    /// it, so another machine's record there (a forgery; no two SlopBar ids share their hex digits
+    /// and dashes) is not shown here, as it was when every record was read.
+    #[test]
+    fn the_file_under_this_machines_name_is_not_read_whatever_it_holds() {
+        let store = Rclone::with("cloud", dropbox());
+        let forged = serde_json::to_vec(&record(BUSY, "FORGED-PC", Utc::now())).unwrap();
+        store.runner.files.lock().unwrap().insert(format!("cloud:SlopBar/presence/{ME}.json"), forged);
+        let from = store.runner.count();
+        assert!(store.others(ME, &Kept::default()).unwrap().is_empty());
+        assert_eq!((store.runner.ran(from, "lsjson"), store.runner.ran(from, "cat")), (1, 0));
+        assert_eq!(store.list().unwrap().len(), 1, "every record, as before");
     }
 
     /// Remotes whose listing carries no hash this computer counts are not asked for one, and download
