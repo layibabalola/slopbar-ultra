@@ -71,6 +71,8 @@ pub struct Report {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MonitorState {
     pub reconnect: bool,
+    /// Two renewals ended uncertain, so automatic replay stopped (`monitor_uncertain`).
+    pub uncertain: bool,
     /// When the sign-in ends: the earliest end the provider gave it, at sign-in or since. Renewing
     /// never moves it later; only a new sign-in does.
     pub ends_at: Option<DateTime<Utc>>,
@@ -473,14 +475,14 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
             let early = if state.and_then(|s| s.ends_at).is_some_and(|t| t > now) { ", well before the date it was due to end" } else { "" };
             monitoring.push(check(id, Status::Problem, format!("{who}: monitoring sign-in needs reconnecting"),
                 format!("Its monitoring sign-in can no longer be renewed{early}. Reconnecting needs no account use."), connect));
+        } else if error == Some("monitor_storage") {
+            monitoring.push(check(id, Status::Problem, format!("{who}: monitoring sign-in unreadable"),
+                "The saved monitoring sign-in could not be read or saved. Check disk space and file access, then reconnect.", connect));
         } else if let Some(at) = ending {
             sign_ins.ending += 1;
             sign_ins.limited = sign_ins.limited.or(Some(a.provider));
             monitoring.push(check(id, Status::Warning, format!("{who}: monitoring sign-in ends soon"),
                 format!("{} This one ends {}; reconnect before then to avoid a gap.", sign_in_limit(a.provider), within(at - now)), connect));
-        } else if error == Some("monitor_storage") {
-            monitoring.push(check(id, Status::Problem, format!("{who}: monitoring sign-in unreadable"),
-                "The saved monitoring sign-in could not be read or saved. Check disk space and file access, then reconnect.", connect));
         } else if let Some(e) = error {
             // The wait (`Monitor::token_with`), during which the same reason is kept without asking
             // again; for the proxy, also the site, since a proxy may let usage through but not it.
@@ -822,7 +824,7 @@ mod tests {
     fn monitoring_that_needs_reconnecting_is_a_problem_with_its_fix() {
         let mut case = Case::healthy();
         case.accounts[0].monitor_error = Some("monitor_reconnect".into());
-        case.monitoring.insert("Claude:b".into(), MonitorState { reconnect: true, ends_at: None });
+        case.monitoring.insert("Claude:b".into(), MonitorState { reconnect: true, uncertain: false, ends_at: None });
         let r = case.run();
         for id in ["a", "b"] {
             let c = find(&r, &format!("monitoring:claude:{id}"));
@@ -869,8 +871,8 @@ mod tests {
     #[test]
     fn a_monitoring_sign_in_expiring_within_three_days_is_a_warning() {
         let mut case = Case::healthy();
-        case.monitoring.insert("Claude:a".into(), MonitorState { reconnect: false, ends_at: Some(now() + Duration::hours(30)) });
-        case.monitoring.insert("Claude:b".into(), MonitorState { reconnect: false, ends_at: Some(now() + Duration::days(20)) });
+        case.monitoring.insert("Claude:a".into(), MonitorState { reconnect: false, uncertain: false, ends_at: Some(now() + Duration::hours(30)) });
+        case.monitoring.insert("Claude:b".into(), MonitorState { reconnect: false, uncertain: false, ends_at: Some(now() + Duration::days(20)) });
         let r = case.run();
         let c = find(&r, "monitoring:claude:a");
         assert_eq!((c.status, c.title.as_str()), (Status::Warning, "a@example.invalid: monitoring sign-in ends soon"));
@@ -878,15 +880,15 @@ mod tests {
         assert!(r.checks.iter().all(|c| c.id != "monitoring:claude:b"), "far-off deadlines are fine");
         // Within RENEW_DAYS but not WARN_DAYS: Connect all takes it along; Health says nothing yet.
         let mut later = Case::healthy();
-        later.monitoring.insert("Claude:a".into(), MonitorState { reconnect: false, ends_at: Some(now() + Duration::days(5)) });
+        later.monitoring.insert("Claude:a".into(), MonitorState { reconnect: false, uncertain: false, ends_at: Some(now() + Duration::days(5)) });
         assert_eq!(later.run().status, Status::Ok);
         let mut close = Case::healthy();
-        close.monitoring.insert("Claude:a".into(), MonitorState { reconnect: false, ends_at: Some(now() + Duration::minutes(30)) });
+        close.monitoring.insert("Claude:a".into(), MonitorState { reconnect: false, uncertain: false, ends_at: Some(now() + Duration::minutes(30)) });
         let reason = find(&close.run(), "monitoring:claude:a").reason.clone();
         assert!(reason.contains("within 1 hour;"), "one hour, not hours: {reason}");
         // A passed deadline is only a renewal hint: renewing at the next refresh clears it.
         let mut passed = Case::healthy();
-        passed.monitoring.insert("Claude:a".into(), MonitorState { reconnect: false, ends_at: Some(now() - Duration::hours(1)) });
+        passed.monitoring.insert("Claude:a".into(), MonitorState { reconnect: false, uncertain: false, ends_at: Some(now() - Duration::hours(1)) });
         assert_eq!(passed.run().status, Status::Ok);
     }
 
@@ -894,9 +896,9 @@ mod tests {
     fn an_ended_monitoring_sign_in_says_why_and_a_refused_one_is_still_a_fault() {
         let mut case = Case::healthy();
         case.accounts.push(account("c", true, Some(1)));
-        case.monitoring.insert("Claude:a".into(), MonitorState { reconnect: true, ends_at: Some(now() - Duration::days(2)) });
-        case.monitoring.insert("Claude:b".into(), MonitorState { reconnect: true, ends_at: Some(now() + Duration::days(9)) });
-        case.monitoring.insert("Claude:c".into(), MonitorState { reconnect: true, ends_at: Some(now() + Duration::days(1)) });
+        case.monitoring.insert("Claude:a".into(), MonitorState { reconnect: true, uncertain: false, ends_at: Some(now() - Duration::days(2)) });
+        case.monitoring.insert("Claude:b".into(), MonitorState { reconnect: true, uncertain: false, ends_at: Some(now() + Duration::days(9)) });
+        case.monitoring.insert("Claude:c".into(), MonitorState { reconnect: true, uncertain: false, ends_at: Some(now() + Duration::days(1)) });
         let r = case.run();
         let a = find(&r, "monitoring:claude:a");
         assert_eq!((a.status, a.title.as_str()), (Status::Problem, "a@example.invalid: monitoring sign-in ended"));
@@ -913,6 +915,9 @@ mod tests {
         let mut case = Case::healthy();
         case.accounts[0].error = Some("monitor_uncertain".into());
         assert_eq!(find(&case.run(), "monitoring:claude:a").title, "a@example.invalid: monitoring sign-in needs reconnecting");
+        // Reconnected since that error: the saved sign-in says so before the next refresh does.
+        case.monitoring.insert("Claude:a".into(), MonitorState { reconnect: false, uncertain: false, ends_at: Some(now() + Duration::days(30)) });
+        assert_eq!(case.run().status, Status::Ok, "a stale error must not flag a fresh sign-in");
     }
 
     #[test]
@@ -920,10 +925,10 @@ mod tests {
         let mut case = Case::healthy();
         case.accounts.push(account("c", true, Some(1)));
         case.accounts.push(account("d", false, Some(1)));
-        case.monitoring.insert("Claude:a".into(), MonitorState { reconnect: true, ends_at: Some(now() - Duration::hours(3)) });
-        case.monitoring.insert("Claude:b".into(), MonitorState { reconnect: false, ends_at: Some(now() + Duration::hours(30)) });
+        case.monitoring.insert("Claude:a".into(), MonitorState { reconnect: true, uncertain: false, ends_at: Some(now() - Duration::hours(3)) });
+        case.monitoring.insert("Claude:b".into(), MonitorState { reconnect: false, uncertain: false, ends_at: Some(now() + Duration::hours(30)) });
         // Ending in 5 days: no row of its own yet, but signed in along with the others.
-        case.monitoring.insert("Claude:c".into(), MonitorState { reconnect: false, ends_at: Some(now() + Duration::days(5)) });
+        case.monitoring.insert("Claude:c".into(), MonitorState { reconnect: false, uncertain: false, ends_at: Some(now() + Duration::days(5)) });
         let r = case.run();
         let first = r.checks.iter().position(|c| c.id.starts_with("monitoring")).unwrap();
         let s = &r.checks[first];
@@ -935,10 +940,10 @@ mod tests {
         assert_eq!((r.problems, r.warnings), (1, 2), "the summary repeats rows already counted");
         // One alone needs no summary; refusals alone say nothing of a limit.
         let mut one = Case::healthy();
-        one.monitoring.insert("Claude:a".into(), MonitorState { reconnect: true, ends_at: Some(now() - Duration::hours(3)) });
+        one.monitoring.insert("Claude:a".into(), MonitorState { reconnect: true, uncertain: false, ends_at: Some(now() - Duration::hours(3)) });
         assert!(one.run().checks.iter().all(|c| c.id != RENEWAL_SUMMARY));
         let mut refused = Case::healthy();
-        for id in ["a", "b"] { refused.monitoring.insert(format!("Claude:{id}"), MonitorState { reconnect: true, ends_at: None }); }
+        for id in ["a", "b"] { refused.monitoring.insert(format!("Claude:{id}"), MonitorState { reconnect: true, uncertain: false, ends_at: None }); }
         let r = refused.run();
         let s = find(&r, RENEWAL_SUMMARY);
         assert_eq!(s.title, "Monitoring sign-ins: 2 need reconnecting");
@@ -1000,7 +1005,7 @@ mod tests {
     fn an_ended_sign_in_s_old_reading_is_not_reported_twice() {
         let mut case = Case::healthy();
         case.accounts[0].fetched_at = Some(now() - Duration::hours(10));
-        case.monitoring.insert("Claude:a".into(), MonitorState { reconnect: true, ends_at: Some(now() - Duration::hours(10)) });
+        case.monitoring.insert("Claude:a".into(), MonitorState { reconnect: true, uncertain: false, ends_at: Some(now() - Duration::hours(10)) });
         let r = case.run();
         assert!(r.checks.iter().any(|c| c.id == "monitoring:claude:a"));
         assert!(r.checks.iter().all(|c| c.id != "freshness:claude:a"), "a refresh cannot bring it back: the monitoring row says why");
