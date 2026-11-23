@@ -1733,8 +1733,14 @@ listen("usage-updated", loadBulk);
 // carries it, followed while it goes on, with Retry over SSH (see `peer_sign_ins`).
 
 let peerRuns = [];
-/** What the last Retry on each machine's card said, by machine id. */
+/** What the last Retry on each machine's card said, by machine id: its text, and the run revision
+ * it speaks of (shown only while the card still shows that revision). */
 const peerNotes = {};
+/** Machines whose Retry is on its way: one at a time each, so a second click sends nothing. */
+const peerBusy = new Set();
+/** Machines whose waiting sign-in just started again, by machine id: the run's revision then, and
+ * until when Retry stays hidden while the card still shows that revision (its sign-in waits anew). */
+const peerRestarted = {};
 
 /** A card's lines: where the run is, and what the person here should know about it. */
 function peerRunLines(p) {
@@ -1750,8 +1756,10 @@ function peerRunLines(p) {
     return [t("bulkConnectStopped", { done: r.done, n: r.total, error: errorText("", r.error) }), t("peerSignInStoppedHint", { machine })];
   }
   if (r.finished) return [t(r.total ? "signInAllDone" : "signInAllNone", { n: r.total }), ""];
+  // A run that names its start can have just its waiting sign-in started again from here; an older
+  // computer's (none named) runs its sign-ins again instead (see `retry_peer_sign_in`).
   const step = !current ? t("peerSignInStarting")
-    : r.still_waiting && !r.everywhere ? t("peerSignInWaiting", { machine, account: who(current) })
+    : r.still_waiting && !r.everywhere ? t(r.started_at ? "peerSignInWaiting" : "peerSignInWaitingAll", { machine, account: who(current) })
     : t(current.kind === "connect" ? "signInAllConnecting" : "signInAllAdding",
       { g: r.email, e: r.emails, i: r.done + 1, n: r.total, account: who(current), where: t("signInWhereMachine", { machine }) });
   const quiet = Math.max(1, Math.round((Date.now() - new Date(p.written_at)) / 60000));
@@ -1776,43 +1784,68 @@ function renderPeerRuns() {
       card.append(line);
     }
     const r = p.run;
-    if (!r.everywhere && ((r.finished && r.error) || r.still_waiting || p.quiet)) {
+    const id = p.machine_id;
+    const restarted = peerRestarted[id];
+    const justRestarted = restarted?.revision === r.revision && Date.now() < restarted.until;
+    // While Retry is on its way, that; else its last word while the card still shows what it spoke
+    // of; or why there is no Retry.
+    const said = peerNotes[id];
+    let note = peerBusy.has(id) ? t("peerSignInRetrying", { machine: p.machine }) : said?.revision === r.revision ? said.text : "";
+    if (!r.everywhere && !justRestarted && ((r.finished && r.error) || r.still_waiting || p.quiet)) {
       if (p.reachable) {
         const retry = document.createElement("button");
         retry.className = "btn";
         retry.textContent = t("signInRetry");
-        retry.addEventListener("click", () => retryPeer(p, retry));
+        retry.disabled = peerBusy.has(id);
+        retry.addEventListener("click", () => retryPeer(p));
         card.append(retry);
       } else {
-        peerNotes[p.machine_id] ??= t("peerSignInNotPaired", { machine: p.machine });
+        note ||= t("peerSignInNotPaired", { machine: p.machine });
       }
     }
-    if (!r.everywhere && peerNotes[p.machine_id]) {
-      const note = document.createElement("p");
-      note.className = "dim";
-      note.textContent = peerNotes[p.machine_id];
-      card.append(note);
+    if (!r.everywhere && note) {
+      const line = document.createElement("p");
+      line.className = "dim";
+      line.textContent = note;
+      card.append(line);
     }
     return card;
   }));
 }
 
-async function retryPeer(p, button) {
-  button.disabled = true;
-  peerNotes[p.machine_id] = t("peerSignInRetrying", { machine: p.machine });
+async function retryPeer(p) {
+  const id = p.machine_id;
+  if (peerBusy.has(id)) return;
+  peerBusy.add(id);
   renderPeerRuns();
+  // What the card shows: whether its run goes on, the start that names it and its open sign-in's
+  // place as that computer counts it, so only that sign-in starts again there while it waits (see
+  // `retry_peer_sign_in`).
+  const r = p.run;
   try {
-    await invoke("retry_peer_sign_in", { machineId: p.machine_id });
-    peerNotes[p.machine_id] = t("peerSignInRetrySent", { machine: p.machine });
-    // The new run reaches the roster seconds later: followed closely meanwhile.
+    const did = await invoke("retry_peer_sign_in", { machineId: id, going: !r.finished, startedAt: r.started_at ?? null, step: r.open ?? null });
+    const revision = shownRevision(id) ?? r.revision;
+    // Its sign-in waits anew: Retry comes back once the card hears so, or after 5 minutes.
+    if (did === "restarted") peerRestarted[id] = { revision, until: Date.now() + 300000 };
+    const key = { restarted: "peerSignInRestartSent", moved_on: "peerSignInMovedOn", nothing_missing: "peerSignInNothingMissing" }[did] ?? "peerSignInRetrySent";
+    peerNotes[id] = { text: t(key, { machine: p.machine }), revision };
+    // What it did reaches the roster seconds later: followed closely meanwhile.
     peerExpectUntil = Date.now() + 120000;
   } catch (err) {
     const code = String(err);
-    peerNotes[p.machine_id] = code === "peer_not_paired" ? t("peerSignInNotPaired", { machine: p.machine })
+    const text = code === "peer_not_paired" ? t("peerSignInNotPaired", { machine: p.machine })
       : t("peerSignInRetryFailed", { machine: p.machine, error: errorText("", code) });
+    peerNotes[id] = { text, revision: shownRevision(id) ?? r.revision };
+  } finally {
+    peerBusy.delete(id);
   }
+  // What it said shows at once; the roster's news follows.
+  renderPeerRuns();
   loadPeerRuns();
 }
+
+/** The run revision a machine's card shows now (cards redraw while Retry is on its way). */
+const shownRevision = (id) => peerRuns.find((p) => p.machine_id === id)?.run.revision;
 
 let peerTimer = null;
 let peerExpectUntil = 0;
