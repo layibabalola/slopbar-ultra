@@ -916,8 +916,7 @@ pub fn start_login_observed(provider: Provider, sources: &[Source], diagnostics:
     if relayed && source.distro.is_some() {
         return Err("relay_unsupported".into());
     }
-    static LOGIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let name = format!(".slopbar-login-{}-{}-{}", std::process::id(), chrono::Utc::now().timestamp_millis(), LOGIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let name = login_dir_name();
     let target = options.target.filter(|_| source.distro.is_none());
     let mut cmd = crate::login::action(provider, false).to_owned();
     if provider == Provider::Claude {
@@ -962,7 +961,7 @@ pub fn start_login_observed(provider: Provider, sources: &[Source], diagnostics:
         // falls back to `codex login` and the default browser.
         if let Ok((child, tree, rpc)) = start_codex_app(&source, &dir, &native, target) {
             if let Some(d) = &diagnostics { d.login(LoginStage::ProcessStart, true, false, None, 0); }
-            return Ok(LoginJob { provider, source: login, dir, native, started: Instant::now(), child, tree: Some(tree), rpc: Some(rpc), diagnostics, finished: false });
+            return Ok(LoginJob { provider, source: login, dir, native, started: Instant::now(), child, tree: Some(tree), rpc: Some(rpc), again: None, diagnostics, finished: false });
         }
         // `codex login` would open this computer's own browser, where nobody completes it.
         if relayed {
@@ -972,23 +971,19 @@ pub fn start_login_observed(provider: Provider, sources: &[Source], diagnostics:
         }
     }
     let visible = console(target.as_ref());
-    let mut term = crate::login::command(provider, &source, &dir, &native, cmd, visible);
-    if !visible {
-        term.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    }
-    let mut breakaway = false;
+    let mut start = CliStart { provider, source: source.clone(), cmd: cmd.to_owned(), visible, env: None, breakaway: false, again: 0 };
     if let (Provider::Claude, Some(target)) = (provider, &target) {
         if let Some(env) = crate::signin::claude_browser_env(target) {
-            term.envs(env);
+            start.env = Some(env);
             // The browser it opens outlives the sign-in; a relayed page opens no browser here.
-            breakaway = !relayed;
+            start.breakaway = !relayed;
         } else if relayed {
             // Without `BROWSER` the CLI would open this computer's own browser, where nobody is.
             let _ = std::fs::remove_dir_all(&dir);
             return Err("relay_unsupported".into());
         }
     }
-    let (child, tree) = match crate::login::ProcessTree::spawn_with(&mut term, visible, breakaway) {
+    let (child, tree) = match start.spawn(&dir, &native) {
         Ok(process) => process,
         Err(_) => {
             if let Some(d) = &diagnostics { d.login(LoginStage::ProcessStart, false, source.distro.is_some(), None, 0); }
@@ -997,7 +992,50 @@ pub fn start_login_observed(provider: Provider, sources: &[Source], diagnostics:
         }
     };
     if let Some(d) = &diagnostics { d.login(LoginStage::ProcessStart, true, source.distro.is_some(), None, 0); }
-    Ok(LoginJob { provider, source: login, dir, native, started: Instant::now(), child, tree: Some(tree), rpc: None, diagnostics, finished: false })
+    // Only a page handed to SlopBar (`BROWSER`) can be refused and the CLI started again.
+    let again = start.env.is_some().then_some(start);
+    Ok(LoginJob { provider, source: login, dir, native, started: Instant::now(), child, tree: Some(tree), rpc: None, again, diagnostics, finished: false })
+}
+
+/// A new sign-in folder's name, `.slopbar-login-<process>-<millis>-<n>`: startup cleanup knows it
+/// by that (`login::abandoned`) once it is old.
+fn login_dir_name() -> String {
+    static LOGIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(".slopbar-login-{}-{}-{}", std::process::id(), chrono::Utc::now().timestamp_millis(), LOGIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// How many times, at most, a sign-in's CLI is started when each page it makes names a callback
+/// port browsers refuse (see `signin::PAGE_REFUSED`): Windows hands out free ports in order, so a
+/// new CLI often gets the next one, and this steps past the longest run of refused ones (6665-6669)
+/// with room. A relayed sign-in starts its whole sign-in again as often (see `relay`).
+pub const REFUSED_TRIES: u32 = 8;
+
+/// How a CLI sign-in's process starts, kept so the same sign-in can start again in its folder when
+/// its page named a port browsers refuse: the CLI there listens on another port the next time.
+struct CliStart {
+    provider: Provider,
+    /// Where the CLI is found (the sign-in folder's own `Source` is the job's).
+    source: Source,
+    cmd: String,
+    visible: bool,
+    /// `BROWSER` and where it opens the page (see `signin::claude_browser_env`).
+    env: Option<[(std::ffi::OsString, std::ffi::OsString); 2]>,
+    breakaway: bool,
+    /// How many times it was started again (the first start not counted).
+    again: u32,
+}
+
+impl CliStart {
+    fn spawn(&self, dir: &Path, native: &str) -> std::io::Result<(std::process::Child, crate::login::ProcessTree)> {
+        let mut term = crate::login::command(self.provider, &self.source, dir, native, &self.cmd, self.visible);
+        if !self.visible {
+            term.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        }
+        if let Some(env) = &self.env {
+            term.envs(env.iter().map(|(name, value)| (name, value)));
+        }
+        crate::login::ProcessTree::spawn_with(&mut term, self.visible, self.breakaway)
+    }
 }
 
 /// Whether a CLI sign-in gets a console window of its own: it does (its terminal says what to do
@@ -1035,6 +1073,8 @@ pub struct LoginJob {
     /// A Codex sign-in through the app server (see `codex_signin`): it says when the user is done
     /// instead of exiting.
     rpc: Option<crate::codex_signin::Started>,
+    /// How to start the CLI again when its page named a port browsers refuse (see `CliStart`).
+    again: Option<CliStart>,
     native: String,
     child: std::process::Child,
     provider: Provider,
@@ -1047,19 +1087,22 @@ impl LoginJob {
     /// Polls until the sign-in has produced a login, then imports it and cleans up.
     /// Gives up after 15 minutes (the temp dir is removed either way).
     pub async fn wait(self, client: &reqwest::Client) -> Option<Slot> {
-        let slot = self.wait_isolated(client).await?;
+        let slot = self.wait_isolated(client).await.ok()?;
         let _guard = VAULT.lock().unwrap();
         save_slot(&slot).ok()?;
         Some(slot)
     }
 
-    /// Complete a separate login without ever importing it into the switching vault.
-    pub async fn wait_isolated(mut self, client: &reqwest::Client) -> Option<Slot> {
+    /// Complete a separate login without ever importing it into the switching vault. Fails with
+    /// `signin_port_refused` when every page its CLI made named a callback port browsers refuse
+    /// (see [`REFUSED_TRIES`]), else `monitor_login_failed`.
+    pub async fn wait_isolated(mut self, client: &reqwest::Client) -> Result<Slot, &'static str> {
         use crate::diagnostics::LoginStage;
+        const FAILED: &str = "monitor_login_failed";
         let result = loop {
             if self.started.elapsed() > Duration::from_secs(15 * 60) {
                 self.record_login(LoginStage::Timeout, false, None);
-                break None;
+                break Err(FAILED);
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
             if let Some(rpc) = &self.rpc {
@@ -1067,7 +1110,7 @@ impl LoginJob {
                 match rpc.done.try_recv() {
                     Ok(true) => self.record_login(LoginStage::ProcessExit, true, None),
                     Err(std::sync::mpsc::TryRecvError::Empty) => continue,
-                    _ => { self.record_login(LoginStage::ProcessExit, false, None); break None; }
+                    _ => { self.record_login(LoginStage::ProcessExit, false, None); break Err(FAILED); }
                 }
                 let mut slot = None;
                 for _ in 0..10 {
@@ -1076,25 +1119,33 @@ impl LoginJob {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                 }
                 self.record_login(LoginStage::Credentials, slot.is_some(), None);
-                break slot;
+                break slot.ok_or(FAILED);
+            }
+            // Its page named a callback port browsers refuse, so it was not opened: the CLI starts
+            // again and listens on another port.
+            if self.page_refused() {
+                match self.start_again() {
+                    Ok(()) => continue,
+                    Err(e) => break Err(e),
+                }
             }
             // Wait for successful CLI exit, not the first partially written credential file.
             match self.child.try_wait() {
-                Ok(Some(status)) => { self.record_login(LoginStage::ProcessExit, status.success(), status.code()); if !status.success() { break None; } },
+                Ok(Some(status)) => { self.record_login(LoginStage::ProcessExit, status.success(), status.code()); if !status.success() { break Err(FAILED); } },
                 Ok(None) => continue,
-                _ => { self.record_login(LoginStage::ProcessExit, false, None); break None; },
+                _ => { self.record_login(LoginStage::ProcessExit, false, None); break Err(FAILED); },
             }
             let slot = read_login(self.provider, &self.source, &[]);
             self.record_login(LoginStage::Credentials, slot.is_some(), None);
-            let Some(mut slot) = slot else { break None };
+            let Some(mut slot) = slot else { break Err(FAILED) };
             if slot.provider == Provider::Claude {
                 // A monitor must be bound to the server-verified account, not a config label.
                 let verified = with_claude_profile(client, slot).await;
                 self.record_login(LoginStage::Profile, verified.is_some(), None);
-                let Some(verified) = verified else { break None };
+                let Some(verified) = verified else { break Err(FAILED) };
                 slot = verified;
             }
-            break Some(slot);
+            break Ok(slot);
         };
         // Close the process tree before reading/removing any remaining login state.
         drop(self.rpc.take());
@@ -1103,11 +1154,12 @@ impl LoginJob {
         let _ = self.child.wait();
         // Credentials may reach the vault, main CLI, or monitor only after a
         // durable handoff marker prevents later cleanup from logging them out.
-        let result = result.filter(|_| {
+        let result = result.and_then(|slot| {
             let ok = crate::login::handoff(&self.dir, self.provider).is_ok();
-            self.record_login(LoginStage::Handoff, ok, None); ok
+            self.record_login(LoginStage::Handoff, ok, None);
+            if ok { Ok(slot) } else { Err(FAILED) }
         });
-        if result.is_none() {
+        if result.is_err() {
             let (provider, source, dir, native) = (self.provider, self.source.clone(), self.dir.clone(), self.native.clone());
             let _ = tokio::task::spawn_blocking(move || crate::login::logout(provider, &source, &dir, &native)).await;
         }
@@ -1117,9 +1169,62 @@ impl LoginJob {
         result
     }
 
+    /// Whether the CLI's page was refused for its callback port (see `signin::PAGE_REFUSED`).
+    fn page_refused(&self) -> bool {
+        self.again.is_some() && std::fs::symlink_metadata(self.dir.join(crate::signin::PAGE_REFUSED)).is_ok()
+    }
+
+    /// Ends the CLI, and everything it started, and starts it again in a new sign-in folder, so it
+    /// listens on another port: up to [`REFUSED_TRIES`] starts in all. The old folder goes once its
+    /// processes let go of it; its page never opened, so it holds no sign-in. (Each start shows in
+    /// diagnostics as a `ProcessStart` of its own.)
+    fn start_again(&mut self) -> Result<(), &'static str> {
+        // The old CLI goes first, and everything it started: its port with it.
+        drop(self.tree.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let Some(start) = self.again.as_mut() else { return Err("monitor_login_failed") };
+        if start.again + 1 >= REFUSED_TRIES {
+            return Err("signin_port_refused");
+        }
+        start.again += 1;
+        // A new folder: the old CLI's processes may still be ending, and writing to theirs.
+        let name = login_dir_name();
+        let dir = start.source.home.join(&name);
+        if std::fs::create_dir(&dir).is_err() || crate::login::prepare(&dir, start.provider, &start.cmd).is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err("monitor_storage");
+        }
+        let old = std::mem::replace(&mut self.dir, dir.clone());
+        self.native = format!("{}/{name}", start.source.native_home);
+        self.source = Source { home: dir.clone(), claude_dir: Some(dir.clone()), codex_dir: Some(dir), ..self.source.clone() };
+        remove_when_free(old);
+        let started = start.spawn(&self.dir, &self.native);
+        let ok = started.is_ok();
+        if let Ok((child, tree)) = started {
+            self.child = child;
+            self.tree = Some(tree);
+        }
+        self.record_login(crate::diagnostics::LoginStage::ProcessStart, ok, None);
+        if ok { Ok(()) } else { Err("monitor_login_failed") }
+    }
+
     fn record_login(&self, stage: crate::diagnostics::LoginStage, ok: bool, exit_code: Option<i32>) {
         if let Some(d) = &self.diagnostics { d.login(stage, ok, self.source.distro.is_some(), exit_code, crate::diagnostics::millis(self.started)); }
     }
+}
+
+/// Deletes a sign-in folder whose processes are ending, retrying while they still hold it; one
+/// still held after that is left to startup cleanup.
+fn remove_when_free(dir: PathBuf) {
+    std::thread::spawn(move || {
+        for _ in 0..20 {
+            if std::fs::remove_dir_all(&dir).is_ok() || std::fs::symlink_metadata(&dir).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
 }
 
 impl Drop for LoginJob {
@@ -1129,7 +1234,24 @@ impl Drop for LoginJob {
         drop(self.tree.take());
         let _ = self.child.kill();
         let _ = self.child.wait();
-        // A cancelled task leaves the marked folder for startup logout/cleanup.
+        if self.finished {
+            return;
+        }
+        // Stopped or started again before it finished: a sign-in its CLI may have made meanwhile
+        // was never handed over (that happens only as it finishes), so it is signed out and the
+        // folder removed now, as a failed one is, rather than left until SlopBar next starts.
+        let (provider, source, dir, native) = (self.provider, self.source.clone(), self.dir.clone(), self.native.clone());
+        std::thread::spawn(move || {
+            // Its processes, ended above, let go of the folder first.
+            std::thread::sleep(Duration::from_secs(1));
+            crate::login::logout(provider, &source, &dir, &native);
+            for _ in 0..10 {
+                if std::fs::remove_dir_all(&dir).is_ok() || std::fs::symlink_metadata(&dir).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
     }
 }
 
@@ -1235,11 +1357,20 @@ mod login_source_tests {
             ("if relayed && source.distro.is_some() { return Err(\"relay_unsupported\".into()); }", "a CLI in WSL opens its own browser"),
             ("if relayed { if let Some(d) = &diagnostics { d.login(LoginStage::ProcessStart, false, false, None, 0); } let _ = std::fs::remove_dir_all(&dir); return Err(\"relay_unsupported\".into()); }",
                 "codex login opens this computer's browser"),
-            ("let visible = console(target.as_ref()); let mut term = crate::login::command(provider, &source, &dir, &native, cmd, visible);", "the terminal follows `console`"),
-            ("breakaway = !relayed;", "a relayed page opens no browser here to outlive the sign-in"),
+            ("let visible = console(target.as_ref()); let mut start = CliStart { provider, source: source.clone(), cmd: cmd.to_owned(), visible,",
+                "the terminal follows `console`"),
+            ("start.breakaway = !relayed;", "a relayed page opens no browser here to outlive the sign-in"),
             ("} else if relayed { let _ = std::fs::remove_dir_all(&dir); return Err(\"relay_unsupported\".into()); }", "without BROWSER the CLI opens a browser here"),
+            ("let (child, tree) = match start.spawn(&dir, &native) {", "the first start is the one a start again repeats"),
         ] {
             assert!(crate::source_guard::has(start, &crate::source_guard::tokens(needle)), "{why}: {needle}\n{start}");
+        }
+        // Every start, the first and each one again, runs the same command the same way.
+        let spawn = crate::source_guard::function(&code, "accounts.rs", "fn spawn(&self, dir: &Path, native: &str)", "accounts::login_source_tests (src-tauri/src/accounts.rs)");
+        for needle in ["let mut term = crate::login::command(self.provider, &self.source, dir, native, &self.cmd, self.visible);",
+            "if !self.visible { term.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()); }",
+            "crate::login::ProcessTree::spawn_with(&mut term, self.visible, self.breakaway)"] {
+            assert!(crate::source_guard::has(spawn, &crate::source_guard::tokens(needle)), "{needle}\n{spawn}");
         }
     }
 }

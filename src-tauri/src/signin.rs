@@ -23,6 +23,60 @@ use serde::{Deserialize, Serialize};
 /// Set on a CLI sign-in that `BROWSER` points at SlopBar: `profile:<folder>` or `private`.
 pub const TARGET_ENV: &str = "SLOPBAR_SIGNIN_TARGET";
 
+/// The ports browsers refuse to open: the WHATWG Fetch standard's "bad ports", which Chrome and Edge
+/// (ERR_UNSAFE_PORT), Firefox and Safari all block. A sign-in page whose callback names one can never
+/// come back to its CLI. Claude Code listens on whatever free port Windows gives it, and a computer
+/// whose dynamic port range starts low (1024-15000 instead of 49152-65535) can give it one of these.
+const BROWSER_REFUSED: [u16; 83] = [
+    0, 1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101, 102, 103, 104, 109, 110, 111, 113,
+    115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563,
+    587, 601, 636, 989, 990, 993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669,
+    6679, 6697, 10080,
+];
+
+/// Whether browsers refuse to open `port` (see [`BROWSER_REFUSED`]).
+pub fn browser_refuses(port: u16) -> bool {
+    BROWSER_REFUSED.contains(&port)
+}
+
+/// The loopback port a sign-in page sends the browser back to: its `redirect_uri`'s, when that is
+/// `http://` on `localhost` or a loopback address.
+pub fn callback_port(url: &str) -> Option<u16> {
+    let url = reqwest::Url::parse(url).ok()?;
+    let back = url.query_pairs().find(|(key, _)| key == "redirect_uri")?.1.into_owned();
+    let back = reqwest::Url::parse(&back).ok()?;
+    let loopback = match back.host()? {
+        url::Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+    };
+    if back.scheme() != "http" || !loopback {
+        return None;
+    }
+    back.port_or_known_default()
+}
+
+/// Left in a CLI sign-in's own folder (its `CLAUDE_CONFIG_DIR`) when its page named a callback port
+/// browsers refuse, instead of opening the page: the sign-in that runs the CLI starts it again,
+/// and the new one listens on another port (see `accounts::LoginJob`).
+pub const PAGE_REFUSED: &str = "slopbar-page-refused";
+
+/// Leaves [`PAGE_REFUSED`] in `dir` when it is one of SlopBar's own sign-in folders (a real folder
+/// named `.slopbar-login-…`, see `accounts::start_login_observed`); false when it is not, or the
+/// file could not be made, so the page opens as before.
+fn refuse_page(dir: Option<&Path>) -> bool {
+    let Some(dir) = dir else { return false };
+    let ours = dir.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with(".slopbar-login-"));
+    if !ours || !std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+        return false;
+    }
+    // Never through a file already there: one left from an earlier refusal still says it.
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join(PAGE_REFUSED)) {
+        Ok(_) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::AlreadyExists,
+    }
+}
+
 /// The user's choice of window (Settings > Accounts).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -173,6 +227,14 @@ impl Session {
         // The time is written in the file: a file's own time on Windows is coarser than the clock.
         let opened = std::fs::read_to_string(self.dir.join(OPENED)).ok().and_then(|s| s.trim().parse::<u128>().ok());
         opened.is_some_and(|ms| ms >= millis(since))
+    }
+
+    /// When, at or after `since`, a sign-in's page for this profile was last refused for its
+    /// callback port (its CLI then starts again, see [`PAGE_REFUSED`]): its wait for a page counts
+    /// from then. Milliseconds since 1970.
+    pub fn page_refused_since(&self, since: std::time::SystemTime) -> Option<u128> {
+        let refused = std::fs::read_to_string(self.dir.join(REFUSED)).ok().and_then(|s| s.trim().parse::<u128>().ok());
+        refused.filter(|ms| *ms >= millis(since))
     }
 
     /// A new profile in [`sessions_root`].
@@ -496,6 +558,10 @@ fn progress_html(account: &str, lang: &str, progress: &Progress) -> String {
 /// (Claude's opens through `BROWSER`, in a process of its own): see [`Session::page_opened_since`].
 const OPENED: &str = "slopbar-page-opened";
 
+/// Written in a profile each time a sign-in page for it was refused for its callback port instead
+/// of opened: see [`Session::page_refused_since`].
+const REFUSED: &str = "slopbar-page-refused";
+
 fn millis(t: std::time::SystemTime) -> u128 {
     t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis())
 }
@@ -518,12 +584,12 @@ fn label_page(account: &str, lang: &str, progress: Option<&Progress>, revision: 
          .spin{{display:inline-block;width:.8em;height:.8em;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-.1em}}\
          @keyframes spin{{to{{transform:rotate(1turn)}}}}@media (prefers-reduced-motion:reduce){{.spin{{animation-duration:2.4s}}}}\
          </style></head><body><h1>{heading}</h1><p class=\"keep\">{keep}</p><div id=\"progress\" aria-live=\"polite\">{section}</div>\
-         <p>{body}</p><p>{codex}</p><script>(function(){{var seen={revision},n=0,box=document.getElementById('progress');\
+         <p>{body}</p><p>{recover}</p><p>{codex}</p><script>(function(){{var seen={revision},n=0,box=document.getElementById('progress');\
          window.slopbarProgress=function(p){{if(p.revision>seen){{seen=p.revision;box.innerHTML=p.html;document.title=p.title;}}}};\
          function poll(){{var s=document.createElement('script');s.src='{script}?'+(++n);s.onload=s.onerror=function(){{s.remove();}};document.head.appendChild(s);}}\
          setInterval(poll,1000);document.addEventListener('visibilitychange',poll);}})();</script></body></html>",
         lang = esc(lang), title = esc(&page_title(account, lang, progress)), heading = t("signinPageHeading"), keep = t("signinPageKeepOpen"),
-        body = t("signinPageBody"), codex = t("signinPageCodex"), script = PROGRESS_SCRIPT,
+        body = t("signinPageBody"), recover = t("signinPageRecover"), codex = t("signinPageCodex"), script = PROGRESS_SCRIPT,
     )
 }
 
@@ -686,6 +752,20 @@ pub fn launch_from_env(args: &[OsString]) -> Option<i32> {
     }
     let Some(target) = Target::decode(&target) else { return Some(2) };
     let url = args[1].to_str()?;
+    // A page here whose callback port browsers refuse could never finish: it is not opened, and
+    // the sign-in starts its CLI again for another port. (A relayed page goes to the computer
+    // completing it as ever: that computer starts the whole sign-in again there.)
+    let here = !matches!(target, Target::Relay(_));
+    if here && allowed_url(url) && callback_port(url).is_some_and(browser_refuses)
+        && refuse_page(std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).as_deref()) {
+        // The email's window counts its wait for a page from now (see `Session::page_refused_since`).
+        if let Target::Profile(dir) = &target {
+            if session_folder(dir) {
+                let _ = std::fs::write(dir.join(REFUSED), millis(std::time::SystemTime::now()).to_string());
+            }
+        }
+        return Some(1);
+    }
     if let Target::Relay(nonce) = target {
         // The app checks the page against the sign-in it started (`relay::Slot::deposit`).
         let handed = allowed_url(url)
@@ -936,6 +1016,75 @@ mod tests {
             let page = label_page("a@example.invalid", lang, Some(&progress), 3);
             assert!(!page.contains("{account}") && !page.contains("{i}") && !page.contains("signinPage"), "{lang}: {page}");
         }
+    }
+
+    #[test]
+    fn the_label_page_says_how_to_start_a_stuck_sign_in_again() {
+        for lang in crate::i18n::languages() {
+            let page = label_page("a@example.invalid", lang, None, 0);
+            let recover = esc(&crate::i18n::t(lang, "signinPageRecover", &[]));
+            assert!(recover != "signinPageRecover" && page.contains(&format!("<p>{recover}</p>")), "{lang}: {page}");
+            let button = crate::i18n::t(lang, "signInRetryOpen", &[]);
+            assert!(crate::i18n::t(lang, "signinPageRecover", &[]).contains(&button), "{lang}: the page names the button Settings shows ({button})");
+        }
+    }
+
+    #[test]
+    fn browsers_refuse_the_fetch_standards_bad_ports_and_only_those() {
+        for port in [0, 1, 25, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080] {
+            assert!(browser_refuses(port), "{port}");
+        }
+        for port in [1024, 1455, 1721, 6664, 6670, 6680, 7925, 10081, 13856, 15000, 49152, 65535] {
+            assert!(!browser_refuses(port), "{port}");
+        }
+        assert!(BROWSER_REFUSED.windows(2).all(|w| w[0] < w[1]), "kept in order, each once");
+    }
+
+    #[test]
+    fn a_pages_callback_port_is_its_loopback_redirect_s() {
+        let page = |back: &str| format!("https://claude.com/cai/oauth/authorize?code=true&client_id=x&response_type=code&redirect_uri={}&state=s",
+            url::form_urlencoded::byte_serialize(back.as_bytes()).collect::<String>());
+        assert_eq!(callback_port(&page("http://localhost:6667/callback")), Some(6667));
+        assert_eq!(callback_port(&page("http://LOCALHOST:6667/callback")), Some(6667));
+        assert_eq!(callback_port(&page("http://127.0.0.1:1455/auth/callback")), Some(1455));
+        assert_eq!(callback_port(&page("http://[::1]:7925/callback")), Some(7925));
+        assert_eq!(callback_port(&page("http://localhost/callback")), Some(80), "no port named: http's own");
+        for back in ["https://localhost:6667/callback", "http://example.com:6667/callback", "http://10.0.0.1:6667/callback", "not a url"] {
+            assert_eq!(callback_port(&page(back)), None, "{back}");
+        }
+        assert_eq!(callback_port("https://claude.com/cai/oauth/authorize?code=true&state=s"), None, "no redirect_uri");
+        assert_eq!(callback_port("not a url"), None);
+    }
+
+    #[test]
+    fn a_refused_page_is_marked_only_in_a_slopbar_sign_in_folder() {
+        let t = TempDir::new();
+        assert!(!refuse_page(None), "no folder: the page opens as before");
+        let other = t.0.join("not-ours");
+        std::fs::create_dir(&other).unwrap();
+        assert!(!refuse_page(Some(&other)) && !other.join(PAGE_REFUSED).exists(), "never in another folder");
+        let gone = t.0.join(".slopbar-login-1-1000-1");
+        assert!(!refuse_page(Some(&gone)) && !gone.exists(), "nor in one that is not there");
+        let ours = t.0.join(".slopbar-login-1-1000-2");
+        std::fs::create_dir(&ours).unwrap();
+        assert!(refuse_page(Some(&ours)) && ours.join(PAGE_REFUSED).is_file());
+        assert!(refuse_page(Some(&ours)), "one left from an earlier refusal still says it");
+        let file = t.0.join(".slopbar-login-1-1000-3");
+        std::fs::write(&file, b"").unwrap();
+        assert!(!refuse_page(Some(&file)), "a file of that name is no folder");
+    }
+
+    #[test]
+    fn a_refused_page_restarts_the_wait_for_one() {
+        let root = TempDir::new();
+        let session = Session::create_in(&root.0).unwrap();
+        let before = std::time::SystemTime::now();
+        assert_eq!(session.page_refused_since(before), None);
+        let at = millis(std::time::SystemTime::now());
+        std::fs::write(session.dir().join(REFUSED), at.to_string()).unwrap();
+        assert_eq!(session.page_refused_since(before), Some(at));
+        assert_eq!(session.page_refused_since(std::time::SystemTime::now() + Duration::from_secs(60)), None, "an earlier sign-in's refusal is not this one's");
+        assert!(!session.page_opened_since(before), "a refused page was not opened");
     }
 
     /// For rendering it headless: `SLOPBAR_PAGE_OUT=<dir> cargo test --lib write_a_progress_page -- --ignored`
