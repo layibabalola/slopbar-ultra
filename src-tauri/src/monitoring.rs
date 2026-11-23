@@ -72,12 +72,18 @@ impl Renewal {
     }
 }
 
-/// Where a connected account's monitoring sign-in stands, from its saved state (`Monitor::health`)
-/// and the last refresh's monitoring error, if any. A passed end that the provider has not refused
-/// yet is left to the next renewal, which the provider decides.
+/// Where a connected account's monitoring sign-in stands, from its saved state (`Monitor::health`),
+/// else from the last refresh's monitoring error. The saved state wins when there is one: it changes
+/// the moment a sign-in finishes, while the error stays until the next refresh. A passed end that
+/// the provider has not refused yet is left to the next renewal, which the provider decides.
 pub fn renewal(state: Option<&crate::health::MonitorState>, error: Option<&str>, now: DateTime<Utc>) -> Renewal {
     let ends = state.and_then(|s| s.ends_at);
-    if state.is_some_and(|s| s.reconnect) || error.is_some_and(|e| SIGN_IN_ERRORS.contains(&e)) {
+    let refused = match state {
+        Some(s) => s.reconnect || s.uncertain,
+        // No saved state of this account's (another account's, or unreadable): the error says.
+        None => error.is_some_and(|e| SIGN_IN_ERRORS.contains(&e)),
+    };
+    if refused {
         return match ends {
             Some(at) if at <= now + chrono::Duration::days(EARLY_DAYS) => Renewal::Ended(at),
             _ => Renewal::Refused,
@@ -89,10 +95,15 @@ pub fn renewal(state: Option<&crate::health::MonitorState>, error: Option<&str>,
     }
 }
 
-/// The earlier of two ends, either of which may be unknown: a sign-in's end only ever moves
-/// earlier, as Claude Code keeps it.
-fn earlier(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
-    match (a, b) {
+/// A sign-in's end after a renewal that succeeded at `now`, from the end it had and the one the
+/// reply gave (either may be unknown). Claude's only ever moves earlier, as Claude Code keeps it,
+/// unless the renewal succeeded on or after it: then that end was not the provider's, and the
+/// reply's stands. Another provider's end is whatever its latest reply said.
+fn next_end(provider: Provider, had: Option<DateTime<Utc>>, reply: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if provider != Provider::Claude || had.is_some_and(|t| t <= now) {
+        return reply;
+    }
+    match (had, reply) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     }
@@ -268,7 +279,8 @@ impl Monitor {
                 None => private_store::load_secret(&self.path(&slot)).ok().and_then(|b| serde_json::from_slice::<Session>(&b).ok()),
             };
             if let Some(s) = session.filter(|s| s.provider == *provider && s.id == *id) {
-                found.insert(key, crate::health::MonitorState { reconnect: s.reconnect, ends_at: s.ends_at.or(s.refresh_expires_at) });
+                found.insert(key, crate::health::MonitorState { reconnect: s.reconnect, uncertain: s.uncertain_attempts >= 2,
+                    ends_at: s.ends_at.or(s.refresh_expires_at) });
             }
         }
         found
@@ -698,7 +710,8 @@ impl Monitor {
                     state.session.refresh_expires_at = reply
                         .refresh_token_expires_in
                         .and_then(|seconds| after_seconds(now, seconds));
-                    state.session.ends_at = earlier(state.session.ends_at.or(previous_end), state.session.refresh_expires_at);
+                    state.session.ends_at = next_end(state.session.provider, state.session.ends_at.or(previous_end),
+                        state.session.refresh_expires_at, now);
                     state.session.uncertain_attempts = 0;
                     state.session.uncertain_retry_at = None;
                     state.session.expires_at = reply

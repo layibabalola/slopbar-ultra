@@ -1113,10 +1113,12 @@ async fn start_monitoring_login(app: AppHandle, provider: Provider, id: String, 
     }))
 }
 
-/// What the monitor holds for an account: its saved session's state, or None without one. A
-/// sign-in that finished changes it at once, before any refresh shows it.
-async fn monitor_held(app: &AppHandle, target: &bulk::Target) -> Option<health::MonitorState> {
-    app.state::<AppState>().monitor.health(&[(target.provider, target.id.clone())]).await.into_values().next()
+/// Whether an account needs a monitoring sign-in, by what the monitor holds for it: none of its
+/// own, or one that ended, was refused or ends soon (`monitoring::renewal`). A sign-in that just
+/// finished counts at once, where the snapshot shows it only after the next refresh.
+async fn needs_monitor_sign_in(app: &AppHandle, target: &bulk::Target) -> bool {
+    let held = app.state::<AppState>().monitor.health(&[(target.provider, target.id.clone())]).await.into_values().next();
+    held.is_none_or(|s| monitoring::renewal(Some(&s), None, chrono::Utc::now()).due())
 }
 
 /// Updates "Connect monitoring for all" and tells Settings.
@@ -1382,9 +1384,11 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     let account = snapshot.accounts.iter().find(|a| a.provider == target.provider && a.id == target.id);
                     match step.kind {
                         bulk::Kind::Add => account.is_none(),
-                        bulk::Kind::Connect => account.map_or(added.contains(&(target.provider, &target.id)), bulk::needs_sign_in),
+                        // Still here; whether it still needs the sign-in is the monitor's to say.
+                        bulk::Kind::Connect => account.is_some() || added.contains(&(target.provider, &target.id)),
                     }
                 };
+                let still = still && (step.kind == bulk::Kind::Add || needs_monitor_sign_in(&h, target).await);
                 if !still {
                     mark(at, StepState::Skipped, None);
                     page.steps[in_group].1 = signin::PageStep::Skipped;
@@ -1398,8 +1402,6 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     break 'groups;
                 }
                 mark(at, StepState::Running, None);
-                // What the monitor holds for this account before any wait (see below).
-                let held = if step.kind == bulk::Kind::Connect { monitor_held(&h, target).await } else { None };
                 // Another sign-in is open (one the user or automatic monitoring started): wait for it.
                 let free = async {
                     while h.state::<AppState>().account_operations.busy(monitoring::SIGN_IN) {
@@ -1411,14 +1413,11 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     _ = stop.notified() => true,
                 };
                 // A sign-in that finished during that wait may have connected this account already:
-                // never ask for it twice. The snapshot can lag that sign-in; the monitor cannot.
-                if !stopped && step.kind == bulk::Kind::Connect {
-                    let now_held = monitor_held(&h, target).await;
-                    if now_held.is_some() && now_held != held && !monitoring::renewal(now_held.as_ref(), None, chrono::Utc::now()).due() {
-                        mark(at, StepState::Skipped, None);
-                        page.steps[in_group].1 = signin::PageStep::Skipped;
-                        continue;
-                    }
+                // never ask for it twice.
+                if !stopped && step.kind == bulk::Kind::Connect && !needs_monitor_sign_in(&h, target).await {
+                    mark(at, StepState::Skipped, None);
+                    page.steps[in_group].1 = signin::PageStep::Skipped;
+                    continue;
                 }
                 let session = group_session.get_or_insert_with(|| {
                     let session = signin_session(&h);
