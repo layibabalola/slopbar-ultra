@@ -3,6 +3,7 @@
 import { t, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, errorText, windowLabel, placesText } from "./i18n.js";
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
+import { cliSignInText } from "./accounttext.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -18,6 +19,8 @@ let snapshot = { accounts: [] };
 let shown = [];
 let selected = 0;
 let busy = false;
+/** The account whose ended CLI sign-in the hint just named: Enter again switches anyway. */
+let warned = null;
 
 /** The binding window: the one closest to its limit, as the balancer compares. */
 const peak = (a) => a.windows.reduce((m, w) => (w.used_percent > (m?.used_percent ?? -1) ? w : m), null);
@@ -30,11 +33,13 @@ export function matches(a, query) {
   return query.toLowerCase().split(/\s+/).filter(Boolean).every((word) => text.includes(word));
 }
 
-/** Accounts with the most room first; the ones in use and unreadable ones after. */
+/** Accounts with the most room first; the ones in use, those whose saved CLI sign-in ended (switching
+ * to one stops the CLI until it signs in again) and unreadable ones after. */
 function ranked(accounts, query) {
   const room = (a) => (a.stale || a.error || !peak(a) ? -1 : 100 - peak(a).used_percent);
+  const ended = (a) => Number(cliSignInText(a)?.ended ?? false);
   return accounts.filter((a) => matches(a, query))
-    .sort((x, y) => Number(x.active) - Number(y.active) || room(y) - room(x) || name(x).localeCompare(name(y)));
+    .sort((x, y) => Number(x.active) - Number(y.active) || ended(x) - ended(y) || room(y) - room(x) || name(x).localeCompare(name(y)));
 }
 
 function render() {
@@ -51,8 +56,10 @@ function render() {
       : `<b>—</b><small>${esc(t("usageUnknown"))}</small>`;
     // The machines it is in use on, so switching here does not land on another's account unawares.
     const places = placesText(a);
-    const meta = [PROVIDER_NAME[a.provider], a.alias ? a.email : "", a.plan, places.names.length ? places.short : ""].filter(Boolean).join(" · ");
-    return `<li role="option" id="option-${i}" data-i="${i}" aria-selected="${i === selected}">
+    // A saved CLI sign-in that ended or ends soon, named before Enter is pressed on it.
+    const cli = cliSignInText(a);
+    const meta = [PROVIDER_NAME[a.provider], a.alias ? a.email : "", a.plan, places.names.length ? places.short : "", cli?.label].filter(Boolean).join(" · ");
+    return `<li role="option" id="option-${i}" data-i="${i}" aria-selected="${i === selected}" ${cli ? `title="${esc(cli.hint)}"` : ""}>
       <span class="mark-box" title="${PROVIDER_NAME[a.provider]}">${MARK[a.provider]}</span>
       <span class="who"><b>${esc(name(a))}</b><small>${esc(meta)}</small></span>
       <span class="room">${a.active ? `<span class="in-use">${t("inUse")}</span><br>` : ""}${room}</span>
@@ -67,6 +74,14 @@ async function choose(i) {
   const a = shown[i];
   if (!a || busy) return;
   if (a.active) { invoke("hide_switcher"); return; }
+  // Its saved CLI sign-in ended: say so first; choosing it again switches anyway (then `claude /login`).
+  const cli = cliSignInText(a);
+  if (cli?.ended && warned !== `${a.provider}:${a.id}`) {
+    warned = `${a.provider}:${a.id}`;
+    $hint.textContent = `${cli.label}: ${cli.hint}`;
+    $hint.classList.add("error");
+    return;
+  }
   busy = true;
   $hint.textContent = t("switching");
   try {
@@ -97,6 +112,7 @@ $results.addEventListener("click", (e) => {
 function reset() {
   $query.value = "";
   selected = 0;
+  warned = null;
   $hint.textContent = t("switcherHint");
   $hint.classList.remove("error");
   render();

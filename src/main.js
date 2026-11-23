@@ -3,7 +3,7 @@ import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { creditAdviceText } from "./alerts.js";
 import { sparkline } from "./sparkline.js";
-import { accountTip } from "./accounttext.js";
+import { accountTip, cliSignInText } from "./accounttext.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -200,6 +200,8 @@ function renderDetails(snap) {
         // Every row has one detail line, whatever its state, so switching doesn't change heights.
         // Where it's in use: here and on the user's other computers (shared via a synced folder).
         const places = placesText(a);
+        // A saved CLI sign-in that ended or ends soon, said before anyone presses Use.
+        const cli = cliSignInText(a);
         const meta = [from, places.inUse || (a.alias ? a.email : ""), ...places.seen, a.leased ? t("leased", { purpose: a.leased }) : "", a.used_outside ? t("usedOutside") : "", a.org, stale]
           .filter(Boolean).join(" · ") || " ";
         // This computer's own trail ends where its readings stopped: not beside another's numbers.
@@ -218,6 +220,7 @@ function renderDetails(snap) {
           ${overlapLine(a)}
           <div class="acc-meta" title="${esc([meta, a.leased ? t("leasedHint") : "", a.used_outside ? t("usedOutsideHint") : ""].filter(Boolean).join("\n"))}">${esc(meta)}</div>
           ${a.error || a.monitor_error ? `<div class="error ${coveredMonitoring(a) ? "covered" : ""}">${esc(accountErrorText(PROVIDER_NAME[provider], a))}</div>` : ""}
+          ${cli ? `<div class="error" title="${esc(cli.hint)}">${esc(cli.label)}</div>` : ""}
           ${!a.monitor_connected || a.monitor_renewal || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account", "monitor_network", "monitor_uncertain"].includes(a.monitor_error ?? a.error)
             ? `<button class="monitor" data-provider="${provider}" data-id="${esc(a.id)}">${t(a.monitor_connected ? "monitorReconnect" : "monitorConnect")}</button>` : ""}
           ${a.monitor_connected ? `<button class="monitor" data-disconnect="true" data-provider="${provider}" data-id="${esc(a.id)}">${t("monitorDisconnect")}</button>` : ""}
@@ -242,8 +245,10 @@ function renderCompactList(snap) {
     // from the windows that have not reset since it was taken.
     const r = shownReading(a);
     const w = r.shared ? peak({ windows: currentWindows(r) }) : a.stale || a.error ? null : peak(a);
+    // A saved CLI sign-in that ended is a problem too: Use would stop the CLI.
+    const cli = cliSignInText(a);
     // While another computer covers it, a monitoring sign-in to make here is no "!" (Health: a warning).
-    const problem = coveredMonitoring(a) ? "" : accountErrorText(PROVIDER_NAME[a.provider], a);
+    const problem = (coveredMonitoring(a) ? "" : accountErrorText(PROVIDER_NAME[a.provider], a)) || (cli?.ended ? cli.label : "");
     const used = w ? `${Math.round(w.used_percent)}%` : "—";
     const usedText = w ? [`${windowLabel(w)}: ${used} ${t("used")}`, r.from].filter(Boolean).join(", ") : t("usageUnknown");
     const tip = accountTip(a, { sub: subs[key], trail: r.shared ? null : trails[key], creditAdvice: creditAdvice[key] });

@@ -187,14 +187,15 @@ pub enum Request {
         #[serde(default)]
         remove_slot: bool,
     },
-    /// Monitoring sign-ins for every account without one, one after another. Without `confirm`
-    /// only says which accounts that would be.
+    /// Monitoring sign-ins for every account that needs one (`bulk::needs_sign_in`), one after
+    /// another; never a CLI sign-in. Without `confirm` only says which accounts that would be.
     ConnectMonitoringAll {
         #[serde(default)]
         confirm: bool,
     },
-    /// "Sign in all accounts" (see `bulk::sign_in_plan`): pending accounts signed in again and, with
-    /// `monitoring` (default true), monitoring for each account without it, by email. Without
+    /// "Sign in all accounts" (see `bulk::sign_in_plan`): pending accounts signed in again, a new
+    /// CLI sign-in for each account not in use whose saved one ended or ends soon, and, with
+    /// `monitoring` (default true), monitoring for each account that needs it, by email. Without
     /// `confirm` only says what it would open.
     SignInAll {
         #[serde(default)]

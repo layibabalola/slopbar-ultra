@@ -1,7 +1,7 @@
 import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { sparkline } from "./sparkline.js";
-import { money, pct, amount, renewalText, adviceText, creditsLine, extraUsageLine } from "./accounttext.js";
+import { money, pct, amount, renewalText, adviceText, creditsLine, extraUsageLine, cliSignInText } from "./accounttext.js";
 import { t, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, LANGUAGES, resetText, errorText, accountErrorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText, overlapText, seatsText, shownReading, currentWindows } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
@@ -153,11 +153,17 @@ function overlapChip(a) {
 }
 
 function signInChips(p, a) {
-  const monitoring = a.monitor_connected && ["monitor_reconnect", "monitor_wrong_account", "monitor_uncertain"].includes(a.monitor_error ?? a.error);
+  // Ended on the provider's fixed limit (`monitor_renewal`) reads as such, not as a rejection.
+  const ended = a.monitor_renewal === "ended";
+  const monitoring = !ended && a.monitor_connected && ["monitor_reconnect", "monitor_wrong_account", "monitor_uncertain"].includes(a.monitor_error ?? a.error);
   const cli = p === "claude" ? "claude /login" : "codex login";
+  // The saved CLI sign-in of an account not in use that ended or ends soon: Use would stop the CLI.
+  const ends = cliSignInText(a);
   return [
+    ended ? `<em class="chip unexpected" title="${esc(t("monitorEnded"))}">${t("monitorEndedChip")}</em>` : "",
     monitoring ? `<em class="chip unexpected" title="${esc(t("monitorRejectedHint"))}">${t("monitorRejected")}</em>` : "",
     a.cli_rejected ? `<em class="chip unexpected" title="${esc(t("cliRejectedHint", { cli }))}">${t("cliRejected")}</em>` : "",
+    ends ? `<em class="chip ${ends.ended ? "unexpected" : "outside"}" title="${esc(ends.hint)}">${esc(ends.label)}</em>` : "",
   ].join("");
 }
 
@@ -271,6 +277,9 @@ $("accounts").addEventListener("click", async (e) => {
   const use = e.target.closest("[data-use]");
   if (use) {
     const { use: provider, id } = use.dataset;
+    // Its saved CLI sign-in ended: switching stops the CLI until it signs in again, so ask first.
+    const cli = cliSignInText(snapshot.accounts.find((a) => a.provider === provider && a.id === id) ?? {});
+    if (cli?.ended && !confirm(`${cli.label}\n\n${cli.hint}`)) return;
     const before = snapshot;
     // Mark the new account at once; the backend confirms (or reverts) it.
     snapshot = { ...snapshot, accounts: snapshot.accounts.map((a) => (a.provider === provider ? { ...a, active: a.id === id } : a)) };
@@ -1207,6 +1216,12 @@ function fixButton(fix, i, count) {
   const label = {
     connect_monitoring: () => t("monitorConnect"),
     connect_monitoring_all: () => count ? `${t("bulkConnectButton")} (${count})` : t("bulkConnectButton"),
+    // Everything the run signs in: from Health it fixes the monitoring rows too, whatever the
+    // Accounts page's monitoring box says.
+    sign_in_all: () => {
+      const n = (bulk.sign_in ?? []).reduce((total, g) => total + g.steps.length, 0) || count;
+      return n ? `${t("signInAllButton")} (${n})` : t("signInAllButton");
+    },
     refresh: () => t("healthFixRefresh"),
     restart_app: () => t("healthFixRestart"),
     open_settings: () => `${t("healthFixOpen")} ${t(FIX_PAGES[fix.page] ?? "settings")}`,
@@ -1245,6 +1260,13 @@ $("health").addEventListener("click", async (e) => {
       // One sign-in at a time; Settings > Accounts follows the run and can stop it.
       const queued = await invoke("connect_monitoring_all");
       if (queued.length) { status.textContent = t("monitorPending"); status.hidden = false; }
+    } else if (fix.action === "sign_in_all") {
+      // With monitoring: the monitoring summary's rows are what it is to fix, and the CLI ones are
+      // best renewed with their monitoring in one sitting. The Accounts page follows the run and
+      // can stop or retry it.
+      await invoke("sign_in_all_accounts", { monitoring: true });
+      document.querySelector('.nav[data-page="accounts"]')?.click();
+      loadBulk();
     } else if (fix.action === "refresh") {
       snapshot = await invoke("refresh");
       renderAccounts();
@@ -1477,8 +1499,10 @@ const who = (target) => target.account || t("unknownAccount");
 /** "Sign in all accounts" as it would run now: its groups (one per email) and sign-ins. */
 function signInPlan() {
   const monitoring = $("sign-in-all-monitoring").checked;
+  // Without monitoring only the accounts' own sign-ins run: new ones ("add") and new ones for a
+  // saved sign-in that ended or ends soon ("renew").
   const groups = (bulk.sign_in ?? [])
-    .map((g) => ({ ...g, steps: g.steps.filter((s) => monitoring || s.kind === "add") }))
+    .map((g) => ({ ...g, steps: g.steps.filter((s) => monitoring || s.kind !== "connect") }))
     .filter((g) => g.steps.length);
   return { groups, steps: groups.reduce((n, g) => n + g.steps.length, 0), monitoring };
 }
@@ -1505,7 +1529,7 @@ function renderBulk() {
   if (running && c.current && c.still_waiting) {
     status.textContent = t("signInStillWaiting", { account: who(c.current), where });
   } else if (running && c.current && c.emails) {
-    status.textContent = t(c.kind === "add" ? "signInAllAdding" : "signInAllConnecting",
+    status.textContent = t(c.kind === "connect" ? "signInAllConnecting" : "signInAllAdding",
       { g: c.email, e: c.emails, i: c.done + 1, n: c.total, account: who(c.current), where });
   } else if (running && c.current) status.textContent = t("bulkConnecting", { i: c.done + 1, n: c.total, account: who(c.current) });
   else if (c?.finished && c.error) {
@@ -1591,7 +1615,7 @@ function peerRunLines(p) {
   if (r.finished) return [t(r.total ? "signInAllDone" : "signInAllNone", { n: r.total }), ""];
   const step = !current ? t("peerSignInStarting")
     : r.still_waiting ? t("peerSignInWaiting", { machine, account: who(current) })
-    : t(current.kind === "add" ? "signInAllAdding" : "signInAllConnecting",
+    : t(current.kind === "connect" ? "signInAllConnecting" : "signInAllAdding",
       { g: r.email, e: r.emails, i: r.done + 1, n: r.total, account: who(current), where: t("signInWhereMachine", { machine }) });
   const quiet = Math.max(1, Math.round((Date.now() - new Date(p.written_at)) / 60000));
   return [step, p.quiet ? t("peerSignInQuiet", { machine, t: duration(quiet) }) : t("peerSignInCoach", { machine })];

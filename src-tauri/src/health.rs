@@ -16,6 +16,10 @@ use crate::monitoring::{Renewal, RENEW_DAYS, WARN_DAYS};
 /// counted among the problems and warnings.
 pub const RENEWAL_SUMMARY: &str = "monitoring_renewal";
 
+/// The same for saved CLI sign-ins of accounts not in use that ended or end soon, with "Sign in
+/// all accounts" as its fix. Not counted either.
+pub const CLI_RENEWAL_SUMMARY: &str = "cli_renewal";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
@@ -31,6 +35,9 @@ pub enum Fix {
     ConnectMonitoring { provider: Provider, id: String },
     /// "Connect monitoring for all": every account that needs a monitoring sign-in, one at a time.
     ConnectMonitoringAll,
+    /// "Sign in all accounts": among its sign-ins, a new CLI sign-in for every account not in use
+    /// whose saved one ended or ends soon, one email at a time.
+    SignInAll,
     Refresh,
     RestartApp,
     OpenSettings { page: &'static str },
@@ -361,6 +368,82 @@ struct SignIns {
     limited: Option<Provider>,
 }
 
+/// Whether "Sign in all accounts" makes the account a new CLI sign-in, by `now`'s dates as
+/// `bulk::needs_cli_sign_in` goes by the snapshot's: its saved one ended or ends within
+/// `RENEW_DAYS`, or the provider rejected it, and it is not in use; never a token-only account.
+fn cli_due(a: &AccountUsage, now: DateTime<Utc>) -> bool {
+    (crate::accounts::cli_renewal(a.cli_ends_at, a.active, now).is_some() || crate::bulk::rejected_claude_login(a)) && !a.active && !a.id.starts_with("token:")
+}
+
+/// Saved CLI sign-ins that ended, or end within `WARN_DAYS` (see `accounts::cli_renewal`): one row
+/// each, and one more for two or more that "Sign in all accounts" can make again
+/// (`CLI_RENEWAL_SUMMARY`). An account not in use is only a warning: nothing fails until the CLI is
+/// switched to it, and automatic switching never is. The account in use is a problem once its
+/// sign-in ended, since the CLI stops (an agent running it never sees the CLI's own notice), but
+/// SlopBar never signs it in: the CLI manages that sign-in.
+fn cli_sign_ins(accounts: &[AccountUsage], now: DateTime<Utc>) -> Vec<Check> {
+    use crate::model::RenewalKind;
+    let mut rows = vec![];
+    let (mut ended, mut ending) = (0, 0);
+    let mut limited = None;
+    for a in accounts {
+        let Some(at) = a.cli_ends_at else { continue };
+        let id = format!("cli_signin:{}:{}", a.provider.key(), a.id);
+        if a.active {
+            let cli = match a.provider { Provider::Claude => "claude /login", Provider::Codex => "codex login" };
+            if at <= now {
+                rows.push(check(id, Status::Problem, format!("{}: CLI sign-in ended", name(a)),
+                    format!("{} The CLI's own sign-in, in use now, ended {}: the CLI stops until it signs in again. Run `{cli}`, or Use another account; the CLI manages this sign-in, so SlopBar leaves it alone.",
+                        sign_in_limit(a.provider), ago(now, at)), None));
+            } else if at <= now + Duration::days(WARN_DAYS) {
+                rows.push(check(id, Status::Warning, format!("{}: CLI sign-in ends soon", name(a)),
+                    format!("{} The CLI's own sign-in, in use now, ends {}; run `{cli}` before then, or the CLI stops until it signs in again.",
+                        sign_in_limit(a.provider), within(at - now)), None));
+            }
+            continue;
+        }
+        let Some(kind) = crate::accounts::cli_renewal(Some(at), false, now) else { continue };
+        // As Sign in all accounts counts them (`bulk::needs_cli_sign_in`): never a token-only account.
+        let fixable = !a.id.starts_with("token:");
+        let (how, fix) = if fixable {
+            ("Sign in all accounts signs it in again: one browser sign-in as this account, saved as its CLI sign-in. It switches nothing and signs nothing out.", Fix::SignInAll)
+        } else {
+            ("SlopBar cannot sign it in again, since it does not know which account it is: switch to it and sign the CLI in, or remove it if it is no longer used.",
+                Fix::OpenSettings { page: "accounts" })
+        };
+        if kind == RenewalKind::Ended {
+            if fixable {
+                ended += 1;
+                limited = limited.or(Some(a.provider));
+            }
+            rows.push(check(id, Status::Warning, format!("{}: CLI sign-in ended", name(a)),
+                format!("{} Its saved CLI sign-in ended {}, so switching the CLI to it would stop the CLI until it signs in again; automatic switching passes it over. {how}",
+                    sign_in_limit(a.provider), ago(now, at)), Some(fix)));
+        } else if at <= now + Duration::days(WARN_DAYS) {
+            if fixable {
+                ending += 1;
+                limited = limited.or(Some(a.provider));
+            }
+            rows.push(check(id, Status::Warning, format!("{}: CLI sign-in ends soon", name(a)),
+                format!("{} Its saved CLI sign-in ends {}; after that, switching the CLI to it would stop the CLI until it signs in again, so automatic switching passes it over already. {how}",
+                    sign_in_limit(a.provider), within(at - now)), Some(fix)));
+        }
+        // Ending within RENEW_DAYS only: Sign in all accounts takes it along; no row of its own yet.
+    }
+    if ended + ending >= 2 {
+        let queued = accounts.iter().filter(|a| cli_due(a, now)).count();
+        let mut parts = vec![];
+        if ended > 0 { parts.push(format!("{ended} ended")); }
+        if ending > 0 { parts.push(format!("{ending} {} soon", if ending == 1 { "ends" } else { "end" })); }
+        let reason = format!("{} No setting makes it permanent. Sign in all accounts signs in the {queued} accounts not in use that need it one after another, including any ending within {RENEW_DAYS} days, so they next end together. It switches nothing, and with monitoring on it renews their monitoring sign-ins in the same sitting.",
+            limited.map(sign_in_limit).unwrap_or_default());
+        let mut summary = check(CLI_RENEWAL_SUMMARY, Status::Warning, format!("CLI sign-ins: {}", parts.join(", ")), reason, Some(Fix::SignInAll));
+        summary.count = Some(queued);
+        rows.insert(0, summary);
+    }
+    rows
+}
+
 /// Every check, worst first within the order Settings lists them.
 pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
     let interval = Duration::minutes(inputs.refresh_minutes.max(1) as i64);
@@ -469,13 +552,22 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
             0 => String::new(),
             n => format!(" ({n} covered by your other computers' readings)"),
         };
-        let reason = if let Some(p) = sign_ins.limited {
+        let mut reason = if let Some(p) = sign_ins.limited {
             format!("{} No setting makes it permanent. Connect all signs in the {} accounts that need it one after another, including any ending within {RENEW_DAYS} days, so they next end together.",
                 sign_in_limit(p), sign_ins.queued)
         } else {
             format!("Connect all signs in the {} accounts that need it one after another.", sign_ins.queued)
         };
-        let mut summary = check(RENEWAL_SUMMARY, status, format!("Monitoring sign-ins: {}{covered}", parts.join(", ")), reason, Some(Fix::ConnectMonitoringAll));
+        // Saved CLI sign-ins due as well: Sign in all accounts makes both in one sitting, an
+        // email's in one browser window, where Connect all would leave the CLI ones for another.
+        let cli_count = inputs.accounts.iter().filter(|a| cli_due(a, now)).count();
+        let fix = if cli_count > 0 {
+            reason.push_str(&format!(" Sign in all accounts does that and makes the {cli_count} saved CLI sign-in{} due in the same sitting.", if cli_count == 1 { "" } else { "s" }));
+            Fix::SignInAll
+        } else {
+            Fix::ConnectMonitoringAll
+        };
+        let mut summary = check(RENEWAL_SUMMARY, status, format!("Monitoring sign-ins: {}{covered}", parts.join(", ")), reason, Some(fix));
         summary.count = Some(sign_ins.queued);
         monitoring.insert(0, summary);
     }
@@ -485,15 +577,22 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
     }
     checks.extend(monitoring);
 
-    // The CLI's own saved login, which SlopBar switches but never renews or signs in again.
+    // The CLI's own saved login, which SlopBar switches but never renews. The CLI signs in again
+    // the one in use; Sign in all accounts makes a new one for an account not in use.
+    // Not in use, it is a warning, as a saved sign-in that ended is: nothing fails until a switch.
     for a in inputs.accounts.iter().filter(|a| a.cli_rejected) {
         let cli = match a.provider { Provider::Claude => "claude /login", Provider::Codex => "codex login" };
-        let how = if a.active { format!("Run `{cli}` to sign the CLI in again.") }
-            else { format!("Switch to it and run `{cli}`, or remove it if it is no longer used.") };
-        checks.push(check(format!("cli:{}:{}", a.provider.key(), a.id), Status::Problem, format!("{}: CLI sign-in rejected", name(a)),
-            format!("The provider no longer accepts the CLI's saved sign-in for this account; the CLI manages that sign-in. {how}"),
-            Some(Fix::OpenSettings { page: "accounts" })));
+        let (status, how, fix) = if a.active {
+            (Status::Problem, format!("Run `{cli}` to sign the CLI in again; the CLI manages that sign-in."), Fix::OpenSettings { page: "accounts" })
+        } else if crate::bulk::rejected_claude_login(a) && !a.id.starts_with("token:") {
+            (Status::Warning, "Sign in all accounts signs it in again as a new CLI sign-in for this account, switching nothing; or remove it if it is no longer used.".to_string(), Fix::SignInAll)
+        } else {
+            (Status::Warning, format!("Switch to it and run `{cli}`, or remove it if it is no longer used."), Fix::OpenSettings { page: "accounts" })
+        };
+        checks.push(check(format!("cli:{}:{}", a.provider.key(), a.id), status, format!("{}: CLI sign-in rejected", name(a)),
+            format!("The provider no longer accepts the CLI's saved sign-in for this account. {how}"), Some(fix)));
     }
+    checks.extend(cli_sign_ins(inputs.accounts, now));
     if inputs.vault_plaintext > 0 {
         checks.push(check("vault", Status::Warning, "Saved sign-ins",
             format!("{} saved sign-in(s) could not be encrypted yet and are still stored as plaintext; SlopBar retries at each start. Check disk space and file access.", inputs.vault_plaintext),
@@ -659,8 +758,8 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         check("notifications", Status::Ok, "Notifications", "Registered with Windows.", None)
     });
 
-    // The summary repeats rows already counted.
-    let counted = || checks.iter().filter(|c| c.id != RENEWAL_SUMMARY);
+    // The summaries repeat rows already counted.
+    let counted = || checks.iter().filter(|c| c.id != RENEWAL_SUMMARY && c.id != CLI_RENEWAL_SUMMARY);
     let problems = counted().filter(|c| c.status == Status::Problem).count();
     let warnings = counted().filter(|c| c.status == Status::Warning).count();
     let status = checks.iter().map(|c| c.status).max().unwrap_or(Status::Ok);
@@ -911,6 +1010,92 @@ mod tests {
         let s = find(&r, RENEWAL_SUMMARY);
         assert_eq!(s.title, "Monitoring sign-ins: 2 need reconnecting");
         assert!(!s.reason.contains("30 days"), "{}", s.reason);
+    }
+
+    #[test]
+    fn a_saved_cli_sign_in_that_ended_or_ends_soon_says_so_with_sign_in_all_as_its_fix() {
+        let mut case = Case::healthy();
+        case.accounts[0].cli_ends_at = Some(now() - Duration::days(2));
+        case.accounts[1].cli_ends_at = Some(now() + Duration::hours(30));
+        let r = case.run();
+        // Accounts not in use: nothing fails until the CLI is switched to one, so a warning.
+        let a = find(&r, "cli_signin:claude:a");
+        assert_eq!((a.status, a.title.as_str(), a.fix.clone()), (Status::Warning, "a@example.invalid: CLI sign-in ended", Some(Fix::SignInAll)));
+        assert!(a.reason.contains("about 30 days") && a.reason.contains("ended 2 days ago") && a.reason.contains("would stop the CLI")
+            && a.reason.contains("switches nothing") && a.reason.contains("automatic switching passes it over"), "{}", a.reason);
+        let b = find(&r, "cli_signin:claude:b");
+        assert_eq!((b.status, b.title.as_str()), (Status::Warning, "b@example.invalid: CLI sign-in ends soon"));
+        assert!(b.reason.contains("ends within 30 hours"), "{}", b.reason);
+        let s = find(&r, CLI_RENEWAL_SUMMARY);
+        assert_eq!((s.status, s.title.as_str(), s.fix.clone(), s.count), (Status::Warning, "CLI sign-ins: 1 ended, 1 ends soon", Some(Fix::SignInAll), Some(2)));
+        assert!(s.reason.contains("No setting makes it permanent") && s.reason.contains("the 2 accounts not in use"), "{}", s.reason);
+        assert_eq!((r.status, r.problems, r.warnings), (Status::Warning, 0, 2), "the summary repeats rows already counted");
+        assert_eq!(serde_json::to_value(&a.fix).unwrap(), serde_json::json!({ "action": "sign_in_all" }));
+
+        // The account in use: the CLI manages its sign-in, so no fix; but once it ended the CLI
+        // stops, which an agent running it never hears about from the CLI itself.
+        let mut in_use = Case::healthy();
+        in_use.accounts[0].active = true;
+        in_use.accounts[0].cli_ends_at = Some(now() - Duration::days(2));
+        let r = in_use.run();
+        let c = find(&r, "cli_signin:claude:a");
+        assert_eq!((c.status, c.fix.clone()), (Status::Problem, None));
+        assert!(c.reason.contains("in use now, ended 2 days ago") && c.reason.contains("claude /login"), "{}", c.reason);
+        assert!(r.checks.iter().all(|c| c.id != CLI_RENEWAL_SUMMARY));
+        in_use.accounts[0].cli_ends_at = Some(now() + Duration::hours(20));
+        assert_eq!(find(&in_use.run(), "cli_signin:claude:a").status, Status::Warning);
+        in_use.accounts[0].cli_ends_at = Some(now() + Duration::days(5));
+        assert_eq!(in_use.run().status, Status::Ok);
+        // Ending within 7 days but not 3: Sign in all accounts takes it along, Health says nothing yet.
+        let mut later = Case::healthy();
+        later.accounts[0].cli_ends_at = Some(now() + Duration::days(5));
+        later.accounts[1].cli_ends_at = Some(now() + Duration::days(25));
+        assert_eq!(later.run().status, Status::Ok);
+        // One other that ended: a row of its own, no summary.
+        later.accounts.push(account("c", true, Some(1)));
+        later.accounts[2].cli_ends_at = Some(now() - Duration::hours(1));
+        let r = later.run();
+        assert!(r.checks.iter().all(|c| c.id != CLI_RENEWAL_SUMMARY), "one row alone needs no summary");
+        assert_eq!(find(&r, "cli_signin:claude:c").status, Status::Warning);
+    }
+
+    #[test]
+    fn monitoring_and_cli_sign_ins_due_together_are_made_in_one_sitting() {
+        let mut case = Case::healthy();
+        for id in ["a", "b"] {
+            case.monitoring.insert(format!("Claude:{id}"), MonitorState { reconnect: true, uncertain: false, ends_at: Some(now() - Duration::hours(3)) });
+        }
+        assert_eq!(find(&case.run(), RENEWAL_SUMMARY).fix, Some(Fix::ConnectMonitoringAll), "monitoring alone: Connect all");
+        case.accounts[0].cli_ends_at = Some(now() - Duration::hours(3));
+        let s = find(&case.run(), RENEWAL_SUMMARY).clone();
+        assert_eq!(s.fix, Some(Fix::SignInAll), "Sign in all accounts makes both, an email's in one browser window");
+        assert!(s.reason.contains("the 1 saved CLI sign-in due"), "{}", s.reason);
+        // A rejected saved Claude login of an account not in use is one Sign in all accounts makes
+        // again too, and, like one that ended, only a warning.
+        let mut rejected = Case::healthy();
+        rejected.accounts[1].cli_rejected = true;
+        let c = find(&rejected.run(), "cli:claude:b").clone();
+        assert_eq!((c.status, c.fix.clone()), (Status::Warning, Some(Fix::SignInAll)));
+        assert!(c.reason.contains("Sign in all accounts signs it in again"), "{}", c.reason);
+        // A Codex one may only have aged out: the old advice, no sign-in queued.
+        rejected.accounts[1].provider = Provider::Codex;
+        let c = find(&rejected.run(), "cli:codex:b").clone();
+        assert_eq!((c.status, c.fix.clone()), (Status::Warning, Some(Fix::OpenSettings { page: "accounts" })));
+        assert!(c.reason.contains("codex login"), "{}", c.reason);
+    }
+
+    #[test]
+    fn a_token_only_account_whose_cli_sign_in_ended_is_said_but_not_offered_sign_in_all() {
+        let mut case = Case::healthy();
+        for (i, id) in ["token:abc", "token:def"].into_iter().enumerate() {
+            case.accounts[i].id = id.into();
+            case.accounts[i].cli_ends_at = Some(now() - Duration::days(1));
+        }
+        let r = case.run();
+        let c = find(&r, "cli_signin:claude:token:abc");
+        assert_eq!((c.status, c.fix.clone()), (Status::Warning, Some(Fix::OpenSettings { page: "accounts" })));
+        assert!(c.reason.contains("cannot sign it in again"), "{}", c.reason);
+        assert!(r.checks.iter().all(|c| c.id != CLI_RENEWAL_SUMMARY), "Sign in all accounts would renew none of them");
     }
 
     #[test]
