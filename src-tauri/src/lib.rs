@@ -68,6 +68,7 @@ mod door;
 mod desktop;
 mod desktop_apps;
 mod pairing;
+mod relay;
 mod instance;
 mod mcp_update;
 pub use instance::claim as claim_instance;
@@ -75,7 +76,7 @@ mod keep_running;
 pub use keep_running::{from_args as keep_running, start_kind as keep_running_start, started as keep_running_started, Start as KeepRunningStart};
 mod mcp;
 pub use mcp::serve_stdio as serve_mcp;
-pub use mcp::{call_cli, pair_receive, sharing_state};
+pub use mcp::{call_cli, pair_receive, relay_cli, sharing_state};
 #[cfg(feature = "desktop")]
 mod dock;
 #[cfg(feature = "desktop")]

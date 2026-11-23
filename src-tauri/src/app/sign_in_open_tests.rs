@@ -19,11 +19,13 @@ const NO_PROFILE: bool = false;
 const OPENERS: [(&str, &[&str]); 3] = [
     // "Add account": Settings' (`add_account`) and an agent's (the door's AddAccount, `door_call`).
     ("start_add_account", &["add_account", "door_call"]),
-    // "Sign in all accounts" signing a restored account in again (`run_sign_ins`).
-    ("add_expected", &["run_sign_ins"]),
+    // "Sign in all accounts" signing a restored account in again (`run_sign_ins`), and the same
+    // sign-in completed in another computer's browser (`relay_start`).
+    ("add_expected", &["relay_start", "run_sign_ins"]),
     // Connect monitoring: the user's or an agent's (`connect_monitoring`), "Connect monitoring for
-    // all" and "Sign in all accounts" (`run_sign_ins`), and the automatic one (`auto_connect_tick`).
-    ("start_monitoring_login", &["connect_monitoring", "run_sign_ins", "auto_connect_tick"]),
+    // all" and "Sign in all accounts" (`run_sign_ins`), the automatic one (`auto_connect_tick`), and
+    // one completed in another computer's browser (`relay_start`).
+    ("start_monitoring_login", &["connect_monitoring", "relay_start", "run_sign_ins", "auto_connect_tick"]),
 ];
 
 /// What a sign-in holds while it is open (a reservation or its mark).

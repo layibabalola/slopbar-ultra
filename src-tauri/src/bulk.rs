@@ -8,7 +8,7 @@ use crate::accounts::Provider;
 use crate::model::{AccountUsage, Snapshot};
 use crate::settings::Settings;
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Target {
     pub provider: Provider,
     pub id: String,
@@ -16,7 +16,7 @@ pub struct Target {
     pub account: Option<String>,
     /// Lapsed accounts: the day the plan ended (the last paid day the user entered, or the end
     /// the provider gave).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<NaiveDate>,
 }
 
@@ -111,7 +111,7 @@ pub fn add_pending(list: &mut Vec<Pending>, restored: impl IntoIterator<Item = P
 /// One sign-in of "Sign in all accounts": `Add` saves a pending account's login in the vault (the
 /// account appears), `Renew` saves a new CLI login for an account whose saved one ended or ends soon
 /// (`needs_cli_sign_in`) the same way, and `Connect` gives an account its monitoring sign-in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Add,
@@ -119,18 +119,32 @@ pub enum Kind {
     Connect,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Step {
     pub kind: Kind,
     #[serde(flatten)]
     pub target: Target,
     /// Who must sign in: the account's email, prefilled where the CLI can.
     pub email: Option<String>,
+    /// Another of the user's computers whose sign-in this is, completed in this computer's browser
+    /// ("Sign in all your computers from here", see `relay`); None: this computer's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<Machine>,
+}
+
+/// Another of the user's computers, as its own SlopBar names it, and the SSH host that reaches it
+/// from here (kept here, never shown).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Machine {
+    pub id: String,
+    pub name: String,
+    #[serde(skip)]
+    pub host: String,
 }
 
 /// The sign-ins for one email, run back to back in that email's browser profile, so Google is
 /// asked once for all of them.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Group {
     pub email: Option<String>,
     pub steps: Vec<Step>,
@@ -149,17 +163,17 @@ pub fn sign_in_plan(snapshot: &Snapshot, pending: &[Pending], monitoring: bool) 
             continue;
         }
         let target = Target { provider: p.provider, id: p.id.clone(), account: p.email.clone(), ended: None };
-        steps.push(Step { kind: Kind::Add, target: target.clone(), email: p.email.clone() });
+        steps.push(Step { kind: Kind::Add, target: target.clone(), email: p.email.clone(), machine: None });
         if monitoring {
-            steps.push(Step { kind: Kind::Connect, target, email: p.email.clone() });
+            steps.push(Step { kind: Kind::Connect, target, email: p.email.clone(), machine: None });
         }
     }
     for a in &snapshot.accounts {
         if needs_cli_sign_in(a) {
-            steps.push(Step { kind: Kind::Renew, target: target(a, None), email: a.email.clone() });
+            steps.push(Step { kind: Kind::Renew, target: target(a, None), email: a.email.clone(), machine: None });
         }
         if monitoring && needs_sign_in(a) {
-            steps.push(Step { kind: Kind::Connect, target: target(a, None), email: a.email.clone() });
+            steps.push(Step { kind: Kind::Connect, target: target(a, None), email: a.email.clone(), machine: None });
         }
     }
     by_email(steps)
@@ -170,26 +184,52 @@ pub fn sign_in_plan(snapshot: &Snapshot, pending: &[Pending], monitoring: bool) 
 /// all accounts".
 pub fn connect_plan(snapshot: &Snapshot) -> Vec<Group> {
     by_email(snapshot.accounts.iter().filter(|a| needs_sign_in(a))
-        .map(|a| Step { kind: Kind::Connect, target: target(a, None), email: a.email.clone() }).collect())
+        .map(|a| Step { kind: Kind::Connect, target: target(a, None), email: a.email.clone(), machine: None }).collect())
 }
 
-/// Steps grouped by email in the order the emails first appear, Claude before Codex within one.
-fn by_email(steps: Vec<Step>) -> Vec<Group> {
-    let key = |s: &Step| s.email.as_deref().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty())
-        .unwrap_or_else(|| format!("\0{}:{}", s.target.provider.key(), s.target.id));
+/// Which email group a step joins: its email, whatever its case; an account without one is a
+/// group of its own (on its own computer).
+fn email_key(s: &Step) -> String {
+    s.email.as_deref().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty())
+        .unwrap_or_else(|| format!("\0{}:{}:{}", s.machine.as_ref().map_or("", |m| m.id.as_str()), s.target.provider.key(), s.target.id))
+}
+
+/// `steps` in groups by email, in the order the emails first appear.
+fn grouped(steps: Vec<Step>) -> Vec<Group> {
     let mut groups: Vec<(String, Group)> = Vec::new();
     for step in steps {
-        let k = key(&step);
+        let k = email_key(&step);
         match groups.iter_mut().find(|(g, _)| *g == k) {
             Some((_, g)) => g.steps.push(step),
             None => groups.push((k, Group { email: step.email.clone(), steps: vec![step] })),
         }
     }
-    for (_, g) in &mut groups {
+    groups.into_iter().map(|(_, g)| g).collect()
+}
+
+/// Steps grouped by email in the order the emails first appear, Claude before Codex within one.
+fn by_email(steps: Vec<Step>) -> Vec<Group> {
+    let mut groups = grouped(steps);
+    for g in &mut groups {
         // Stable: an account's Add stays before its Connect, accounts keep their order.
         g.steps.sort_by_key(|s| s.target.provider != Provider::Claude);
     }
-    groups.into_iter().map(|(_, g)| g).collect()
+    groups
+}
+
+/// "Sign in all your computers from here" (see `relay`): this computer's plan and each other
+/// computer's, merged by email in the order the emails first appear (this computer's first), so an
+/// email's sign-ins on every computer run back to back in its one browser profile here and Google
+/// is asked once per email for all of them. Within an email this computer's steps come first, then
+/// each other computer's in `others`' order, each in its own plan's order (Claude before Codex, an
+/// account's own sign-in before its monitoring one).
+pub fn everywhere(here: Vec<Group>, others: Vec<(Machine, Vec<Group>)>) -> Vec<Group> {
+    let mut steps: Vec<Step> = here.into_iter().flat_map(|g| g.steps).map(|s| Step { machine: None, ..s }).collect();
+    for (machine, plan) in others {
+        steps.extend(plan.into_iter().flat_map(|g| g.steps).map(|s| Step { machine: Some(machine.clone()), ..s }));
+    }
+    // Stable within each email: computers keep this order, and each its own steps' order.
+    grouped(steps)
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -367,6 +407,45 @@ mod tests {
         rejected.provider = Provider::Claude;
         rejected.active = true;
         assert!(!needs_cli_sign_in(&rejected));
+    }
+
+    #[test]
+    fn every_computers_sign_ins_run_by_email_this_computers_first() {
+        let step = |kind: Kind, provider: Provider, id: &str, email: Option<&str>| Step {
+            kind, target: Target { provider, id: id.into(), account: email.map(Into::into), ended: None }, email: email.map(Into::into), machine: None,
+        };
+        let machine = |name: &str| Machine { id: format!("id-{name}"), name: name.into(), host: name.to_lowercase() };
+        let here = vec![Group { email: Some("b@example.invalid".into()), steps: vec![step(Kind::Renew, Provider::Claude, "b", Some("b@example.invalid"))] }];
+        let desk = vec![
+            Group { email: Some("A@example.invalid".into()), steps: vec![
+                step(Kind::Renew, Provider::Claude, "a", Some("A@example.invalid")),
+                step(Kind::Connect, Provider::Claude, "a", Some("A@example.invalid")),
+                step(Kind::Connect, Provider::Codex, "ax", Some("A@example.invalid")),
+            ] },
+            Group { email: Some("b@example.invalid".into()), steps: vec![step(Kind::Connect, Provider::Claude, "b", Some("b@example.invalid"))] },
+            Group { email: None, steps: vec![step(Kind::Connect, Provider::Claude, "n", None)] },
+        ];
+        let mini = vec![
+            Group { email: Some("a@example.invalid".into()), steps: vec![step(Kind::Renew, Provider::Claude, "a", Some("a@example.invalid"))] },
+            Group { email: None, steps: vec![step(Kind::Connect, Provider::Claude, "n", None)] },
+        ];
+        let plan = everywhere(here, vec![(machine("DESK"), desk), (machine("MINI"), mini)]);
+        let seen: Vec<(Option<&str>, Vec<String>)> = plan.iter().map(|g| (g.email.as_deref(), g.steps.iter().map(|s| format!("{} {:?} {}",
+            s.machine.as_ref().map_or("here", |m| m.name.as_str()), s.kind, s.target.id)).collect())).collect();
+        assert_eq!(seen, [
+            (Some("b@example.invalid"), vec!["here Renew b".to_string(), "DESK Connect b".into()]),
+            (Some("A@example.invalid"), vec!["DESK Renew a".to_string(), "DESK Connect a".into(), "DESK Connect ax".into(), "MINI Renew a".into()]),
+            (None, vec!["DESK Connect n".to_string()]),
+            (None, vec!["MINI Connect n".to_string()]),
+        ], "one group per email across computers (its case aside), this computer's first, each computer's steps in its own order; \
+            an account without an email is a group of its own on each computer");
+        // What another computer's preview sends reads back as a plan.
+        let sent = serde_json::json!([{ "email": "a@example.invalid", "steps": [{ "kind": "renew", "provider": "claude", "id": "a", "account": "a@example.invalid", "email": "a@example.invalid" }] }]);
+        let read: Vec<Group> = serde_json::from_value(sent).unwrap();
+        assert_eq!((read[0].steps[0].kind, read[0].steps[0].machine.clone()), (Kind::Renew, None));
+        // A relayed step names its computer, never the host that reaches it.
+        let shown = serde_json::to_value(&plan[0].steps[1]).unwrap();
+        assert_eq!(shown["machine"], serde_json::json!({ "id": "id-DESK", "name": "DESK" }));
     }
 
     #[test]
