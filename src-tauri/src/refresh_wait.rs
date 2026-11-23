@@ -565,7 +565,8 @@ mod tests {
         assert!(next.starts_with(&tokens("if !sharing::still(&place, &sharing::Place::of(&h.state::<AppState>().settings.lock().unwrap())) { return None; } let wrote = store.write(")),
             "a refresh's presence record only where the settings still share. {}\n{locked}", update(HANDS));
         // What Health shows of it is worked out by the helper health's tests cover.
-        assert!(has(next, "let wrote = store.write(&presence::own(id, name, interval, &mine, now)); let listed = store.list(); \
+        assert!(has(next, "let wrote = store.write(&presence::own(id, name, interval, &mine, now)); \
+            let listed = store.others(id, &h.state::<AppState>().presence_kept); \
             let result = health::SharingResult::of(now, &wrote, &listed);"), "{}\n{locked}", update(HANDS));
         assert!(!has(&app, "presence::withdraw(") && !has(&app, "roster::withdraw("),
             "this machine's files are withdrawn through sharing (sharing::Files): by the refresh and on exit, never by a save. {}", update(HANDS));
