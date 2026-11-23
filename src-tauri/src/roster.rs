@@ -372,14 +372,16 @@ fn invisible(c: char) -> bool {
 
 pub trait RosterStore: Send + Sync {
     /// Every roster file there: its name, bytes and modification time (when known).
+    #[cfg(test)]
     fn list(&self) -> std::io::Result<Vec<(String, Vec<u8>, Option<DateTime<Utc>>)>> {
         Ok(self.listing(&|_, _, _| None)?.files.into_iter().map(|f| (f.name, f.bytes, f.modified)).collect())
     }
-    /// Every roster file there as `list` reads it, with the names listed whose bytes could not be
-    /// read (neither gone nor changed), and each file's content hash where the storage lists one at
-    /// no cost: an rclone remote on a cloud whose listing carries them (`Rclone::files_listed`). A
-    /// file listed with a hash goes to `known` first, and the bytes it gives back, kept from a read
-    /// of the file with that hash, stand in for downloading it again (a process each over rclone).
+    /// Every roster file there (its name, bytes and modification time, when known), with the names
+    /// listed whose bytes could not be read (neither gone nor changed), and each file's content
+    /// hash where the storage lists one at no cost: an rclone remote on a cloud whose listing carries
+    /// them (`Rclone::files_listed`). A file listed with a hash goes to `known` first, and the bytes
+    /// it gives back, kept from a read of the file with that hash, stand in for downloading it again
+    /// (a process each over rclone).
     fn listing(&self, known: Known) -> std::io::Result<Listed>;
     /// Replaces the file `name` in one step where the storage can: a folder renames a finished
     /// temporary file over it, and an rclone remote uploads straight over it (`Rclone::put`).
@@ -1452,7 +1454,7 @@ mod tests {
         let store = Folder(shared.0.clone());
         let p = pass("synthetic roster passphrase");
         let key = SealKey::new(&p).unwrap();
-        let mut a = own(MACHINE_A, " DESK\u{200B}-A\u{202E}\u{FE0F}\u{34F}\u{E0041} ", &[account("claude", "cl-one")], now());
+        let mut a = own(MACHINE_A, " DESK\u{200B}-A\u{202E}\u{FE0F}\u{34F}\u{E0041}\u{2028}\u{2029} ", &[account("claude", "cl-one")], now());
         a.readings = vec![Reading { lapsed: false, provider: Provider::Claude, id: "cl-one".into(), taken_at: now(),
             windows: vec![UsageWindow { kind: "weekly".into(), window_seconds: None, used_percent: 5.0, resets_at: None }] }];
         store.put(&file_name(MACHINE_A).unwrap(), &seal(&a, &key).unwrap()).unwrap();
@@ -2034,5 +2036,66 @@ mod tests {
         let mut c = Syncer::default();
         c.sync(&store, &p, (MACHINE_B, "LAPTOP-B"), &[], now() + Duration::minutes(5), false, false);
         assert!(c.seen.peers[0].run.is_none(), "not taken back, so not written on");
+    }
+
+    /// A store whose writes land but say they failed, as a write cut off at rclone's time limit
+    /// after the upload went through.
+    struct Landing(Folder);
+
+    impl RosterStore for Landing {
+        fn listing(&self, known: Known) -> std::io::Result<Listed> { self.0.listing(known) }
+        fn put(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+            self.0.put(name, bytes)?;
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "synthetic: landed, then timed out"))
+        }
+        fn remove(&self, name: &str) -> std::io::Result<()> { self.0.remove(name) }
+    }
+
+    /// A roster this machine tried to write is its own when it is found there, though the write
+    /// said it failed: nothing is put back. And a later read that finds its own copy again (the
+    /// other writer stopped, or an older listing caught up) calls off a rewrite not yet made.
+    #[test]
+    fn a_write_that_said_it_failed_but_landed_is_not_put_back_and_a_later_read_decides() {
+        let shared = TempDir::new();
+        let p = pass("synthetic roster passphrase");
+        let at = |m: i64| now() + Duration::minutes(m);
+        let read = |percent: f64, m: i64| [reading("claude", "cl-one", percent, Some(m), false)];
+        let store = Counting(Folder(shared.0.clone()), Default::default());
+        let writes = || store.1.load(std::sync::atomic::Ordering::SeqCst);
+        let mut a = Syncer::default();
+        a.sync(&store, &p, (MACHINE_A, "DESK-A"), &read(10.0, 0), at(0), false, false);
+        // A changed reading's write lands but says it timed out.
+        a.sync(&Landing(Folder(shared.0.clone())), &p, (MACHINE_A, "DESK-A"), &read(60.0, 15), at(15), false, false);
+        assert_eq!(a.seen.wrote, Some(false));
+        let landed = std::fs::read(roster_file(&shared, MACHINE_A)).unwrap();
+        assert_eq!(open(&landed, &p, &mut HashMap::new()).unwrap().readings[0].windows[0].used_percent, 60.0);
+        // The next read finds it: one of this machine's, so not put back (the readings write goes
+        // again after the gap, as any failed one does).
+        a.sync(&store, &p, (MACHINE_A, "DESK-A"), &read(60.0, 20), at(20), false, false);
+        a.sync(&store, &p, (MACHINE_A, "DESK-A"), &read(60.0, 25), at(25), false, false);
+        a.sync(&store, &p, (MACHINE_A, "DESK-A"), &read(60.0, 30), at(30), false, false);
+        assert_eq!((a.seen.own_rewritten, writes()), (0, 2), "nothing put back: the write at 30 is the readings' own retry");
+        // Put back once (written over at once), then again: that rewrite waits out 15 minutes, and a
+        // read meanwhile (Settings watching) finds this machine's own copy back: none is made.
+        let mut b = Syncer::default();
+        let dir = TempDir::new();
+        let other = Counting(Folder(dir.0.clone()), Default::default());
+        let file = roster_file(&dir, MACHINE_A);
+        let key = SealKey::new(&p).unwrap();
+        let theirs = seal(&own(MACHINE_A, "DESK-A-COPY", &[account("claude", "cl-one")], at(0)), &key).unwrap();
+        let sync = |b: &mut Syncer, m: i64, soon: bool| b.sync(&other, &p, (MACHINE_A, "DESK-A"), &read(10.0, 0), at(m), false, soon);
+        sync(&mut b, 0, false);
+        std::fs::write(&file, &theirs).unwrap();
+        sync(&mut b, 10, false);
+        sync(&mut b, 11, false);
+        assert_eq!(b.seen.own_rewritten, 1);
+        let mine = std::fs::read(&file).unwrap();
+        std::fs::write(&file, &theirs).unwrap();
+        sync(&mut b, 12, true);
+        std::fs::write(&file, &mine).unwrap();
+        sync(&mut b, 13, true);
+        let made = other.1.load(std::sync::atomic::Ordering::SeqCst);
+        sync(&mut b, 27, false);
+        assert_eq!((b.seen.own_rewritten, other.1.load(std::sync::atomic::Ordering::SeqCst)), (1, made), "the latest read found its own: nothing to put back");
     }
 }
