@@ -1543,8 +1543,10 @@ mod tests {
             write(&store, n, now);
             store.runner.unreadable.lock().unwrap().push(path(n));
         }
-        let (records, cats, batched) = read(&store, &kept);
-        assert_eq!((records.len(), cats, batched.len()), (0, 1 + 3, 1), "printed nothing, and none read alone either");
+        for _ in 0..REFUSALS {
+            let (records, cats, batched) = read(&store, &kept);
+            assert_eq!((records.len(), cats, batched.len()), (0, 1 + 3, 1), "printed nothing, and none read alone either");
+        }
         store.runner.unreadable.lock().unwrap().clear();
         let (records, cats, batched) = read(&store, &kept);
         assert_eq!((records.len(), cats, batched.len()), (3, 1, 1), "batched again");
