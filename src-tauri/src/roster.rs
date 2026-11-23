@@ -28,6 +28,15 @@
 //! sign-in about 30 days after it is made, so this lets one machine's sign-ins cover the others.
 //! Only readings a machine took itself are written, never one it was given, and only when one
 //! changed (coalesced, see `READINGS_GAP_MINUTES`) or to re-date them now and then.
+//!
+//! Each machine reads its own roster back with the others. When the copy there is not the one it
+//! last wrote (a sync service put back an older version, something else wrote over it, or it is
+//! gone), it is written again at the next sync (`RESTORE_GAP_MINUTES`), so a restored file cannot
+//! keep old readings or an old run in front of the other machines.
+//!
+//! Over rclone each file read is a process: at the slow pace (`READ_EVERY_MINUTES`) a roster whose
+//! name, size and modification time are as the last read found them is not downloaded again
+//! (`RosterStore::list_known`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,6 +48,7 @@ use crate::accounts::Provider;
 use crate::backup::{OpenError, Passphrase, SealKey};
 use crate::bulk::Pending;
 use crate::model::{AccountUsage, SharedReading, UsageWindow};
+use crate::rclone::{Known, Listed, RemoteFile};
 
 pub const FORMAT: &str = "slopbar-roster";
 const VERSION: u32 = 1;
@@ -99,6 +109,13 @@ const WRITE_LIMIT: u64 = 192 * 1024;
 /// Another machine's roster missing from one read (a sync app between versions, a download that
 /// failed) is kept from the read before for this long, so its readings do not blink out.
 const KEEP_MISSING_MINUTES: i64 = 2 * READ_EVERY_MINUTES;
+/// This machine's roster found not as it last wrote it is written again at the next sync. Found so
+/// again and again (something else writes the same file: a copy of this machine with the same id,
+/// or a sync service that keeps putting an older copy back), it is written again only after these
+/// waits since the last time, one more each time and the last one over and over, so a fight costs
+/// a write every few hours, not one per read; a day without one starts them over.
+const RESTORE_WAITS_MINUTES: [i64; 3] = [15, 60, 6 * 60];
+const RESTORE_CALM_HOURS: i64 = 24;
 const PASSPHRASE_FILE: &str = "roster-passphrase.bin";
 const MAX_PASSPHRASE: usize = 1024;
 
@@ -343,9 +360,10 @@ pub fn open(bytes: &[u8], passphrase: &Passphrase, keys: &mut HashMap<String, [u
 /// the interlinear annotation marks): a name from another machine loses them, and its spaces at
 /// either end, so "DESK-1" with one added cannot pass for this PC's "DESK-1". Letters of another
 /// script that look alike are not caught this way; the reading is marked as another machine's.
+/// The line and paragraph separators go too: a name is one line wherever it is shown or quoted.
 fn invisible(c: char) -> bool {
     matches!(c, '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}' | '\u{180B}'..='\u{180F}'
-        | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}'
+        | '\u{200B}'..='\u{200F}' | '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}'
         | '\u{FFA0}' | '\u{FFF0}'..='\u{FFFB}' | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E0FFF}')
 }
 
@@ -354,7 +372,15 @@ fn invisible(c: char) -> bool {
 
 pub trait RosterStore: Send + Sync {
     /// Every roster file there: its name, bytes and modification time (when known).
-    fn list(&self) -> std::io::Result<Vec<(String, Vec<u8>, Option<DateTime<Utc>>)>>;
+    fn list(&self) -> std::io::Result<Vec<(String, Vec<u8>, Option<DateTime<Utc>>)>> {
+        Ok(self.listing(&|_, _, _| None)?.files.into_iter().map(|f| (f.name, f.bytes, f.modified)).collect())
+    }
+    /// Every roster file there as `list` reads it, with the names listed whose bytes could not be
+    /// read (neither gone nor changed), and each file's content hash where the storage lists one at
+    /// no cost: an rclone remote on a cloud whose listing carries them (`Rclone::files_listed`). A
+    /// file listed with a hash goes to `known` first, and the bytes it gives back, kept from a read
+    /// of the file with that hash, stand in for downloading it again (a process each over rclone).
+    fn listing(&self, known: Known) -> std::io::Result<Listed>;
     /// Replaces the file `name` in one step where the storage can: a folder renames a finished
     /// temporary file over it, and an rclone remote uploads straight over it (`Rclone::put`).
     fn put(&self, name: &str, bytes: &[u8]) -> std::io::Result<()>;
@@ -381,22 +407,28 @@ impl Folder {
 }
 
 impl RosterStore for Folder {
-    fn list(&self) -> std::io::Result<Vec<(String, Vec<u8>, Option<DateTime<Utc>>)>> {
+    /// Every file is read: a folder lists no hashes, and a read costs no process.
+    fn listing(&self, _: Known) -> std::io::Result<Listed> {
         let entries = match std::fs::read_dir(self.dir()) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Listed::default()),
             Err(e) => return Err(e),
         };
-        Ok(entries.flatten()
-            .filter_map(|e| {
-                let path = e.path();
-                if path.extension().and_then(|x| x.to_str()) != Some(EXTENSION) {
-                    return None;
-                }
-                let meta = e.metadata().ok().filter(|m| m.is_file() && m.len() <= MAX_FILE)?;
-                Some((e.file_name().to_string_lossy().into_owned(), std::fs::read(&path).ok()?, meta.modified().ok().map(DateTime::<Utc>::from)))
-            })
-            .collect())
+        let mut listed = Listed::default();
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some(EXTENSION) {
+                continue;
+            }
+            let Some(meta) = e.metadata().ok().filter(|m| m.is_file() && m.len() <= MAX_FILE) else { continue };
+            let name = e.file_name().to_string_lossy().into_owned();
+            match std::fs::read(&path) {
+                Ok(bytes) => listed.files.push(RemoteFile { name, bytes, modified: meta.modified().ok().map(DateTime::<Utc>::from), hash: None }),
+                // A file the sync app holds, or one only in the cloud that could not be fetched.
+                Err(_) => listed.unread.push(name),
+            }
+        }
+        Ok(listed)
     }
 
     fn put(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
@@ -415,8 +447,8 @@ impl RosterStore for Folder {
 }
 
 impl<R: crate::rclone::Runner> RosterStore for crate::rclone::Rclone<R> {
-    fn list(&self) -> std::io::Result<Vec<(String, Vec<u8>, Option<DateTime<Utc>>)>> {
-        self.files(REMOTE_DIR, EXTENSION, MAX_FILE)
+    fn listing(&self, known: Known) -> std::io::Result<Listed> {
+        self.files_listed(REMOTE_DIR, EXTENSION, MAX_FILE, true, known)
     }
 
     fn put(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
@@ -518,6 +550,11 @@ pub struct Seen {
     pub unreadable: usize,
     /// Rosters from a newer SlopBar.
     pub unsupported: usize,
+    /// How many times this machine's roster was found not as it last wrote it, or gone, and was
+    /// written again (`Syncer::restore`), since the roster sync last started afresh (SlopBar started,
+    /// or the passphrase or sharing location changed). One that keeps rising means something else
+    /// writes this machine's file: Health says so from `OWN_REWRITTEN_WARN`.
+    pub own_rewritten: usize,
 }
 
 impl Seen {
@@ -551,15 +588,54 @@ pub struct Syncer {
     first_seen: HashMap<(String, Provider, String), (DateTime<Utc>, DateTime<Utc>)>,
     /// When each version of the other machines' rosters (machine id, as dated) was first seen.
     rosters_seen: HashMap<(String, DateTime<Utc>), DateTime<Utc>>,
-    /// When a write for readings alone was last tried, whether or not it worked: the next waits
-    /// out the gap either way, so a sharing location that is down costs one try per gap.
+    /// When a write for readings alone, or to put this machine's roster back (`restore`), was last
+    /// tried, whether or not it worked: the next waits out the gap either way, so a sharing
+    /// location that is down costs one try per gap.
     readings_tried: Option<DateTime<Utc>>,
     /// Settings: "Share usage readings" is off, so this machine's roster carries none (and is
     /// rewritten without them at once).
     pub withhold_readings: bool,
     /// Whether the last sync withheld readings: the first sync that does tries at once.
     withheld: bool,
+    /// The rosters the last read used (this machine's and the other machines' own files) that were
+    /// listed with a content hash: by name, that hash and the bytes read. At the slow pace a file
+    /// listed again with the same hash and size is not downloaded again (`RosterStore::listing`).
+    files: HashMap<String, (String, Vec<u8>)>,
+    /// The SHA-256 of the sealed roster this run last wrote: what its own file must read back as.
+    written_hash: Option<[u8; 32]>,
+    /// The rosters whose writes failed since then: a write cut short by its time limit may have
+    /// landed all the same, so finding one of them there is no reason to write again.
+    tried_hashes: Vec<[u8; 32]>,
+    /// The last read found this machine's roster not as it last wrote it, or not at all: it is
+    /// written again at the next sync (`RESTORE_WAITS_MINUTES`).
+    restore: bool,
+    /// When a write for that reason was last tried, whether or not it worked, and how many were
+    /// tried with less than `RESTORE_CALM_HOURS` between one and the next.
+    restore_tried: Option<DateTime<Utc>>,
+    restores: usize,
     pub seen: Seen,
+}
+
+/// What a sealed roster must read back as (`Syncer::written_hash`).
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).into()
+}
+
+/// Failed writes whose rosters are still accepted as this machine's (`Syncer::tried_hashes`).
+const TRIED_KEPT: usize = 4;
+
+/// This machine's own file as a read found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Own {
+    /// Not listed.
+    Absent,
+    /// Listed, but its bytes could not be read: neither gone nor changed.
+    Unread,
+    /// A roster this run wrote, or tried to.
+    Written,
+    /// Anything else: an older copy put back, another file written over it, damage.
+    Other,
 }
 
 impl Syncer {
@@ -588,8 +664,9 @@ impl Syncer {
     /// One refresh's turn: writes this machine's roster when its accounts or its run changed (or a
     /// day passed, or a few minutes while its run goes on), or a reading changed and the last write
     /// is `READINGS_GAP_MINUTES` old (or `READINGS_HEARTBEAT_HOURS`, to re-date readings taken
-    /// since), then reads every roster when due, or at once with `force`. With `soon`, Settings is
-    /// watching, so rosters are read more often.
+    /// since), or the last read found it not as written (`restore`), then reads every roster when
+    /// due, or at once with `force`. With `soon`, Settings is watching, so rosters are read more
+    /// often.
     #[allow(clippy::too_many_arguments)]
     pub fn sync(&mut self, store: &dyn RosterStore, passphrase: &Passphrase, me: (&str, &str), accounts: &[AccountUsage], now: DateTime<Utc>, force: bool, soon: bool) {
         let Some(name) = file_name(me.0) else { return };
@@ -598,8 +675,10 @@ impl Syncer {
         let read_first = !self.started && self.run.is_none();
         self.started = true;
         if read_first {
-            let recent = |r: &Run| r.finished && r.error.is_some() && now - r.at.min(now) < Duration::minutes(SHOW_FINISHED_MINUTES);
-            if let Some(run) = self.read_all(store, passphrase, me.0, &name, now).filter(recent) {
+            // Not one dated ahead of this clock (as another machine's roster is not trusted then):
+            // it would count as recent for as long as its date lies ahead, and be written on.
+            let recent = |r: &Run| r.finished && r.error.is_some() && r.at <= now + Duration::minutes(5) && now - r.at.min(now) < Duration::minutes(SHOW_FINISHED_MINUTES);
+            if let Some(run) = self.read_all(store, passphrase, me.0, &name, now, false).filter(recent) {
                 self.written_run = Some(run.clone());
                 self.run = Some(run);
                 self.adopted = true;
@@ -627,24 +706,53 @@ impl Syncer {
                 || !same_readings(written, &mine.readings) && waited(Duration::minutes(READINGS_GAP_MINUTES))
                 || newer && waited(Duration::hours(READINGS_HEARTBEAT_HOURS))
         });
+        // The last read found this machine's roster not as it was written, or gone (a sync service
+        // put back an older copy, say): written again now, and while it keeps being found so, after
+        // each of `RESTORE_WAITS_MINUTES`. Like a write of readings alone, it waits out the gap after
+        // one of them was tried and failed, so a sharing location that is down costs a try a gap.
+        let failed_lately = self.readings_tried.is_some_and(|t| self.written.as_ref().is_none_or(|(_, _, at)| t > *at) && now - t < Duration::minutes(READINGS_GAP_MINUTES));
+        let restores = match self.restore_tried {
+            Some(t) if now - t < Duration::hours(RESTORE_CALM_HOURS) => self.restores,
+            _ => 0,
+        };
+        let waited = restores == 0 || self.restore_tried.is_some_and(|t| now - t >= Duration::minutes(RESTORE_WAITS_MINUTES[restores.min(RESTORE_WAITS_MINUTES.len()) - 1]));
+        let restore_due = self.restore && !failed_lately && waited;
         let mut wrote = false;
-        if accounts_due || run_due || readings_due {
+        if accounts_due || run_due || readings_due || restore_due {
             if self.seal.is_none() {
                 self.seal = SealKey::new(passphrase).ok();
             }
-            if !(accounts_due || run_due) {
+            if (readings_due || restore_due) && !(accounts_due || run_due) {
                 self.readings_tried = Some(now);
             }
-            let put = self.seal.as_ref().and_then(|key| seal(&mine, key).ok()).map(|bytes| store.put(&name, &bytes));
+            if restore_due {
+                self.restore_tried = Some(now);
+                self.restores = restores + 1;
+            }
+            let sealed = self.seal.as_ref().and_then(|key| seal(&mine, key).ok());
+            let put = sealed.as_ref().map(|bytes| store.put(&name, bytes));
             let ok = matches!(put, Some(Ok(())));
             self.seen.wrote = Some(ok);
             self.seen.write_error = put.and_then(Result::err).as_ref().and_then(crate::proxy::refusal_code);
+            let hash = sealed.as_deref().map(digest);
             if ok {
                 self.written = Some((mine.accounts.clone(), mine.readings.clone(), now));
                 self.written_run = mine.run.clone();
                 self.seen.written_at = Some(now);
+                self.written_hash = hash;
+                self.tried_hashes.clear();
+                // Whatever made it due, the file is the one written now.
+                if std::mem::take(&mut self.restore) {
+                    self.seen.own_rewritten += 1;
+                }
                 // A change of accounts is worth reading back; a step of a run is not.
                 wrote = accounts_due;
+            } else if let Some(hash) = hash {
+                // It may have landed all the same (a write cut off at its time limit).
+                self.tried_hashes.push(hash);
+                if self.tried_hashes.len() > TRIED_KEPT {
+                    self.tried_hashes.remove(0);
+                }
             }
         }
         // A machine sent a Retry stays live until its run changes or the wait runs out.
@@ -652,7 +760,10 @@ impl Syncer {
         self.expecting.retain(|id, (until, at)| {
             now < *until && peers.iter().find(|p| &p.machine_id == id).and_then(|p| p.run.as_ref()).map(|r| r.at) == *at
         });
-        let every = if self.seen.peers.iter().any(Peer::running) || !self.expecting.is_empty() {
+        // A run whose machine went quiet (`QUIET_MINUTES`) keeps no pace: one that stopped for
+        // good would hold every other machine at the live pace until its roster is ignored.
+        let live = self.seen.peers.iter().any(|p| p.running() && now - p.written_at <= Duration::minutes(QUIET_MINUTES));
+        let every = if live || !self.expecting.is_empty() {
             Duration::seconds(READ_LIVE_SECONDS)
         } else if soon {
             Duration::seconds(READ_SOON_SECONDS)
@@ -670,31 +781,61 @@ impl Syncer {
         if !(force || wrote || read_due) {
             return;
         }
-        self.read_all(store, passphrase, me.0, &name, now);
+        // A file listed with the content hash it had when it was last downloaded is not downloaded
+        // again, at any pace: its bytes are those. A forced read (sync_roster) downloads everything.
+        self.read_all(store, passphrase, me.0, &name, now, !force);
     }
 
-    /// Reads every roster; returns the run this machine's own roster carries.
-    fn read_all(&mut self, store: &dyn RosterStore, passphrase: &Passphrase, own_id: &str, own_name: &str, now: DateTime<Utc>) -> Option<Run> {
+    /// Reads every roster; returns the run this machine's own roster carries. With `known`, a file
+    /// listed with the content hash (and size) of the bytes the last read kept of it is not read
+    /// again (`RosterStore::listing`): those bytes stand in for it.
+    fn read_all(&mut self, store: &dyn RosterStore, passphrase: &Passphrase, own_id: &str, own_name: &str, now: DateTime<Utc>, known: bool) -> Option<Run> {
         self.seen.read_at = Some(now);
-        match store.list() {
+        let listed = if known {
+            let kept = &self.files;
+            store.listing(&|name: &str, size: u64, hash: &str| {
+                kept.get(name).filter(|(h, bytes)| h == hash && bytes.len() as u64 == size).map(|(_, bytes)| bytes.clone())
+            })
+        } else {
+            store.listing(&|_, _, _| None)
+        };
+        match listed {
             Err(e) => {
                 self.seen.read = Some(false);
                 self.seen.read_error = crate::proxy::refusal_code(&e);
                 None
             }
-            Ok(files) => {
+            Ok(listed) => {
                 self.seen.read = Some(true);
                 self.seen.read_error = None;
-                self.read(files, passphrase, own_id, own_name, now)
+                let mut hashed: HashMap<String, (String, Vec<u8>)> = listed.files.iter()
+                    .filter_map(|f| Some((f.name.clone(), (f.hash.clone()?, f.bytes.clone()))))
+                    .collect();
+                let (run, used) = self.read(listed, passphrase, own_id, own_name, now);
+                // Kept: the rosters this read used, so files nobody reads cost nothing to keep.
+                hashed.retain(|name, _| used.contains(name));
+                self.files = hashed;
+                run
             }
         }
     }
 
-    fn read(&mut self, files: Vec<(String, Vec<u8>, Option<DateTime<Utc>>)>, passphrase: &Passphrase, own_id: &str, own_name: &str, now: DateTime<Utc>) -> Option<Run> {
+    /// Reads the files a listing found: returns the run this machine's own roster carries, and the
+    /// names of the files used (this machine's own and the other machines' own files).
+    fn read(&mut self, listed: Listed, passphrase: &Passphrase, own_id: &str, own_name: &str, now: DateTime<Utc>) -> (Option<Run>, Vec<String>) {
         let (mut unreadable, mut unsupported, mut own_accounts, mut own_run) = (0, 0, None, None);
+        let mut own = if listed.unread.iter().any(|n| n == own_name) { Own::Unread } else { Own::Absent };
+        let mut used = Vec::new();
         let mut peers: HashMap<String, Peer> = HashMap::new();
         let mut rosters_seen = HashMap::new();
-        for (name, bytes, modified) in files {
+        for RemoteFile { name, bytes, modified, .. } in listed.files {
+            // This machine's own file: a roster this run wrote (or tried to), byte for byte, or not
+            // (an older copy put back, another file written over it, damage).
+            let mine = name == own_name;
+            if mine {
+                let hash = digest(&bytes);
+                own = if self.written_hash == Some(hash) || self.tried_hashes.contains(&hash) { Own::Written } else { Own::Other };
+            }
             let roster = match open(&bytes, passphrase, &mut self.keys) {
                 Ok(r) => r,
                 Err(OpenError::WrongOrDamaged) => { unreadable += 1; continue; }
@@ -703,16 +844,24 @@ impl Syncer {
             // A clock running ahead is not trusted: the storage's time is used instead.
             let ahead = roster.written_at > now + Duration::minutes(5);
             let written_at = if ahead { modified.unwrap_or(now).min(now) } else { roster.written_at };
-            if roster.machine_id == own_id || name == own_name {
-                own_accounts = Some(roster.accounts.len());
-                own_run = roster.run;
+            // This machine's roster is the file named after it, saying it is this machine's, as
+            // another machine's is; one under its name that says it is another's is nobody's.
+            if mine {
+                if roster.machine_id == own_id {
+                    own_accounts = Some(roster.accounts.len());
+                    own_run = roster.run;
+                    used.push(name);
+                } else {
+                    own = Own::Other;
+                }
                 continue;
             }
             // Each machine writes under its own id's name (`file_name`): another file claiming it,
-            // a sync app's conflicted copy say, does not stand in for it.
+            // a sync app's conflicted copy say, does not stand in for it, this machine included.
             if file_name(&roster.machine_id).as_deref() != Some(name.as_str()) {
                 continue;
             }
+            used.push(name);
             // When this machine first saw this version of the roster, dated ahead or not: its
             // readings are dated from then at the latest, so one left dated ahead does not wake up
             // fresh once this clock reaches its date. Remembered for this run of SlopBar only: after
@@ -759,10 +908,22 @@ impl Syncer {
         self.first_seen = peers.iter()
             .flat_map(|p| p.readings.iter().map(|r| ((p.machine_id.clone(), r.reading.provider, r.reading.id.clone()), (r.reading.taken_at, r.seen_at))))
             .collect();
+        // Once this run has written its roster, the copy there must be that one: if not, or if the
+        // listing (which worked) had none, the next sync writes it again. A copy listed but not read
+        // says nothing either way. The latest read that saw it decides.
+        self.restore = match own {
+            Own::Absent | Own::Other => self.written_hash.is_some(),
+            Own::Unread => self.restore,
+            Own::Written => false,
+        };
         self.seen = Seen { own_accounts, peers, unreadable, unsupported, ..self.seen.clone() };
-        own_run
+        (own_run, used)
     }
 }
+
+/// From this many rewrites of this machine's roster found not as written (`Seen::own_rewritten`),
+/// Health says something else writes it.
+pub const OWN_REWRITTEN_WARN: usize = 3;
 
 /// A run going on whose machine has not rewritten its roster for this long has gone quiet (its
 /// SlopBar stopped, or lost the sharing location); one rewrites every few refreshes at most.
@@ -937,7 +1098,7 @@ mod tests {
     struct Counting(Folder, std::sync::atomic::AtomicUsize);
 
     impl RosterStore for Counting {
-        fn list(&self) -> std::io::Result<Vec<(String, Vec<u8>, Option<DateTime<Utc>>)>> { self.0.list() }
+        fn listing(&self, known: Known) -> std::io::Result<Listed> { self.0.listing(known) }
         fn put(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
             self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.0.put(name, bytes)
@@ -1383,7 +1544,7 @@ mod tests {
     struct Failing(std::sync::atomic::AtomicUsize);
 
     impl RosterStore for Failing {
-        fn list(&self) -> std::io::Result<Vec<(String, Vec<u8>, Option<DateTime<Utc>>)>> { Ok(vec![]) }
+        fn listing(&self, _: Known) -> std::io::Result<Listed> { Ok(Listed::default()) }
         fn put(&self, _: &str, _: &[u8]) -> std::io::Result<()> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(std::io::Error::other("synthetic failure"))
@@ -1694,5 +1855,184 @@ mod tests {
         let back = open(&seal(&roster, &key).unwrap(), &pass("synthetic roster passphrase"), &mut HashMap::new()).unwrap();
         assert_eq!(back.accounts.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["cl-one"]);
         assert_eq!(back.machine, "APC");
+    }
+
+    /// A sync service that puts an older copy of this machine's roster back (a restore of an earlier
+    /// version), something that writes over it, or a copy that goes: the next read finds it and the
+    /// next sync writes the roster again, so the other machines see this machine's readings as they
+    /// are. A copy listed but not read (a sync app holding it) is neither gone nor changed.
+    #[test]
+    fn a_roster_put_back_damaged_or_lost_is_written_again_at_the_next_sync() {
+        let p = pass("synthetic roster passphrase");
+        let at = |m: i64| now() + Duration::minutes(m);
+        let read = |percent: f64, m: i64| [reading("claude", "cl-one", percent, Some(m), false)];
+        // An older copy put back.
+        let shared = TempDir::new();
+        let store = Counting(Folder(shared.0.clone()), Default::default());
+        let writes = || store.1.load(std::sync::atomic::Ordering::SeqCst);
+        let file = roster_file(&shared, MACHINE_A);
+        let mut a = Syncer::default();
+        let sync = |a: &mut Syncer, percent: f64, m: i64| a.sync(&store, &p, (MACHINE_A, "DESK-A"), &read(percent, m), at(m), false, false);
+        sync(&mut a, 10.0, 0);
+        let old = std::fs::read(&file).unwrap();
+        sync(&mut a, 60.0, 15);
+        assert_eq!(writes(), 2, "a changed reading goes out after the gap");
+        // The read at 25 finds it, and the sync after writes the roster again, though nothing else is
+        // due (the reading has not changed since 15).
+        std::fs::write(&file, &old).unwrap();
+        sync(&mut a, 60.0, 20);
+        sync(&mut a, 60.0, 25);
+        assert_eq!((writes(), a.seen.own_rewritten), (2, 0), "found at the read, written at the next sync");
+        sync(&mut a, 60.0, 30);
+        assert_eq!((writes(), a.seen.own_rewritten), (3, 1));
+        let back = open(&std::fs::read(&file).unwrap(), &p, &mut HashMap::new()).unwrap();
+        assert_eq!(back.readings.iter().map(|r| (r.windows[0].used_percent, r.taken_at)).collect::<Vec<_>>(), [(60.0, at(30))]);
+        let mut b = Syncer::default();
+        let mut here = vec![reading("claude", "cl-one", 1.0, None, true)];
+        b.sync(&store, &p, (MACHINE_B, "LAPTOP-B"), &here, at(31), false, false);
+        apply_readings(&mut here, &b.seen, "LAPTOP-B", margin(), at(31));
+        assert_eq!(shared_percent(&here[0]), Some(("DESK-A".into(), 60.0)), "the other machines see the reading as it is");
+        // Gone, damaged, or claiming to be another machine's: the same, each the first of its run.
+        let fresh = |change: &dyn Fn(&PathBuf)| {
+            let shared = TempDir::new();
+            let store = Counting(Folder(shared.0.clone()), Default::default());
+            let file = roster_file(&shared, MACHINE_A);
+            let mut a = Syncer::default();
+            a.sync(&store, &p, (MACHINE_A, "DESK-A"), &read(10.0, 0), at(0), false, false);
+            change(&file);
+            a.sync(&store, &p, (MACHINE_A, "DESK-A"), &read(10.0, 0), at(10), false, false);
+            a.sync(&store, &p, (MACHINE_A, "DESK-A"), &read(10.0, 0), at(15), false, false);
+            let back = std::fs::read(&file).ok().and_then(|bytes| open(&bytes, &p, &mut HashMap::new()).ok());
+            (store.1.load(std::sync::atomic::Ordering::SeqCst), a.seen.own_rewritten, back.map(|r| r.machine_id))
+        };
+        let rewritten = (2, 1, Some(MACHINE_A.to_string()));
+        assert_eq!(fresh(&|file| std::fs::remove_file(file).unwrap()), rewritten, "gone");
+        assert_eq!(fresh(&|file| std::fs::write(file, b"{\"format\":\"slopbar-roster\",\"damaged\":true}").unwrap()), rewritten, "damaged");
+        let key = SealKey::new(&p).unwrap();
+        // `file_name` keeps hex digits and dashes only, so an id with a letter added maps to this
+        // machine's file: under its name, a roster saying it is another machine's is nobody's.
+        let claimed = seal(&own(&format!("{MACHINE_A}Z"), "DESK-A", &[account("claude", "cl-one")], at(1)), &key).unwrap();
+        assert_eq!(fresh(&|file| std::fs::write(file, &claimed).unwrap()), rewritten, "another machine's under this one's name");
+        // Listed but not read (a sync app holds it): nothing is written.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let held = std::cell::RefCell::new(None);
+            let (writes, rewritten, _) = fresh(&|file| { *held.borrow_mut() = Some(std::fs::OpenOptions::new().read(true).share_mode(0).open(file).unwrap()); });
+            assert_eq!((writes, rewritten), (1, 0), "unread: neither gone nor changed");
+        }
+        // A machine's first sync since it started has written nothing to compare with: it reads its
+        // old copy (to take back a failed run) and writes, as every start does.
+        let mut restarted = Syncer::default();
+        std::fs::write(&file, &old).unwrap();
+        restarted.sync(&store, &p, (MACHINE_A, "DESK-A"), &read(60.0, 80), at(80), false, false);
+        assert_eq!(restarted.seen.own_rewritten, 0);
+    }
+
+    /// While something else keeps writing this machine's file (a copy of this machine with the same
+    /// id, or a sync service putting an older copy back again and again), the roster is written
+    /// again at once, then 15 minutes, an hour and 6 hours after the time before, then every 6
+    /// hours: at the live pace (a read every 15 seconds) too. A day without one starts over. A
+    /// store whose writes fail is tried once a gap in all.
+    #[test]
+    fn a_roster_something_else_keeps_writing_is_written_again_ever_less_often() {
+        let shared = TempDir::new();
+        let store = Counting(Folder(shared.0.clone()), Default::default());
+        let writes = || store.1.load(std::sync::atomic::Ordering::SeqCst);
+        let p = pass("synthetic roster passphrase");
+        let key = SealKey::new(&p).unwrap();
+        let at = |s: i64| now() + Duration::seconds(s);
+        let one = [account("claude", "cl-one")];
+        let file = roster_file(&shared, MACHINE_A);
+        let theirs = seal(&own(MACHINE_A, "DESK-A-COPY", &one, at(0)), &key).unwrap();
+        // Another machine's run goes on all along (its roster rewritten every minute), so this
+        // machine reads every 15 seconds (`READ_LIVE_SECONDS`).
+        let b_file = file_name(MACHINE_B).unwrap();
+        let running = |s: i64| {
+            let mut r = own(MACHINE_B, "LAPTOP-B", &one, at(s));
+            r.run = Some(Run { at: at(s), ..run(1, false, "running") });
+            seal(&r, &key).unwrap()
+        };
+        store.0.put(&b_file, &running(0)).unwrap();
+        let mut a = Syncer::default();
+        let mut rewrites = vec![];
+        for s in (0..=8 * 3600).step_by(READ_LIVE_SECONDS as usize) {
+            if s % 60 == 0 {
+                store.0.put(&b_file, &running(s)).unwrap();
+            }
+            // The other writer, before every sync.
+            if s > 0 {
+                std::fs::write(&file, &theirs).unwrap();
+            }
+            let before = a.seen.own_rewritten;
+            a.sync(&store, &p, (MACHINE_A, "DESK-A"), &one, at(s), false, false);
+            if a.seen.own_rewritten > before {
+                rewrites.push(s);
+            }
+        }
+        // Found by the read at 15 s: written at 30 s, then after 15 minutes, an hour, 6 hours.
+        assert_eq!(rewrites, [30, 30 + 900, 30 + 900 + 3600, 30 + 900 + 3600 + 6 * 3600]);
+        assert_eq!(writes(), 1 + rewrites.len(), "nothing but the first write and the rewrites");
+        // It stops, and B's run ends: a day later, an older copy put back once is written over at the
+        // next sync after the read that finds it, as the first time.
+        let mut ended = own(MACHINE_B, "LAPTOP-B", &one, at(8 * 3600));
+        ended.run = Some(Run { at: at(8 * 3600), ..run(2, true, "done") });
+        store.0.put(&b_file, &seal(&ended, &key).unwrap()).unwrap();
+        let calm = 8 * 3600 + 25 * 3600;
+        for s in (8 * 3600 + 300..calm).step_by(300) {
+            a.sync(&store, &p, (MACHINE_A, "DESK-A"), &one, at(s), false, false);
+        }
+        std::fs::write(&file, &theirs).unwrap();
+        let before = a.seen.own_rewritten;
+        for s in (calm..calm + 20 * 60).step_by(300) {
+            a.sync(&store, &p, (MACHINE_A, "DESK-A"), &one, at(s), false, false);
+        }
+        assert_eq!(a.seen.own_rewritten, before + 1, "after a calm day, at once again");
+        // A store whose writes fail and whose listing has no file of this machine's (the sharing
+        // folder gone, say): one try a gap, as for readings alone.
+        let mut b = Syncer::default();
+        b.sync(&Folder(shared.0.clone()), &p, (MACHINE_B, "LAPTOP-B"), &one, at(0), false, false);
+        let failing = Failing(Default::default());
+        for m in 1..=2 * READINGS_GAP_MINUTES {
+            b.sync(&failing, &p, (MACHINE_B, "LAPTOP-B"), &one, at(60 * m), false, false);
+        }
+        assert_eq!(failing.0.load(std::sync::atomic::Ordering::SeqCst), 2, "the read at 10 minutes finds it gone: tried at 11 and 26");
+    }
+
+    /// Only the file named after this machine is its roster, as only a file named after a machine
+    /// is that machine's: a copy beside it that claims this machine (a sync service's conflicted
+    /// copy) is neither counted nor taken back after a restart, in whatever order it is listed.
+    #[test]
+    fn a_copy_claiming_this_machine_is_not_its_roster() {
+        let shared = TempDir::new();
+        let store = Folder(shared.0.clone());
+        let p = pass("synthetic roster passphrase");
+        let key = SealKey::new(&p).unwrap();
+        let mut a = Syncer::default();
+        a.offer_run(run(4, true, "failed"));
+        a.sync(&store, &p, (MACHINE_A, "DESK-A"), &[account("claude", "cl-one")], now(), false, false);
+        let mut copy = own(MACHINE_A, "DESK-A", &[account("claude", "cl-one"), account("claude", "cl-two"), account("codex", "cx-one")], now());
+        copy.run = Some(run(9, true, "failed"));
+        for name in [format!("{MACHINE_A} (1).roster"), format!("{MACHINE_A}~2.roster")] {
+            store.put(&name, &seal(&copy, &key).unwrap()).unwrap();
+        }
+        let mut restarted = Syncer::default();
+        restarted.sync(&store, &p, (MACHINE_A, "DESK-A"), &[account("claude", "cl-one")], now() + Duration::minutes(1), true, false);
+        let mut b = Syncer::default();
+        b.sync(&store, &p, (MACHINE_B, "LAPTOP-B"), &[], now() + Duration::minutes(2), false, false);
+        assert_eq!(peer_runs(&b.seen, now() + Duration::minutes(2)).iter().map(|r| r.run.revision).collect::<Vec<_>>(), [4], "the run taken back is its own file's");
+        restarted.sync(&store, &p, (MACHINE_A, "DESK-A"), &[account("claude", "cl-one")], now() + Duration::minutes(3), true, false);
+        assert_eq!(restarted.seen.own_accounts, Some(1));
+        assert_eq!(restarted.seen.own_rewritten, 0, "copies beside it are not its file: nothing to put back");
+        // A failed run dated ahead of this clock (a clock that ran fast, or a planted one) is not
+        // taken back after a restart: it would count as recent until its date.
+        let mut ahead = own(MACHINE_A, "DESK-A", &[account("claude", "cl-one")], now());
+        ahead.run = Some(Run { at: now() + Duration::days(30), ..run(7, true, "failed") });
+        store.put(&file_name(MACHINE_A).unwrap(), &seal(&ahead, &key).unwrap()).unwrap();
+        let mut again = Syncer::default();
+        again.sync(&store, &p, (MACHINE_A, "DESK-A"), &[account("claude", "cl-one")], now() + Duration::minutes(4), false, false);
+        let mut c = Syncer::default();
+        c.sync(&store, &p, (MACHINE_B, "LAPTOP-B"), &[], now() + Duration::minutes(5), false, false);
+        assert!(c.seen.peers[0].run.is_none(), "not taken back, so not written on");
     }
 }

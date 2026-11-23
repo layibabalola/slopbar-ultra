@@ -44,7 +44,8 @@ MEGA, S3, WebDAV, SFTP and the other rclone backends. rclone keeps its own confi
 - **Where rclone is found.** SlopBar's own copy (`%LOCALAPPDATA%\SlopBar\rclone\rclone.exe`, from
   the guided setup), then `%LOCALAPPDATA%\Microsoft\WinGet\Links`, then `PATH` (last: folders on
   `PATH` can be writable by anyone). All of them read the same rclone config.
-- **Calls.** SlopBar runs only these, and only on `<remote>:SlopBar/presence`:
+- **Calls.** SlopBar runs only these, and only on `<remote>:SlopBar/presence` and, with the account roster on,
+  `<remote>:SlopBar/roster`:
   - `lsjson --files-only --no-mimetype` to list records;
   - `cat <file>` to read each one;
   - `rcat <id>.json` to write this machine's record in one step: rclone replaces the file whole
@@ -56,6 +57,20 @@ MEGA, S3, WebDAV, SFTP and the other rclone backends. rclone keeps its own confi
 
   A read that still misses a record (an older SlopBar writing the old way, a failed listing)
   keeps that machine's last record while it is live by its own time (`presence::Recall`).
+
+  The account roster (`SlopBar/roster`, `roster::Syncer`) uses the same three calls. On Dropbox,
+  Google Drive, OneDrive and Box its listing adds `--hash`: those clouds list each file's content
+  hash with no extra request (rclone would compute it by reading every file elsewhere, so other
+  remotes are not asked). A roster listed with the same hash and size as the copy the last read
+  kept is not downloaded again, at any pace, so a read costs the listing and one `cat` per roster
+  that changed; a forced read (`sync_roster`) downloads every file. Modelled for a machine with two
+  others, refreshing every 5 minutes (`rclone::tests::an_hour_of_roster_reads_over_rclone_starts_fewer_processes`),
+  roster processes an hour go from 24 to 6 when nothing changes, 28 to 18 when readings change all
+  along, 240 to 60 with Settings open, and 48 to 24 while another machine runs Sign in all.
+
+  A remote's kind, which sets the proxy each call goes through, comes from `listremotes --long`
+  and is kept 30 minutes; a call that fails forgets it, so a remote pointed at another cloud is
+  looked up again at once.
 
   A clean quit rewrites this machine's record with no accounts.
 - **Each call.** rclone runs with no window, `--ask-password=false` (it never waits on an

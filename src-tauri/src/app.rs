@@ -225,7 +225,8 @@ pub(crate) async fn health_report(app: &AppHandle) -> health::Report {
         roster: {
             let seen = state.roster_seen.lock().unwrap().clone();
             health::Roster { enabled: settings.account_roster, passphrase_saved: roster_passphrase_saved(), wrote: seen.wrote, read: seen.read,
-                write_error: seen.write_error, read_error: seen.read_error, unreadable: seen.unreadable, waiting: roster_waiting(&state, &snapshot).len() }
+                write_error: seen.write_error, read_error: seen.read_error, unreadable: seen.unreadable, waiting: roster_waiting(&state, &snapshot).len(),
+                own_rewritten: seen.own_rewritten }
         },
         journal: state.diagnostics.health(),
         notifications: health::Notifications { registered: seen.notifications_registered, app_enabled, system_enabled,
@@ -640,6 +641,8 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             }
             let rec = recommend_unleased(&app, provider, expected_percent, hours, lease_id.as_deref());
             let mut result = value(&rec)?;
+            // Here only: pick_account's and lease_account's errors quote the summary with no excluded list.
+            result["summary"] = format!("{}{}", rec.summary, headroom::shared_note(&rec)).into();
             result["switched"] = false.into();
             if let (true, headroom::Action::Switch, Some(id)) = (switch, rec.action, rec.recommended.clone()) {
                 let done = agent_switch(&app, provider, id).await?;
@@ -3438,7 +3441,7 @@ async fn roster_status(app: &AppHandle, sync: bool) -> serde_json::Value {
         "location": settings.presence_remote.is_some() || settings.presence_folder.is_some(),
         "passphrase_saved": roster_passphrase_saved(),
         "wrote": seen.wrote, "written_at": seen.written_at, "write_error": seen.write_error, "read": seen.read, "read_at": seen.read_at, "read_error": seen.read_error,
-        "own_accounts": seen.own_accounts, "unreadable": seen.unreadable, "unsupported": seen.unsupported,
+        "own_accounts": seen.own_accounts, "own_rewritten": seen.own_rewritten, "unreadable": seen.unreadable, "unsupported": seen.unsupported,
         "share_readings": settings.share_readings,
         "machines": seen.peers.iter().map(|p| serde_json::json!({ "machine": p.machine, "written_at": p.written_at, "accounts": p.accounts.len(), "readings": p.readings.len() })).collect::<Vec<_>>(),
         "waiting": waiting,
