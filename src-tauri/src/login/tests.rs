@@ -143,6 +143,20 @@ fn source(home: &Path) -> Source {
 }
 
 #[test]
+fn only_a_folder_whose_login_was_never_handed_over_may_be_signed_out() {
+    let home = TempDir::new();
+    let dir = home.0.join(".slopbar-login-1-1000-1");
+    std::fs::create_dir(&dir).unwrap();
+    assert!(!not_handed_off(&dir), "no marker says nothing");
+    prepare(&dir, Provider::Claude, action(Provider::Claude, false)).unwrap();
+    assert!(not_handed_off(&dir), "prepared, not handed over");
+    handoff(&dir, Provider::Claude).unwrap();
+    assert!(!not_handed_off(&dir), "handed over");
+    std::fs::write(dir.join("slopbar-owner.json"), b"not json").unwrap();
+    assert!(!not_handed_off(&dir), "an unreadable marker says nothing");
+}
+
+#[test]
 fn exported_credentials_are_never_logged_out_even_if_folder_deletion_failed() {
     for provider in Provider::ALL {
         let home = TempDir::new();

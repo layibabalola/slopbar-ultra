@@ -682,7 +682,8 @@ pub enum Fault {
 /// `relay_failed`, so no free text from it reaches a result, a notification or the roster.
 const KNOWN: &[&str] = &[
     "signin_stopped", "signin_window_closed", "monitor_wrong_account", "monitor_wrong_workspace", "desktop_locked", "desktop_not_shown",
-    "no_desktop_session", "signin_browser_missing", "signin_profile_storage", "signin_url_rejected", "relay_port_unusable", "monitor_login_failed",
+    "no_desktop_session", "signin_browser_missing", "signin_profile_storage", "signin_url_rejected", "relay_port_unusable", "relay_port_refused",
+    "signin_port_refused", "monitor_login_failed",
     "monitor_storage", "relay_unknown_account", "relay_lost", "relay_unheard", "relay_no_page", "relay_unsupported", "relay_page_unexpected",
     "relay_outdated", "relay_step_unknown", "relay_stopped_there", "wrong_machine", "peer_busy", "signin_busy", "monitor_busy", "CLI not found", "tunnel_failed",
     "app_not_running", "slopbar_not_installed", "not_running", "door_unavailable", "timeout", "ssh_timeout", "ssh_missing", "ssh_failed",
@@ -707,7 +708,7 @@ pub fn fault(code: &str) -> Fault {
     match code {
         "signin_stopped" | "signin_window_closed" | "monitor_wrong_account" | "monitor_wrong_workspace" | "desktop_locked" | "desktop_not_shown"
         | "signin_browser_missing" | "signin_profile_storage" => Fault::StopRun,
-        "relay_port_unusable" | "monitor_login_failed" | "monitor_storage" | "relay_unknown_account" => Fault::SkipStep,
+        "relay_port_unusable" | "relay_port_refused" | "signin_port_refused" | "monitor_login_failed" | "monitor_storage" | "relay_unknown_account" => Fault::SkipStep,
         _ => Fault::DropComputer,
     }
 }
@@ -726,6 +727,7 @@ pub fn why(code: &str) -> &'static str {
         "wrong_machine" => "leftWrongMachine",
         "CLI not found" => "leftNoCli",
         "relay_port_unusable" => "leftPort",
+        "relay_port_refused" | "signin_port_refused" => "leftPortRefused",
         "relay_stopped_there" => "leftStoppedThere",
         "relay_unknown_account" => "leftUnknownAccount",
         _ => "leftFailed",
@@ -939,8 +941,10 @@ const LOST_AFTER: Duration = Duration::from_secs(90);
 /// How long a start keeps trying a computer that does not answer (restarting into an update).
 const START_RETRY: Duration = Duration::from_secs(90);
 /// How many times a sign-in is started again for a new port when this computer cannot use the one
-/// its CLI picked (Windows reserves some): Claude Code picks a new one each time; Codex's is fixed.
-const PORT_TRIES: u32 = 3;
+/// its CLI picked (Windows reserves some) or browsers refuse it (see `signin::browser_refuses`):
+/// Claude Code picks a new one each time, often the next free one where Windows hands them out in
+/// order, so enough to step past the longest run of refused ports (6665-6669). Codex's is fixed.
+const PORT_TRIES: u32 = crate::accounts::REFUSED_TRIES;
 
 /// Everything one relayed sign-in holds here: its tunnel, whether it was asked to stop, and the
 /// step it is on there. Dropping the [`Relayed`] that owns it closes the tunnel at once and asks
@@ -952,6 +956,8 @@ pub struct Shared {
     step: std::sync::Mutex<Option<String>>,
     /// The other computer said the step ended (done, not needed or failed there): nothing to stop.
     ended_there: std::sync::atomic::AtomicBool,
+    /// The person asked for this sign-in again (see [`Relayed::restart`]).
+    restart: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {
@@ -985,6 +991,9 @@ fn drive_timed(desk: &dyn Desk, host: &str, ids: &Ids, step: &crate::bulk::Step,
     let provider = step.target.provider;
     let email = step.email.as_deref();
     let mut tries = 0;
+    // A sign-in there started again (for a port, or asked for): the last one may hold that
+    // computer's one sign-in for a moment as it ends.
+    let mut again = false;
     loop {
         // Never a new sign-in there once this one was stopped here.
         if shared.cancelled() {
@@ -992,11 +1001,13 @@ fn drive_timed(desk: &dyn Desk, host: &str, ids: &Ids, step: &crate::bulk::Step,
         }
         let id = uuid::Uuid::new_v4().simple().to_string();
         *shared.step.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
+        // Whether a step ended there is said of the step it names: a new one has not.
+        shared.ended_there.store(false, std::sync::atomic::Ordering::SeqCst);
         let start = Request::RelayStart {
             step: id.clone(), from: ids.from.clone(), machine: ids.machine.clone(), kind: step.kind,
             provider, id: step.target.id.clone(), email: step.email.clone(),
         };
-        let mut state = start_there(desk, host, &start, shared, timing)?;
+        let mut state = start_there(desk, host, &start, shared, timing, again)?;
         let mut last_heard = Instant::now();
         let mut reopened = false;
         // The page, as it came (it is sent once).
@@ -1012,6 +1023,16 @@ fn drive_timed(desk: &dyn Desk, host: &str, ids: &Ids, step: &crate::bulk::Step,
                 }
                 return Err("signin_stopped".into());
             }
+            // Asked for again (Retry this sign-in), unless it is done: this one stops there,
+            // its tunnel closes, and a new one starts there, whose page opens here.
+            if !matches!(state.phase, Phase::Done | Phase::Skipped) && shared.restart.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                shared.tunnel.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if !state.phase.ended() {
+                    let _ = desk.call(host, &Request::RelayStop { step: id.clone() }, Duration::ZERO);
+                }
+                again = true;
+                break;
+            }
             if state.url.is_some() {
                 page_url = state.url.clone();
             }
@@ -1025,22 +1046,33 @@ fn drive_timed(desk: &dyn Desk, host: &str, ids: &Ids, step: &crate::bulk::Step,
                 Phase::Starting => {}
                 Phase::Page => {
                     let held = shared.tunnel.lock().unwrap_or_else(|e| e.into_inner()).is_some();
-                    if !held {
+                    // A tunnel just closed for a start again (see `Relayed::restart`) is not opened
+                    // again for this page: the next pass starts the new one.
+                    if !held && !shared.restart.load(std::sync::atomic::Ordering::SeqCst) {
                         let Some(url) = page_url.clone() else { return Err("relay_failed".into()) };
                         let page = check_page(&url, provider, email).map_err(String::from)?;
-                        match desk.tunnel(host, &page) {
+                        // A port browsers refuse is one no page here could come back to.
+                        let held = if crate::signin::browser_refuses(page.port) { Err("relay_port_refused") } else { desk.tunnel(host, &page) };
+                        match held {
                             Ok(tunnel) => *shared.tunnel.lock().unwrap_or_else(|e| e.into_inner()) = Some(tunnel),
-                            // This computer cannot use the port the CLI there picked: a new sign-in
-                            // there picks another (Claude Code), else only this sign-in is left out.
-                            Err("relay_port_unusable") if provider == Provider::Claude && tries + 1 < PORT_TRIES => {
+                            // This computer cannot use the port the CLI there picked, or browsers
+                            // refuse it: a new sign-in there picks another (Claude Code), else only
+                            // this sign-in is left out.
+                            Err("relay_port_unusable" | "relay_port_refused") if provider == Provider::Claude && tries + 1 < PORT_TRIES => {
                                 tries += 1;
                                 let _ = desk.call(host, &Request::RelayStop { step: id.clone() }, Duration::ZERO);
+                                again = true;
                                 break;
                             }
                             Err(e) => return Err(e.into()),
                         }
                         if shared.cancelled() {
                             return Err("signin_stopped".into());
+                        }
+                        // Asked for again while its tunnel opened: this page is not opened, and the
+                        // next pass starts the new one.
+                        if shared.restart.load(std::sync::atomic::Ordering::SeqCst) {
+                            continue;
                         }
                         desk.open(&url)?;
                         opened();
@@ -1086,8 +1118,9 @@ fn drive_timed(desk: &dyn Desk, host: &str, ids: &Ids, step: &crate::bulk::Step,
 
 /// Starts `start` there: its first state, with the page when it came within [`START_WAIT`]. A
 /// computer that does not answer (restarting into an update) is asked again for [`START_RETRY`]; a
-/// sign-in no longer needed there answers `Skipped`.
-fn start_there(desk: &dyn Desk, host: &str, start: &Request, shared: &Shared, timing: &Timing) -> Result<State, String> {
+/// sign-in no longer needed there answers `Skipped`. `again`: this sign-in's last one there was
+/// just stopped, and may hold that computer's one sign-in (`signin_busy`) for a moment as it ends.
+fn start_there(desk: &dyn Desk, host: &str, start: &Request, shared: &Shared, timing: &Timing, again: bool) -> Result<State, String> {
     let until = Instant::now() + timing.start_retry;
     loop {
         if shared.cancelled() {
@@ -1097,7 +1130,8 @@ fn start_there(desk: &dyn Desk, host: &str, start: &Request, shared: &Shared, ti
             Ok(answer) => return serde_json::from_value::<State>(answer).map_err(|_| "relay_failed".to_string()),
             Err(e) => {
                 let e = known(&e);
-                let passing = e.starts_with("ssh_") || matches!(e.as_str(), "not_running" | "door_unavailable" | "timeout" | "remote_no_answer");
+                let passing = e.starts_with("ssh_") || matches!(e.as_str(), "not_running" | "door_unavailable" | "timeout" | "remote_no_answer")
+                    || (again && e == "signin_busy");
                 if !passing || Instant::now() > until || shared.cancelled() {
                     return Err(e);
                 }
@@ -1121,6 +1155,18 @@ impl Relayed {
     /// `stop(host, step)` asks the other computer to stop step `step` (on a thread of its own).
     pub fn new(host: &str, stop: std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>) -> Self {
         Relayed { shared: Default::default(), host: host.to_owned(), stop }
+    }
+
+    /// Starts this sign-in again ("Retry this sign-in"): [`drive`] starts a new one there, whose page
+    /// opens here. Its tunnel closes at once, so no answer from the old page reaches the old sign-in,
+    /// and the one there is asked to stop now, so a state call waiting on it answers at once rather
+    /// than at the end of its wait.
+    pub fn restart(&self) {
+        self.shared.restart.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.shared.tunnel.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(step) = self.shared.step.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            (self.stop)(&self.host, &step);
+        }
     }
 }
 

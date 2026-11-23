@@ -200,6 +200,17 @@ fn write_owner(dir: &Path, provider: Provider, imported: bool) -> std::io::Resul
     )
 }
 
+/// Whether `dir`'s marker says, readably, that its login was never handed over (see [`handoff`]):
+/// only such a folder may be signed out. A missing, linked or unreadable marker says nothing, so
+/// false, as startup cleanup treats it.
+pub fn not_handed_off(dir: &Path) -> bool {
+    let marker = dir.join("slopbar-owner.json");
+    if !std::fs::symlink_metadata(&marker).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink()) {
+        return false;
+    }
+    std::fs::read(&marker).ok().and_then(|b| serde_json::from_slice::<Owner>(&b).ok()).is_some_and(|owner| !owner.imported)
+}
+
 /// Persist the handoff BEFORE returning credentials to any caller. If this fails,
 /// the login must not be exported. A crash or failed delete after handoff can then
 /// never make startup cleanup revoke the same login now held by a CLI or monitor.
