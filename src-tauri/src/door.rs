@@ -211,6 +211,15 @@ pub enum Request {
         #[serde(default)]
         everywhere: bool,
     },
+    /// Starts the running run's open sign-in again in the same window, as Settings' "Retry this
+    /// sign-in" does, for another computer's Retry on its "Signing in on <machine>" card or an
+    /// agent: only sign-in `step` (its place in the run's steps, from 0) of the run that started at
+    /// `run_started_at`, and only once it has waited long enough that the person here was asked
+    /// whether to retry it (see `app::restartable`). Never starts a run or a sign-in that is not open.
+    RestartSignIn {
+        step: usize,
+        run_started_at: chrono::DateTime<chrono::Utc>,
+    },
     /// `slopbar-mcp --relay` only, never an MCP tool: another of the user's computers asking what
     /// this one's "Sign in all accounts" would run now, for completing it in its own browser (see
     /// `relay`): who this computer is, the plan (with monitoring sign-ins when `monitoring`), which

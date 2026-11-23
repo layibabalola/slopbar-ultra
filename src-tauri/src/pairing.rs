@@ -34,8 +34,8 @@ const KEY_PREFIX: &str = "slopbar-pair-";
 const SSH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Tools another computer may be asked to run through `run_on_machine`: what bringing it up
 /// needs, and nothing that takes a secret.
-pub const REMOTE_TOOLS: [&str; 15] = ["get_machine_readiness", "get_app_info", "get_health", "get_usage", "get_settings", "list_sharing_locations", "get_sharing_setup",
-    "get_roster", "sync_roster", "update_settings", "sign_in_all", "stop_sign_ins", "connect_monitoring_all", "refresh_usage", "restart_app"];
+pub const REMOTE_TOOLS: [&str; 16] = ["get_machine_readiness", "get_app_info", "get_health", "get_usage", "get_settings", "list_sharing_locations", "get_sharing_setup",
+    "get_roster", "sync_roster", "update_settings", "sign_in_all", "stop_sign_ins", "restart_sign_in", "connect_monitoring_all", "refresh_usage", "restart_app"];
 
 /// What the source sends the target, on `ssh`'s standard input only.
 #[derive(Debug, Serialize, Deserialize)]
@@ -1655,6 +1655,7 @@ mod tests {
         assert!(check_remote("update_settings", &json!({ "patch": { "phone": { "url": "https://ntfy.sh/x" } } })).unwrap_err().contains("not phone"));
         assert!(check_remote("update_settings", &json!({})).is_err());
         assert!(check_remote("sign_in_all", &json!({ "confirm": true })).is_ok());
+        assert!(check_remote("restart_sign_in", &json!({ "step": 0, "run_started_at": "2026-11-23T10:00:00Z" })).is_ok(), "a sign-in still waiting there can start again from here");
         for t in REMOTE_TOOLS {
             assert!(!t.contains("passphrase") && !t.contains("backup") && !t.contains("remove"), "{t}");
         }
