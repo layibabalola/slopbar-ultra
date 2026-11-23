@@ -2651,6 +2651,9 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
     *state.usage_cache.lock().unwrap() = cache.clone();
     phases.end(P::Fetch);
 
+    // What the last refresh worked out, for the early redraw: before a switch below publishes this
+    // refresh's bare numbers.
+    let previous = state.snapshot.lock().unwrap().accounts.clone();
     let decisions = {
         let last = state.last_switch.lock().unwrap().clone();
         let leased = state.leases.lock().unwrap().accounts();
@@ -2658,8 +2661,12 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
     };
     let decisions = graceful_decisions(app, &list, &settings, decisions);
     for (provider, id) in decisions {
-        // Publish the current numbers first so the switch notice can name both accounts.
-        *state.snapshot.lock().unwrap() = Snapshot { accounts: list.clone(), updated_at: Some(chrono::Utc::now()) };
+        // Publish the current numbers first so the switch notice can name both accounts, with what
+        // sharing and the rosters last read add to them, as the early redraw below has.
+        let mut accounts = list.clone();
+        carry_over(&mut accounts, &previous);
+        apply_shared(&state, &settings, &mut accounts);
+        *state.snapshot.lock().unwrap() = Snapshot { accounts, updated_at: Some(chrono::Utc::now()) };
         if switch_to(app, provider, id.clone(), true).await.is_ok() {
             state.last_switch.lock().unwrap().insert(provider, Instant::now());
             for a in list.iter_mut().filter(|a| a.provider == provider) {
@@ -2686,7 +2693,9 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
     // refresh until they are worked out below.
     {
         let mut early = list.clone();
-        carry_over(&mut early, &state.snapshot.lock().unwrap().accounts);
+        carry_over(&mut early, &previous);
+        // Other machines' readings as the rosters last read have them, against this refresh's own.
+        apply_shared(&state, &settings, &mut early);
         let early = Snapshot { accounts: early, updated_at: Some(chrono::Utc::now()) };
         *state.snapshot.lock().unwrap() = early.clone();
         let _ = app.emit("usage-updated", &early);
@@ -2741,6 +2750,7 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
     let surged = presence::infer(&mut state.presence_tracks.lock().unwrap(), &mut list, hold, surge, now);
     if settings.account_roster {
         sync_roster(app, &settings, list.clone(), false, false).await;
+        apply_shared(&state, &settings, &mut list);
     }
     let watch = unexpected::Watch { covered, notify: settings.notifications.unexpected_use, web_use: &settings.web_use };
     let log = {
@@ -2807,6 +2817,19 @@ fn carry_over(list: &mut [crate::model::AccountUsage], previous: &[crate::model:
     }
     // A switch may have changed which account is in use here since the last refresh.
     presence::overlap(list, presence::identity().map_or("", |(_, name)| name.as_str()));
+}
+
+/// Other machines' readings of these accounts, from the rosters last read (no I/O): shown where
+/// this machine has none fresh, and naming the machine whose recent reading covers each (see
+/// `roster::apply_readings`). Only while the roster is on.
+fn apply_shared(state: &AppState, settings: &settings::Settings, list: &mut [model::AccountUsage]) {
+    if !settings.account_roster {
+        return;
+    }
+    let me = presence::identity().map_or("", |(_, name)| name.as_str());
+    // A refresh: another machine's reading must be newer than this one's own by more than that.
+    let margin = chrono::Duration::minutes(settings.refresh_minutes.max(1) as i64);
+    roster::apply_readings(list, &state.roster_seen.lock().unwrap(), me, margin, chrono::Utc::now());
 }
 
 /// Records which account each CLI has signed in, seeding the log once from the diagnostics
@@ -3336,6 +3359,9 @@ async fn sync_roster(app: &AppHandle, settings: &settings::Settings, accounts: V
             if let Some(run) = run {
                 sync.offer_run(run);
             }
+            // Read where the roster's lock is held, as the place is: a sync that started before
+            // readings were turned off cannot write them after the write that took them out.
+            sync.withhold_readings = !h.state::<AppState>().settings.lock().unwrap().share_readings;
             sync.sync(store.as_ref(), &passphrase, (id, name), &accounts, now, force, soon);
             sync.seen.clone()
         })
@@ -3413,7 +3439,8 @@ async fn roster_status(app: &AppHandle, sync: bool) -> serde_json::Value {
         "passphrase_saved": roster_passphrase_saved(),
         "wrote": seen.wrote, "written_at": seen.written_at, "write_error": seen.write_error, "read": seen.read, "read_at": seen.read_at, "read_error": seen.read_error,
         "own_accounts": seen.own_accounts, "unreadable": seen.unreadable, "unsupported": seen.unsupported,
-        "machines": seen.peers.iter().map(|p| serde_json::json!({ "machine": p.machine, "written_at": p.written_at, "accounts": p.accounts.len() })).collect::<Vec<_>>(),
+        "share_readings": settings.share_readings,
+        "machines": seen.peers.iter().map(|p| serde_json::json!({ "machine": p.machine, "written_at": p.written_at, "accounts": p.accounts.len(), "readings": p.readings.len() })).collect::<Vec<_>>(),
         "waiting": waiting,
     })
 }
@@ -3480,7 +3507,10 @@ async fn set_roster_passphrase(app: &AppHandle, passphrase: Option<backup::Passp
     let sharing = state.sharing.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || sharing.with_syncer(|sync| sync.reset())).await;
     *state.roster_seen.lock().unwrap() = roster::Seen::default();
-    Ok(roster_status(app, true).await)
+    let status = roster_status(app, true).await;
+    // What other machines' readings show and cover here follows the rosters this one opens.
+    refresh_soon(app);
+    Ok(status)
 }
 
 #[tauri::command]

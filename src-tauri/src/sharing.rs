@@ -304,7 +304,8 @@ fn start(files: &impl Withdraw, kind: Kind, place: &Place, index: usize, done: &
 impl<S: Forget> Sharing<S> {
     /// A settings save, called holding `settings_lock` (no I/O but this machine's own disk): notes
     /// what the next refresh withdraws, and keeps it in the file. Whether a refresh is due: the
-    /// providers polled, where in-use status is shared, or whether the roster is on, changed.
+    /// providers polled, where in-use status is shared, whether the roster is on, or whether it
+    /// carries readings, changed (readings turned off go from the roster at that refresh).
     pub fn saved(&self, before: &Settings, after: &Settings) -> bool {
         let (from, to) = (Place::of(before), Place::of(after));
         {
@@ -317,6 +318,7 @@ impl<S: Forget> Sharing<S> {
             }
         }
         before.providers.claude != after.providers.claude || before.providers.codex != after.providers.codex || from != to
+            || to.roster && before.share_readings != after.share_readings
     }
 
     /// Whether a save left anything for `catch_up`, or a withdrawal that ran late has ended since
@@ -817,6 +819,10 @@ mod tests {
         let mut claude = at("A", true);
         claude.providers.claude = !claude.providers.claude;
         assert!(sharing.saved(&at("A", true), &claude));
+        // Readings turned off go from this machine's roster at once: the refresh rewrites it.
+        let quiet = Settings { share_readings: false, ..at("A", true) };
+        assert!(sharing.saved(&at("A", true), &quiet) && sharing.saved(&quiet, &at("A", true)), "readings shared or not");
+        assert!(!sharing.saved(&at("A", false), &Settings { share_readings: false, ..at("A", false) }), "with no roster to carry them");
         assert!(!sharing.is_due(), "and nothing to withdraw or forget");
 
         assert!(sharing.saved(&Settings::default(), &at("A", false)), "sharing turned on");

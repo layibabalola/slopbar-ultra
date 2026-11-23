@@ -22,9 +22,11 @@ export function sparklineText(points) {
  * the last 7 days ending now and the y axis 0–100%, so every account's line reads the same way.
  * Without readings in those 7 days it draws nothing (a bare baseline read as "flat at 0%") but
  * keeps its place, so rows line up, and says so to screen readers. `tooltip: false` leaves out
- * the hover text, for a row whose own tooltip already says it.
+ * the hover text, for a row whose own tooltip already says it. `silent` keeps only its place, saying
+ * nothing: for a row showing another computer's reading, which this computer's line does not describe.
  */
-export function sparkline(points, { width = 56, height = 16, now = Date.now(), tooltip = true } = {}) {
+export function sparkline(points, { width = 56, height = 16, now = Date.now(), tooltip = true, silent = false } = {}) {
+  if (silent) return `<span class="spark spark-empty" style="width:${width}px;height:${height}px" aria-hidden="true"></span>`;
   const shown = (points ?? []).filter(([at, v]) => at >= now - SPAN && at <= now + 60000 && Number.isFinite(v));
   const label = sparklineText(shown);
   if (!shown.length) {

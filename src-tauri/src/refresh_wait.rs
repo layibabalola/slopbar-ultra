@@ -548,7 +548,7 @@ mod tests {
         let synced = one_call(sync, "sharing.sync_roster", "sync_roster in app.rs", HANDS);
         let [place, read, run] = args(synced)[..] else { panic!("sharing.sync_roster takes the place, the live settings and the sync: {synced}. {}", update(HANDS)) };
         assert!(place == "&place" && read == "live" && closure_body(run) == Some(tokens("{ if let Some(run) = run { sync.offer_run(run); } \
-            sync.sync(store.as_ref(), &passphrase, (id, name), &accounts, now, force, soon); sync.seen.clone() }").as_str()) && run.starts_with("|sync|"),
+            sync.withhold_readings = !h.state::<AppState>().settings.lock().unwrap().share_readings; sync.sync(store.as_ref(), &passphrase, (id, name), &accounts, now, force, soon); sync.seen.clone() }").as_str()) && run.starts_with("|sync|"),
             "a roster sync only where the settings still share. {}\n{sync}", update(HANDS));
         // A sync that could not run leaves no proxy reason from an earlier one (`Seen::unsynced`).
         assert!(has(sync, "else { state.roster_seen.lock().unwrap().unsynced(); return; };")

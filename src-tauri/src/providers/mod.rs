@@ -121,7 +121,7 @@ pub async fn fetch_all(
                 monitor_ends_at: None,
                 monitor_renewal: None,
                 billing: slot.billing(),
-                remote: vec![], overlap: vec![],
+                remote: vec![], overlap: vec![], shared: None, covered_by: None,
                 used_outside: false,
                 runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None, desktop: false, seats: None,
                 // When the saved CLI sign-in ends, and whether it needs a new one while the

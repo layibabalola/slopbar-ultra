@@ -428,7 +428,7 @@ mod tests {
             id: id.into(), provider: Provider::Claude, email: Some(format!("{id}@example.invalid")), alias: None, plan: Some("max".into()), org: None,
             active, sources: vec![], windows: vec![window("session", 10.0, 3), window("weekly", weekly, weekly_resets_in_hours)],
             credits: None, resets: vec![], error: None, monitor_error: None, stale: false,
-            fetched_at: Some(at(NOW) - Duration::minutes(2)), monitor_connected: true, monitor_ends_at: None, monitor_renewal: None, billing: Default::default(), remote: vec![], overlap: vec![], used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None,
+            fetched_at: Some(at(NOW) - Duration::minutes(2)), monitor_connected: true, monitor_ends_at: None, monitor_renewal: None, billing: Default::default(), remote: vec![], overlap: vec![], shared: None, covered_by: None, used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None,
         }
     }
 
