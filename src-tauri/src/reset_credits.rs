@@ -72,7 +72,8 @@ pub struct Expiring {
     pub id: String,
     pub email: Option<String>,
     pub alias: Option<String>,
-    /// The credit's kind ("full", "session", "weekly").
+    /// The credit's kind ("full", "session", "weekly", "fable" or "unknown"; Codex's come from its
+    /// credits' details and are mostly "unknown").
     pub reset_kind: String,
     pub count: u32,
     pub expires_at: DateTime<Utc>,
@@ -124,7 +125,7 @@ pub fn advise(accounts: &[AccountUsage], now: DateTime<Utc>) -> Vec<CreditAdvice
         Some(CreditAdvice {
             provider: acc.provider, id: acc.id.clone(), email: acc.email.clone(), alias: acc.alias.clone(),
             at_limit, limit_at: if at_limit { None } else { soon }, resets_at,
-            credits: credits.iter().map(|r| r.count).sum(), usable_now: credits.iter().any(|r| r.usable), expires_at,
+            credits: credits.iter().fold(0u32, |n, r| n.saturating_add(r.count)), usable_now: credits.iter().any(|r| r.usable), expires_at,
             choice, reason, switch_to: (choice == Choice::Switch).then_some(switch_to).flatten(),
         })
     }).collect()

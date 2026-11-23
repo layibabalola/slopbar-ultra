@@ -263,7 +263,7 @@ pub fn group_resets(resets: &[ResetGrant]) -> Vec<ResetGroup> {
             });
             continue;
         };
-        g.count += r.count;
+        g.count = g.count.saturating_add(r.count);
         g.entries += 1;
         if r.expires_at.is_some() && g.expires_at.is_none_or(|e| r.expires_at.unwrap() < e) { g.expires_at = r.expires_at; }
         if r.next_available_at.is_some() && g.next_available_at.is_none_or(|e| r.next_available_at.unwrap() < e) { g.next_available_at = r.next_available_at; }
@@ -278,14 +278,26 @@ pub fn group_resets(resets: &[ResetGrant]) -> Vec<ResetGroup> {
     groups
 }
 
-/// One line describing a usage-limit reset or a group of identical ones (i18n.js `resetText`).
-pub fn reset_text(lang: &str, r: &ResetGroup, now: DateTime<Utc>) -> String {
-    let scope = match r.kind.as_str() { "session" => Some("resetSession"), "weekly" => Some("resetWeekly"), "full" => Some("resetFull"), _ => None };
+/// A reset's name: the provider's title only when SlopBar knows its kind (a title alone may claim
+/// a reach it does not have), else the kind's own name; with `hint`, a Fable reset says it gives
+/// back only what Fable used this week.
+pub fn reset_name(lang: &str, kind: &str, title: Option<&str>, hint: bool) -> String {
+    let scope = match kind {
+        "session" => Some("resetSession"), "weekly" => Some("resetWeekly"), "full" => Some("resetFull"), "fable" => Some("resetFable"), _ => None,
+    };
     let name = match scope {
-        Some(scope) => r.title.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| t(lang, scope, &[])),
+        Some(scope) => title.filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| t(lang, scope, &[])),
         None => t(lang, "resetUnknown", &[]),
     };
+    if hint && kind == "fable" { format!("{name} ({})", t(lang, "resetFableHint", &[])) } else { name }
+}
+
+/// One line describing a usage-limit reset or a group of identical ones (i18n.js `resetText`).
+pub fn reset_text(lang: &str, r: &ResetGroup, now: DateTime<Utc>) -> String {
+    let name = reset_name(lang, &r.kind, r.title.as_deref(), false);
     let mut parts = vec![if r.count > 1 { format!("{name} ×{}", r.count) } else { name }];
+    // A Fable reset refills only part of the week: what Fable used of it.
+    if r.kind == "fable" { parts.push(t(lang, "resetFableHint", &[])); }
     if r.usable {
         parts.push(t(lang, "resetUsableNow", &[]));
     } else if r.count > 0 {
@@ -465,6 +477,22 @@ mod tests {
         assert_eq!(money("en", 1_234_567.0), "$1,234,567");
         assert_eq!(money("de", 1234.5), "$1.234,5");
         assert_eq!(money("es", 1234.0), "$1234");
+    }
+
+    #[test]
+    fn a_fable_reset_says_it_gives_back_only_what_fable_used_in_every_language() {
+        let now = at("2026-11-23T12:00:00Z");
+        let fable = ResetGrant { kind: "fable".into(), title: None, count: 2, usable: false, expires_at: Some(at("2026-12-01T12:00:00Z")), next_available_at: None };
+        let groups = group_resets(&[fable.clone()]);
+        assert_eq!(reset_text("en", &groups[0], now), "Fable reset ×2 · gives back only what Fable used this week · not usable now · expires Dec 1");
+        assert_eq!(reset_name("en", "fable", None, true), "Fable reset (gives back only what Fable used this week)");
+        assert_eq!(reset_name("en", "full", Some("Full reset (Monthly)"), true), "Full reset (Monthly)");
+        assert_eq!(reset_name("en", "unknown", Some("Full reset (Monthly)"), true), "Reset · type unknown", "a title never names a reach SlopBar cannot see");
+        for lang in crate::i18n::languages() {
+            let text = reset_text(lang, &groups[0], now);
+            assert!(text.starts_with(&t(lang, "resetFable", &[])) && text.contains(&t(lang, "resetFableHint", &[])), "{lang}: {text}");
+            assert_ne!(t(lang, "resetFable", &[]), "resetFable", "{lang}");
+        }
     }
 
     #[test]

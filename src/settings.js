@@ -2,7 +2,7 @@ import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { sparkline } from "./sparkline.js";
 import { money, pct, amount, renewalText, adviceText, creditsLine, extraUsageLine, cliSignInText } from "./accounttext.js";
-import { t, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, LANGUAGES, resetText, errorText, accountErrorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText, overlapText, seatsText, shownReading, currentWindows } from "./i18n.js";
+import { t, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, LANGUAGES, resetText, groupResets, errorText, accountErrorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText, overlapText, seatsText, shownReading, currentWindows } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -89,11 +89,12 @@ function accountRow(p, a) {
     : "";
   // In use here and on the user's other computers (shared through a synced folder), by machine.
   const places = placesText(a);
-  const held = a.resets ?? [];
+  // Identical resets merged, as the flyout and the widget list them; a Claude one says where it is used.
+  const held = groupResets(a.resets);
   const total = held.reduce((n, r) => n + r.count, 0);
   const resets = total > 0
     ? `<em class="chip resets ${held.some((r) => r.usable) ? "live" : ""}" aria-label="${esc(t("resetsHeld", { n: total }))}"
-        title="${esc([t("resetsTitle"), ...held.map(resetText)].join("\n"))}">↺ ${total}</em>`
+        title="${esc([t("resetsTitle"), ...held.map(resetText), ...(p === "claude" ? [t("resetClaim")] : [])].join("\n"))}">↺ ${total}</em>`
     : "";
   return `
     <div class="account" data-key="${p}:${esc(a.id)}">
@@ -211,6 +212,7 @@ function renderAccounts() {
         <div class="group">
           ${list.length ? list.map((a) => accountRow(p, a)).join("") : `<div class="empty">${t("noAccounts")}</div>`}
         </div>
+        ${p === "claude" && list.length && list.every((a) => a.resets_withheld) ? `<p class="hint">${esc(t("resetsWithheld"))}</p>` : ""}
         <div class="group balancer">
           <div class="row">
             <label class="title" for="auto-${p}">${t("autoSwitch")}</label>

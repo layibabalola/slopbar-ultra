@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::accounts::Provider;
 use crate::i18n::t;
 use crate::i18n_format as fmt;
-use crate::model::{AccountUsage, Snapshot, UsageWindow};
+use crate::model::{AccountUsage, ResetGrant, Snapshot, UsageWindow};
 use crate::phone::Kind as PhoneKind;
 use crate::settings::Notifications;
 
@@ -46,8 +46,12 @@ pub struct WindowSeen {
 #[serde(default)]
 pub struct State {
     pub windows: HashMap<String, WindowSeen>,
-    /// Usage-limit resets each account held.
+    /// Usage-limit resets each account held, in all (kept for older builds, which read it).
     pub grants: HashMap<String, u32>,
+    /// Usage-limit resets each account held, per kind, title and usability (`reset_group`), keyed
+    /// `provider:id`: a new one is announced by its own name. An account whose resets are not
+    /// known (`resets_known`) has none here, so the first reading that knows them only records them.
+    pub reset_groups: HashMap<String, HashMap<String, u32>>,
     /// The unexpected-use decision (`alert_at`) last acted on.
     pub unexpected: HashMap<String, DateTime<Utc>>,
     /// Accounts in use on several machines at once, keyed `provider:id`.
@@ -142,6 +146,31 @@ fn new_window(before: &WindowSeen, w: &UsageWindow, now: DateTime<Utc>) -> bool 
     w.resets_at.is_none_or(|at| (at - was).num_milliseconds().abs() > SAME_WINDOW_MS)
 }
 
+/// Whether the account's resets are known: Claude lists them only in a reading that asked for its
+/// reset status, and none while it withholds them from SlopBar (`AccountUsage::resets_withheld`),
+/// so until then an empty list says nothing about what the account holds.
+fn resets_known(a: &AccountUsage) -> bool {
+    a.provider != Provider::Claude || (a.resets_read_at.is_some() && !a.resets_withheld)
+}
+
+/// Resets of one kind, title and usability, as the account's resets are listed (`group_resets`):
+/// the one whose count rose names a new reset.
+fn reset_group(kind: &str, title: Option<&str>, usable: bool) -> String {
+    format!("{kind}|{}|{usable}", title.unwrap_or(""))
+}
+
+/// The hint on a "limit reached" notification when the account holds a reset that is usable now and
+/// refills that limit: Claude's named, with where to use it; Codex's as before.
+fn usable_reset_hint(lang: &str, a: &AccountUsage, window: &str) -> String {
+    let Some(r) = a.resets.iter().find(|r: &&ResetGrant| r.usable && r.count > 0 && r.refills(a.provider, window)) else {
+        return String::new();
+    };
+    match a.provider {
+        Provider::Claude => t(lang, "nLimitHasResetNamed", &[("reset", &fmt::reset_name(lang, &r.kind, r.title.as_deref(), true))]),
+        Provider::Codex => t(lang, "nLimitHasReset", &[]),
+    }
+}
+
 /// Compares a fresh snapshot with what was seen before and returns what changed worth saying
 /// (alerts.js `checkUsage`). `state` is updated whatever the settings say.
 pub fn check_usage(state: &mut State, snap: &Snapshot, prefs: &Notifications, lang: &str, now: DateTime<Utc>) -> Vec<Notice> {
@@ -170,8 +199,7 @@ pub fn check_usage(state: &mut State, snap: &Snapshot, prefs: &Notifications, la
                 let resets = w.resets_at.map(|r| fmt::resets_in(lang, Some(r), now)).unwrap_or_default();
                 let details = [name.as_str(), label.as_str(), resets.as_str()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
                 if now_m >= 100 {
-                    let usable = a.resets.iter().any(|r| r.usable && r.count > 0);
-                    let hint = if usable { t(lang, "nLimitHasReset", &[]) } else { String::new() };
+                    let hint = usable_reset_hint(lang, a, &w.kind);
                     let body = [details, hint].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n");
                     out.push(Notice::Plain {
                         title: t(lang, "nLimitTitle", &[("provider", provider)]), body, page: None,
@@ -200,11 +228,31 @@ pub fn check_usage(state: &mut State, snap: &Snapshot, prefs: &Notifications, la
                 }
             }
         }
-        let total: u32 = a.resets.iter().map(|r| r.count).sum();
-        let before = state.grants.insert(key, total);
-        if prefs.resets && before.is_some_and(|b| total > b) {
-            if let Some(grant) = fmt::group_resets(&a.resets).first() {
-                out.push(plain(t(lang, "nGrantTitle", &[("provider", provider)]), format!("{name} · {}", fmt::reset_text(lang, grant, now))));
+        let total = a.resets.iter().fold(0u32, |n, r| n.saturating_add(r.count));
+        let total_before = state.grants.insert(key.clone(), total);
+        if !resets_known(a) {
+            state.reset_groups.remove(&key);
+            continue;
+        }
+        let mut held: HashMap<String, u32> = HashMap::new();
+        for r in &a.resets {
+            let n = held.entry(reset_group(&r.kind, r.title.as_deref(), r.usable)).or_default();
+            *n = n.saturating_add(r.count);
+        }
+        let before = state.reset_groups.insert(key, held.clone());
+        // Only more resets in all are news: a reset whose kind or title a reading names differently
+        // (Codex's details unread, so its credits read as "unknown") is the same reset.
+        if let (true, Some(before), Some(total_before)) = (prefs.resets, before, total_before) {
+            if total > total_before {
+                // Named by the group that rose, as the account's resets are listed; else the first.
+                let groups = fmt::group_resets(&a.resets);
+                let rose = groups.iter().find(|g| {
+                    let group = reset_group(&g.kind, g.title.as_deref(), g.usable);
+                    held.get(&group).copied().unwrap_or(0) > before.get(&group).copied().unwrap_or(0)
+                }).or(groups.first());
+                if let Some(grant) = rose {
+                    out.push(plain(t(lang, "nGrantTitle", &[("provider", provider)]), format!("{name} · {}", fmt::reset_text(lang, grant, now))));
+                }
             }
         }
     }
@@ -623,18 +671,107 @@ mod tests {
         assert!(!new_window(&WindowSeen::default(), &w, at(NOW)));
     }
 
+    fn grant(kind: &str, usable: bool) -> ResetGrant {
+        ResetGrant { kind: kind.into(), title: None, count: 1, usable, expires_at: None, next_available_at: None }
+    }
+
     #[test]
     fn more_resets_are_announced() {
         let prefs = Notifications::default();
         let mut s = State::default();
         let mut a = account(10.0, RESET);
+        a.resets_read_at = Some(at(NOW));
         check_usage(&mut s, &snap(vec![a.clone()]), &prefs, "en", at(NOW));
         a.resets = vec![ResetGrant { kind: "full".into(), title: None, count: 1, usable: true, expires_at: None, next_available_at: None }];
         let out = check_usage(&mut s, &snap(vec![a.clone()]), &prefs, "en", at(NOW));
         assert_eq!(titles(&out), ["New Claude limit reset"]);
         let Notice::Plain { body, .. } = &out[0] else { panic!() };
         assert_eq!(body, "me@example.invalid · Full reset · usable now");
+        assert!(check_usage(&mut s, &snap(vec![a.clone()]), &prefs, "en", at(NOW)).is_empty());
+        // A Fable reset beside it is announced by its own name, not by the first one listed.
+        a.resets.push(grant("fable", false));
+        let out = check_usage(&mut s, &snap(vec![a.clone()]), &prefs, "en", at(NOW));
+        let Notice::Plain { body, .. } = &out[0] else { panic!() };
+        assert_eq!(body, "me@example.invalid · Fable reset · gives back only what Fable used this week · not usable now");
+        // Using one is no news, nor is it becoming usable.
+        a.resets = vec![grant("fable", true)];
+        assert!(check_usage(&mut s, &snap(vec![a.clone()]), &prefs, "en", at(NOW)).is_empty());
+        // Another of a kind it holds as usable, not usable yet: named as the one that is new.
+        a.resets = vec![grant("full", true), grant("fable", true)];
+        check_usage(&mut s, &snap(vec![a.clone()]), &prefs, "en", at(NOW));
+        a.resets.push(grant("full", false));
+        let out = check_usage(&mut s, &snap(vec![a]), &prefs, "en", at(NOW));
+        let Notice::Plain { body, .. } = &out[0] else { panic!() };
+        assert_eq!(body, "me@example.invalid · Full reset · not usable now");
+    }
+
+    #[test]
+    fn a_reset_read_under_another_name_is_no_new_reset() {
+        // Codex reads its credits' details apart; when that read fails they come as "unknown" ones.
+        let prefs = Notifications::default();
+        let mut s = State::default();
+        let mut a = account(10.0, RESET);
+        a.provider = Provider::Codex;
+        let titled = |n: usize| (0..n).map(|_| ResetGrant { kind: "full".into(), title: Some("Full reset".into()), count: 1, usable: false, expires_at: None, next_available_at: None }).collect::<Vec<_>>();
+        let unknown = |n: usize| (0..n).map(|_| grant("unknown", false)).collect::<Vec<_>>();
+        for resets in [titled(2), unknown(2), titled(2), unknown(2)] {
+            a.resets = resets;
+            assert!(check_usage(&mut s, &snap(vec![a.clone()]), &prefs, "en", at(NOW)).is_empty());
+        }
+        a.resets = titled(3);
+        assert_eq!(titles(&check_usage(&mut s, &snap(vec![a]), &prefs, "en", at(NOW))), ["New Codex limit reset"]);
+    }
+
+    #[test]
+    fn claude_resets_are_compared_only_once_known_and_listed() {
+        let prefs = Notifications::default();
+        let mut s = State::default();
+        // Never read (no reset status yet): nothing is known, nothing is kept.
+        let mut a = account(10.0, RESET);
+        check_usage(&mut s, &snap(vec![a.clone()]), &prefs, "en", at(NOW));
+        assert!(!s.reset_groups.contains_key("claude:a1"));
+        // Withheld from SlopBar: the same.
+        a.resets_read_at = Some(at(NOW));
+        a.resets_withheld = true;
+        check_usage(&mut s, &snap(vec![a.clone()]), &prefs, "en", at(NOW));
+        assert!(!s.reset_groups.contains_key("claude:a1"));
+        // Listed at last, holding two from before: recorded, not announced as new.
+        a.resets_withheld = false;
+        a.resets = vec![grant("full", false), grant("fable", false)];
+        assert!(check_usage(&mut s, &snap(vec![a.clone()]), &prefs, "en", at(NOW)).is_empty());
+        a.resets.push(grant("full", false));
+        let out = check_usage(&mut s, &snap(vec![a.clone()]), &prefs, "en", at(NOW));
+        assert_eq!(titles(&out), ["New Claude limit reset"]);
+        // Withheld again, then listed: a fresh baseline.
+        a.resets_withheld = true;
+        check_usage(&mut s, &snap(vec![a.clone()]), &prefs, "en", at(NOW));
+        a.resets_withheld = false;
+        a.resets.push(grant("weekly", false));
         assert!(check_usage(&mut s, &snap(vec![a]), &prefs, "en", at(NOW)).is_empty());
+    }
+
+    #[test]
+    fn a_limit_reached_names_only_a_usable_reset_that_refills_it() {
+        let prefs = Notifications::default();
+        let body = |resets: Vec<ResetGrant>, kind: &str| {
+            let mut s = State::default();
+            let mut a = account(50.0, RESET);
+            a.windows[0].kind = kind.into();
+            a.resets = resets;
+            a.resets_read_at = Some(at(NOW));
+            check_usage(&mut s, &snap(vec![a.clone()]), &prefs, "en", at(NOW));
+            a.windows[0].used_percent = 100.0;
+            let out = check_usage(&mut s, &snap(vec![a]), &prefs, "en", at(NOW));
+            let Some(Notice::Plain { body, .. }) = out.iter().find(|n| matches!(n, Notice::Plain { title, .. } if title == "Claude limit reached")) else { panic!("{:?}", titles(&out)) };
+            body.lines().nth(1).unwrap_or("").to_string()
+        };
+        assert_eq!(body(vec![grant("full", true)], "session"), "Usable now: Full reset. Use it on claude.ai, or in Claude Code (/limit-reset) while this account is in use.");
+        assert_eq!(body(vec![grant("fable", true)], "weekly"), "Usable now: Fable reset (gives back only what Fable used this week). Use it on claude.ai, or in Claude Code (/limit-reset) while this account is in use.");
+        assert_eq!(body(vec![grant("fable", true), grant("weekly", false)], "session"), "", "neither refills a 5-hour limit, or is usable");
+        assert_eq!(body(vec![grant("session", true)], "weekly"), "");
+        assert_eq!(body(vec![grant("weekly", true)], "weekly"), "Usable now: Weekly reset. Use it on claude.ai, or in Claude Code (/limit-reset) while this account is in use.");
+        assert_eq!(body(vec![grant("full", true), grant("weekly", true)], "weekly_opus"), "", "which model limits a reset clears is not kept");
+        assert_eq!(body(vec![grant("unknown", true)], "weekly"), "", "a reach SlopBar cannot see is not promised");
     }
 
     #[test]

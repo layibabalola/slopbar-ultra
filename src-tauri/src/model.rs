@@ -28,8 +28,19 @@ pub struct AccountUsage {
     pub windows: Vec<UsageWindow>,
     /// A balance, or "unlimited".
     pub credits: Option<String>,
-    /// Limit resets the account holds (granted by Anthropic/OpenAI, used on demand).
+    /// Limit resets the account holds (granted by Anthropic/OpenAI, used on demand), as last read
+    /// (`resets_read_at`).
     pub resets: Vec<ResetGrant>,
+    /// Claude lists none of this account's resets to SlopBar: its reset status said it offers
+    /// them only to other clients (Claude Code and claude.ai: "surface", or a newer Claude Code).
+    /// `resets` is then empty whatever the account holds; the user sees them with /limit-reset in
+    /// Claude Code, or on claude.ai.
+    #[serde(default)]
+    pub resets_withheld: bool,
+    /// When the account's resets were last read: Claude's reset status, which is asked for at most
+    /// hourly (daily while withheld); Codex's with each usage reading. None before the first.
+    #[serde(default)]
+    pub resets_read_at: Option<DateTime<Utc>>,
     /// An error code ("token_expired", "token_invalid", "bad_response", "http_<status>")
     /// or a raw network error message.
     pub error: Option<String>,
@@ -258,9 +269,11 @@ impl AccountUsage {
 /// A usage-limit reset the account can spend to refill its limits.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResetGrant {
-    /// "full", "session", "weekly", or "unknown" when the provider scope is unrecognized.
+    /// "full", "session", "weekly", "fable" (Claude: gives back only what Fable used of the weekly
+    /// limit this week), or "unknown" when the provider scope is unrecognized.
     pub kind: String,
-    /// The provider's own title, when it gives one (e.g. "Full reset").
+    /// The provider's own title, when it gives one (Codex: e.g. "Full reset"; Claude's labels are
+    /// not kept).
     pub title: Option<String>,
     pub count: u32,
     /// Whether it can be spent right now (usually only once a limit is reached).
@@ -268,6 +281,24 @@ pub struct ResetGrant {
     pub expires_at: Option<DateTime<Utc>>,
     /// For resets that come back periodically: when the next one becomes available.
     pub next_available_at: Option<DateTime<Utc>>,
+}
+
+impl ResetGrant {
+    /// Whether a reset of this kind refills the limit of a window (`UsageWindow::kind`) that ran
+    /// out. A Claude 5-hour limit takes a session or full reset; the weekly one a weekly, full or
+    /// Fable one (a Fable reset gives back what Fable used of the week, to the weekly limit only); a
+    /// model's own weekly limit (Opus, Sonnet) none that SlopBar can promise, as which limits a reset
+    /// clears is not kept. Codex: any of its resets (their kinds come from its credits' details and
+    /// are mostly "unknown").
+    pub fn refills(&self, provider: Provider, window: &str) -> bool {
+        if provider == Provider::Codex { return true; }
+        match self.kind.as_str() {
+            "full" => window == "session" || window == "weekly",
+            "session" => window == "session",
+            "weekly" | "fable" => window == "weekly",
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

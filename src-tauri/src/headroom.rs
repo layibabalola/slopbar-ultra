@@ -150,6 +150,26 @@ pub struct AccountHeadroom {
     /// only, never advice.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared: Option<SharedHeadroom>,
+    /// Resets the account holds, by kind: information only, never room. Only the user can claim one
+    /// (Claude: in Claude Code or on claude.ai; Codex: in Codex), some only at a limit, and a Fable
+    /// reset gives back only what Fable used of the week, so no advice, pace or ranking counts them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub resets: Vec<HeldReset>,
+    /// Claude lists this account's resets only to Claude Code and claude.ai
+    /// (`AccountUsage::resets_withheld`): none being listed says nothing.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub resets_withheld: bool,
+}
+
+/// Resets of one kind an account holds, as agents get them (no provider title: titles are text
+/// written by others).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HeldReset {
+    /// "full", "weekly", "session", "fable" or "unknown" (`model::ResetGrant::kind`).
+    pub kind: String,
+    pub count: u32,
+    pub usable: bool,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// Another of the user's computers' reading of an account (`AccountUsage::shared`), as agents get
@@ -286,6 +306,9 @@ pub fn headroom(acc: &AccountUsage, settings: &Settings, recent: &Recent, now: D
         fetched_at: acc.fetched_at, age_minutes: acc.fetched_at.map(|t| (now - t).num_minutes().max(0)),
         stale: is_stale, error: acc.error.clone(), windows, advice, binding_window,
         shared: acc.shared.as_ref().map(|s| SharedHeadroom::of(s, now)),
+        resets: crate::i18n_format::group_resets(&acc.resets).into_iter()
+            .map(|g| HeldReset { kind: g.kind, count: g.count, usable: g.usable, expires_at: g.expires_at }).collect(),
+        resets_withheld: acc.resets_withheld,
     }
 }
 
@@ -433,6 +456,14 @@ pub fn recommend(accounts: &[AccountUsage], settings: &Settings, provider: Provi
             // Information only, and only beside an account its own reading alone excludes.
             let alone = reading_exclusion(acc, settings, now).is_some() && cli_exclusion(acc, now, job_end).is_none() && elsewhere_exclusion(acc, settings, now).is_none();
             let shared = acc.shared.as_ref().filter(|_| alone).map(|s| SharedHeadroom::of(s, now));
+            // At a limit, a reset that refills it is the user's way back in: said, never ranked.
+            let claimable = acc.resets.iter().find(|r| r.usable && r.count > 0
+                && acc.windows.iter().any(|w| w.used_percent >= LIMIT_PERCENT && r.refills(acc.provider, &w.kind)));
+            let reason = match claimable {
+                Some(r) if r.kind == "fable" => format!("{reason}; it holds a usable fable reset that only the user can claim (it gives back only what Fable used this week)"),
+                Some(r) => format!("{reason}; it holds a usable {} reset that only the user can claim", r.kind),
+                None => reason,
+            };
             excluded.push(Excluded { id: acc.id.clone(), label, active: acc.active, reason, shared });
             continue;
         }
@@ -522,7 +553,7 @@ fn finish(provider: Provider, expected_percent: Option<f64>, hours: Option<f64>,
     let (action, summary) = match best {
         Some(c) if c.active => (Action::Stay, format!("Keep using {}: it fits the job and should be used first.", name(&c.label, &c.id))),
         Some(c) => (Action::Switch, format!("Switch to {}: it fits the job and its capacity is lost soonest. Switch only if the user allowed switching.", name(&c.label, &c.id))),
-        None => (Action::None, "No eligible account has room for this job; wait for a reset or ask the user.".into()),
+        None => (Action::None, "No eligible account has room for this job; wait for a limit to come back or ask the user.".into()),
     };
     Recommendation {
         provider, expected_percent, hours,
@@ -551,7 +582,7 @@ pub fn shared_note(rec: &Recommendation) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::RemoteSeat;
+    use crate::model::{RemoteSeat, ResetGrant};
 
     fn at(s: &str) -> DateTime<Utc> { DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc) }
     const NOW: &str = "2026-10-21T12:00:00Z";
@@ -565,8 +596,38 @@ mod tests {
             id: id.into(), provider: Provider::Claude, email: Some(format!("{id}@example.invalid")), alias: None, plan: Some("max".into()), org: None,
             active, sources: vec![], windows: vec![window("session", 10.0, 3), window("weekly", weekly, weekly_resets_in_hours)],
             credits: None, resets: vec![], error: None, monitor_error: None, stale: false,
-            fetched_at: Some(at(NOW) - Duration::minutes(2)), monitor_connected: true, monitor_ends_at: None, monitor_renewal: None, billing: Default::default(), remote: vec![], overlap: vec![], shared: None, covered_by: None, used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None,
+            fetched_at: Some(at(NOW) - Duration::minutes(2)), monitor_connected: true, monitor_ends_at: None, monitor_renewal: None, billing: Default::default(), remote: vec![], overlap: vec![], shared: None, covered_by: None, used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None,
         }
+    }
+
+    #[test]
+    fn held_resets_are_information_never_room() {
+        let now = at(NOW);
+        let settings = Settings::default();
+        let grant = |kind: &str, usable: bool| ResetGrant { kind: kind.into(), title: Some("TEXT-BY-OTHERS".into()), count: 1, usable, expires_at: None, next_available_at: None };
+        let mut full = account("full", false, 100.0, 20);
+        full.resets = vec![grant("fable", true), grant("fable", true), grant("session", true)];
+        let h = headroom(&full, &settings, &Recent::default(), now);
+        assert_eq!(h.advice, Advice::AtLimit, "a held reset changes no advice");
+        assert_eq!(h.resets, vec![HeldReset { kind: "fable".into(), count: 2, usable: true, expires_at: None }, HeldReset { kind: "session".into(), count: 1, usable: true, expires_at: None }]);
+        assert!(!serde_json::to_string(&h).unwrap().contains("TEXT-BY-OTHERS"), "no provider title reaches an agent here");
+        // Excluded at its weekly limit, it says it holds a reset that refills it; never ranked by it.
+        let spare = account("spare", true, 30.0, 40);
+        let rec = recommend(&[full.clone(), spare.clone()], &settings, Provider::Claude, Some(10.0), Some(2.0), now);
+        assert_eq!(rec.recommended.as_deref(), Some("spare"));
+        let reason = &rec.excluded.iter().find(|e| e.id == "full").unwrap().reason;
+        assert!(reason.ends_with("; it holds a usable fable reset that only the user can claim (it gives back only what Fable used this week)"), "{reason}");
+        // One that does not refill the limit reached, or is not usable now, is not mentioned.
+        full.resets = vec![grant("session", true), grant("weekly", false)];
+        let rec = recommend(&[full.clone(), spare], &settings, Provider::Claude, Some(10.0), Some(2.0), now);
+        assert!(!rec.excluded[0].reason.contains("only the user can claim"), "{}", rec.excluded[0].reason);
+        // Withheld: said, so that none listed is not read as none held.
+        full.resets.clear();
+        full.resets_withheld = true;
+        let h = serde_json::to_value(headroom(&full, &settings, &Recent::default(), now)).unwrap();
+        assert_eq!((h["resets_withheld"].as_bool(), h.get("resets").is_none()), (Some(true), true));
+        let h = serde_json::to_value(headroom(&account("plain", true, 10.0, 40), &settings, &Recent::default(), now)).unwrap();
+        assert!(h.get("resets_withheld").is_none() && h.get("resets").is_none(), "nothing to say: nothing said");
     }
 
     #[test]
