@@ -210,7 +210,7 @@ function renderDetails(snap) {
           ${overlapLine(a)}
           <div class="acc-meta" title="${esc([meta, a.leased ? t("leasedHint") : "", a.used_outside ? t("usedOutsideHint") : ""].filter(Boolean).join("\n"))}">${esc(meta)}</div>
           ${a.error || a.monitor_error ? `<div class="error">${esc(accountErrorText(PROVIDER_NAME[provider], a))}</div>` : ""}
-          ${!a.monitor_connected || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account", "monitor_network", "monitor_uncertain"].includes(a.monitor_error ?? a.error)
+          ${!a.monitor_connected || a.monitor_renewal || ["monitor_reconnect", "monitor_storage", "monitor_wrong_account", "monitor_network", "monitor_uncertain"].includes(a.monitor_error ?? a.error)
             ? `<button class="monitor" data-provider="${provider}" data-id="${esc(a.id)}">${t(a.monitor_connected ? "monitorReconnect" : "monitorConnect")}</button>` : ""}
           ${a.monitor_connected ? `<button class="monitor" data-disconnect="true" data-provider="${provider}" data-id="${esc(a.id)}">${t("monitorDisconnect")}</button>` : ""}
           ${bars(a)}
@@ -344,11 +344,24 @@ function layout() {
   else invoke("set_panel_height", { height: Math.ceil($details.scrollHeight - $accounts.clientHeight + $accounts.scrollHeight) });
 }
 
+// Monitoring sign-ins that ended, were refused or end within 3 days (`monitor_renewal`, from
+// `monitoring::renewal`; it also marks those ending within 7, which this leaves to Settings): one
+// line that opens Settings > Health, where Connect all signs them in again in one sitting.
+const $monitorRenew = document.getElementById("monitor-renew");
+const WARN_MS = 3 * 86_400_000;
+function renderRenewLine(snap) {
+  const due = (snap?.accounts ?? []).filter((a) => a.monitor_renewal
+    && (a.monitor_renewal !== "ending" || new Date(a.monitor_ends_at) - Date.now() <= WARN_MS)).length;
+  $monitorRenew.hidden = !due;
+  $monitorRenew.textContent = due ? t("monitorRenewDue", { n: due }) : "";
+}
+$monitorRenew?.addEventListener("click", () => invoke("open_settings", { page: "health" }));
+
 function render(snap) {
   lastSnap = snap;
   if (!IS_DOCK) loadCreditAdvice();
   if (IS_DOCK) renderCompact(snap);
-  else renderDetails(snap);
+  else { renderDetails(snap); renderRenewLine(snap); }
   layout();
 }
 
