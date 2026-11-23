@@ -62,6 +62,9 @@ pub struct AppState {
     presence_tracks: Mutex<presence::Tracks>,
     /// The other machines' last records, for a read that misses one (see `presence::Recall`).
     presence_recall: Mutex<presence::Recall>,
+    /// The records the last read had the bytes of, which stand in for downloading them again while
+    /// they are listed unchanged (see `presence::Kept`).
+    presence_kept: presence::Kept,
     /// Where in-use status is shared: what settings saves left for the next refresh to withdraw,
     /// and the account roster's sync, its keys and last write, which share one lock (see `sharing`).
     sharing: std::sync::Arc<sharing::Sharing>,
@@ -518,6 +521,14 @@ async fn open_billing_page(provider: Provider) -> Result<(), String> {
         .await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
 }
 
+/// Opens Claude's usage page in the browser (`subscriptions::CLAUDE_USAGE_PAGE`): a fixed address, so the
+/// window chooses nothing. It shows the banked resets of whichever account the browser is signed in to.
+#[tauri::command]
+async fn open_claude_usage_page() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| std::process::Command::new("explorer.exe").arg(subscriptions::CLAUDE_USAGE_PAGE).spawn().map(|_| ()))
+        .await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
+}
+
 /// Writes a diagnostics export; shared by Settings and the agents' door.
 async fn write_export(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     let state = app.state::<AppState>();
@@ -662,6 +673,10 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             let held = state.settings_lock.lock().await;
             let current = app.state::<AppState>().settings.lock().unwrap().clone();
             let next = settings::patched(&current, &patch, updates_enabled())?;
+            // A run reads the sign-in window again at each sign-in (see `settings::while_signing_in`).
+            if state.bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished) {
+                settings::while_signing_in(&current, &next)?;
+            }
             let snapshot = app.state::<AppState>().snapshot.lock().unwrap().clone();
             for key in next.aliases.keys().filter(|k| !current.aliases.contains_key(*k)) {
                 if !snapshot.accounts.iter().any(|a| format!("{}:{}", a.provider.name(), a.id) == *key) {
@@ -3622,7 +3637,9 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
                 return None;
             }
             let wrote = store.write(&presence::own(id, name, interval, &mine, now));
-            let listed = store.list();
+            // Over rclone, neither this machine's own record nor one listed unchanged since the last
+            // read is downloaded (`PresenceStore::others`).
+            let listed = store.others(id, &h.state::<AppState>().presence_kept);
             // With the network's proxy's code for whichever it stopped, which Health words.
             let result = health::SharingResult::of(now, &wrote, &listed);
             Some((listed.unwrap_or_default(), result))
@@ -4609,6 +4626,18 @@ mod sign_in_tests {
         assert!(matches!(retry, crate::door::Request::SignInAll { retry: true, .. }));
     }
 
+    /// An agent's update_settings (here, or run_on_machine's from another computer) never changes
+    /// the sign-in window under a run: the patch is checked against a run going before it is saved.
+    #[test]
+    fn an_agent_s_window_change_waits_for_a_run_to_end() {
+        use crate::source_guard::{find, function, has, tokens};
+        let code = tokens(include_str!("app.rs"));
+        let door = function(&code, "app.rs", "async fn door_call(", "app::sign_in_tests");
+        let arm = &door[find(door, "R::UpdateSettings { patch } =>").expect("update_settings' arm")..];
+        let arm = &arm[..find(arm, "store_settings(&app, held, next.clone())").expect("where the arm saves")];
+        assert!(has(arm, "if state.bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished) { settings::while_signing_in(&current, &next)?; }"), "{arm}");
+    }
+
     #[test]
     fn readiness_waits_only_when_asked_and_old_apps_still_read_it() {
         let plain = serde_json::to_value(crate::door::Request::GetReadiness { wait_seconds: None, since: None }).unwrap();
@@ -4689,6 +4718,7 @@ pub fn run() {
         sources: Mutex::default(),
         presence_tracks: Mutex::default(),
         presence_recall: Mutex::default(),
+        presence_kept: presence::Kept::default(),
         // What saves left for the next refresh to withdraw, kept between runs (see `sharing`).
         sharing: std::sync::Arc::new(sharing::Sharing::kept_in(settings::app_dir().expect("config directory").join(sharing::DUE_FILE))),
         roster_seen: Mutex::default(),
@@ -4767,6 +4797,7 @@ pub fn run() {
             check_calendar_path,
             default_calendar_path,
             open_billing_page,
+            open_claude_usage_page,
             export_diagnostics,
             record_frontend_error,
             refresh,
