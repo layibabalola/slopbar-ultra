@@ -268,6 +268,26 @@ impl Session {
     }
 }
 
+/// What a sign-in leaves in its profile as it goes, for the run's watches' tests elsewhere.
+#[cfg(test)]
+impl Session {
+    /// As [`open`] marks a page it opened in the profile now.
+    pub fn page_opened_now(&self) {
+        std::fs::write(self.dir.join(OPENED), millis(std::time::SystemTime::now()).to_string()).unwrap();
+    }
+
+    /// As [`launch_from_env`] marks a page for the profile it refused for its port now.
+    pub fn page_refused_now(&self) {
+        std::fs::write(self.dir.join(REFUSED), millis(std::time::SystemTime::now()).to_string()).unwrap();
+    }
+
+    /// As if its browser had been seen running for the sign-in running now, and then closed (see
+    /// [`Session::browser_closed`]: no browser runs in a test).
+    pub fn browser_seen_then_closed(&self) {
+        self.opened.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl Drop for Session {
     /// Closing and deleting can wait seconds on a browser letting go of its files, so on an async
     /// runtime it runs on a thread of its own.
