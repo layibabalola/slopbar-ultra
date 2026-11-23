@@ -62,7 +62,8 @@ MEGA, S3, WebDAV, SFTP and the other rclone backends. rclone keeps its own confi
   `deletefile <id>.roster` when the roster is turned off. On Dropbox and Google Drive its listing
   adds `--hash`: those clouds list a content hash this computer can check (Dropbox's, or SHA-256)
   with no extra request (checked on Dropbox with rclone v1.74.4: the same two requests with or
-  without it; rclone 1.56 or later, as older ones name the hashes otherwise and so skip nothing). Other remotes are not asked: OneDrive lists only a quickxor, which other bytes can
+  without it; rclone 1.56 or later, as older ones name the hashes otherwise and so skip nothing).
+  Other remotes are not asked: OneDrive lists only a quickxor, which other bytes can
   be made to match, Box only a SHA-1, and elsewhere rclone would compute hashes by reading every
   file. A roster listed with the hash and size of the copy the last read kept (kept only when its
   bytes had the hash it was listed with) is not downloaded again, at any pace, so a read costs the

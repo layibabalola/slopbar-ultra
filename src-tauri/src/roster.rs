@@ -566,9 +566,10 @@ pub struct Seen {
     /// written again (`Syncer::restore`), since the roster sync last started afresh (SlopBar started,
     /// or the passphrase or sharing location changed).
     pub own_rewritten: usize,
-    /// How many of those tries came one after another, each within `RESTORE_CALM_HOURS` of the one
-    /// before, up to now: from `OWN_REWRITTEN_WARN` something keeps writing this machine's file, and
-    /// Health says so. A calm day brings it back to none.
+    /// How many of those rewrites came in a row, each try within `RESTORE_CALM_HOURS` of the one
+    /// before, up to now (a try whose write failed rewrote nothing and is not counted): from
+    /// `OWN_REWRITTEN_WARN` something keeps writing this machine's file, and Health says so. A calm
+    /// day brings it back to none.
     pub own_restores: usize,
 }
 
@@ -626,9 +627,11 @@ pub struct Syncer {
     /// written again at the next sync (`RESTORE_WAITS_MINUTES`).
     restore: bool,
     /// When a write for that reason was last tried, whether or not it worked, and how many were
-    /// tried with less than `RESTORE_CALM_HOURS` between one and the next.
+    /// tried with less than `RESTORE_CALM_HOURS` between one and the next (the waits go by them);
+    /// how many of those worked (Health goes by them: a try that failed rewrote nothing).
     restore_tried: Option<DateTime<Utc>>,
     restores: usize,
+    restored: usize,
     pub seen: Seen,
 }
 
@@ -742,6 +745,9 @@ impl Syncer {
                 self.readings_tried = Some(now);
             }
             if restore_due {
+                if restores == 0 {
+                    self.restored = 0;
+                }
                 self.restore_tried = Some(now);
                 self.restores = restores + 1;
             }
@@ -760,6 +766,7 @@ impl Syncer {
                 // Whatever made it due, the file is the one written now.
                 if std::mem::take(&mut self.restore) {
                     self.seen.own_rewritten += 1;
+                    self.restored += 1;
                 }
                 // A change of accounts is worth reading back; a step of a run is not.
                 wrote = accounts_due;
@@ -772,7 +779,7 @@ impl Syncer {
             }
         }
         self.seen.own_restores = match self.restore_tried {
-            Some(t) if now - t < Duration::hours(RESTORE_CALM_HOURS) => self.restores,
+            Some(t) if now - t < Duration::hours(RESTORE_CALM_HOURS) => self.restored,
             _ => 0,
         };
         // A machine sent a Retry stays live until its run changes or the wait runs out.
@@ -2165,5 +2172,60 @@ mod tests {
         std::fs::rename(&away, &root).unwrap();
         a.sync(&store, &p, (MACHINE_A, "DESK-A"), &one, now() + Duration::minutes(15), false, false);
         assert_eq!((store.1.load(std::sync::atomic::Ordering::SeqCst), a.seen.own_rewritten), (1, 0));
+    }
+
+    /// A store whose next writes fail, as many as it holds.
+    struct FailingFor(Folder, std::sync::atomic::AtomicUsize);
+
+    impl RosterStore for FailingFor {
+        fn listing(&self, known: Known) -> std::io::Result<Listed> { self.0.listing(known) }
+        fn put(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+            if self.1.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                self.1.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(std::io::Error::other("synthetic failure"));
+            }
+            self.0.put(name, bytes)
+        }
+        fn remove(&self, name: &str) -> std::io::Result<()> { self.0.remove(name) }
+    }
+
+    /// Tries to put this machine's roster back whose writes failed rewrote nothing: Health goes by
+    /// the rewrites, so one found once and put back on the third try is one, not three.
+    #[test]
+    fn tries_whose_writes_failed_are_not_counted_as_rewrites() {
+        let shared = TempDir::new();
+        let p = pass("synthetic roster passphrase");
+        let key = SealKey::new(&p).unwrap();
+        let store = FailingFor(Folder(shared.0.clone()), Default::default());
+        let one = [account("claude", "cl-one")];
+        let at = |m: i64| now() + Duration::minutes(m);
+        let mut a = Syncer::default();
+        a.sync(&store, &p, (MACHINE_A, "DESK-A"), &one, at(0), false, false);
+        std::fs::write(roster_file(&shared, MACHINE_A), seal(&own(MACHINE_A, "DESK-A-COPY", &one, at(0)), &key).unwrap()).unwrap();
+        store.1.store(2, std::sync::atomic::Ordering::SeqCst);
+        for m in (5..=120).step_by(5) {
+            a.sync(&store, &p, (MACHINE_A, "DESK-A"), &one, at(m), false, false);
+        }
+        assert_eq!(store.1.load(std::sync::atomic::Ordering::SeqCst), 0, "two tries failed");
+        assert_eq!((a.seen.own_rewritten, a.seen.own_restores), (1, 1), "one rewrite");
+    }
+
+    /// Under this machine's name, a roster that says it is another machine's (`file_name` keeps hex
+    /// digits and dashes only, so an id with a letter added lands there) is not its roster: its
+    /// failed run is not taken back after a restart, so not written on as this machine's.
+    #[test]
+    fn a_roster_under_this_machines_name_claiming_another_is_not_taken_back() {
+        let shared = TempDir::new();
+        let store = Folder(shared.0.clone());
+        let p = pass("synthetic roster passphrase");
+        let key = SealKey::new(&p).unwrap();
+        let mut planted = own(&format!("{MACHINE_A}Z"), "DESK-A", &[account("claude", "cl-one"), account("claude", "cl-two")], now());
+        planted.run = Some(run(5, true, "failed"));
+        store.put(&file_name(MACHINE_A).unwrap(), &seal(&planted, &key).unwrap()).unwrap();
+        let mut restarted = Syncer::default();
+        restarted.sync(&store, &p, (MACHINE_A, "DESK-A"), &[account("claude", "cl-one")], now() + Duration::minutes(1), false, false);
+        let mut b = Syncer::default();
+        b.sync(&store, &p, (MACHINE_B, "LAPTOP-B"), &[], now() + Duration::minutes(2), false, false);
+        assert_eq!(b.seen.peers.iter().map(|p| (p.machine_id.as_str(), p.run.is_some(), p.accounts.len())).collect::<Vec<_>>(), [(MACHINE_A, false, 1)]);
     }
 }

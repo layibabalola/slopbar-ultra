@@ -134,7 +134,8 @@ impl Runner for Cli {
         let ran = self.run_once(args, input);
         // A listing, upload or deletion that failed may have gone through the proxy of a cloud the
         // remote no longer is (pointed elsewhere since): its kind is looked up again for the next
-        // one. Not for a download: it follows a listing that worked through the same proxy.
+        // one. Not for a download, which follows a listing that worked: a download failing on its
+        // own (its cloud's file hosts unreachable) waits for the listing's failure, or KIND_KEPT.
         let first = args.first().is_some_and(|verb| matches!(*verb, "lsjson" | "rcat" | "deletefile"));
         if let (Some(remote), true) = (&self.remote, first) {
             if !ran.as_ref().is_ok_and(|r| matches!(r.code, Some(0) | Some(DIR_NOT_FOUND) | Some(FILE_NOT_FOUND))) {
