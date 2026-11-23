@@ -532,6 +532,7 @@ fn explain(error: &str) -> String {
         "bad_state" | "no_sign_in_waiting" => "No Dropbox sign-in is waiting (it finished, failed or was cancelled): see get_sharing_setup.".into(),
         "not_from_a_remote_call" => "A computer reached over SSH cannot reach on to another one.".into(),
         "signin_busy" => "A sign-in is already open (or another computer is completing one of this computer's): try again when it ends.".into(),
+        "signin_window_in_use" => "Nothing was changed: signin_window cannot change while a sign-in run is going, since its next sign-ins would open outside their email's browser profile. Try again when the run ends, or leave signin_window out of the patch.".into(),
         "signin_plan_expired" => "That plan is over 10 minutes old, was replaced, or was already started: gather it again (sign_in_all with everywhere and no confirm).".into(),
         e if e.starts_with("ssh_failed") => format!("SSH could not run the command ({}). Check key auth with: ssh -o BatchMode=yes <host> hostname; see the README's field guide.",
             e.trim_start_matches("ssh_failed").trim_start_matches(':').trim().chars().filter(|c| !c.is_control()).take(200).collect::<String>()),
@@ -718,8 +719,9 @@ fn serve<W: Write + Send + 'static>(mut input: impl BufRead, out: W) -> std::io:
     }
 }
 
-/// Runs one tool as a tool call would and returns its result or its error text. `remote_ok` is
-/// false for a `--call` (reached over SSH from another computer).
+/// Runs one tool as a tool call would and returns its result or its error text, sanitized as the
+/// MCP server sanitizes it (`call_result`, `result`). `remote_ok` is false for a `--call-b64`
+/// (reached over SSH from another computer).
 fn run_tool(name: &str, args: Value, pipe: &str, remote_ok: bool) -> Result<Value, String> {
     // Called in from another computer: a sign-in reaches only an app that refuses it while
     // nobody sees the desktop (older ones did not check).
@@ -737,8 +739,9 @@ fn run_tool(name: &str, args: Value, pipe: &str, remote_ok: bool) -> Result<Valu
     let message = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } });
     let cancelled = Mutex::new(HashSet::new());
     let outcome = match step(&message, &crate::door::exports_dir, &cancelled) {
-        Step::Call { request, .. } => crate::door::call(pipe, &request),
-        Step::Local { name, args, .. } => crate::pairing::local_tool(&name, &args, pipe, remote_ok),
+        // For its request, as over MCP: inspect_window's text keeps its bound and line breaks.
+        Step::Call { request, .. } => crate::door::call(pipe, &request).map(|value| sanitize_answer(&request, value)),
+        Step::Local { name, args, .. } => crate::pairing::local_tool(&name, &args, pipe, remote_ok).map(sanitize),
         Step::Reply(reply) if reply.pointer("/result/isError") == Some(&Value::Bool(false)) => {
             return Ok(reply.pointer("/result/structuredContent").cloned().unwrap_or(Value::Null));
         }
@@ -746,7 +749,7 @@ fn run_tool(name: &str, args: Value, pipe: &str, remote_ok: bool) -> Result<Valu
             .and_then(Value::as_str).unwrap_or("failed").to_string()),
         Step::Quiet => Err("failed".into()),
     };
-    outcome.map(sanitize).map_err(|e| explain(&e))
+    outcome.map_err(|e| explain(&e))
 }
 
 /// `slopbar-mcp --call <tool> [key=value…]` or `--call-b64 <base64 {"tool","arguments"}>`: runs
@@ -754,6 +757,11 @@ fn run_tool(name: &str, args: Value, pipe: &str, remote_ok: bool) -> Result<Valu
 /// another computer runs this one's tools over SSH (see `pairing::remote_call`); values that
 /// parse as JSON are passed as JSON, anything else as a string. Returns the exit code.
 pub fn call_cli(args: &[String]) -> i32 {
+    print_answer(cli_outcome(args, &crate::door::pipe_name()))
+}
+
+/// The outcome `call_cli` prints for `args`, asking the app at door `pipe`.
+fn cli_outcome(args: &[String], pipe: &str) -> Result<Value, String> {
     let parsed: Result<(String, Value), String> = match args.first().map(String::as_str) {
         Some("--call-b64") => args.get(1)
             .and_then(|b| base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, b).ok())
@@ -774,8 +782,7 @@ pub fn call_cli(args: &[String]) -> i32 {
     };
     // Only `--call-b64` is how another computer calls in; from a shell here, ssh_host is fine.
     let remote_ok = args.first().map(String::as_str) == Some("--call");
-    let outcome = parsed.and_then(|(tool, arguments)| run_tool(&tool, arguments, &crate::door::pipe_name(), remote_ok));
-    print_answer(outcome)
+    parsed.and_then(|(tool, arguments)| run_tool(&tool, arguments, pipe, remote_ok))
 }
 
 fn print_answer(outcome: Result<Value, String>) -> i32 {
@@ -1113,6 +1120,68 @@ mod tests {
         let clean = sanitize_answer(&crate::door::Request::GetUsage, answer);
         assert_eq!(clean["text"].as_str().unwrap().chars().count(), MAX_TEXT);
         assert!(!clean["text"].as_str().unwrap().contains('\n'));
+    }
+
+    /// `slopbar-mcp --call` (a shell here) and `--call-b64` (another computer) get a door answer
+    /// sanitized for its request, as an agent does over MCP: inspect_window's text whole up to
+    /// WINDOW_TEXT with its line breaks, and every other string, any other request's text too, at
+    /// MAX_TEXT. Through a door of the test's own that answers every request with the same page.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_call_from_a_shell_gets_a_window_s_text_as_an_agent_does() {
+        let pipe = format!(r"\\.\pipe\slopbar-door-test-mcp-{}", std::process::id());
+        let page = format!("Health\n\tSharing: DESK-1\u{1b}[2J\n{}", "y".repeat(30_000));
+        let answer = json!({ "window": "settings", "page": "health", "was_visible": false, "text": page, "screenshot": "z".repeat(2000) });
+        tokio::spawn(crate::door::serve(pipe.clone(), move |_| std::future::ready(Ok(answer.clone()))));
+        let call = |args: &[&str]| {
+            let (args, pipe) = (args.iter().map(|a| a.to_string()).collect::<Vec<_>>(), pipe.clone());
+            tokio::task::spawn_blocking(move || cli_outcome(&args, &pipe))
+        };
+        // The door opens once its task first runs.
+        let opened = std::time::Instant::now();
+        while let Err(e) = call(&["--call", "get_app_info"]).await.unwrap() {
+            assert!(opened.elapsed() < std::time::Duration::from_secs(10), "the test's door never answered: {e}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let window = call(&["--call", "inspect_window", "window=settings", "page=health"]).await.unwrap().unwrap();
+        let text = window["text"].as_str().unwrap();
+        assert!(text.starts_with("Health\n\tSharing: DESK-1[2J\n"), "line breaks kept, escapes dropped");
+        assert_eq!(text.chars().count(), WINDOW_TEXT);
+        assert_eq!(window["screenshot"].as_str().unwrap().chars().count(), MAX_TEXT, "other strings keep the short cap");
+        let asked = json!({ "tool": "inspect_window", "arguments": { "window": "settings", "page": "health" } });
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, asked.to_string());
+        assert_eq!(call(&["--call-b64", b64.as_str()]).await.unwrap().unwrap(), window, "another computer's call gets the same");
+        let usage = call(&["--call", "get_usage"]).await.unwrap().unwrap();
+        let text = usage["text"].as_str().unwrap();
+        assert!(text.chars().count() == MAX_TEXT && !text.contains('\n'), "any other request's text is an ordinary string");
+        // A tool of slopbar-mcp's own (here one that passes the door's answer on) is cut as before.
+        let readiness = call(&["--call", "get_machine_readiness"]).await.unwrap().unwrap();
+        let text = readiness["text"].as_str().unwrap();
+        assert!(text.chars().count() == MAX_TEXT && !text.contains('\n'), "a local tool's strings keep the short cap");
+    }
+
+    /// update_settings' schema offers exactly the settings `settings::patched` takes, and every field
+    /// it names inside them exists, so nothing it offers is refused as unknown or read-only (the sign-in
+    /// window was, while PATCHABLE lacked it) and nothing patchable goes unoffered.
+    #[test]
+    fn update_settings_offers_exactly_what_it_takes() {
+        let schema = settings_patch_schema();
+        let offered = schema["properties"]["patch"]["properties"].as_object().unwrap();
+        let mut keys: Vec<&str> = offered.keys().map(String::as_str).collect();
+        let mut patchable = crate::settings::PATCHABLE.to_vec();
+        keys.sort_unstable();
+        patchable.sort_unstable();
+        assert_eq!(keys, patchable);
+        fn named(schema: &Value, stored: &Value, path: &str) {
+            for (key, inner) in schema.get("properties").and_then(Value::as_object).into_iter().flatten() {
+                let here = format!("{path}.{key}");
+                named(inner, stored.get(key).unwrap_or_else(|| panic!("{here} is offered but is no setting")), &here);
+            }
+        }
+        let stored = serde_json::to_value(crate::settings::Settings::default()).unwrap();
+        for (key, inner) in offered {
+            named(inner, stored.get(key).unwrap_or_else(|| panic!("{key} is offered but is no setting")), key);
+        }
     }
 
     #[test]
