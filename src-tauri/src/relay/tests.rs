@@ -552,3 +552,61 @@ fn a_request_through_the_port_must_get_an_http_answer() {
     assert!(!reaches(std::net::Ipv4Addr::LOCALHOST.into(), port));
     answering.join().unwrap();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Live, against another of the user's computers (never run by default)
+
+/// Asks the stop of a live step there however the check ends.
+struct StopThere<'a>(&'a str, String);
+
+impl Drop for StopThere<'_> {
+    fn drop(&mut self) {
+        let _ = crate::pairing::relay_call(&crate::pairing::Ssh, self.0, &Request::RelayStop { step: self.1.clone() }, Duration::ZERO);
+    }
+}
+
+/// `SLOPBAR_RELAY_LIVE_HOST=<ssh alias> cargo test --lib relay::tests::live -- --ignored --nocapture`:
+/// asks that computer (running a SlopBar that speaks the relay) for its plan, starts its first
+/// sign-in with no window there, checks the page it hands over, opens the tunnel for that page's
+/// port and proves a request reaches its CLI through it, then stops the sign-in there. Nothing is
+/// signed in or out, no browser opens on either computer, and the page is never printed.
+#[test]
+#[ignore]
+fn live_relay_against_another_computer() {
+    let Ok(host) = std::env::var("SLOPBAR_RELAY_LIVE_HOST") else { return };
+    let here = crate::presence::identity().map(|(id, _)| id.clone()).expect("this computer's machine id");
+    let remote = crate::pairing::Ssh;
+    let started = Instant::now();
+    let offer = match ask(&remote, &host, None, &here, true) {
+        Asked::Offer(offer) => offer,
+        other => panic!("{host} cannot take a relayed sign-in: {other:?}"),
+    };
+    let steps: Vec<_> = offer.plan.iter().flat_map(|g| g.steps.iter()).collect();
+    println!("{} answered in {:?}: {} sign-ins due there; reads its own usage for {:?}; {} in use ending", offer.machine.name, started.elapsed(),
+        steps.len(), offer.own, offer.in_use.len());
+    let step = steps.first().expect("a sign-in due there to try");
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let stop = StopThere(&host, id.clone());
+    let start = Request::RelayStart { step: id.clone(), from: here.clone(), machine: offer.machine.id.clone(), kind: step.kind,
+        provider: step.target.provider, id: step.target.id.clone(), email: step.email.clone() };
+    let started = Instant::now();
+    let state: State = serde_json::from_value(crate::pairing::relay_call(&remote, &host, &start, Duration::from_secs(40)).expect("started there")).unwrap();
+    assert_eq!((state.step.as_str(), state.phase), (id.as_str(), Phase::Page), "its page is handed over: {:?}", state.error);
+    println!("{:?} {} sign-in there handed over its page in {:?}", step.kind, step.target.provider.key(), started.elapsed());
+    let page = check_page(state.url.as_deref().unwrap(), step.target.provider, step.email.as_deref()).expect("the CLI's own page for that account");
+    let opened = Instant::now();
+    let tunnel = Tunnel::open(&crate::pairing::Ssh::exe(), &host, &page).expect("a tunnel to its CLI");
+    println!("port {} (localhost: {}) reaches its CLI through the tunnel, opened in {:?}", page.port, page.localhost, opened.elapsed());
+    drop(tunnel);
+    drop(stop);
+    let mut ended = state;
+    for _ in 0..6 {
+        let ask = Request::RelayState { step: id.clone(), since: ended.revision, wait_seconds: 5 };
+        ended = serde_json::from_value(crate::pairing::relay_call(&remote, &host, &ask, Duration::from_secs(5)).unwrap()).unwrap();
+        if ended.phase.ended() {
+            break;
+        }
+    }
+    assert_eq!((ended.phase, ended.error.as_deref()), (Phase::Failed, Some("signin_stopped")), "stopped there, nothing saved");
+    println!("stopped there: {:?}", ended.error);
+}
