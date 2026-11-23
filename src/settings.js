@@ -1513,6 +1513,8 @@ function signInPlan() {
 }
 
 function renderBulk() {
+  // An event before the page has loaded its settings: drawn once it has.
+  if (!settings) return;
   const c = bulk.connecting;
   const running = c && !c.finished;
   const plan = signInPlan();
@@ -1542,7 +1544,11 @@ function renderBulk() {
   } else if (running && c.current) status.textContent = t("bulkConnecting", { i: c.done + 1, n: c.total, account });
   else if (c?.finished && c.error) {
     const failed = c.steps?.find((s) => s.state === "failed");
-    status.textContent = t("bulkConnectStopped", { done: c.done, n: c.total, error: errorText(providerName(failed?.provider), c.error) });
+    // A sitting counts the sign-ins it made (not those it left out), and names who it left out.
+    const done = c.everywhere ? c.steps.filter((s) => s.state === "done").length : c.done;
+    const left = c.everywhere ? leftOut(c.left_out) : "";
+    status.textContent = [t("bulkConnectStopped", { done, n: c.total, error: errorText(providerName(failed?.provider), c.error) }),
+      left ? t("signInLeftOut", { list: left }) : ""].filter(Boolean).join(" ");
   }
   else if (c?.finished && c.everywhere) {
     // Counted as done only what was signed in, then who was left out and why.
@@ -1575,9 +1581,14 @@ function inUseText(list) {
  * exactly what each will sign in (its name, SSH host, sign-ins and emails), then runs it.
  */
 async function signInEverywhere(monitoring = $("sign-in-all-monitoring").checked) {
-  if (stopping()) return void invoke("stop_sign_ins").finally(loadBulk);
   const button = $("sign-in-everywhere");
   const status = $("bulk-status");
+  // A run goes: never stopped from here (the button's own click stops it), and no sitting meanwhile.
+  if (stopping()) {
+    status.textContent = t("signin_busy");
+    status.hidden = false;
+    return;
+  }
   button.disabled = true;
   status.textContent = t("signInEverywhereChecking");
   status.hidden = false;
@@ -1639,7 +1650,8 @@ $("sign-in-all").addEventListener("click", async () => {
   loadBulk();
 });
 $("sign-in-all-monitoring").addEventListener("change", renderBulk);
-$("sign-in-everywhere").addEventListener("click", () => signInEverywhere());
+// The button stops a run that goes (as the other two do); only its own click does.
+$("sign-in-everywhere").addEventListener("click", () => stopping() ? void invoke("stop_sign_ins").finally(loadBulk) : signInEverywhere());
 $("bulk-retry").addEventListener("click", async () => {
   const c = bulk.connecting;
   if (c?.everywhere && c.finished) return void signInEverywhere(c.monitoring);
@@ -1744,7 +1756,7 @@ function renderPeerRuns() {
         peerNotes[p.machine_id] ??= t("peerSignInNotPaired", { machine: p.machine });
       }
     }
-    if (peerNotes[p.machine_id]) {
+    if (!r.everywhere && peerNotes[p.machine_id]) {
       const note = document.createElement("p");
       note.className = "dim";
       note.textContent = peerNotes[p.machine_id];

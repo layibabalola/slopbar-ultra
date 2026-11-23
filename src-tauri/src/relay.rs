@@ -4,9 +4,9 @@
 //! authorization URL) is handed to this computer, which opens an SSH tunnel for the one loopback
 //! port that page sends the browser back to, and opens the page here. The provider's answer (the
 //! authorization code) goes from this computer's browser through the user's own SSH to the other
-//! computer's CLI, which exchanges it itself: no SlopBar code reads, stores or logs a code or a
-//! token on either computer, and the login is saved only on the computer whose CLI made it, as a
-//! sign-in at its own screen saves it.
+//! computer's CLI, which exchanges it itself: the relay never reads, stores or logs the code or a
+//! token on either computer, and the login is saved only on the computer whose CLI made it, by that
+//! computer's SlopBar as a sign-in at its own screen is.
 //!
 //! The other computer's half is a [`Slot`]: one relayed sign-in at a time, its page, and how it
 //! ended, reached over SSH through `slopbar-mcp --relay` (never an MCP tool, so a page never lands
@@ -259,10 +259,11 @@ impl Slot {
         }
         o.phase = Phase::Page;
         o.url = Some(url.to_owned());
-        // The bump below makes this the page's revision.
-        o.page_revision = self.revision() + 1;
+        // Counted under the same lock that sets the page, so any answer either has neither or both:
+        // a caller that saw this revision was sent the page with it.
+        o.page_revision = self.revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         drop(open);
-        self.bump();
+        self.changed.notify_waiters();
         true
     }
 
@@ -432,6 +433,21 @@ pub struct InUse {
     pub ends_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Another computer's accounts in use whose sign-ins end, as the person is shown them: only those
+/// this computer knows (`known`: provider, id, email, its own or the rosters'), with this
+/// computer's id and email for them, so nothing that computer wrote is shown as it wrote it.
+pub fn known_in_use(in_use: &[InUse], known: &[(Provider, String, Option<String>)]) -> Vec<InUse> {
+    let same = |a: &Option<String>, b: &Option<String>| match (a, b) {
+        (Some(a), Some(b)) => a.trim().eq_ignore_ascii_case(b.trim()),
+        (None, None) => true,
+        _ => false,
+    };
+    in_use.iter().filter_map(|u| {
+        let (_, id, email) = known.iter().find(|(p, i, e)| *p == u.provider && *i == u.id && same(e, &u.email))?;
+        Some(InUse { id: id.clone(), email: email.clone(), ..u.clone() })
+    }).collect()
+}
+
 /// What becomes of one of another computer's sign-ins in a sitting (see [`keep`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keep {
@@ -594,9 +610,9 @@ pub fn ask(remote: &dyn crate::pairing::Remote, host: &str, expected: Option<&st
     if answer.busy {
         return skip(&name, "peer_busy");
     }
-    // Shown to the person and agents: cleaned like a name (see `shown_name`).
-    let in_use = answer.in_use.into_iter()
-        .map(|u| InUse { machine: name.clone(), id: shown_name(&u.id, "?"), email: u.email.map(|e| shown_name(&e, "?")), ..u }).collect();
+    // As that computer gave them: only those this computer knows are shown, as it knows them
+    // (see `known_in_use`).
+    let in_use = answer.in_use.into_iter().map(|u| InUse { machine: name.clone(), ..u }).collect();
     Asked::Offer(Offer { machine: crate::bulk::Machine { id: machine.id, name, host: host.to_owned() }, plan: answer.plan, own: answer.own_readings, in_use })
 }
 
@@ -710,6 +726,7 @@ pub fn why(code: &str) -> &'static str {
         "wrong_machine" => "leftWrongMachine",
         "CLI not found" => "leftNoCli",
         "relay_port_unusable" => "leftPort",
+        "relay_stopped_there" => "leftStoppedThere",
         "relay_unknown_account" => "leftUnknownAccount",
         _ => "leftFailed",
     }
@@ -1041,11 +1058,14 @@ fn drive_timed(desk: &dyn Desk, host: &str, ids: &Ids, step: &crate::bulk::Step,
                 let url = page_url.clone().ok_or("tunnel_failed")?;
                 let page = check_page(&url, provider, email).map_err(String::from)?;
                 let tunnel = desk.tunnel(host, &page).map_err(String::from)?;
+                // Kept first, then the stop looked at: a Stop that comes between them (which sets
+                // the stop before it takes the tunnel) still closes this one.
+                *shared.tunnel.lock().unwrap_or_else(|e| e.into_inner()) = Some(tunnel);
                 if shared.cancelled() {
+                    shared.tunnel.lock().unwrap_or_else(|e| e.into_inner()).take();
                     let _ = desk.call(host, &Request::RelayStop { step: id.clone() }, Duration::ZERO);
                     return Err("signin_stopped".into());
                 }
-                *shared.tunnel.lock().unwrap_or_else(|e| e.into_inner()) = Some(tunnel);
             }
             let ask = Request::RelayState { step: id.clone(), since: state.revision, wait_seconds: STATE_WAIT };
             match desk.call(host, &ask, Duration::from_secs(u64::from(STATE_WAIT))) {

@@ -133,8 +133,8 @@ Claude ends every sign-in about 30 days after it is made, on every computer. Onc
 paired or checked from here (or named by the shared account list and reachable at its name in
 `~/.ssh/config`), its renewals can be made from whichever computer you sit at: Settings → Accounts →
 **Sign in all your computers from here**, or ask the agent there to call `sign_in_all` with
-`everywhere: true` (it shows the plan; with `confirm: true` it raises a notification you start
-yourself, and opens the same confirmation as the button). Each other computer runs its CLI's
+`everywhere: true` (it shows the plan; with `confirm: true` it raises a notification whose Review
+and start opens the same confirmation as the button). Each other computer runs its CLI's
 sign-in with no window and hands its page over; the page opens in this computer's browser, and the
 provider's answer goes back to that computer's CLI through an SSH tunnel for the one port that page
 names. Their screens can stay locked. PowerShell 7 must start over SSH on each of them. A computer is

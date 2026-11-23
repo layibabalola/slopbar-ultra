@@ -254,7 +254,7 @@ fn each_computer_says_what_it_needs_or_why_it_is_left_out() {
         "a name loses what hides in it; the host stays here to reach it");
     assert_eq!((offer.plan.len(), offer.plan[0].steps[0].kind), (1, crate::bulk::Kind::Renew));
     assert!(offer.own.uses(Provider::Claude, "any") && offer.own.uses(Provider::Codex, "x") && !offer.own.uses(Provider::Codex, "y"));
-    assert_eq!((offer.in_use[0].machine.as_str(), offer.in_use[0].id.as_str()), ("DESK-1", "b"), "its account in use is named, for the person");
+    assert_eq!((offer.in_use[0].machine.as_str(), offer.in_use[0].id.as_str()), ("DESK-1", "b"), "its account in use, named by its computer");
     let calls = fleet.asked.lock().unwrap().clone();
     assert_eq!(calls.last().unwrap(), &("desk".to_string(), "--relay".to_string(), serde_json::json!({ "op": "relay_plan", "monitoring": false, "from": "id-here" })),
         "one relay call: its plan, with the monitoring switch here and who asks, and nothing started there");
@@ -315,6 +315,8 @@ fn a_failure_stops_the_run_only_when_the_person_or_this_computer_caused_it() {
     assert_eq!((why("ssh_timeout"), why("not_running"), why("relay_outdated"), why("peer_busy")), ("leftUnreachable", "leftNotRunning", "leftOutdated", "leftBusy"));
     assert_eq!((why("no_ssh_host"), why("slopbar_not_installed"), why("relay_page_unexpected")), ("leftNoHost", "leftNotInstalled", "leftFailed"));
     assert_eq!(fault("relay_stopped_there"), Fault::DropComputer, "stopped at that computer: it is left out, the sitting goes on");
+    assert_eq!(why("relay_stopped_there"), "leftStoppedThere");
+    assert_eq!(fault("no_desktop_session"), Fault::DropComputer, "nobody at that computer's desktop is that computer's, not this run's");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -643,6 +645,20 @@ fn live_relay_against_another_computer() {
     }
     assert_eq!((ended.phase, ended.error.as_deref()), (Phase::Failed, Some("signin_stopped")), "stopped there, nothing saved");
     println!("stopped there: {:?}", ended.error);
+}
+
+#[test]
+fn another_computers_accounts_in_use_are_shown_only_as_this_computer_knows_them() {
+    // Real ids are long (Claude: account and organization uuids, 73 characters).
+    let long = "5c650f99-e202-4b6f-bba5-8a8101c94589:e1be1c76-2c7b-469a-acdf-117bf3866793";
+    assert!(long.len() > 64);
+    let theirs = |id: &str, email: Option<&str>| InUse { machine: "DESK".into(), provider: Provider::Claude, id: id.into(), email: email.map(Into::into), ends_at: None };
+    let known = vec![(Provider::Claude, long.to_string(), Some("Someone@example.invalid".to_string()))];
+    let shown = known_in_use(&[theirs(long, Some("someone@example.invalid")), theirs("unknown", Some("someone@example.invalid")),
+        theirs(long, Some("other@example.invalid")), theirs(long, None)], &known);
+    assert_eq!(shown.len(), 1, "a known account matches whatever its email's case; another id, email or none does not");
+    assert_eq!((shown[0].id.as_str(), shown[0].email.as_deref(), shown[0].machine.as_str()), (long, Some("Someone@example.invalid"), "DESK"),
+        "shown as this computer knows it");
 }
 
 #[test]

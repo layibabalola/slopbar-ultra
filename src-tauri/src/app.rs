@@ -111,8 +111,9 @@ pub struct AppState {
     /// "Sign in all your computers from here": the plan last gathered, so the person's OK runs
     /// exactly what was shown (see `gather_everywhere`), once.
     everywhere: Mutex<Option<Everywhere>>,
-    /// A sitting waiting for the person's confirmation in Settings (see `confirm_everywhere_here`).
-    everywhere_ask: Mutex<Option<bool>>,
+    /// A sitting waiting for the person's confirmation in Settings (see `confirm_everywhere_here`):
+    /// its monitoring switch, and when it was asked.
+    everywhere_ask: Mutex<Option<(bool, Instant)>>,
 }
 
 impl AppState {
@@ -766,6 +767,10 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
                 return Ok(shown);
             }
             desktop_shown()?;
+            // One run at a time: an open sign-in is never stopped for an agent's request.
+            if app.state::<AppState>().bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished) {
+                return Err("signin_busy".into());
+            }
             let plan = gather_everywhere(&app, monitoring).await?;
             let any = !plan.computers.is_empty();
             let asked = any && ask_everywhere(&app, &plan);
@@ -2075,11 +2080,8 @@ async fn gather_everywhere(app: &AppHandle, monitoring: bool) -> Result<Everywhe
                 if let (Some(dir), Some((_, alias))) = (dir.as_deref(), by_name.iter().find(|(id, _)| *id == offer.machine.id)) {
                     pairing::remember_new_host(dir, &offer.machine.id, alias);
                 }
-                // Only accounts this computer knows are named to the person (the rest is that
-                // computer's own word).
-                let knows = |provider: Provider, id: &str, email: &Option<String>| known.iter().any(|(p, i, e)| *p == provider && i == id
-                    && match (e, email) { (Some(a), Some(b)) => a.trim().eq_ignore_ascii_case(b.trim()), (None, None) => true, _ => false });
-                in_use.extend(offer.in_use.iter().filter(|u| knows(u.provider, &u.id, &u.email)).cloned());
+                // Only accounts this computer knows are named to the person, as it knows them.
+                in_use.extend(relay::known_in_use(&offer.in_use, &known));
                 let shares_with_it = shares && peers.iter().any(|p| p.machine_id == offer.machine.id);
                 let mut kept = Vec::new();
                 for step in offer.plan.iter().flat_map(|g| g.steps.iter()) {
@@ -2137,16 +2139,17 @@ fn ask_everywhere(app: &AppHandle, plan: &Everywhere) -> bool {
 /// an agent's request and Retry of such a sitting start, so every sitting is one the person saw.
 fn confirm_everywhere_here(app: &AppHandle, monitoring: bool) {
     // Read by the page as it loads, or at once by one already open.
-    *app.state::<AppState>().everywhere_ask.lock().unwrap() = Some(monitoring);
+    *app.state::<AppState>().everywhere_ask.lock().unwrap() = Some((monitoring, Instant::now()));
     let _ = app.emit_to(SETTINGS_LABEL, "sign-in-everywhere-ask", ());
     show_settings_page(app, Some("accounts".into()));
 }
 
 /// Settings > Accounts asks whether a sitting waits for the person's confirmation (see
-/// `confirm_everywhere_here`): its monitoring switch, once.
+/// `confirm_everywhere_here`): its monitoring switch, once, while the ask is fresh (an ask left
+/// from long ago never opens a confirmation by surprise).
 #[tauri::command]
 fn take_everywhere_ask(state: tauri::State<AppState>) -> Option<bool> {
-    state.everywhere_ask.lock().unwrap().take()
+    state.everywhere_ask.lock().unwrap().take().filter(|(_, at)| at.elapsed() < EVERYWHERE_FRESH).map(|(monitoring, _)| monitoring)
 }
 
 /// Where a relayed sign-in's page opens here: the email's fresh profile (made now if its turn has
