@@ -155,14 +155,13 @@ impl Runner for Cli {
         kind_of(&self.exe, self.remote.as_deref()?)
     }
 
-    /// As this rclone's batched calls went while SlopBar runs (a newer one put in its place starts
-    /// over after a restart).
+    /// As this rclone's batched calls went lately (`Batching`).
     fn batch_most(&self) -> usize {
-        batching().lock().unwrap_or_else(|e| e.into_inner()).get(&self.exe).copied().unwrap_or_default().most
+        batching().lock().unwrap_or_else(|e| e.into_inner()).get(&self.exe).copied().unwrap_or_default().at(Instant::now()).most
     }
 
     fn batched(&self, read: Batched) {
-        batching().lock().unwrap_or_else(|e| e.into_inner()).entry(self.exe.clone()).or_default().after(read);
+        batching().lock().unwrap_or_else(|e| e.into_inner()).entry(self.exe.clone()).or_default().after(read, Instant::now());
     }
 }
 
@@ -172,23 +171,29 @@ fn batching() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Ba
     BATCHING.get_or_init(Default::default)
 }
 
-/// How an rclone's batched calls have gone (`Rclone::batch`): how many files to ask it for at once,
-/// and how many reads in a row its calls only refused.
+/// How an rclone's batched calls have gone lately (`Rclone::batch`): how many files to ask it for at
+/// once, how many reads in a row its calls only refused, and when either last went down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Batching {
     most: usize,
     refusals: u8,
+    changed: Option<Instant>,
 }
 
 impl Default for Batching {
     fn default() -> Self {
-        Batching { most: BATCH_MOST, refusals: 0 }
+        Batching { most: BATCH_MOST, refusals: 0, changed: None }
     }
 }
 
 /// Reads in a row whose batched calls only refused (printed nothing and failed, while the same files
 /// one at a time could be read) before none is made: one such read can be the network's moment.
 const REFUSALS: u8 = 2;
+
+/// How long `Batching` holds after it last went down before it starts over: a slow link or an
+/// rclone that refuses the call is asked again in full an hour later (at most one call's worth of
+/// records unread, or two refused calls, an hour), and refusals far apart do not add up.
+const BATCHING_KEPT: Duration = Duration::from_secs(60 * 60);
 
 /// What one read's batched calls did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -202,18 +207,30 @@ pub struct Batched {
 }
 
 impl Batching {
-    /// After a read: a call that ran out of time halves how many the next ask for (one: none
-    /// together), so a slow link or a stalling file holds back fewer records and a timed-out chunk
-    /// is read in smaller ones; a call that gave anything clears the refusals; the `REFUSALS`th read
-    /// in a row that only refused stops batching. Until SlopBar restarts.
-    fn after(&mut self, read: Batched) {
+    /// As it stands at `now`: started over once `BATCHING_KEPT` has passed since it last went down.
+    fn at(self, now: Instant) -> Batching {
+        match self.changed {
+            Some(at) if now.saturating_duration_since(at) >= BATCHING_KEPT => Batching::default(),
+            _ => self,
+        }
+    }
+
+    /// After a read at `now`: a call that ran out of time halves how many the next ask for (one:
+    /// none together), so a slow link or a stalling file holds back fewer records and a timed-out
+    /// chunk is read in smaller ones; a call that gave anything clears the refusals; the
+    /// `REFUSALS`th read in a row that only refused stops batching. For `BATCHING_KEPT` (or until
+    /// SlopBar restarts).
+    fn after(&mut self, read: Batched, now: Instant) {
+        *self = self.at(now);
         if read.timed_out {
             self.most = (self.most / 2).max(1);
+            self.changed = Some(now);
         }
         if read.gave {
             self.refusals = 0;
         } else if read.refused {
             self.refusals = self.refusals.saturating_add(1);
+            self.changed = Some(now);
             if self.refusals >= REFUSALS {
                 self.most = 1;
             }
@@ -540,9 +557,9 @@ impl<R: Runner> Rclone<R> {
             }
         }
         // A batched call that printed nothing and failed, where the same files one at a time could
-        // be read: an rclone older than 1.63, or settings of its own that refuse the call (a filter
-        // in the environment, which `--files-from-raw` will not run beside), or the network's
-        // moment. Where they could not be read either (the network), it was not refused.
+        // be read: an rclone older than 1.63 (it refuses `--separator`), or the network's moment.
+        // Where they could not be read either (the network, or a filter set in rclone's
+        // environment, which refuses a `cat` of one file as well), it was not refused.
         batched.refused = (0..entries.len()).any(|i| after_nothing[i] && got[i].is_some());
         if batched != Batched::default() {
             self.runner.batched(batched);
@@ -621,7 +638,7 @@ enum Batch {
     /// What it printed, the separator each file is followed by, and whether it ended well.
     Printed { stdout: Vec<u8>, separator: String, complete: bool },
     /// It failed having printed nothing: an rclone that does not take the command (older than
-    /// 1.63, or set up so that it refuses it), or no file it could read (the network).
+    /// 1.63), or no file it could read (the network; a filter set in rclone's environment).
     Nothing,
     /// It did not end (ran out of time) or did not start.
     Failed { timed_out: bool },
@@ -790,12 +807,14 @@ mod tests {
         remotes: String,
         fail: Option<i32>,
         /// A batched `cat` (`--files-from-raw -`): the names each one was given; from its
-        /// `refuse_from`th call on, `refuse` fails it with that exit code and nothing printed, as
-        /// rclone before 1.63 does (2) or one whose environment sets a filter (1); `hang` times it
-        /// out; the files in `guessed` print the call's separator inside their bytes. It prints the
+        /// `refuse_from`th call on, `refuse` fails it with that exit code and nothing printed, as an
+        /// rclone before 1.63 does (1; an unknown flag exits 2 from rclone 1.69 on); `hang` times it
+        /// out; the files in `guessed` print the call's separator inside their bytes, and those in
+        /// `batch_skips` are left out of it (exit 0) though a `cat` of one finds it. It prints the
         /// files in reverse order of their names (rclone's is by name), so nothing goes by order.
         batched: Mutex<Vec<Vec<String>>>,
         refuse: Option<i32>,
+        batch_skips: Mutex<Vec<String>>,
         refuse_from: usize,
         batch_calls: std::sync::atomic::AtomicUsize,
         hang: std::sync::atomic::AtomicBool,
@@ -874,7 +893,8 @@ mod tests {
                             code = 1;
                             continue;
                         }
-                        let Some(bytes) = files.get(&path).filter(|_| !self.gone.lock().unwrap().contains(&path)) else { continue };
+                        let left_out = self.gone.lock().unwrap().contains(&path) || self.batch_skips.lock().unwrap().contains(&path);
+                        let Some(bytes) = files.get(&path).filter(|_| !left_out) else { continue };
                         if self.guessed.lock().unwrap().contains(&path) {
                             let half = bytes.len() / 2;
                             out.extend_from_slice(&bytes[..half]);
@@ -911,11 +931,11 @@ mod tests {
         }
 
         fn batch_most(&self) -> usize {
-            self.batching.lock().unwrap().most
+            self.batching.lock().unwrap().at(Instant::now()).most
         }
 
         fn batched(&self, read: Batched) {
-            self.batching.lock().unwrap().after(read);
+            self.batching.lock().unwrap().after(read, Instant::now());
         }
     }
 
@@ -1504,10 +1524,10 @@ mod tests {
         let (records, cats, batched) = read(&store, &kept);
         assert_eq!((records.len(), cats, batched.len()), (22, 2, 0));
 
-        // A call that fails having printed nothing (an rclone before 1.63 refuses it with 2, one whose
-        // environment sets a filter with 1): one at a time at once; since that works, it was refused,
+        // A call that fails having printed nothing (an rclone before 1.63 refuses `--separator` with
+        // 1, as a newer one would with 2): one at a time at once; since that works, it was refused,
         // and after two such reads in a row none is made.
-        for code in [2, 1] {
+        for code in [1, 2] {
             let refusing = Rclone::with("cloud", Fake { refuse: Some(code), ..dropbox() });
             let kept = Kept::default();
             for second in 0..3 {
@@ -1518,6 +1538,18 @@ mod tests {
                 let expected = if second < 2 { 1 + 3 } else { 3 };
                 assert_eq!((records.len(), cats), (3, expected), "{code}, read {second}");
             }
+        }
+        // A call that ended well having printed nothing (its files left out of it, though each can be
+        // read alone) refused nothing: still batched after two such reads.
+        let skipping = Rclone::with("cloud", dropbox());
+        let kept = Kept::default();
+        for second in 0..3 {
+            for n in 0..3 {
+                write(&skipping, n, now + chrono::Duration::seconds(second));
+                skipping.runner.batch_skips.lock().unwrap().push(path(n));
+            }
+            let (records, cats, batched) = read(&skipping, &kept);
+            assert_eq!((records.len(), cats, batched.len()), (3, 1 + 3, 1), "read {second}");
         }
         // Twenty due and refused: the first call only, then one at a time.
         let refusing = Rclone::with("cloud", Fake { refuse: Some(1), ..dropbox() });
@@ -1601,23 +1633,32 @@ mod tests {
     /// the refusals. Each rclone (by its path) keeps its own, while SlopBar runs.
     #[test]
     fn batching_follows_how_the_calls_went() {
+        let t0 = Instant::now();
+        let minutes = |m: u64| t0 + Duration::from_secs(60 * m);
         let mut b = Batching::default();
         let (gave, refused, timed_out) = (Batched { gave: true, ..Default::default() }, Batched { refused: true, ..Default::default() }, Batched { timed_out: true, ..Default::default() });
-        b.after(timed_out);
-        assert_eq!(b.most, 8);
-        b.after(refused);
-        b.after(gave);
-        b.after(refused);
-        assert_eq!(b.most, 8, "a read that gave between two refusals");
-        b.after(refused);
-        assert_eq!(b.most, 1, "two refusals in a row");
+        b.after(timed_out, t0);
+        assert_eq!(b.at(t0).most, 8);
+        b.after(refused, minutes(5));
+        b.after(gave, minutes(10));
+        b.after(refused, minutes(15));
+        assert_eq!(b.at(minutes(15)).most, 8, "a read that gave between two refusals");
+        b.after(refused, minutes(20));
+        assert_eq!(b.at(minutes(20)).most, 1, "two refusals in a row");
+        // An hour after it last went down it starts over: asked in full again.
+        assert_eq!((b.at(minutes(79)).most, b.at(minutes(80))), (1, Batching::default()));
         let mut b = Batching::default();
-        for _ in 0..6 {
-            b.after(timed_out);
+        for m in 0..6 {
+            b.after(timed_out, minutes(m));
         }
-        assert_eq!(b.most, 1, "halved down to one at a time");
-        b.after(Batched { gave: true, refused: true, timed_out: false });
+        assert_eq!(b.at(minutes(6)).most, 1, "halved down to one at a time");
+        b.after(Batched { gave: true, refused: true, timed_out: false }, minutes(7));
         assert_eq!(b.refusals, 0);
+        // Refusals far apart do not add up.
+        let mut b = Batching::default();
+        b.after(refused, t0);
+        b.after(refused, minutes(61));
+        assert_eq!((b.at(minutes(61)).most, b.refusals), (BATCH_MOST, 1));
         // Kept by the rclone's path, for every Cli of it.
         let dir = crate::test_support::TempDir::new();
         let (one, other) = (dir.0.join("rclone-batching-one.exe"), dir.0.join("rclone-batching-other.exe"));

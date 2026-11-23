@@ -75,15 +75,18 @@ MEGA, S3, WebDAV, SFTP and the other rclone backends. rclone keeps its own confi
   is taken only for the record whose listed size and hash it has, so one that changed since the
   listing, or holds the separator, is downloaded alone. When the call fails having given some,
   the records it did not give are not read that time, and `Recall` keeps their machines while
-  they are live; so when it is killed at 20 seconds, whatever it printed, and the next read asks
-  for half as many in a call (down to one at a time) until SlopBar restarts. When it fails having
-  printed nothing, its records are downloaded alone; if that works, the call was refused (an older
-  rclone refuses the flag, and `--files-from-raw` refuses any other filter, one set in rclone's
-  environment too), and after two reads in a row like that none is made until SlopBar restarts
-  (one such read can be the network's moment; a read whose call gave anything starts the count
-  again). Output is not limited in size, as a `cat` of one file is not: a file that grows after
-  the listing is read until rclone ends or is killed (rclone refuses `--max-size` beside
-  `--files-from-raw`). Modelled for a refresh every 5 minutes
+  they are live; so are all of a call's records when it is killed at 20 seconds, whatever it
+  printed, and the next read then asks for half as many in a call (down to one at a time). When
+  it fails having printed nothing, its records are downloaded alone; if that works, the call was
+  refused (an rclone older than 1.63 refuses `--separator`), and after two reads in a row like
+  that none is made (one such read can be the network's moment; a read whose call gave anything
+  starts the count again). Either holds for an hour after it last went down, or until SlopBar
+  restarts, and then the call is made in full again. A filter set in rclone's environment
+  (`RCLONE_MAX_SIZE`…) refuses the batched call and a `cat` of one file alike, so presence over
+  rclone reads nothing there, with or without batching. Output is not limited in size, as a
+  `cat` of one file is not: a file that grows after the listing is read until rclone ends or is
+  killed (rclone refuses `--max-size` beside `--files-from-raw`). Modelled for a refresh every 5
+  minutes
   (`rclone::tests::an_hour_of_presence_exchanges_over_rclone_starts_fewer_processes`), presence
   processes an hour go from 120 to 36 beside five running machines and two asleep ones (84 with
   each record downloaded alone), 60 to 36 beside two running ones, and 60 to 24 beside two asleep
@@ -112,7 +115,8 @@ MEGA, S3, WebDAV, SFTP and the other rclone backends. rclone keeps its own confi
 
   A clean quit rewrites this machine's record with no accounts.
 - **Each call.** rclone runs with no window, `--ask-password=false` (it never waits on an
-  encrypted config's prompt), `--contimeout 10s --timeout 15s`, and a hard 20-second kill. Calls
+  encrypted config's prompt), `--contimeout 10s --timeout 15s`, and a hard 20-second kill (a
+  batched `cat` has the same 20 seconds for all its files). Calls
   run off the async runtime. rclone's stderr is discarded and its output is never logged.
 - **The setting.** `settings.json` stores only the remote's name, `presence_remote`. A chosen
   remote takes precedence over `presence_folder`. A missing rclone means no sharing; it never
