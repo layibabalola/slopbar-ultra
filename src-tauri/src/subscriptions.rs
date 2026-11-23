@@ -783,6 +783,11 @@ pub fn billing_page(provider: Provider) -> &'static str {
     }
 }
 
+/// Claude's usage page, where claude.ai (and Claude Desktop, which shows claude.ai) lists the plan's
+/// usage and the banked resets of the account signed in there: Claude lists those to its own
+/// clients only, not to SlopBar. Fixed here, as the billing pages; Claude Code itself points there.
+pub const CLAUDE_USAGE_PAGE: &str = "https://claude.ai/settings/usage";
+
 /// Accounts whose plan the user is letting lapse, past its last paid day: automatic switching
 /// must not move onto them.
 pub fn lapsed(settings: &Settings, provider: Provider, id: &str, now: DateTime<Utc>) -> bool {
