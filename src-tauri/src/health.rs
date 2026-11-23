@@ -376,12 +376,14 @@ struct SignIns {
 
 /// A renewal summary's reason and fix once the user has other computers: "Sign in all your
 /// computers from here" renews theirs in the same sitting, their pages opening here (`relay`).
+/// One short sentence: get_health's strings reach agents cut at `mcp::MAX_TEXT`, and the CLI
+/// summary is long already.
 fn everywhere(reason: String, fix: Fix, other_computers: usize) -> (String, Fix) {
     if other_computers == 0 || !matches!(fix, Fix::SignInAll | Fix::ConnectMonitoringAll) {
         return (reason, fix);
     }
     let others = if other_computers == 1 { "your other computer's".to_string() } else { format!("your {other_computers} other computers'") };
-    (format!("{reason} Signing in from here does the same for {others} sign-ins in one sitting, their pages opening on this computer, after you confirm."), Fix::SignInEverywhere)
+    (format!("{reason} Sign in from here adds {others} sign-ins, their pages opening here, after you confirm."), Fix::SignInEverywhere)
 }
 
 /// Whether "Sign in all accounts" makes the account a new CLI sign-in, by `now`'s dates as
@@ -1092,7 +1094,7 @@ mod tests {
         for id in [CLI_RENEWAL_SUMMARY, RENEWAL_SUMMARY] {
             let s = find(&r, id);
             assert_eq!(s.fix, Some(Fix::SignInEverywhere), "{id}");
-            assert!(s.reason.contains("your 2 other computers' sign-ins in one sitting, their pages opening on this computer, after you confirm"), "{}", s.reason);
+            assert!(s.reason.ends_with(" Sign in from here adds your 2 other computers' sign-ins, their pages opening here, after you confirm."), "{}", s.reason);
         }
         assert_eq!(find(&r, "cli_signin:claude:a").fix, Some(Fix::SignInAll), "an account's own row stays this computer's");
         assert_eq!(serde_json::to_value(Fix::SignInEverywhere).unwrap(), serde_json::json!({ "action": "sign_in_everywhere" }));
@@ -1105,6 +1107,30 @@ mod tests {
         }
         alone.other_computers = 1;
         assert_eq!(find(&alone.run(), RENEWAL_SUMMARY).fix, Some(Fix::SignInEverywhere));
+    }
+
+    #[test]
+    fn the_renewal_summaries_reach_agents_whole() {
+        // get_health's strings reach agents cut at mcp::MAX_TEXT. The longest summaries: Codex's
+        // longer limit sentence, monitoring and CLI sign-ins due together, other computers; with
+        // room for three-digit counts.
+        let mut case = Case::healthy();
+        for a in &mut case.accounts {
+            a.provider = Provider::Codex;
+            a.cli_ends_at = Some(now() - Duration::days(2));
+        }
+        for id in ["a", "b"] {
+            case.monitoring.insert(format!("Codex:{id}"), MonitorState { reconnect: true, uncertain: false, ends_at: Some(now() - Duration::hours(3)) });
+        }
+        case.other_computers = 99;
+        let r = case.run();
+        for id in [CLI_RENEWAL_SUMMARY, RENEWAL_SUMMARY] {
+            let s = find(&r, id);
+            assert_eq!(s.fix, Some(Fix::SignInEverywhere), "{id}");
+            assert!(s.reason.starts_with(sign_in_limit(Provider::Codex)), "{id}: {}", s.reason);
+            let n = s.reason.chars().count();
+            assert!(n + 4 <= crate::mcp::MAX_TEXT, "{id}: {n} characters");
+        }
     }
 
     #[test]
