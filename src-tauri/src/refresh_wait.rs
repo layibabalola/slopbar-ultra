@@ -520,7 +520,7 @@ mod tests {
             "so is a removed account's cache entry. {}\n{remove}", update(HANDS));
         assert!(!has(remove, "usage_cache"), "and nothing else touches the cache there:\n{remove}");
         let add = function(&app, "app.rs", "async fn start_add_account(", HANDS);
-        assert!(has(add, "let added = job.wait(&http_client()).await; drop(session); drop(pending); if let Some(slot) = added {")
+        assert!(has(add, "let added = job.wait(&http_client()).await; drop(opens); drop(pending); if let Some(slot) = added {")
             && find(add, "job.wait(") < find(add, "do_refresh(&app).await"), "it covers the sign-in, not the refresh. {}\n{add}", update(HANDS));
         let login = function(&app, "app.rs", "async fn start_monitoring_login(", HANDS);
         assert!(has(login, "retry_soon(&app, key); refresh_soon(&app); outcome"), "{}\n{login}", update(HANDS));
