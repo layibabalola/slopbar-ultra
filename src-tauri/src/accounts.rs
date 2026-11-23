@@ -1122,8 +1122,8 @@ impl LoginJob {
                 break slot.ok_or(FAILED);
             }
             // Its page named a callback port browsers refuse, so it was not opened: the CLI starts
-            // again and listens on another port.
-            if self.page_refused() {
+            // again and listens on another port. (One that finished meanwhile is read as usual.)
+            if self.page_refused() && !matches!(self.child.try_wait(), Ok(Some(status)) if status.success()) {
                 match self.start_again() {
                     Ok(()) => continue,
                     Err(e) => break Err(e),
@@ -1188,10 +1188,14 @@ impl LoginJob {
             return Err("signin_port_refused");
         }
         start.again += 1;
-        // A new folder: the old CLI's processes may still be ending, and writing to theirs.
+        // A new folder: the old CLI's processes may still be ending, and writing to theirs. Never one
+        // that was there already (as at the first start): only a folder made here is removed.
         let name = login_dir_name();
         let dir = start.source.home.join(&name);
-        if std::fs::create_dir(&dir).is_err() || crate::login::prepare(&dir, start.provider, &start.cmd).is_err() {
+        if std::fs::create_dir(&dir).is_err() {
+            return Err("monitor_storage");
+        }
+        if crate::login::prepare(&dir, start.provider, &start.cmd).is_err() {
             let _ = std::fs::remove_dir_all(&dir);
             return Err("monitor_storage");
         }
@@ -1244,6 +1248,11 @@ impl Drop for LoginJob {
         std::thread::spawn(move || {
             // Its processes, ended above, let go of the folder first.
             std::thread::sleep(Duration::from_secs(1));
+            // Never a login that was handed over (nor one whose folder says nothing readable):
+            // startup cleanup's own rule.
+            if !crate::login::not_handed_off(&dir) {
+                return;
+            }
             crate::login::logout(provider, &source, &dir, &native);
             for _ in 0..10 {
                 if std::fs::remove_dir_all(&dir).is_ok() || std::fs::symlink_metadata(&dir).is_err() {
