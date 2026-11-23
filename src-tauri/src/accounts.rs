@@ -117,15 +117,19 @@ impl Slot {
 
     /// When this saved sign-in ends: the date the provider set when it was made, which renewing
     /// never moves (Claude ends every sign-in about 30 days after it is made; Claude Code saves the
-    /// date as `refreshTokenExpiresAt`). None when the login does not say: Codex, or a login saved
-    /// by an older Claude Code.
+    /// date as `refreshTokenExpiresAt`, in milliseconds). None when the login does not say (Codex,
+    /// or a login saved by an older Claude Code), or says something no sign-in could mean: a zero,
+    /// seconds instead of milliseconds, or a date years away, which would otherwise mark every
+    /// account's sign-in as ended.
     pub fn ends_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        match self.provider {
+        let at = match self.provider {
             Provider::Claude => self.data["credentials"]["claudeAiOauth"]["refreshTokenExpiresAt"]
                 .as_i64()
-                .and_then(chrono::DateTime::from_timestamp_millis),
-            Provider::Codex => None,
-        }
+                .and_then(chrono::DateTime::from_timestamp_millis)?,
+            Provider::Codex => return None,
+        };
+        let earliest = chrono::DateTime::from_timestamp(1_704_067_200, 0)?; // 2024-01-01
+        (at >= earliest && at <= chrono::Utc::now() + chrono::Duration::days(400)).then_some(at)
     }
 }
 
@@ -407,16 +411,53 @@ fn store_login_in(vault: &Path, slot: &Slot) -> std::io::Result<()> {
     save_slot_in(vault, &slot)
 }
 
+/// What `store_renewal` did with a new CLI sign-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Renewed {
+    /// It replaced the saved login.
+    Saved,
+    /// The account is now signed in where the CLI runs: the CLI manages that login, and the next
+    /// `capture` would put the live one back over a new one. Nothing was saved.
+    InUse,
+    /// The saved login was removed meanwhile, and a removed account stays removed. Nothing was saved.
+    Removed,
+}
+
+/// Saves a new CLI sign-in for an account the vault already has, made because its saved one ended
+/// or ends soon (see `cli_renewal`), as `store_login` does; but only while the account is still
+/// saved and still not signed in at any of `sources`, both checked under the vault lock, so neither
+/// a switch nor a removal during the sign-in is undone. Nothing is signed out either way: an unsaved
+/// sign-in simply runs out.
+pub fn store_renewal(slot: &Slot, sources: &[Source]) -> std::io::Result<Renewed> {
+    let _guard = VAULT.lock().unwrap();
+    let vault = vault_dir().ok_or_else(|| std::io::Error::other("no config dir"))?;
+    store_renewal_in(&vault, slot, sources)
+}
+
+fn store_renewal_in(vault: &Path, slot: &Slot, sources: &[Source]) -> std::io::Result<Renewed> {
+    let known = load_slots_in(vault);
+    if !known.iter().any(|s| s.provider == slot.provider && s.id == slot.id) {
+        return Ok(Renewed::Removed);
+    }
+    if sources.iter().any(|source| read_login(slot.provider, source, &known).is_some_and(|live| live.id == slot.id)) {
+        return Ok(Renewed::InUse);
+    }
+    store_login_in(vault, slot)?;
+    Ok(Renewed::Saved)
+}
+
 /// A new Claude sign-in's account record comes from the profile API, which returns fewer fields
 /// than Claude Code saves (billingType and subscriptionCreatedAt, which `Slot::billing` reads,
-/// among them): the old login's record fills in what the new one lacks, for the same account only.
-/// The new record's own fields win. Claude Code replaces the whole record once the account is in
-/// use again.
+/// among them): the old login's record fills in what the new one lacks, for the same account and
+/// organization only (the CLI's own record can be another organization's of the same person). The
+/// new record's own fields win. Claude Code replaces the whole record once the account is in use
+/// again.
 fn keep_details(new: &mut Slot, old: &Slot) {
     if new.provider != Provider::Claude || new.provider != old.provider || new.id != old.id {
         return;
     }
-    let same = new.data["oauth_account"]["accountUuid"].as_str().is_some_and(|u| Some(u) == old.data["oauth_account"]["accountUuid"].as_str());
+    let same_as = |key: &str| new.data["oauth_account"][key].as_str().is_some_and(|v| Some(v) == old.data["oauth_account"][key].as_str());
+    let same = same_as("accountUuid") && same_as("organizationUuid");
     if let (true, Some(fresh), Some(saved)) = (same, new.data["oauth_account"].as_object_mut(), old.data["oauth_account"].as_object()) {
         for (key, value) in saved {
             fresh.entry(key.clone()).or_insert_with(|| value.clone());
@@ -672,11 +713,24 @@ fn refresh_token(slot: &Slot) -> Option<&str> {
     }
 }
 
+/// How much later the saved login's sign-in must end than a profile's before the saved one counts
+/// as a newer sign-in whatever was issued when (see `keeps`): `RENEW_DAYS` plus `EARLY_DAYS`. Along
+/// one sign-in's renewals the end stays put or moves a little earlier (the provider may end one up
+/// to `EARLY_DAYS` early), while "Sign in all accounts" makes a new sign-in at most `RENEW_DAYS`
+/// before the old one ends, and it ends about 30 days after it is made: at least 20 days later.
+const NEWER_SIGN_IN_DAYS: i64 = crate::monitoring::RENEW_DAYS + crate::monitoring::EARLY_DAYS;
+
 /// Whether a profile's `live` login should replace the vault's `saved` copy of the same account:
 /// it differs and the saved one is not certainly newer. The profile is where the account was in
-/// use, so it wins when the order is unknown.
+/// use, so it wins when the order is unknown. The saved one is certainly newer when it was issued
+/// later, or when it is a new sign-in (`store_renewal`) whose end is weeks after the live one's: a
+/// CLI still running in the project on the sign-in it replaced keeps renewing that one and writing
+/// it back, and taking it would undo the new sign-in. Only the saved copy wins by its end, and only
+/// by that margin, so a newer copy of one sign-in whose end moved earlier is never taken for the
+/// older one: writing an older copy over a newer one would leave a refresh token already rotated away.
 fn keeps(live: &Slot, saved: &Slot) -> bool {
-    let saved_newer = matches!((issued(saved), issued(live)), (Some(s), Some(l)) if s > l);
+    let saved_newer = matches!((issued(saved), issued(live)), (Some(s), Some(l)) if s > l)
+        || matches!((saved.ends_at(), live.ends_at()), (Some(s), Some(l)) if s - l > chrono::Duration::days(NEWER_SIGN_IN_DAYS));
     refresh_token(live) != refresh_token(saved) && !saved_newer
 }
 
@@ -1166,6 +1220,11 @@ mod profile_tests {
         slot
     }
 
+    /// Milliseconds `days` from now.
+    fn in_days(days: i64) -> i64 {
+        (chrono::Utc::now() + chrono::Duration::days(days)).timestamp_millis()
+    }
+
     #[test]
     fn a_saved_cli_sign_in_says_when_it_ends_and_whether_it_needs_a_new_one() {
         use crate::model::RenewalKind;
@@ -1175,6 +1234,10 @@ mod profile_tests {
         assert_eq!(ending("r", 1, end).ends_at().map(|t| t.timestamp_millis()), Some(end));
         assert_eq!(claude("r", 1).ends_at(), None, "a login saved by an older Claude Code says nothing");
         assert_eq!(codex("r", "2026-10-01T00:00:00Z").ends_at(), None, "Codex gives no end");
+        // Nothing a sign-in could mean marks an account's sign-in as ended.
+        for nonsense in [0, 1_700_000_000, in_days(800)] {
+            assert_eq!(ending("r", 1, nonsense).ends_at(), None, "{nonsense}");
+        }
         assert_eq!(cli_renewal(Some(at(-1)), false, now), Some(RenewalKind::Ended));
         assert_eq!(cli_renewal(Some(now), false, now), Some(RenewalKind::Ended), "it ends at its end");
         assert_eq!(cli_renewal(Some(at(6)), false, now), Some(RenewalKind::Ending), "within RENEW_DAYS");
@@ -1186,7 +1249,7 @@ mod profile_tests {
     #[test]
     fn a_new_cli_sign_in_replaces_the_saved_one_and_keeps_details_only_the_old_one_had() {
         let vault = TempDir::new();
-        let mut old = ending("r-old", 1_000, 1_000_000);
+        let mut old = ending("r-old", 1_000, in_days(-2));
         old.data["oauth_account"]["billingType"] = json!("stripe_subscription");
         old.data["oauth_account"]["emailAddress"] = json!("old@example.invalid");
         save_slot_in(&vault.0, &old).unwrap();
@@ -1195,10 +1258,11 @@ mod profile_tests {
             Some(json!({ "accountUuid": "user-9", "organizationUuid": "org-1", "billingType": "apple" }))).unwrap();
         save_slot_in(&vault.0, &other).unwrap();
 
-        let new = ending("r-new", 2_000, 9_000_000);
-        store_login_in(&vault.0, &new).unwrap();
+        let end = in_days(30);
+        let new = ending("r-new", 2_000, end);
+        assert_eq!(store_renewal_in(&vault.0, &new, &[]).unwrap(), Renewed::Saved);
         let saved = load_slots_in(&vault.0).into_iter().find(|s| s.id == new.id).unwrap();
-        assert_eq!((refresh_token(&saved), saved.ends_at().map(|t| t.timestamp_millis())), (Some("r-new"), Some(9_000_000)));
+        assert_eq!((refresh_token(&saved), saved.ends_at().map(|t| t.timestamp_millis())), (Some("r-new"), Some(end)));
         assert_eq!(saved.billing().billing_type.as_deref(), Some("stripe_subscription"), "kept: the profile API does not return it");
         assert_eq!(saved.data["oauth_account"]["emailAddress"], "test@example.invalid", "the new login's own fields win");
         assert_eq!(stored(&vault.0, &other).as_deref(), Some("r-x"));
@@ -1207,6 +1271,84 @@ mod profile_tests {
         let fresh = TempDir::new();
         store_login_in(&fresh.0, &new).unwrap();
         assert!(load_slots_in(&fresh.0)[0].data["oauth_account"].get("billingType").is_none());
+        // Never another organization's details: the CLI's own record can be one of the same person's.
+        let mut elsewhere = old.clone();
+        elsewhere.data["oauth_account"]["organizationUuid"] = json!("org-2");
+        let mut renewed = ending("r-2", 3_000, end);
+        keep_details(&mut renewed, &elsewhere);
+        assert!(renewed.data["oauth_account"].get("billingType").is_none());
+    }
+
+    #[test]
+    fn a_renewal_is_not_saved_once_the_account_is_in_use_or_removed() {
+        let (vault, cli) = (TempDir::new(), TempDir::new());
+        let old = ending("r-old", 1_000, in_days(-2));
+        save_slot_in(&vault.0, &old).unwrap();
+        let new = ending("r-new", 2_000, in_days(30));
+        // Switched to it while its sign-in was open: the CLI's live login is the old one, which the
+        // next capture would put back, so the new one is not saved.
+        write_profile(&old, &cli.0).unwrap();
+        assert_eq!(store_renewal_in(&vault.0, &new, &[profile_source(&cli.0)]).unwrap(), Renewed::InUse);
+        assert_eq!(stored(&vault.0, &old).as_deref(), Some("r-old"));
+        // Not in use anywhere: saved.
+        assert_eq!(store_renewal_in(&vault.0, &new, &[]).unwrap(), Renewed::Saved);
+        assert_eq!(stored(&vault.0, &old).as_deref(), Some("r-new"));
+        // Removed while its sign-in was open: it stays removed.
+        let empty = TempDir::new();
+        assert_eq!(store_renewal_in(&empty.0, &new, &[]).unwrap(), Renewed::Removed);
+        assert!(load_slots_in(&empty.0).is_empty());
+    }
+
+    #[test]
+    fn a_new_sign_in_wins_over_a_project_cli_still_renewing_the_one_it_replaced() {
+        let (vault, root) = (TempDir::new(), TempDir::new());
+        let old = ending("r-old", 1_000, in_days(2));
+        save_slot_in(&vault.0, &old).unwrap();
+        let wanted = [(Provider::Claude, old.id.clone())];
+        sync_profiles_in(&vault.0, &root.0, &wanted, &Active::new());
+        let dir = root.0.join(profile_name(Provider::Claude, &old.id));
+        // Sign in all accounts makes a new sign-in, saved in the vault.
+        save_slot_in(&vault.0, &ending("r-new", 2_000, in_days(30))).unwrap();
+        // A CLI still running in the project renews the old sign-in after it, and writes it back.
+        write_login(&ending("r-old-2", 9_000, in_days(2)), &profile_source(&dir)).unwrap();
+        sync_profiles_in(&vault.0, &root.0, &wanted, &Active::new());
+        assert_eq!(stored(&vault.0, &old).as_deref(), Some("r-new"), "the new sign-in stays");
+        assert_eq!(in_profile(&root.0, &old).as_deref(), Some("r-new"), "and the project gets it");
+        // Its own renewals come back as before.
+        write_login(&ending("r-new-2", 10_000, in_days(30)), &profile_source(&dir)).unwrap();
+        sync_profiles_in(&vault.0, &root.0, &wanted, &Active::new());
+        assert_eq!(stored(&vault.0, &old).as_deref(), Some("r-new-2"));
+        // Switching to the account takes the profile's copy back only when it is newer.
+        write_login(&ending("r-old-3", 11_000, in_days(2)), &profile_source(&dir)).unwrap();
+        let saved = load_slots_in(&vault.0).into_iter().find(|s| s.id == old.id).unwrap();
+        assert!(reclaim_profile(&vault.0, &root.0, &saved).is_none(), "the old sign-in's copy is not taken back");
+        assert_eq!(stored(&vault.0, &old).as_deref(), Some("r-new-2"));
+    }
+
+    #[test]
+    fn a_newer_copy_of_one_sign_in_whose_end_moved_earlier_still_wins() {
+        // Along one sign-in's renewals the end can move a few days earlier; the newer copy must win,
+        // or the profile and the vault get a refresh token that was already rotated away.
+        for days_earlier in [3, 9] {
+            let (vault, root) = (TempDir::new(), TempDir::new());
+            let saved = ending("r1", 1_000, in_days(20));
+            save_slot_in(&vault.0, &saved).unwrap();
+            let wanted = [(Provider::Claude, saved.id.clone())];
+            sync_profiles_in(&vault.0, &root.0, &wanted, &Active::new());
+            let dir = root.0.join(profile_name(Provider::Claude, &saved.id));
+            write_login(&ending("r2", 2_000, in_days(20 - days_earlier)), &profile_source(&dir)).unwrap();
+            sync_profiles_in(&vault.0, &root.0, &wanted, &Active::new());
+            assert_eq!(stored(&vault.0, &saved).as_deref(), Some("r2"), "{days_earlier} days earlier, in sync");
+            assert_eq!(in_profile(&root.0, &saved).as_deref(), Some("r2"));
+            // The same when switching to it takes the profile's copy back.
+            write_login(&ending("r3", 3_000, in_days(20 - days_earlier - 1)), &profile_source(&dir)).unwrap();
+            let current = load_slots_in(&vault.0).into_iter().find(|s| s.id == saved.id).unwrap();
+            assert_eq!(reclaim_profile(&vault.0, &root.0, &current).as_ref().and_then(refresh_token), Some("r3"), "{days_earlier} days earlier, reclaimed");
+            assert_eq!(stored(&vault.0, &saved).as_deref(), Some("r3"));
+        }
+        // One copy without an end (an older Claude Code): the order it was issued in decides, as before.
+        let older = claude("r1", 1_000);
+        assert!(keeps(&ending("r2", 2_000, in_days(5)), &older) && !keeps(&older, &ending("r2", 2_000, in_days(5))));
     }
 
     fn in_profile(root: &Path, slot: &Slot) -> Option<String> {

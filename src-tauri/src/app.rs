@@ -460,6 +460,10 @@ async fn export_diagnostics(app: AppHandle) -> Result<String, String> {
 /// An agent's switch: the same as Use in Settings, then the balancer's cooldown so the next poll
 /// does not switch straight back. Returns the new snapshot and whether the account held.
 async fn agent_switch(app: &AppHandle, provider: Provider, id: String) -> Result<serde_json::Value, String> {
+    // A saved CLI sign-in that had ended before the switch: the CLI stops until it signs in again.
+    let ended_at = app.state::<AppState>().snapshot.lock().unwrap().accounts.iter()
+        .find(|a| a.provider == provider && a.id == id && !a.active)
+        .and_then(|a| a.cli_ends_at).filter(|t| *t <= chrono::Utc::now());
     switch_to(app, provider, id.clone(), false).await?;
     app.state::<AppState>().last_switch.lock().unwrap().insert(provider, Instant::now());
     let desktop = switch_desktop(app, provider, &id).await;
@@ -470,6 +474,10 @@ async fn agent_switch(app: &AppHandle, provider: Provider, id: String) -> Result
     let mut result = serde_json::to_value(snapshot).map_err(|e| e.to_string())?;
     result["switched_to_requested"] = held.into();
     result["desktop"] = serde_json::to_value(desktop).map_err(|e| e.to_string())?;
+    if let Some(at) = ended_at {
+        result["cli_signin_ended_at"] = serde_json::json!(at);
+        result["warning"] = "This account's saved CLI sign-in had ended, so the CLI stops until it signs in again: the user runs `claude /login`, or switches back. Next time, sign_in_all signs it in again first, without switching.".into();
+    }
     Ok(result)
 }
 
@@ -728,7 +736,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             }
             let plan = sign_in_all(&app, monitoring).await?;
             Ok(serde_json::json!({ "started": !plan.is_empty(), "plan": plan,
-                "next": "Each sign-in opens after the previous one finishes. get_usage shows the accounts, monitor_connected and no monitor_renewal as they complete." }))
+                "next": "Each sign-in opens after the previous one finishes. get_usage shows the accounts, monitor_connected, and no monitor_renewal or cli_renewal, as they complete." }))
         }
         R::RemoveLapsedAccounts { confirm } => {
             if !confirm {
@@ -974,10 +982,14 @@ fn forget_pending(provider: Provider, id: &str) {
 /// ended or ends soon (`bulk::Kind::Renew`), as "Add account" does, but only as that account: a
 /// login of any other account is not saved and is revoked, the way monitoring rejects a wrong
 /// account. The new login replaces the vault's saved one; nothing is signed out, and the CLI's own
-/// files are never written. Returns once the user is done.
-async fn add_expected(app: &AppHandle, expected: &bulk::Step, session: Option<&signin::Session>) -> Result<(), String> {
+/// files are never written. Returns once the user is done: whether a login was saved (a renewal is
+/// not, once the account is in use or was removed meanwhile; see `accounts::store_renewal`).
+async fn add_expected(app: &AppHandle, expected: &bulk::Step, session: Option<&signin::Session>) -> Result<bool, String> {
     let provider = expected.target.provider;
+    let id = expected.target.id.clone();
     let _operation = app.state::<AppState>().account_operations.begin(provider, "add-account")?;
+    // The account itself too, so it is not removed (`remove_one`) while its sign-in is open.
+    let _account = app.state::<AppState>().account_operations.begin(provider, &id)?;
     let _sign_in = app.state::<AppState>().account_operations.begin_key(monitoring::SIGN_IN)?;
     let _open = app.state::<AppState>().sign_ins.open();
     let found = app.state::<AppState>().sources.lock().unwrap().clone();
@@ -987,16 +999,26 @@ async fn add_expected(app: &AppHandle, expected: &bulk::Step, session: Option<&s
     let client = http_client();
     let login = job.wait_isolated(&client).await.ok_or("monitor_login_failed")?;
     // The slot id names the account and, for Claude, its organization (server-verified above).
-    if login.provider != provider || login.id != expected.target.id {
+    if login.provider != provider || login.id != id {
         // Never a token a stored login or monitor holds; this fresh login holds none of those.
         app.state::<AppState>().monitor.discard_unstored_login(&login, &accounts::load_slots(), &client).await;
         return Err(wrong_account(provider, expected.email.as_deref(), login.email.as_deref()));
     }
-    accounts::store_login(&login).map_err(|_| "monitor_storage".to_string())?;
-    forget_pending(provider, &login.id);
-    let _ = app.emit("account-added", (login.provider, login.email.clone()));
+    if expected.kind == bulk::Kind::Renew {
+        // Not if the CLI was switched to the account meanwhile, or the account removed.
+        let (renewal, sources) = (login.clone(), app.state::<AppState>().sources.lock().unwrap().clone());
+        let renewed = tauri::async_runtime::spawn_blocking(move || accounts::store_renewal(&renewal, &sources)).await
+            .map_err(|_| "monitor_storage".to_string())?.map_err(|_| "monitor_storage".to_string())?;
+        if renewed != accounts::Renewed::Saved {
+            return Ok(false);
+        }
+    } else {
+        accounts::store_login(&login).map_err(|_| "monitor_storage".to_string())?;
+        forget_pending(provider, &login.id);
+        let _ = app.emit("account-added", (login.provider, login.email.clone()));
+    }
     refresh_soon(app);
-    Ok(())
+    Ok(true)
 }
 
 /// A refresh after a sign-in, not waited for: one can take most of a minute (finding sign-ins,
@@ -1123,14 +1145,14 @@ async fn needs_monitor_sign_in(app: &AppHandle, target: &bulk::Target) -> bool {
     held.is_none_or(|s| monitoring::renewal(Some(&s), None, chrono::Utc::now()).due())
 }
 
-/// Whether an account's saved CLI sign-in still needs a new one (`accounts::cli_renewal`), read
-/// from the vault itself, where a sign-in that finished shows at once, before any refresh does. Not
-/// once the account is in use: the CLI manages that sign-in.
+/// Whether an account's saved CLI sign-in still needs a new one (`accounts::cli_renewal`, or the
+/// provider rejected it), read from the vault itself, where a sign-in that finished shows at once,
+/// before any refresh does. Not once the account is in use: the CLI manages that sign-in.
 fn cli_sign_in_due(app: &AppHandle, target: &bulk::Target) -> bool {
     let active = app.state::<AppState>().snapshot.lock().unwrap().accounts.iter()
         .any(|a| a.provider == target.provider && a.id == target.id && a.active);
-    accounts::load_slots().into_iter().find(|s| s.provider == target.provider && s.id == target.id)
-        .is_some_and(|s| accounts::cli_renewal(s.ends_at(), active, chrono::Utc::now()).is_some())
+    !active && accounts::load_slots().into_iter().find(|s| s.provider == target.provider && s.id == target.id)
+        .is_some_and(|s| accounts::cli_renewal(s.ends_at(), false, chrono::Utc::now()).is_some() || providers::cli_rejected(&s))
 }
 
 /// Updates "Connect monitoring for all" and tells Settings.
@@ -1469,7 +1491,7 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                             auto_monitor_saved(&h, |t| t.manual(&key, true));
                             match start_monitoring_login(h.clone(), target.provider, target.id.clone(), false, session.clone()).await {
                                 // Stopping drops this future, and with it the sign-in.
-                                Ok(task) => AbortOnDrop(task).await.unwrap_or_else(|_| Err("monitor_login_failed".into())),
+                                Ok(task) => AbortOnDrop(task).await.unwrap_or_else(|_| Err("monitor_login_failed".into())).map(|()| true),
                                 Err(e) => Err(e),
                             }
                         }
@@ -1516,12 +1538,19 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     }
                 };
                 match outcome {
-                    Ok(()) => {
+                    Ok(true) => {
                         mark(at, StepState::Done, None);
                         if step.kind == bulk::Kind::Add {
                             added.insert((target.provider, &target.id));
                         }
                         page.steps[in_group].1 = signin::PageStep::Done;
+                        show(session.as_deref(), &page);
+                    }
+                    // A renewal for an account the CLI was switched to, or that was removed, while
+                    // its sign-in was open: nothing to save, and nothing for the rest to wait on.
+                    Ok(false) => {
+                        mark(at, StepState::Skipped, None);
+                        page.steps[in_group].1 = signin::PageStep::Skipped;
                         show(session.as_deref(), &page);
                     }
                     Err(e) => {
@@ -1626,7 +1655,7 @@ fn bulk_status(state: tauri::State<AppState>) -> serde_json::Value {
         "to_connect": bulk::to_connect(&snapshot),
         "lapsed": bulk::lapsed(&snapshot, &settings, chrono::Utc::now()),
         "connecting": state.bulk_connect.lock().unwrap().clone(),
-        // "Sign in all accounts" with monitoring; without it, only the `add` steps run.
+        // "Sign in all accounts" with monitoring; without it, only the `add` and `renew` steps run.
         "sign_in": bulk::sign_in_plan(&snapshot, &pending_accounts(&state, &snapshot), true),
         "roster_waiting": roster_waiting(&state, &snapshot).len(),
         "signin_profiles": signin::count(),
@@ -1814,6 +1843,10 @@ async fn lease_account(app: &AppHandle, provider: Provider, purpose: &str, minut
         Some(id) => {
             let snapshot = state.snapshot.lock().unwrap();
             let account = snapshot.accounts.iter().find(|a| a.provider == provider && a.id == id).ok_or("monitor_wrong_account")?;
+            // A job would run on a saved CLI sign-in that ended, and stop until it signs in again.
+            if !account.active && account.cli_ends_at.is_some_and(|t| t <= chrono::Utc::now()) {
+                return Err("cli_signin_ended: this account's saved CLI sign-in ended, so a job on it would stop until it signs in again; sign_in_all signs it in again (the user completes the page), or lease another account".into());
+            }
             (id, account.alias.clone().or(account.email.clone()), account.active)
         }
         None => {

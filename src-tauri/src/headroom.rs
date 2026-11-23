@@ -276,10 +276,21 @@ fn name(label: &Option<String>, id: &str) -> String {
 }
 
 /// Why an account cannot take a job, or None when it can be ranked.
-fn exclusion(acc: &AccountUsage, settings: &Settings, now: DateTime<Utc>) -> Option<String> {
-    // Switching the CLI to it would stop the CLI until it signs in again (`accounts::cli_renewal`).
-    if crate::accounts::cli_renewal(acc.cli_ends_at, acc.active, now) == Some(crate::model::RenewalKind::Ended) {
-        return Some("its saved CLI sign-in ended: the CLI would stop until it signs in again (Sign in all accounts renews it)".into());
+fn exclusion(acc: &AccountUsage, settings: &Settings, now: DateTime<Utc>, job_end: Option<DateTime<Utc>>) -> Option<String> {
+    // Switching the CLI to an account whose saved sign-in ended stops the CLI until it signs in
+    // again (`accounts::cli_renewal`); one ending within WARN_DAYS, or before the job is done, stops
+    // it then. The account in use keeps its own: the CLI manages that sign-in.
+    if let Some(at) = acc.cli_ends_at.filter(|_| !acc.active) {
+        let renew = "sign_in_all signs it in again as a new CLI sign-in";
+        if at <= now {
+            return Some(format!("its saved CLI sign-in ended, so switching to it would stop the CLI until it signs in again ({renew})"));
+        }
+        if at <= now + Duration::days(crate::monitoring::WARN_DAYS) {
+            return Some(format!("its saved CLI sign-in ends within {} days, and the CLI would stop then until it signs in again ({renew})", crate::monitoring::WARN_DAYS));
+        }
+        if job_end.is_some_and(|end| at <= end) {
+            return Some(format!("its saved CLI sign-in ends before the job does, and the CLI would stop then until it signs in again ({renew})"));
+        }
     }
     if acc.error.is_some() { return Some("its last reading failed".into()); }
     if stale(acc, settings, now) { return Some("its reading is stale".into()); }
@@ -307,7 +318,7 @@ pub fn recommend(accounts: &[AccountUsage], settings: &Settings, provider: Provi
     let mut excluded = Vec::new();
     for acc in accounts.iter().filter(|a| a.provider == provider) {
         let label = label(acc);
-        if let Some(reason) = exclusion(acc, settings, now) {
+        if let Some(reason) = exclusion(acc, settings, now, job_end) {
             excluded.push(Excluded { id: acc.id.clone(), label, active: acc.active, reason });
             continue;
         }
@@ -492,14 +503,21 @@ mod tests {
         current.cli_ends_at = Some(now - Duration::days(1));
         let mut ended = account("ended", false, 5.0, 20);
         ended.cli_ends_at = Some(now - Duration::hours(1));
-        let mut soon = account("soon", false, 10.0, 30);
-        soon.cli_ends_at = Some(now + Duration::days(2));
-        let rec = recommend(&[current, ended, soon], &settings, Provider::Claude, None, None, now);
-        let left_out = rec.excluded.iter().find(|e| e.id == "ended").unwrap();
-        assert!(left_out.reason.starts_with("its saved CLI sign-in ended"), "{}", left_out.reason);
-        assert!(rec.excluded.iter().all(|e| e.id != "current" && e.id != "soon"), "one in use, or still working, stays a candidate");
-        assert_eq!(rec.recommended.as_deref(), Some("soon"));
-        assert!(rec.ranking.iter().all(|c| c.id != "ended"), "automatic switching picks from the ranking");
+        let mut ending = account("ending", false, 6.0, 25);
+        ending.cli_ends_at = Some(now + Duration::days(2));
+        let mut later = account("later", false, 10.0, 30);
+        later.cli_ends_at = Some(now + Duration::days(5));
+        let accounts = [current, ended, ending, later];
+        let rec = recommend(&accounts, &settings, Provider::Claude, None, None, now);
+        let reason = |rec: &Recommendation, id: &str| rec.excluded.iter().find(|e| e.id == id).map(|e| e.reason.clone()).unwrap_or_default();
+        assert!(reason(&rec, "ended").starts_with("its saved CLI sign-in ended"), "{}", reason(&rec, "ended"));
+        assert!(reason(&rec, "ending").starts_with("its saved CLI sign-in ends within 3 days"), "{}", reason(&rec, "ending"));
+        assert!(rec.excluded.iter().all(|e| e.id != "current" && e.id != "later"), "one in use, or still working, stays a candidate");
+        assert_eq!(rec.recommended.as_deref(), Some("later"));
+        assert!(rec.ranking.iter().all(|c| c.id != "ended" && c.id != "ending"), "automatic switching picks from the ranking");
+        // A six-day job would outlast the one ending in five.
+        let long = recommend(&accounts, &settings, Provider::Claude, None, Some(6.0 * 24.0), now);
+        assert!(reason(&long, "later").starts_with("its saved CLI sign-in ends before the job does"), "{}", reason(&long, "later"));
     }
 
     #[test]

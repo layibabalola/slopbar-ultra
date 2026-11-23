@@ -247,19 +247,24 @@ test("a monitoring renewal the network's proxy stopped says it was monitoring", 
 });
 
 test("a saved CLI sign-in that ended or ends soon says so before anyone presses Use", () => {
-  const ended = cliSignInText({ ...account, cli_renewal: "ended", cli_ends_at: iso(now - 26 * HOUR) }, now);
+  const spare = { ...account, active: false, sources: [] };
+  const ended = cliSignInText({ ...spare, cli_renewal: "ended", cli_ends_at: iso(now - 26 * HOUR) }, now);
   assert.equal(ended.ended, true);
   assert.equal(ended.label, t("cliSignInEnded"));
   assert.match(ended.hint, /30 days/);
   assert.match(ended.hint, /Use would stop the CLI/);
-  const ending = cliSignInText({ ...account, cli_renewal: "ending", cli_ends_at: iso(now + 50 * HOUR) }, now);
+  const ending = cliSignInText({ ...spare, cli_renewal: "ending", cli_ends_at: iso(now + 50 * HOUR) }, now);
   assert.equal(ending.ended, false);
   assert.match(ending.label, /^CLI sign-in ends in 2d 2h$/);
-  // Nothing to say: no renewal (the account in use never has one), or no end known.
-  assert.equal(cliSignInText({ ...account, cli_ends_at: iso(now - HOUR) }, now), null);
-  assert.equal(cliSignInText({ ...account, cli_renewal: "ended" }, now), null);
+  // By the date, not the last refresh's verdict: an end that passed since says so already.
+  assert.equal(cliSignInText({ ...spare, cli_renewal: "ending", cli_ends_at: iso(now - 60000) }, now).ended, true);
+  // Nothing to say: the account in use (even with the verdict from before a switch), no end known,
+  // or an end more than 3 days away (Sign in all accounts still takes it from 7).
+  assert.equal(cliSignInText({ ...account, cli_renewal: "ended", cli_ends_at: iso(now - HOUR) }, now), null);
+  assert.equal(cliSignInText({ ...spare, cli_renewal: "ended" }, now), null);
+  assert.equal(cliSignInText({ ...spare, cli_renewal: "ending", cli_ends_at: iso(now + 5 * 24 * HOUR) }, now), null);
   // The compact flyout's tooltip carries it with everything else.
-  const lines = accountTipLines({ ...account, cli_renewal: "ended", cli_ends_at: iso(now - HOUR) }, { now }).flat();
+  const lines = accountTipLines({ ...spare, cli_renewal: "ended", cli_ends_at: iso(now - HOUR) }, { now }).flat();
   assert.ok(lines.some((l) => l.startsWith(`${t("cliSignInEnded")}: `)), lines.join("\n"));
   // Every language has its own words for them, with the same placeholders.
   const keys = ["cliSignInEnded", "cliSignInEnding", "cliSignInEndedHint", "cliSignInEndingHint"];

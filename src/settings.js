@@ -271,6 +271,9 @@ $("accounts").addEventListener("click", async (e) => {
   const use = e.target.closest("[data-use]");
   if (use) {
     const { use: provider, id } = use.dataset;
+    // Its saved CLI sign-in ended: switching stops the CLI until it signs in again, so ask first.
+    const cli = cliSignInText(snapshot.accounts.find((a) => a.provider === provider && a.id === id) ?? {});
+    if (cli?.ended && !confirm(`${cli.label}\n\n${cli.hint}`)) return;
     const before = snapshot;
     // Mark the new account at once; the backend confirms (or reverts) it.
     snapshot = { ...snapshot, accounts: snapshot.accounts.map((a) => (a.provider === provider ? { ...a, active: a.id === id } : a)) };
@@ -1200,7 +1203,11 @@ function fixButton(fix, i, count) {
   const label = {
     connect_monitoring: () => t("monitorConnect"),
     connect_monitoring_all: () => count ? `${t("bulkConnectButton")} (${count})` : t("bulkConnectButton"),
-    sign_in_all: () => count ? `${t("signInAllButton")} (${count})` : t("signInAllButton"),
+    // Everything the run would sign in, as the Accounts page counts it (its monitoring box included).
+    sign_in_all: () => {
+      const n = signInPlan().steps || count;
+      return n ? `${t("signInAllButton")} (${n})` : t("signInAllButton");
+    },
     refresh: () => t("healthFixRefresh"),
     restart_app: () => t("healthFixRestart"),
     open_settings: () => `${t("healthFixOpen")} ${t(FIX_PAGES[fix.page] ?? "settings")}`,

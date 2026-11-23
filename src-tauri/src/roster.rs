@@ -112,7 +112,7 @@ pub struct RunStep {
     pub provider: Provider,
     /// Alias, else email: whom to sign in as.
     pub account: Option<String>,
-    /// add or connect.
+    /// add, renew or connect (`bulk::Kind`). An older SlopBar drops a kind it does not know.
     pub kind: String,
     /// pending, running, done, skipped or failed.
     pub state: String,
