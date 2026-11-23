@@ -145,7 +145,7 @@ its SSH server starts Windows PowerShell (run the OpenSSH block above there).
 ## Without an MCP client
 
 `slopbar-mcp.exe` runs one tool from a shell and prints one JSON line (`{"ok": …}` or
-`{"error": "…"}`):
+`{"error": "…"}`, with the error's code beside it as `"code"` when it has one):
 
 ```powershell
 & "$env:LOCALAPPDATA\SlopBar\slopbar-mcp.exe" --call get_machine_readiness ssh_host=newpc | Out-String
@@ -166,7 +166,7 @@ unless its output is captured, so without one each line returns at once and show
 | A sign-in page in **Sign in all your computers from here** shows "This site can't be reached" (ERR_UNSAFE_PORT) | That computer's CLI got a local port browsers refuse to open, which happens where Windows hands out ports from 1024 up. Current versions never open such a page and start the sign-in again for another port. For this or any page that can't finish, press **Retry this sign-in** in Settings → Accounts: only that sign-in starts again, in the same window. |
 | The other computer has no working rclone remote named … (or readiness lists `rclone_remote_missing`) | At its screen, click **Set up** in Settings → Data → Other computers, or have the agent run `setup_sharing` with its `ssh_host` and `confirm: true`: either way the Dropbox sign-in opens there. |
 | `setup_sharing` with `ssh_host` fails with `desktop_locked` or `desktop_not_shown` | Nobody can see the new computer's desktop: unlock it (or go back to it), then try again. |
-| `setup_sharing` with `ssh_host` and `open_here` fails with `tunnel_failed` | Port 53682 is in use on this computer (another rclone sign-in is waiting), or SSH could not connect. Close the other sign-in and try again. |
+| `setup_sharing` with `ssh_host` and `open_here` fails with `tunnel_failed` | Port 53682 is in use on this computer (another rclone sign-in is waiting), or SSH could not connect. Close the other sign-in and try again. With `tunnel_failed_joined` the call had joined a setup already running there, which goes on: try again the same way, or stop it with `cancel: true`. |
 | `setup_sharing` with `ssh_host` fails with `update_slopbar_there` | The other computer's SlopBar predates the guided setup: update it there. |
 | The other computer answered without a SlopBar result | Update SlopBar there; pairing needs the same version on both. |
 | Readiness lists `ssh_shell_windows_powershell` | That computer's SSH shell is Windows PowerShell: run the OpenSSH block above there, in an elevated PowerShell (it sets PowerShell 7, or removes the setting so OpenSSH uses cmd). |
