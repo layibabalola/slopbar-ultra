@@ -70,8 +70,8 @@ pub struct AccountUsage {
     /// `fetched_at`, which stay this computer's own readings.
     #[serde(default)]
     pub shared: Option<SharedReading>,
-    /// The other computer whose reading of this account is under `roster::COVERED_HOURS` old (and
-    /// seen to move forward that recently here), whether or not this computer reads it too: its
+    /// The other computer whose own sign-in for this account has not lapsed (`roster::Reading`) and
+    /// whose reading of it is under `roster::COVERED_HOURS` old, whether or not this computer reads it too: its
     /// monitoring sign-in covers this one's, so Health calls this one's ending a warning, not a
     /// problem, and the flyout does not count it among the sign-ins to reconnect.
     #[serde(default)]

@@ -204,7 +204,6 @@ function renderDetails(snap) {
         const cli = cliSignInText(a);
         const meta = [from, places.inUse || (a.alias ? a.email : ""), ...places.seen, a.leased ? t("leased", { purpose: a.leased }) : "", a.used_outside ? t("usedOutside") : "", a.org, stale]
           .filter(Boolean).join(" · ") || " ";
-        // This computer's own trail ends where its readings stopped: not beside another's numbers.
         return `
         <div class="acct ${a.active ? "active" : ""}" data-key="${provider}:${esc(a.id)}">
           <div class="acct-head">

@@ -37,6 +37,13 @@ test("no readings draw nothing, keep their place and say so", () => {
   }
 });
 
+test("a silent sparkline keeps only its place and says nothing", () => {
+  const html = sparkline([[now - HOUR, 40]], { now, silent: true });
+  assert.match(html, /aria-hidden="true"/);
+  assert.match(html, /width:56px;height:16px/);
+  for (const said of ["role=", "aria-label", "title", "<svg"]) assert.ok(!html.includes(said), said);
+});
+
 test("readings older than 7 days count as none", () => {
   const html = sparkline([[now - 8 * 24 * HOUR, 40]], { now });
   assert.match(html, /spark-empty/);
@@ -298,8 +305,8 @@ test("beside another computer's reading, this computer's trail is not described"
   assert.ok(accountTipLines(account, { now, trail }).flat().includes(sparklineText(trail)));
   assert.ok(!accountTipLines({ ...account, stale: true, shared }, { now, trail }).flat().includes(sparklineText(trail)));
   // A Codex window not started when it was read is not "reset since", whatever its age.
-  const unused = { kind: "session", window_seconds: 18000, used_percent: 0, resets_at: iso(now - 3 * HOUR + 18000 * 1000) };
-  const old = shownReading({ ...account, stale: true, shared: { ...shared, taken_at: iso(now - 3 * HOUR), windows: [unused] } }, now);
+  const unused = { kind: "session", window_seconds: 18000, used_percent: 0, resets_at: iso(now - 6 * HOUR + 18000 * 1000) };
+  const old = shownReading({ ...account, stale: true, shared: { ...shared, taken_at: iso(now - 6 * HOUR), windows: [unused] } }, now);
   assert.deepEqual(currentWindows(old, now), [unused]);
   assert.equal(resetSince(old, unused, now), false);
 });
