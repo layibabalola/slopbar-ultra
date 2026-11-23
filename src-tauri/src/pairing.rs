@@ -1660,6 +1660,26 @@ mod tests {
         }
     }
 
+    /// Every setting run_on_machine lets through is one the other computer's update_settings takes,
+    /// so it is applied there rather than refused as read-only (the sign-in window was).
+    #[test]
+    fn a_remote_setting_passes_here_and_applies_there() {
+        for key in REMOTE_SETTINGS {
+            assert!(crate::settings::PATCHABLE.contains(&key), "{key}");
+        }
+        let there = crate::settings::Settings::default();
+        for choice in ["private", "system", "profile"] {
+            let arguments = json!({ "patch": { "signin_window": choice } });
+            check_remote("update_settings", &arguments).unwrap();
+            let applied = crate::settings::patched(&there, &arguments["patch"], false).unwrap();
+            assert_eq!(serde_json::to_value(applied.signin_window).unwrap(), choice);
+        }
+        // Only the key is checked here; a value Settings does not list is refused there.
+        let odd = json!({ "patch": { "signin_window": "incognito" } });
+        check_remote("update_settings", &odd).unwrap();
+        assert!(crate::settings::patched(&there, &odd["patch"], false).is_err());
+    }
+
     #[test]
     fn paired_hosts_are_remembered_by_machine_id_and_never_options() {
         let dir = crate::test_support::TempDir::new();

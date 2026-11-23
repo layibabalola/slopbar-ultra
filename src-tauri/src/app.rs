@@ -682,6 +682,10 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             let held = state.settings_lock.lock().await;
             let current = app.state::<AppState>().settings.lock().unwrap().clone();
             let next = settings::patched(&current, &patch, updates_enabled())?;
+            // A run reads the sign-in window again at each sign-in (see `settings::while_signing_in`).
+            if state.bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished) {
+                settings::while_signing_in(&current, &next)?;
+            }
             let snapshot = app.state::<AppState>().snapshot.lock().unwrap().clone();
             for key in next.aliases.keys().filter(|k| !current.aliases.contains_key(*k)) {
                 if !snapshot.accounts.iter().any(|a| format!("{}:{}", a.provider.name(), a.id) == *key) {
@@ -4640,6 +4644,18 @@ mod sign_in_tests {
         assert!(matches!(plain, crate::door::Request::SignInAll { confirm: true, monitoring: true, retry: false, everywhere: false }));
         let retry: crate::door::Request = serde_json::from_value(serde_json::json!({ "op": "sign_in_all", "confirm": true, "retry": true })).unwrap();
         assert!(matches!(retry, crate::door::Request::SignInAll { retry: true, .. }));
+    }
+
+    /// An agent's update_settings (here, or run_on_machine's from another computer) never changes
+    /// the sign-in window under a run: the patch is checked against a run going before it is saved.
+    #[test]
+    fn an_agent_s_window_change_waits_for_a_run_to_end() {
+        use crate::source_guard::{find, function, has, tokens};
+        let code = tokens(include_str!("app.rs"));
+        let door = function(&code, "app.rs", "async fn door_call(", "app::sign_in_tests");
+        let arm = &door[find(door, "R::UpdateSettings { patch } =>").expect("update_settings' arm")..];
+        let arm = &arm[..find(arm, "store_settings(&app, held, next.clone())").expect("where the arm saves")];
+        assert!(has(arm, "if state.bulk_connect.lock().unwrap().as_ref().is_some_and(|b| !b.finished) { settings::while_signing_in(&current, &next)?; }"), "{arm}");
     }
 
     #[test]

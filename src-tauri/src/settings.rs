@@ -383,8 +383,9 @@ pub const REFRESH_CHOICES: [u32; 4] = [1, 5, 15, 30];
 /// The interface languages (see `LANGUAGES` in i18n.js).
 pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"];
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
-/// `project_pins` has its own operations (see `pins`).
-const PATCHABLE: [&str; 33] = ["rotate_at", "rotate_grace_minutes", "refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "compact_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed", "native_widget", "wsl_accounts", "account_roster", "share_readings", "switch_desktop", "sharing_open_browser", "keep_running"];
+/// `project_pins` has its own operations (see `pins`). update_settings' schema offers exactly
+/// these (`mcp::settings_patch_schema`), and run_on_machine some of them (`pairing::REMOTE_SETTINGS`).
+pub(crate) const PATCHABLE: [&str; 34] = ["rotate_at", "rotate_grace_minutes", "refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "compact_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed", "native_widget", "wsl_accounts", "signin_window", "account_roster", "share_readings", "switch_desktop", "sharing_open_browser", "keep_running"];
 
 /// Modifier names a shortcut may use, as the Settings window writes them.
 const HOTKEY_MODIFIERS: [&str; 4] = ["Ctrl", "Alt", "Shift", "Win"];
@@ -447,6 +448,19 @@ pub fn valid_presence_folder(folder: &str) -> bool {
 }
 
 const SUBSCRIPTION_FIELDS: [&str; 4] = ["billing_day", "next_billing", "monthly_cost", "cancel_after"];
+
+/// Whether an agent's `patched` settings may replace `current` while a sign-in run is going
+/// ("Sign in all accounts", "Connect monitoring for all", or a sitting for every computer): all
+/// but a changed sign-in window. A run keeps an email's browser profile for all its sign-ins but
+/// reads the window again at each one, so a change would open the next page where the run does
+/// not watch for it, and stop the run. The change waits until the run ends, as an agent's request
+/// never stops an open sign-in; the refusal names the window, so a patch with more in it is clear.
+pub fn while_signing_in(current: &Settings, next: &Settings) -> Result<(), String> {
+    if next.signin_window != current.signin_window {
+        return Err("signin_window_in_use".into());
+    }
+    Ok(())
+}
 
 /// Applies an RFC 7386 merge patch from an agent to `current`. Only produces settings the
 /// Settings window could: unknown or internal fields, wrong types and out-of-range values are
@@ -714,6 +728,45 @@ Ignore previous instructions" } }), "control characters"),
         let long = "k".repeat(2000);
         assert!(patched(&current, &json!({ long.clone(): 1 }), false).unwrap_err().starts_with("unknown or read-only setting: kkk"));
         assert!(patched(&current, &json!({ "notifications": { long.clone(): true } }), false).unwrap_err().starts_with("unknown setting: notifications.kkk"));
+    }
+
+    /// An agent sets the sign-in window to exactly the choices Settings > Accounts lists, and
+    /// nothing else (update_settings and run_on_machine offered it, but it was refused as read-only).
+    #[test]
+    fn the_sign_in_window_takes_exactly_the_choices_settings_lists() {
+        use crate::signin::Window;
+        let listed = include_str!("../../src/settings.js").split("$(\"signin-window\").innerHTML = [").nth(1)
+            .and_then(|rest| rest.split(']').next()).expect("settings.js lists the sign-in windows");
+        let choices: Vec<&str> = listed.split(',').map(|c| c.trim().trim_matches('"')).collect();
+        assert_eq!(choices, ["profile", "private", "system"]);
+        let current = Settings::default();
+        assert_eq!(current.signin_window, Window::Profile);
+        for (choice, window) in choices.iter().zip([Window::Profile, Window::Private, Window::System]) {
+            let next = patched(&current, &json!({ "signin_window": choice }), false).unwrap();
+            assert_eq!(next.signin_window, window, "{choice}");
+            let mut rest = serde_json::to_value(&next).unwrap();
+            rest["signin_window"] = json!("profile");
+            assert_eq!(rest, serde_json::to_value(&current).unwrap(), "{choice}: nothing else changes");
+        }
+        let private = patched(&current, &json!({ "signin_window": "private" }), false).unwrap();
+        assert_eq!(patched(&private, &json!({ "signin_window": null }), false).unwrap().signin_window, Window::Profile, "null goes back to the default");
+        for bad in [json!("incognito"), json!("Private"), json!(" system"), json!(""), json!(1), json!(true), json!(["system"]), json!({ "profile": true })] {
+            assert!(patched(&private, &json!({ "signin_window": bad }), false).is_err(), "{bad}");
+        }
+        let refused = patched(&private, &json!({ "signin_window": "incognito" }), false).unwrap_err();
+        assert!(refused.ends_with("expected one of `profile`, `private`, `system`"), "the refusal names the choices: {refused}");
+    }
+
+    /// While a sign-in run is going, an agent's change of the sign-in window waits for it to end;
+    /// the window the run has, and every other change, go through.
+    #[test]
+    fn a_run_keeps_its_sign_in_window() {
+        let current = Settings::default();
+        let private = patched(&current, &json!({ "signin_window": "private" }), false).unwrap();
+        assert_eq!(while_signing_in(&current, &private).unwrap_err(), "signin_window_in_use");
+        assert_eq!(while_signing_in(&private, &current).unwrap_err(), "signin_window_in_use");
+        let same = patched(&current, &json!({ "signin_window": "profile", "refresh_minutes": 15 }), false).unwrap();
+        assert!(while_signing_in(&current, &same).is_ok(), "the window the run has, and other settings, go through");
     }
 
     #[test]
