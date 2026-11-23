@@ -339,7 +339,7 @@ const MESSAGES = {
     signin_profile_storage: "The sign-in browser profile could not be created.",
   },
   pt: {
-    signInRetryOpen: "Tentar este login de novo", signInRetryOpenHint: "Abre uma nova página para este login na mesma janela, e a execução continua. Para uma página que não consegue terminar, como \"Não é possível acessar esse site\".", signinPageRecover: "Uma página não consegue terminar, como \"Não é possível acessar esse site\"? Em Configurações > Contas do SlopBar, escolha Tentar este login de novo: a nova página abre aqui, na aba mais recente.", signin_port_refused: "Cada página deste login indicou uma porta que os navegadores bloqueiam, então nenhuma pôde terminar. Tentar de novo o reinicia.", leftPortRefused: "os navegadores bloqueiam a porta que o login recebeu",
+    signInRetryOpen: "Tentar este login de novo", signInRetryOpenHint: "Abre uma nova página para este login na mesma janela, e a execução continua. Para uma página que não consegue terminar, como \"Não é possível acessar esse site\".", signinPageRecover: "Uma página que não consegue terminar, como \"Não é possível acessar esse site\"? No SlopBar, em Configurações > Contas, escolha Tentar este login de novo: a nova página abre aqui, na aba mais recente.", signin_port_refused: "Cada página deste login indicou uma porta que os navegadores bloqueiam, então nenhuma pôde terminar. Tentar de novo o reinicia.", leftPortRefused: "os navegadores bloqueiam a porta que o login recebeu",
     peerSigningIn: "Entrando em {machine}",
     signInWhereMachine: "no navegador de {machine}",
     peerSignInStarting: "Iniciando o primeiro login…",
@@ -550,7 +550,7 @@ const MESSAGES = {
     signin_profile_storage: "Não foi possível criar o perfil do navegador para o login.",
   },
   es: {
-    signInRetryOpen: "Reintentar este inicio de sesión", signInRetryOpenHint: "Abre una página nueva para este inicio de sesión en la misma ventana, y la ejecución continúa. Para una página que no puede terminar, como \"No se puede acceder a este sitio\".", signinPageRecover: "¿Una página no puede terminar, como \"No se puede acceder a este sitio\"? En Configuración > Cuentas de SlopBar, elige Reintentar este inicio de sesión: la página nueva se abre aquí, en la pestaña más reciente.", signin_port_refused: "Cada página de este inicio de sesión indicó un puerto que los navegadores bloquean, así que ninguna pudo terminar. Reintentar lo vuelve a empezar.", leftPortRefused: "los navegadores bloquean el puerto que recibió su inicio de sesión",
+    signInRetryOpen: "Reintentar este inicio de sesión", signInRetryOpenHint: "Abre una página nueva para este inicio de sesión en la misma ventana, y la ejecución continúa. Para una página que no puede terminar, como \"No se puede acceder a este sitio\".", signinPageRecover: "¿Una página que no puede terminar, como \"No se puede acceder a este sitio\"? En SlopBar, en Configuración > Cuentas, elige Reintentar este inicio de sesión: la página nueva se abre aquí, en la pestaña más reciente.", signin_port_refused: "Cada página de este inicio de sesión indicó un puerto que los navegadores bloquean, así que ninguna pudo terminar. Reintentar lo vuelve a empezar.", leftPortRefused: "los navegadores bloquean el puerto que recibió su inicio de sesión",
     peerSigningIn: "Iniciando sesión en {machine}",
     signInWhereMachine: "en el navegador de {machine}",
     peerSignInStarting: "Empezando el primer inicio de sesión…",
@@ -764,7 +764,7 @@ const MESSAGES = {
     signin_profile_storage: "No se pudo crear el perfil del navegador para el inicio de sesión.",
   },
   fr: {
-    signInRetryOpen: "Réessayer cette connexion", signInRetryOpenHint: "Ouvre une nouvelle page pour cette connexion dans la même fenêtre, et l’exécution continue. Pour une page qui ne peut pas aboutir, comme « Ce site est inaccessible ».", signinPageRecover: "Une page ne peut pas aboutir, comme « Ce site est inaccessible » ? Dans Paramètres > Comptes de SlopBar, choisissez Réessayer cette connexion : la nouvelle page s’ouvre ici, dans le dernier onglet.", signin_port_refused: "Chaque page de cette connexion indiquait un port que les navigateurs bloquent, donc aucune n’a pu aboutir. Réessayer la relance.", leftPortRefused: "les navigateurs bloquent le port obtenu par sa connexion",
+    signInRetryOpen: "Réessayer cette connexion", signInRetryOpenHint: "Ouvre une nouvelle page pour cette connexion dans la même fenêtre, et l’exécution continue. Pour une page qui ne peut pas aboutir, comme « Ce site est inaccessible ».", signinPageRecover: "Une page qui ne peut pas aboutir, comme « Ce site est inaccessible » ? Dans SlopBar, ouvrez Paramètres > Comptes et choisissez Réessayer cette connexion : la nouvelle page s’ouvre ici, dans le dernier onglet.", signin_port_refused: "Chaque page de cette connexion indiquait un port que les navigateurs bloquent, donc aucune n’a pu aboutir. Réessayer la relance.", leftPortRefused: "les navigateurs bloquent le port obtenu par sa connexion",
     peerSigningIn: "Connexion sur {machine}",
     signInWhereMachine: "dans le navigateur de {machine}",
     peerSignInStarting: "Lancement de la première connexion…",
@@ -975,7 +975,7 @@ const MESSAGES = {
     signin_profile_storage: "Le profil de navigateur pour la connexion n’a pas pu être créé.",
   },
   de: {
-    signInRetryOpen: "Diese Anmeldung wiederholen", signInRetryOpenHint: "Öffnet im selben Fenster eine neue Seite für diese Anmeldung, und der Durchlauf geht weiter. Für eine Seite, die nicht fertig werden kann, etwa „Die Website ist nicht erreichbar“.", signinPageRecover: "Eine Seite wird nicht fertig, etwa „Die Website ist nicht erreichbar“? Wähle in SlopBar unter Einstellungen > Konten „Diese Anmeldung wiederholen“: Die neue Seite öffnet sich hier im neuesten Tab.", signin_port_refused: "Jede Seite dieser Anmeldung nannte einen Port, den Browser sperren, daher konnte keine fertig werden. Wiederholen startet sie neu.", leftPortRefused: "Browser sperren den Port, den die Anmeldung bekam",
+    signInRetryOpen: "Diese Anmeldung wiederholen", signInRetryOpenHint: "Öffnet im selben Fenster eine neue Seite für diese Anmeldung, und der Durchlauf geht weiter. Für eine Seite, die nicht fertig werden kann, etwa „Die Website ist nicht erreichbar“.", signinPageRecover: "Eine Seite, die nicht fertig wird, etwa „Die Website ist nicht erreichbar“? Wähle in SlopBar unter Einstellungen > Konten „Diese Anmeldung wiederholen“: Die neue Seite öffnet sich hier im neuesten Tab.", signin_port_refused: "Jede Seite dieser Anmeldung nannte einen Port, den Browser sperren, daher konnte keine fertig werden. Wiederholen startet sie neu.", leftPortRefused: "Browser sperren den Port, den die Anmeldung bekam",
     peerSigningIn: "Anmeldung auf {machine}",
     signInWhereMachine: "im Browser auf {machine}",
     peerSignInStarting: "Die erste Anmeldung startet…",
@@ -1187,7 +1187,7 @@ const MESSAGES = {
     signin_profile_storage: "Das Browserprofil für die Anmeldung konnte nicht erstellt werden.",
   },
   it: {
-    signInRetryOpen: "Riprova questo accesso", signInRetryOpenHint: "Apre una nuova pagina per questo accesso nella stessa finestra, e l’esecuzione continua. Per una pagina che non riesce a finire, come \"Impossibile raggiungere il sito\".", signinPageRecover: "Una pagina non riesce a finire, come \"Impossibile raggiungere il sito\"? In Impostazioni > Account di SlopBar, scegli Riprova questo accesso: la nuova pagina si apre qui, nella scheda più recente.", signin_port_refused: "Ogni pagina di questo accesso indicava una porta che i browser bloccano, quindi nessuna ha potuto finire. Riprova lo riavvia.", leftPortRefused: "i browser bloccano la porta ricevuta dal suo accesso",
+    signInRetryOpen: "Riprova questo accesso", signInRetryOpenHint: "Apre una nuova pagina per questo accesso nella stessa finestra, e l’esecuzione continua. Per una pagina che non riesce a finire, come \"Impossibile raggiungere il sito\".", signinPageRecover: "Una pagina che non riesce a finire, come \"Impossibile raggiungere il sito\"? In SlopBar, apri Impostazioni > Account e scegli Riprova questo accesso: la nuova pagina si apre qui, nella scheda più recente.", signin_port_refused: "Ogni pagina di questo accesso indicava una porta che i browser bloccano, quindi nessuna ha potuto finire. Riprova riavvia questo accesso.", leftPortRefused: "i browser bloccano la porta ricevuta dal suo accesso",
     peerSigningIn: "Accesso su {machine}",
     signInWhereMachine: "nel browser di {machine}",
     peerSignInStarting: "Avvio del primo accesso…",
@@ -1814,7 +1814,7 @@ const MESSAGES = {
     signin_profile_storage: "无法创建用于登录的浏览器配置文件。",
   },
   ko: {
-    signInRetryOpen: "이 로그인 다시 시도", signInRetryOpenHint: "같은 창에서 이 로그인의 새 페이지를 열고, 실행은 계속됩니다. \"사이트에 연결할 수 없음\"처럼 끝낼 수 없는 페이지에 사용하세요.", signinPageRecover: "\"사이트에 연결할 수 없음\"처럼 페이지를 끝낼 수 없나요? SlopBar의 설정 > 계정에서 \"이 로그인 다시 시도\"를 선택하세요. 새 페이지가 여기 가장 최근 탭에서 열립니다.", signin_port_refused: "이 로그인의 모든 페이지가 브라우저가 차단하는 포트를 지정해서 끝낼 수 없었습니다. 다시 시도하면 다시 시작합니다.", leftPortRefused: "로그인에 할당된 포트를 브라우저가 차단합니다",
+    signInRetryOpen: "이 로그인 다시 시도", signInRetryOpenHint: "같은 창에서 이 로그인의 새 페이지를 열고, 실행은 계속됩니다. \"사이트에 연결할 수 없음\"처럼 끝낼 수 없는 페이지에 사용하세요.", signinPageRecover: "\"사이트에 연결할 수 없음\"처럼 페이지를 끝낼 수 없나요? SlopBar의 설정 > 계정에서 \"이 로그인 다시 시도\"를 선택하세요. 새 페이지가 여기 가장 최근 탭에서 열립니다.", signin_port_refused: "이 로그인의 모든 페이지가 브라우저가 차단하는 포트를 지정해서 끝낼 수 없었습니다. 다시 시도하면 다시 시작합니다.", leftPortRefused: "로그인에 할당된 포트를 브라우저가 차단함",
     peerSigningIn: "{machine}에서 로그인 중",
     signInWhereMachine: "{machine}의 브라우저에서",
     peerSignInStarting: "첫 로그인을 시작하는 중…",
@@ -2021,7 +2021,7 @@ const MESSAGES = {
     signin_profile_storage: "로그인용 브라우저 프로필을 만들 수 없습니다.",
   },
   ru: {
-    signInRetryOpen: "Повторить этот вход", signInRetryOpenHint: "Открывает новую страницу для этого входа в том же окне, и запуск продолжается. Для страницы, которая не может завершиться, например «Не удается получить доступ к сайту».", signinPageRecover: "Страница не может завершиться, например «Не удается получить доступ к сайту»? В SlopBar откройте Настройки > Аккаунты и выберите «Повторить этот вход»: новая страница откроется здесь, в самой новой вкладке.", signin_port_refused: "Каждая страница этого входа указывала порт, который браузеры блокируют, поэтому ни одна не смогла завершиться. «Повторить» начнёт вход заново.", leftPortRefused: "браузеры блокируют порт, который получил вход",
+    signInRetryOpen: "Повторить этот вход", signInRetryOpenHint: "Открывает новую страницу для этого входа в том же окне, и запуск продолжается. Для страницы, которая не может завершиться, например «Не удается получить доступ к сайту».", signinPageRecover: "Страница, которая не может завершиться, например «Не удается получить доступ к сайту»? В SlopBar откройте Настройки > Аккаунты и выберите «Повторить этот вход»: новая страница откроется здесь, в самой новой вкладке.", signin_port_refused: "Каждая страница этого входа указывала порт, который браузеры блокируют, поэтому ни одна не смогла завершиться. «Повторить» начнёт вход заново.", leftPortRefused: "браузеры блокируют порт, выданный для входа",
     peerSigningIn: "Вход на {machine}",
     signInWhereMachine: "в браузере на {machine}",
     peerSignInStarting: "Запускается первый вход…",

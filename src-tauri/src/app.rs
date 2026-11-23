@@ -216,6 +216,12 @@ impl StepRestart {
         *self.asked.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.last.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
+
+    /// The sign-in asked for again has started again: a second ask counts as the same one for
+    /// [`RESTART_SETTLE`] from now, however long its start took.
+    fn started(&self) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
 }
 
 /// One sign-in of a run.
@@ -1936,6 +1942,9 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                     let mut opening = true;
                     loop {
                         tokio::select! {
+                            // In this order: a sign-in that finished, or Stop, wins over anything
+                            // that came at the same moment (a Retry never undoes a finished one).
+                            biased;
                             outcome = &mut run => break outcome,
                             _ = stop.notified() => break Err("signin_stopped".into()),
                             // Closing the window once the provider's page says "done" is fine: the
@@ -1985,6 +1994,7 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                                 if let Some(s) = session.as_deref() {
                                     s.rearm();
                                 }
+                                restart.started();
                             }
                         }
                     }
@@ -2392,6 +2402,8 @@ async fn relayed_turn(h: &AppHandle, step: &bulk::Step, machine: &bulk::Machine,
             }
         };
         tokio::select! {
+            // In this order, as for a sign-in here: a finished one, or Stop, wins.
+            biased;
             outcome = &mut run => break outcome,
             _ = stop.notified() => break Err("signin_stopped".into()),
             // As for a sign-in here: the provider's "done" page closed while the other computer saves.
@@ -2406,14 +2418,16 @@ async fn relayed_turn(h: &AppHandle, step: &bulk::Step, machine: &bulk::Machine,
                     continue;
                 }
                 // Asked for again: the one there stops, and a new one starts whose page opens here,
-                // in the same window.
+                // in the same window. A page the old one opened just now is not shown open.
                 relayed.restart();
+                shown = pages.load(std::sync::atomic::Ordering::SeqCst);
                 on_page(false);
                 watch = Box::pin(watch_step(h, None, std::time::SystemTime::now(), true, turn));
                 publish_bulk(h, |b| b.still_waiting = false);
                 if let Some(s) = session {
                     s.rearm();
                 }
+                turn.restart.started();
             }
         }
     };
@@ -2480,8 +2494,11 @@ fn still_waiting_choice(app: &AppHandle, vars: &[(&str, &str)], run: &Arc<StepRe
     let buttons = vec![(crate::i18n::t(&lang, "signInRetry", &[]), "retry"), (crate::i18n::t(&lang, "signInAllStop", &[]), "stop")];
     let (h, run) = (app.clone(), run.clone());
     let _ = notify::notify_choice(app.clone(), title, body, buttons, move |action| match action {
+        // One left from a sign-in that has ended opens Settings, where the run's state is.
         Some("retry") => {
-            restart_open_sign_in(&h, at, Some(&run));
+            if !restart_open_sign_in(&h, at, Some(&run)) {
+                show_settings_page(&h, Some("accounts".into()));
+            }
         }
         Some("stop") => stop_running_sign_ins(&h.state::<AppState>()),
         _ => show_settings_page(&h, Some("accounts".into())),

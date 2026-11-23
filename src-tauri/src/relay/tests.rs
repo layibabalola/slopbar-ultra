@@ -335,12 +335,15 @@ struct FakeDesk {
     /// "Retry this sign-in" pressed here during the state call of this number (1 for the first), as
     /// `Relayed::restart` does it: asked, and the tunnel closed.
     restart_on_state: Mutex<Option<(usize, Arc<Shared>)>>,
+    /// The same, pressed while the first tunnel opens.
+    restart_on_tunnel: Mutex<Option<Arc<Shared>>>,
 }
 
 impl FakeDesk {
     fn new(answers: Vec<Result<serde_json::Value, String>>) -> Self {
         FakeDesk { answers: Mutex::new(answers.into()), calls: Mutex::default(), tunnels: Mutex::default(), tunnel_fails: Mutex::default(),
-            lives: Arc::default(), opened: Mutex::default(), cancel_on_start: Mutex::default(), restart_on_state: Mutex::default() }
+            lives: Arc::default(), opened: Mutex::default(), cancel_on_start: Mutex::default(), restart_on_state: Mutex::default(),
+            restart_on_tunnel: Mutex::default() }
     }
 
     fn ops(&self) -> Vec<String> {
@@ -386,6 +389,9 @@ impl Desk for FakeDesk {
     fn tunnel(&self, _host: &str, page: &Page) -> Result<Box<dyn Hold>, Unheld> {
         if let Some(e) = self.tunnel_fails.lock().unwrap().pop_front() {
             return Err(e);
+        }
+        if let Some(shared) = self.restart_on_tunnel.lock().unwrap().take() {
+            shared.restart.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         self.tunnels.lock().unwrap().push(page.port);
         Ok(Box::new(FakeTunnel(self.lives.clone())))
@@ -542,6 +548,14 @@ fn retry_starts_the_relayed_sign_in_again_with_a_new_page() {
     // A first start that finds it busy is not waited for: another sitting or sign-in holds it.
     let desk = FakeDesk::new(vec![Err("signin_busy".into()), state("page", Some(CLAUDE), 2)]);
     assert_eq!(run(&desk, Provider::Claude, &Shared::default()).0, Err("signin_busy".to_string()));
+    // Pressed while the old page's tunnel opened: that page never opens, the new one does.
+    let shared = Arc::new(Shared::default());
+    let desk = FakeDesk::new(vec![state("page", Some(CLAUDE), 2), state("page", Some(&CLAUDE.replace("7925", "7926")), 2), state("done", None, 3)]);
+    *desk.restart_on_tunnel.lock().unwrap() = Some(shared.clone());
+    assert_eq!(run(&desk, Provider::Claude, &shared), (Ok(true), 1));
+    assert_eq!(desk.tunnels.lock().unwrap().clone(), [7925, 7926]);
+    assert_eq!(desk.opened.lock().unwrap().clone(), [CLAUDE.replace("7925", "7926")], "only the new page opened");
+    assert_eq!(desk.ops(), ["relay_start", "relay_stop", "relay_start", "relay_state"]);
 }
 
 #[test]

@@ -756,15 +756,17 @@ pub fn launch_from_env(args: &[OsString]) -> Option<i32> {
     // the sign-in starts its CLI again for another port. (A relayed page goes to the computer
     // completing it as ever: that computer starts the whole sign-in again there.)
     let here = !matches!(target, Target::Relay(_));
-    if here && allowed_url(url) && callback_port(url).is_some_and(browser_refuses)
-        && refuse_page(std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).as_deref()) {
-        // The email's window counts its wait for a page from now (see `Session::page_refused_since`).
+    if here && allowed_url(url) && callback_port(url).is_some_and(browser_refuses) {
+        // The email's window counts its wait for a page from now (see `Session::page_refused_since`):
+        // said first, since the sign-in ends this process as soon as it sees the mark below.
         if let Target::Profile(dir) = &target {
             if session_folder(dir) {
                 let _ = std::fs::write(dir.join(REFUSED), millis(std::time::SystemTime::now()).to_string());
             }
         }
-        return Some(1);
+        if refuse_page(std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).as_deref()) {
+            return Some(1);
+        }
     }
     if let Target::Relay(nonce) = target {
         // The app checks the page against the sign-in it started (`relay::Slot::deposit`).
