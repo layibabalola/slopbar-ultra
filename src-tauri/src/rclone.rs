@@ -227,8 +227,7 @@ impl Batching {
         *self = self.at(now);
         if read.timed_out {
             // Halved from what the read asked for, even when the hour ran out meanwhile.
-            let asked = if read.most > 0 { read.most } else { self.most };
-            self.most = (asked / 2).max(1);
+            self.most = (read.most / 2).max(1);
             self.changed = Some(now);
         }
         if read.gave || read.timed_out {
@@ -1686,8 +1685,10 @@ mod tests {
         let t0 = Instant::now();
         let minutes = |m: u64| t0 + Duration::from_secs(60 * m);
         let mut b = Batching::default();
-        let (gave, refused, timed_out) = (Batched { gave: true, ..Default::default() }, Batched { refused: true, ..Default::default() }, Batched { timed_out: true, ..Default::default() });
-        b.after(timed_out, t0);
+        let (gave, refused) = (Batched { gave: true, ..Default::default() }, Batched { refused: true, ..Default::default() });
+        // A read that ran out of time, asking for `most` at once.
+        let timed_out = |most: usize| Batched { most, timed_out: true, ..Default::default() };
+        b.after(timed_out(BATCH_MOST), t0);
         assert_eq!((b.at(t0).most, b.at(minutes(59)).most, b.at(minutes(60)).most), (8, 8, BATCH_MOST), "halved, for an hour");
         b.after(refused, minutes(5));
         b.after(gave, minutes(10));
@@ -1699,7 +1700,7 @@ mod tests {
         assert_eq!((b.at(minutes(79)).most, b.at(minutes(80))), (1, Batching::default()));
         let mut b = Batching::default();
         for m in 0..6 {
-            b.after(timed_out, minutes(m));
+            b.after(timed_out(b.at(minutes(m)).most), minutes(m));
         }
         assert_eq!(b.at(minutes(6)).most, 1, "halved down to one at a time");
         b.after(Batched { gave: true, refused: true, ..Default::default() }, minutes(7));
@@ -1710,7 +1711,7 @@ mod tests {
         b.after(refused, t0);
         b.after(refused, minutes(61));
         assert_eq!((b.at(minutes(61)).most, b.refusals), (BATCH_MOST, 1));
-        b.after(timed_out, minutes(62));
+        b.after(timed_out(BATCH_MOST), minutes(62));
         b.after(refused, minutes(63));
         assert_eq!((b.at(minutes(63)).most, b.refusals), (8, 1));
         // A read that ran out of time is halved from what it asked for, though the hour ran out
