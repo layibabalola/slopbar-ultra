@@ -193,6 +193,16 @@ pub struct Run {
     /// Retry from another computer never restarts it.
     #[serde(default)]
     pub everywhere: bool,
+    /// When the run started there, which names it: Retry on its card starts only that run's open
+    /// sign-in again there (`restart_sign_in`). None from a SlopBar that cannot do that, whose
+    /// Retry runs its sign-ins again instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// The open sign-in's place in the run's steps, as that machine counts them (a reader may drop
+    /// steps it cannot read): what Retry on its card names. None between sign-ins, and from a
+    /// SlopBar that does not write it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1172,7 +1182,7 @@ mod tests {
     }
 
     fn run(revision: u64, finished: bool, state: &str) -> Run {
-        Run { revision, at: now(), total: 2, done: 0, emails: 1, email: 1, finished, still_waiting: false, monitoring: true, everywhere: false,
+        Run { revision, at: now(), total: 2, done: 0, emails: 1, email: 1, finished, still_waiting: false, monitoring: true, everywhere: false, started_at: None, open: None,
             error: finished.then(|| "signin_stopped".into()),
             steps: vec![
                 RunStep { provider: Provider::Claude, account: Some("cl-one@example.invalid".into()), kind: "add".into(), state: state.into(), error: None },
@@ -1326,6 +1336,27 @@ mod tests {
         plain.as_object_mut().unwrap().remove("run");
         let bytes = crate::backup::seal_bytes(FORMAT, &serde_json::to_vec(&plain).unwrap(), &key).unwrap();
         assert!(open(&bytes, &pass("synthetic roster passphrase"), &mut HashMap::new()).unwrap().run.is_none());
+    }
+
+    /// The run's start, which names it for a card's Retry, reaches the other computers exactly; a
+    /// run from a SlopBar that does not write it opens without it, and none is written as nothing.
+    #[test]
+    fn a_run_carries_its_start_to_the_other_computers() {
+        let key = SealKey::new(&pass("synthetic roster passphrase")).unwrap();
+        let reopen = |roster: &Roster| open(&seal(roster, &key).unwrap(), &pass("synthetic roster passphrase"), &mut HashMap::new()).unwrap();
+        let started: DateTime<Utc> = "2026-11-23T09:59:58.123456789Z".parse().unwrap();
+        let mut roster = own(MACHINE_A, "A", &[], now());
+        // Its open sign-in's place as that computer counts it, past any step a reader drops.
+        let mut known = run(3, false, "running");
+        known.steps.insert(0, RunStep { provider: Provider::Claude, account: None, kind: "a_kind_from_a_newer_version".into(), state: "done".into(), error: None });
+        roster.run = Some(Run { started_at: Some(started), open: Some(1), ..known });
+        let back = reopen(&roster).run.unwrap();
+        assert_eq!((back.started_at, back.open, back.steps.iter().position(|s| s.state == "running")), (Some(started), Some(1), Some(0)));
+        roster.run = Some(run(3, false, "running"));
+        let written = serde_json::to_value(&roster).unwrap();
+        assert!(written["run"].get("started_at").is_none() && written["run"].get("open").is_none(), "an older reader sees the run it knows");
+        let back = reopen(&roster).run.unwrap();
+        assert_eq!((back.started_at, back.open), (None, None));
     }
 
     /// An account as a refresh leaves it: read at `at` (minutes from `now()`) with its weekly

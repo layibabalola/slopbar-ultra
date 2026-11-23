@@ -147,6 +147,10 @@ pub(crate) const SWITCHER_LABEL: &str = "switcher";
 /// `bulk-monitoring`.
 #[derive(Clone, Serialize)]
 struct BulkConnect {
+    /// When the run started, to the millisecond, which names it: a Retry from another computer, or
+    /// an agent's `restart_sign_in`, acts only on the run it names (see `restartable`). Not a step's
+    /// own `started_at`.
+    run_started_at: chrono::DateTime<chrono::Utc>,
     total: usize,
     done: usize,
     /// The account whose sign-in is open now: sign in as this one.
@@ -864,6 +868,14 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             Ok(serde_json::json!({ "started": !plan.is_empty(), "plan": plan,
                 "next": "Each sign-in opens after the previous one finishes. get_usage shows the accounts, monitor_connected, and no monitor_renewal or cli_renewal, as they complete." }))
         }
+        R::RestartSignIn { step, run_started_at } => {
+            // Its new page opens on this desktop, as every sign-in started through the door.
+            desktop_shown()?;
+            Ok(match restart_from_elsewhere(&app, step, run_started_at) {
+                Ok(()) => serde_json::json!({ "restarted": true, "step": step, "next": RESTARTED_NEXT }),
+                Err(why) => serde_json::json!({ "restarted": false, "reason": why, "next": not_restarted_next(why) }),
+            })
+        }
         R::RelayPlan { monitoring, from } => Ok(relay_plan(&app, monitoring, &from).await),
         R::RelayStart { step, from, machine, kind, provider, id, email } => relay_start(&app, step, from, machine, kind, provider, id, email).await,
         R::RelayState { step, since, wait_seconds } => {
@@ -1476,6 +1488,8 @@ fn publish_bulk(app: &AppHandle, change: impl FnOnce(&mut BulkConnect)) {
 fn roster_run(b: &BulkConnect, at: chrono::DateTime<chrono::Utc>) -> roster::Run {
     let word = |v: serde_json::Value| v.as_str().unwrap_or_default().to_string();
     roster::Run {
+        started_at: Some(b.run_started_at),
+        open: b.steps.iter().position(|s| s.state == StepState::Running),
         revision: b.revision, at, total: b.total, done: b.done, emails: b.emails, email: b.email, finished: b.finished,
         still_waiting: b.still_waiting, monitoring: b.monitoring, error: b.error.clone(), everywhere: b.everywhere,
         steps: b.steps.iter().map(|s| roster::RunStep {
@@ -1684,7 +1698,7 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
             .map(|s| StepRecord { target: s.target.clone(), kind: s.kind, machine: s.machine.as_ref().map(|m| m.name.clone()), state: StepState::Pending,
                 error: None, started_at: None, page_at: None, ended_at: None }).collect();
         let (left_out, in_use) = gathered.clone().map(|g| (g.left_out, g.in_use)).unwrap_or_default();
-        *running = Some(BulkConnect { total, done: 0, current: None, kind: None, emails: if by_email { groups.len() } else { 0 }, email: 0,
+        *running = Some(BulkConnect { run_started_at: chrono::SubsecRound::trunc_subsecs(chrono::Utc::now(), 3), total, done: 0, current: None, kind: None, emails: if by_email { groups.len() } else { 0 }, email: 0,
             finished: total == 0, error: None, steps, by_email, monitoring, still_waiting: false, revision: 0,
             everywhere: gathered.is_some(), left_out, in_use });
         *state.bulk_stop.lock().unwrap() = Some(stop.clone());
@@ -1709,6 +1723,10 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                 }
                 step.state = state;
                 step.error = error;
+            }
+            // A sign-in that ended waits on nobody, even before the next one starts.
+            if state != StepState::Running {
+                b.still_waiting = false;
             }
         });
         // Accounts this run signed in: one only just added has its monitoring sign-in next, though
@@ -1964,9 +1982,12 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                             _ = stop.notified() => break Err("signin_stopped".into()),
                             // Closing the window once the provider's page says "done" is fine: the
                             // sign-in may still be saving (Codex's CLI can take a while), so it gets up to
-                            // two minutes to finish before the queue stops.
-                            _ = &mut closed => break tokio::time::timeout(SIGN_IN_GRACE, &mut run).await
-                                .unwrap_or_else(|_| Err("signin_window_closed".into())),
+                            // two minutes to finish before the queue stops. It waits on nobody then, so a
+                            // Retry from elsewhere hears it is not waiting (see `restartable`).
+                            _ = &mut closed => {
+                                publish_bulk(&h, |b| b.still_waiting = false);
+                                break tokio::time::timeout(SIGN_IN_GRACE, &mut run).await.unwrap_or_else(|_| Err("signin_window_closed".into()));
+                            }
                             e = &mut watch => break Err(e),
                             _ = &mut opened, if opening => {
                                 opening = false;
@@ -2422,7 +2443,10 @@ async fn relayed_turn(h: &AppHandle, step: &bulk::Step, machine: &bulk::Machine,
             outcome = &mut run => break outcome,
             _ = stop.notified() => break Err("signin_stopped".into()),
             // As for a sign-in here: the provider's "done" page closed while the other computer saves.
-            _ = &mut closed => break tokio::time::timeout(SIGN_IN_GRACE, &mut run).await.unwrap_or_else(|_| Err("signin_window_closed".into())),
+            _ = &mut closed => {
+                publish_bulk(h, |b| b.still_waiting = false);
+                break tokio::time::timeout(SIGN_IN_GRACE, &mut run).await.unwrap_or_else(|_| Err("signin_window_closed".into()));
+            }
             e = &mut watch => break Err(e),
             _ = opened => {
                 shown = pages.load(std::sync::atomic::Ordering::SeqCst);
@@ -2543,6 +2567,80 @@ fn restart_open_sign_in(app: &AppHandle, at: usize, run: Option<&Arc<StepRestart
 #[tauri::command]
 fn restart_sign_in(app: AppHandle, at: usize) -> bool {
     restart_open_sign_in(&app, at, None)
+}
+
+/// Why a sign-in asked for again from elsewhere did not start again (see `restartable`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NotRestarted {
+    /// No run goes here: it ended, or none ran since SlopBar started.
+    NoRun,
+    /// The run signs in every computer from this screen (see `relay`): its open sign-in may be
+    /// another computer's, which a request from elsewhere must never reach on to, so only the
+    /// person here starts it again (Settings' "Retry this sign-in").
+    Everywhere,
+    /// Another run goes here now.
+    OtherRun,
+    /// That sign-in is not the open one: it ended, or has not started.
+    NotOpen,
+    /// It has not waited long: the person here may still be completing it.
+    NotWaiting,
+}
+
+/// Whether sign-in `step` of the run that started at `run_started_at` may start again from elsewhere
+/// (the door's `restart_sign_in`: another computer's Retry on its card, or an agent): that run goes
+/// on, is not a sitting for every computer, `step` is its open sign-in, and it has waited long enough
+/// that the person here was asked whether to retry it (`still_waiting`), so it is never cut off in
+/// its first 5 minutes from another computer. Settings' own "Retry this sign-in" and the
+/// notification's Retry, at this screen, need no wait.
+fn restartable(run: Option<&BulkConnect>, step: usize, run_started_at: chrono::DateTime<chrono::Utc>) -> Result<(), NotRestarted> {
+    let run = run.filter(|b| !b.finished).ok_or(NotRestarted::NoRun)?;
+    if run.everywhere {
+        return Err(NotRestarted::Everywhere);
+    }
+    if run.run_started_at != run_started_at {
+        return Err(NotRestarted::OtherRun);
+    }
+    if run.steps.iter().position(|s| s.state == StepState::Running) != Some(step) {
+        return Err(NotRestarted::NotOpen);
+    }
+    if !run.still_waiting {
+        return Err(NotRestarted::NotWaiting);
+    }
+    Ok(())
+}
+
+/// The door's `restart_sign_in`: asks the run named by `run_started_at` to start its open sign-in
+/// `step` again in the same window (see `StepRestart`) when `restartable` says it may. The run and its
+/// restart are read under one hold of `bulk_connect`, which a new run takes to set both, so the ask
+/// reaches the run that was judged; a run that moves on meanwhile takes no ask for another sign-in.
+fn restart_from_elsewhere(app: &AppHandle, step: usize, run_started_at: chrono::DateTime<chrono::Utc>) -> Result<(), NotRestarted> {
+    let state = app.state::<AppState>();
+    let running = state.bulk_connect.lock().unwrap();
+    restartable(running.as_ref(), step, run_started_at)?;
+    let restart = state.bulk_restart.lock().unwrap().clone().ok_or(NotRestarted::NoRun)?;
+    restart.ask(step);
+    Ok(())
+}
+
+/// What `restart_sign_in` tells the agent next. Each fits `mcp::MAX_TEXT`, so it reaches the agent whole.
+const RESTARTED_NEXT: &str = "That sign-in starts again in the same window: its old page closes, a new one opens and the run \
+    goes on. The person at this screen completes it, never you. Follow it with get_machine_readiness (wait_seconds and since); \
+    starting it again once more needs another 5 minutes of waiting.";
+fn not_restarted_next(why: NotRestarted) -> &'static str {
+    match why {
+        NotRestarted::NoRun => "Nothing was restarted: no sign-in run goes on here (it ended, or none ran since the app started). \
+            This tool never starts one; call sign_in_all only when the user asks for it.",
+        NotRestarted::Everywhere => "Nothing was restarted: this run signs in every computer from this screen, so only the person \
+            here starts one of its sign-ins again, with Retry this sign-in in Settings > Accounts.",
+        NotRestarted::OtherRun => "Nothing was restarted: another run goes on here than the one run_started_at names (a step's \
+            own started_at names none). Read get_machine_readiness again, and restart only if the user still wants it.",
+        NotRestarted::NotOpen => "Nothing was restarted: that step is not the open sign-in (it finished, or has not started). \
+            The open one is the step whose state is running, counted from 0 in get_machine_readiness's sign_in.steps.",
+        NotRestarted::NotWaiting => "Nothing was restarted: that sign-in has not waited 5 minutes since it opened (or it was just \
+            started again), so someone may be completing it. Do not loop: wait for sign_in.still_waiting (get_machine_readiness \
+            with wait_seconds and since), or ask the user to choose Retry this sign-in at this screen.",
+    }
 }
 
 #[tauri::command]
@@ -4390,22 +4488,123 @@ async fn peer_sign_ins(app: AppHandle, watching: Option<bool>) -> Vec<serde_json
     }).collect()
 }
 
-/// Retry on a "Signing in on <machine>" card: runs Sign in all accounts on that computer again
-/// through its SSH door (see `pairing::remote_call`), first stopping a run left waiting there. The
-/// computer must have been paired or checked from here (`pairing::host_for`).
+/// What Retry on a "Signing in on <machine>" card did there (see `retry_peer_sign_in`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PeerRetry {
+    /// Only the sign-in the card showed waiting starts again there, in the same window.
+    Restarted,
+    /// Sign in all accounts runs there again, asking only for what is still missing.
+    Retried,
+    /// Nothing: what the card showed has changed there (its sign-in moved on or started again, or
+    /// another run goes), and stopping a run would undo what it did.
+    MovedOn,
+    /// Nothing: no sign-in is missing there any more, so Sign in all accounts started no run.
+    NothingMissing,
+}
+
+/// What a card's Retry does next (see `after_peer_restart`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterRestart {
+    /// Nothing more: the sign-in started again there, or it moved on.
+    Done(PeerRetry),
+    /// Sign in all accounts runs there again. Only with `stop` does a run still going there stop
+    /// first: one left waiting where that computer cannot start one sign-in again, never a run that
+    /// may have started there since the one the card showed ended.
+    WholeRun { stop: bool },
+}
+
+/// Where a card's Retry goes after asking that computer to start the sign-in it showed waiting
+/// again (`restart_sign_in`), from its answer: done; on to Sign in all accounts there when its run
+/// has ended, or, stopping the run left waiting, when its SlopBar does not know the request;
+/// nothing when the sign-in moved on; or the error, when the ask never reached its app (a whole
+/// run would fail the same way).
+fn after_peer_restart(answer: Result<serde_json::Value, String>) -> Result<AfterRestart, String> {
+    match answer {
+        Ok(a) if a["restarted"] == true => Ok(AfterRestart::Done(PeerRetry::Restarted)),
+        Ok(a) if a["reason"] == "no_run" => Ok(AfterRestart::WholeRun { stop: false }),
+        Ok(_) => Ok(AfterRestart::Done(PeerRetry::MovedOn)),
+        Err(e) if crate::mcp::unknown_there(&e, "restart_sign_in") => Ok(AfterRestart::WholeRun { stop: true }),
+        Err(e) => Err(e),
+    }
+}
+
+/// `sign_in_all`'s arguments for a card's Retry: Sign in all accounts there again, with its run's
+/// `monitoring`; only with `stop` does a run still going there stop first (`retry`).
+fn whole_run_arguments(monitoring: bool, stop: bool) -> serde_json::Value {
+    serde_json::json!({ "confirm": true, "monitoring": monitoring, "retry": stop })
+}
+
+/// What a card's Retry did once it asked that computer to run Sign in all accounts again (`stop`:
+/// after stopping a run left waiting there), from its answer.
+fn after_whole_run(ran: Result<serde_json::Value, String>, stop: bool) -> Result<PeerRetry, String> {
+    match ran {
+        Ok(answer) if answer["started"] == false => Ok(PeerRetry::NothingMissing),
+        Ok(_) => Ok(PeerRetry::Retried),
+        // A run goes there now, which this Retry never stops: it moved on.
+        Err(e) if !stop && crate::mcp::code_there(&e, &["monitor_busy"]).is_some() => Ok(PeerRetry::MovedOn),
+        Err(e) => Err(card_error(e)),
+    }
+}
+
+/// An error from that computer as the card says it: a desktop nobody can see there by its code,
+/// which Settings words (another computer prints `explain`'s words, meant for agents).
+fn card_error(error: String) -> String {
+    crate::mcp::code_there(&error, &["desktop_locked", "desktop_not_shown"]).map_or(error, str::to_string)
+}
+
+/// Where a card's Retry goes before asking that computer anything, from what the card shows: its
+/// run still `going`, the start that names it (`started_at`, from a SlopBar that can start one
+/// sign-in again) and its open sign-in's place (`step`).
+fn peer_retry_first(going: bool, started_at: Option<chrono::DateTime<chrono::Utc>>, step: Option<usize>) -> Option<AfterRestart> {
+    match (going, started_at, step) {
+        // Ask it to start that sign-in again (`restart_sign_in`).
+        (true, Some(_), Some(_)) => None,
+        // A run left waiting where that computer cannot start one sign-in again: as before, it
+        // stops and runs again.
+        (true, None, _) => Some(AfterRestart::WholeRun { stop: true }),
+        // Its run ended, or none of its sign-ins is open: Sign in all accounts runs again, never
+        // stopping a run going there now (another run, or that one going on unseen).
+        _ => Some(AfterRestart::WholeRun { stop: false }),
+    }
+}
+
+/// Retry on a "Signing in on <machine>" card, through that computer's SSH door (see
+/// `pairing::remote_call`), which must have been paired or checked from here (`pairing::host_for`).
+/// While the run the card shows goes on (it started at `started_at`, and its sign-in `step` was the
+/// open one), only that sign-in starts again there, in the same window, as the card says
+/// (`restart_sign_in`); nothing when it moved on. Where that run has ended, Sign in all accounts
+/// runs there again, never stopping a run going there; only where that computer's SlopBar is older
+/// does a run left waiting there stop first, as before.
 #[tauri::command]
-async fn retry_peer_sign_in(app: AppHandle, machine_id: String) -> Result<(), String> {
+async fn retry_peer_sign_in(app: AppHandle, machine_id: String, going: bool, started_at: Option<chrono::DateTime<chrono::Utc>>, step: Option<usize>) -> Result<PeerRetry, String> {
     let host = settings::app_dir().and_then(|d| pairing::host_for(&d, &machine_id)).ok_or("peer_not_paired")?;
-    let monitoring = app.state::<AppState>().roster_seen.lock().unwrap().peers.iter()
-        .find(|p| p.machine_id == machine_id).and_then(|p| p.run.as_ref()).is_none_or(|r| r.monitoring);
-    let arguments = serde_json::json!({ "confirm": true, "monitoring": monitoring, "retry": true });
-    tauri::async_runtime::spawn_blocking(move || pairing::remote_call(&pairing::Ssh, &host, "sign_in_all", &arguments))
-        .await.map_err(|_| "ssh_failed".to_string())??;
-    // Its new run reaches the roster a few seconds later: read it at the live pace meanwhile. On the
+    let next = match (peer_retry_first(going, started_at, step), started_at, step) {
+        (Some(next), ..) => next,
+        (None, Some(started_at), Some(at)) => {
+            let (host, arguments) = (host.clone(), serde_json::json!({ "step": at, "run_started_at": started_at }));
+            let answer = tauri::async_runtime::spawn_blocking(move || pairing::remote_call(&pairing::Ssh, &host, "restart_sign_in", &arguments))
+                .await.map_err(|_| "ssh_failed".to_string())?;
+            after_peer_restart(answer).map_err(card_error)?
+        }
+        (None, ..) => AfterRestart::WholeRun { stop: false },
+    };
+    let outcome = match next {
+        AfterRestart::Done(outcome) => outcome,
+        AfterRestart::WholeRun { stop } => {
+            let monitoring = app.state::<AppState>().roster_seen.lock().unwrap().peers.iter()
+                .find(|p| p.machine_id == machine_id).and_then(|p| p.run.as_ref()).is_none_or(|r| r.monitoring);
+            let arguments = whole_run_arguments(monitoring, stop);
+            let ran = tauri::async_runtime::spawn_blocking(move || pairing::remote_call(&pairing::Ssh, &host, "sign_in_all", &arguments))
+                .await.map_err(|_| "ssh_failed".to_string())?;
+            after_whole_run(ran, stop)?
+        }
+    };
+    // What it did reaches the roster a few seconds later: read it at the live pace meanwhile. On the
     // blocking pool: a sync that hangs on a folder holds the roster's lock.
     let sharing = app.state::<AppState>().sharing.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || sharing.with_syncer(|sync| sync.expect_news(&machine_id, chrono::Utc::now()))).await;
-    Ok(())
+    Ok(outcome)
 }
 
 #[tauri::command]
@@ -4573,10 +4772,18 @@ mod sign_in_tests {
         let done = StepRecord { state: StepState::Done, error: None, ..step.clone() };
         assert!(serde_json::to_value(&done).unwrap().get("error").is_none());
         // The same run as the roster carries it to the other computers.
-        let bulk = BulkConnect { total: 2, done: 1, current: None, kind: None, emails: 1, email: 1, finished: true, error: Some("signin_no_page".into()),
+        let started: chrono::DateTime<chrono::Utc> = "2026-10-23T11:58:00.123Z".parse().unwrap();
+        let bulk = BulkConnect { run_started_at: started, total: 2, done: 1, current: None, kind: None, emails: 1, email: 1, finished: true, error: Some("signin_no_page".into()),
             steps: vec![done, step], by_email: true, monitoring: true, still_waiting: false, revision: 9, everywhere: false, left_out: vec![], in_use: vec![] };
         let run = roster_run(&bulk, "2026-10-23T12:00:00Z".parse().unwrap());
         assert_eq!((run.revision, run.finished, run.error.as_deref()), (9, true, Some("signin_no_page")));
+        // The roster names the run as readiness does, so a card's Retry can name it back; readiness
+        // keeps it apart from each step's own start.
+        assert_eq!(run.started_at, Some(started));
+        let shown = serde_json::to_value(&bulk).unwrap();
+        assert_eq!((&shown["run_started_at"], shown.get("started_at")), (&serde_json::json!("2026-10-23T11:58:00.123Z"), None));
+        assert_eq!(run.open, None, "nothing is open once it ended");
+        assert_eq!(roster_run(&open_run(true), "2026-11-23T10:05:00Z".parse().unwrap()).open, Some(1), "the open sign-in's place, as this computer counts it");
         assert_eq!(run.steps.iter().map(|s| (s.kind.as_str(), s.state.as_str())).collect::<Vec<_>>(), [("connect", "done"), ("connect", "failed")]);
         assert_eq!(run.steps[1].account.as_deref(), Some("synthetic@example.invalid"));
     }
@@ -4616,6 +4823,164 @@ mod sign_in_tests {
         let (dropped, waited) = (crate::source_guard::find(arm, "drop(std::mem::replace").unwrap(), crate::source_guard::find(arm, "while held").unwrap());
         assert!(dropped < waited, "the old sign-in goes before the wait for it");
         assert!(!arm.contains("group_session") && !arm.contains("drop(session"), "the email's window stays");
+    }
+
+    /// A run of three sign-ins whose second is open, as `restartable` judges it.
+    fn open_run(still_waiting: bool) -> BulkConnect {
+        let step = |state| StepRecord { target: bulk::Target { provider: Provider::Claude, id: "synthetic-id".into(), account: Some("synthetic@example.invalid".into()), ended: None },
+            kind: bulk::Kind::Connect, machine: None, state, error: None, started_at: None, page_at: None, ended_at: None };
+        BulkConnect { run_started_at: "2026-11-23T10:00:00.5Z".parse().unwrap(), total: 3, done: 1, current: None, kind: None, emails: 1, email: 1, finished: false, error: None,
+            steps: vec![step(StepState::Done), step(StepState::Running), step(StepState::Pending)], by_email: true, monitoring: true, still_waiting,
+            revision: 4, everywhere: false, left_out: vec![], in_use: vec![] }
+    }
+
+    /// From elsewhere, only the open sign-in of the run named, once it has waited: never another
+    /// run's, one that ended or has not started, or one somebody may still be completing.
+    #[test]
+    fn a_sign_in_starts_again_from_elsewhere_only_when_it_is_the_one_waiting() {
+        let run = open_run(true);
+        let started = run.run_started_at;
+        assert_eq!(restartable(Some(&run), 1, started), Ok(()));
+        assert_eq!(restartable(None, 1, started), Err(NotRestarted::NoRun), "nothing ran since the app started");
+        assert_eq!(restartable(Some(&BulkConnect { finished: true, ..open_run(true) }), 1, started), Err(NotRestarted::NoRun), "it ended");
+        let later = started + chrono::Duration::nanoseconds(1);
+        assert_eq!(restartable(Some(&run), 1, later), Err(NotRestarted::OtherRun), "a newer run is not the one the card showed");
+        for at in [0, 2, 3] {
+            assert_eq!(restartable(Some(&run), at, started), Err(NotRestarted::NotOpen), "done, pending or past the end: {at}");
+        }
+        let mut between = open_run(true);
+        between.steps[1].state = StepState::Done;
+        assert_eq!(restartable(Some(&between), 1, started), Err(NotRestarted::NotOpen), "between two sign-ins nothing is open");
+        assert_eq!(restartable(Some(&open_run(false)), 1, started), Err(NotRestarted::NotWaiting), "someone may still be completing it");
+        // A sitting for every computer: its open sign-in may be a third computer's, which a request
+        // from elsewhere never reaches on to; the person at its screen has Retry this sign-in.
+        assert_eq!(restartable(Some(&BulkConnect { everywhere: true, ..open_run(true) }), 1, started), Err(NotRestarted::Everywhere));
+        // Checked in this order: a stale card hears what changed first.
+        assert_eq!(restartable(Some(&open_run(false)), 2, later), Err(NotRestarted::OtherRun));
+        assert_eq!(restartable(Some(&BulkConnect { everywhere: true, finished: true, ..open_run(true) }), 1, later), Err(NotRestarted::NoRun));
+    }
+
+    /// Whatever `restart_sign_in` answers reaches the agent whole (mcp::MAX_TEXT), and says what
+    /// happened in the words of its reason.
+    #[test]
+    fn what_restart_sign_in_tells_an_agent_reaches_it_whole() {
+        let reasons = [NotRestarted::NoRun, NotRestarted::Everywhere, NotRestarted::OtherRun, NotRestarted::NotOpen, NotRestarted::NotWaiting];
+        for text in std::iter::once(RESTARTED_NEXT).chain(reasons.map(not_restarted_next)) {
+            let n = text.chars().count();
+            assert!(n <= crate::mcp::MAX_TEXT, "{n} characters: {text}");
+            assert!(!text.contains("  ") && !text.contains("SlopBar"), "one space between words, no brand: {text}");
+        }
+        assert_eq!(reasons.map(|r| serde_json::to_value(r).unwrap()), ["no_run", "everywhere", "other_run", "not_open", "not_waiting"].map(serde_json::Value::from));
+    }
+
+    /// The card's Retry: only the sign-in it showed starts again where that computer can do so;
+    /// the whole run runs again where its run ended or its SlopBar is older; nothing when the
+    /// sign-in moved on (a whole run would stop a run that moved on, or one someone else started).
+    #[test]
+    fn a_card_s_retry_runs_everything_again_only_where_the_run_ended_or_the_computer_is_older() {
+        let said = |v: serde_json::Value| after_peer_restart(Ok(v));
+        assert_eq!(said(serde_json::json!({ "restarted": true, "step": 1 })), Ok(AfterRestart::Done(PeerRetry::Restarted)));
+        // Its run ended: Sign in all accounts again, without stopping a run started there since.
+        assert_eq!(said(serde_json::json!({ "restarted": false, "reason": "no_run" })), Ok(AfterRestart::WholeRun { stop: false }));
+        for reason in ["everywhere", "other_run", "not_open", "not_waiting", "a_reason_from_a_newer_version"] {
+            assert_eq!(said(serde_json::json!({ "restarted": false, "reason": reason })), Ok(AfterRestart::Done(PeerRetry::MovedOn)), "{reason}");
+        }
+        assert_eq!(said(serde_json::json!({})), Ok(AfterRestart::Done(PeerRetry::MovedOn)), "an answer it cannot read stops nothing");
+        // An older slopbar-mcp there (`step`'s own words), or an older app behind a newer helper:
+        // as before, the run left waiting there stops and runs again.
+        assert_eq!(after_peer_restart(Err("Unknown tool: restart_sign_in".into())), Ok(AfterRestart::WholeRun { stop: true }));
+        assert_eq!(after_peer_restart(Err(crate::mcp::explained("unsupported_request"))), Ok(AfterRestart::WholeRun { stop: true }));
+        for error in ["ssh_failed: Connection timed out", "SlopBar is not running", "Nothing was started: this computer's desktop is locked", "Unknown tool: sign_in_all"] {
+            assert_eq!(after_peer_restart(Err(error.into())), Err(error.into()), "a whole run would fail the same way");
+        }
+    }
+
+    /// Sign in all accounts asked for again there: a run started, nothing was missing, a run that goes
+    /// there now (never stopped unless the card meant to), or an error as the card words it.
+    #[test]
+    fn a_card_s_whole_run_says_what_it_did_there() {
+        assert_eq!(after_whole_run(Ok(serde_json::json!({ "started": true, "plan": [] })), false), Ok(PeerRetry::Retried));
+        assert_eq!(after_whole_run(Ok(serde_json::json!({ "started": false, "plan": [] })), true), Ok(PeerRetry::NothingMissing));
+        let busy = crate::mcp::explained("monitor_busy");
+        assert_eq!(after_whole_run(Err(busy.clone()), false), Ok(PeerRetry::MovedOn), "a run going there is someone's: left alone");
+        assert_eq!(after_whole_run(Err(busy.clone()), true), Err(busy));
+        assert_eq!(after_whole_run(Err(crate::mcp::explained("desktop_locked")), false), Err("desktop_locked".into()), "worded by Settings");
+        assert_eq!(after_whole_run(Err("ssh_timeout".into()), true), Err("ssh_timeout".into()));
+        assert_eq!(serde_json::to_value(PeerRetry::NothingMissing).unwrap(), "nothing_missing");
+        // Only a card that meant to stop the run left waiting asks for that.
+        assert_eq!(whole_run_arguments(true, false), serde_json::json!({ "confirm": true, "monitoring": true, "retry": false }));
+        assert_eq!(whole_run_arguments(false, true)["retry"], true);
+        // The card's whole run takes its `stop` from where it was decided, for its arguments and its answer.
+        let code = crate::source_guard::tokens(include_str!("app.rs"));
+        let retry = crate::source_guard::function(&code, "app.rs", "async fn retry_peer_sign_in(", "app::sign_in_tests");
+        let arm = &retry[crate::source_guard::find(retry, "AfterRestart::WholeRun { stop } => {").expect("the whole run's arm")..];
+        for needle in ["let arguments = whole_run_arguments(monitoring, stop);", "after_whole_run(ran, stop)?"] {
+            assert!(crate::source_guard::has(arm, needle), "{needle}
+{arm}");
+        }
+        assert!(!crate::source_guard::has(retry, "\"retry\": true"), "no Retry stops a run but by `stop`");
+    }
+
+    /// Before asking anything: a run going on that names its start and its open sign-in asks for
+    /// just that one; a run left waiting where that computer cannot do that stops and runs again,
+    /// as before; anything else runs again without stopping what goes there now.
+    #[test]
+    fn a_card_s_retry_stops_a_run_only_where_that_computer_cannot_restart_one_sign_in() {
+        let at = Some("2026-11-23T10:00:00Z".parse().unwrap());
+        assert_eq!(peer_retry_first(true, at, Some(2)), None);
+        assert_eq!(peer_retry_first(true, None, Some(2)), Some(AfterRestart::WholeRun { stop: true }));
+        assert_eq!(peer_retry_first(true, None, None), Some(AfterRestart::WholeRun { stop: true }));
+        assert_eq!(peer_retry_first(true, at, None), Some(AfterRestart::WholeRun { stop: false }), "none of its sign-ins is open: never stop it");
+        for (started, step) in [(at, Some(2)), (None, None), (at, None), (None, Some(1))] {
+            assert_eq!(peer_retry_first(false, started, step), Some(AfterRestart::WholeRun { stop: false }), "its run ended");
+        }
+    }
+
+    /// A sign-in whose window was closed waits on nobody while it may still be saving, so a Retry
+    /// from elsewhere hears it is not waiting rather than that it started again; nor does one that
+    /// ended, before the next starts.
+    #[test]
+    fn a_closed_window_s_sign_in_is_not_waiting() {
+        let code = crate::source_guard::tokens(include_str!("app.rs"));
+        let run = crate::source_guard::function(&code, "app.rs", "fn run_sign_ins(", "app::sign_in_tests");
+        let mark = crate::source_guard::statement(run, "let mark = |at: usize, state: StepState, error: Option<String>|").expect("the run's mark");
+        assert!(crate::source_guard::has(mark, "if state != StepState::Running { b.still_waiting = false; }"), "{mark}");
+        for (signature, publish) in [("fn run_sign_ins(", "publish_bulk(&h, |b| b.still_waiting = false);"), ("async fn relayed_turn(", "publish_bulk(h, |b| b.still_waiting = false);")] {
+            let body = crate::source_guard::function(&code, "app.rs", signature, "app::sign_in_tests");
+            let arm = &body[crate::source_guard::find(body, "_ = &mut closed => {").unwrap_or_else(|| panic!("{signature}: the closed window's arm"))..];
+            let (published, grace) = (crate::source_guard::find(arm, publish), crate::source_guard::find(arm, "tokio::time::timeout(SIGN_IN_GRACE, &mut run)"));
+            assert!(published.zip(grace).is_some_and(|(p, g)| p < g), "{signature}\n{arm}");
+        }
+    }
+
+    #[test]
+    fn restart_sign_in_names_its_sign_in_and_its_run() {
+        let asked: crate::door::Request = serde_json::from_value(serde_json::json!({ "op": "restart_sign_in", "step": 2, "run_started_at": "2026-11-23T10:00:00.5Z" })).unwrap();
+        let at: chrono::DateTime<chrono::Utc> = "2026-11-23T10:00:00.5Z".parse().unwrap();
+        assert!(matches!(asked, crate::door::Request::RestartSignIn { step: 2, run_started_at } if run_started_at == at));
+        for refused in [serde_json::json!({ "op": "restart_sign_in", "step": 2 }), serde_json::json!({ "op": "restart_sign_in", "run_started_at": "2026-11-23T10:00:00Z" }),
+            serde_json::json!({ "op": "restart_sign_in", "step": -1, "run_started_at": "2026-11-23T10:00:00Z" }), serde_json::json!({ "op": "restart_sign_in", "step": 1, "run_started_at": "soon" }),
+            serde_json::json!({ "op": "restart_sign_in", "at": 1, "started_at": "2026-11-23T10:00:00Z" }),
+            serde_json::json!({ "op": "restart_sign_in", "step": 1, "run_started_at": "2026-11-23T10:00:00Z", "everywhere": true })] {
+            assert!(serde_json::from_value::<crate::door::Request>(refused.clone()).is_err(), "{refused}");
+        }
+    }
+
+    /// The door's restart judges the run and takes its restart under one hold of `bulk_connect` (a
+    /// new run sets both under it), and asks only once `restartable` passed.
+    #[test]
+    fn a_restart_from_elsewhere_asks_the_run_it_judged() {
+        let code = crate::source_guard::tokens(include_str!("app.rs"));
+        let body = crate::source_guard::function(&code, "app.rs", "fn restart_from_elsewhere(", "app::sign_in_tests");
+        let at = |needle: &str| crate::source_guard::find(body, &crate::source_guard::tokens(needle)).unwrap_or_else(|| panic!("{needle}\n{body}"));
+        let (held, judged, taken, asked) = (at("let running = state.bulk_connect.lock().unwrap();"), at("restartable(running.as_ref(), step, run_started_at)?;"),
+            at("let restart = state.bulk_restart.lock().unwrap().clone()"), at("restart.ask(step);"));
+        assert!(held < judged && judged < taken && taken < asked, "{body}");
+        assert!(!body.contains("drop(running)") && !body[held..asked].contains('}'), "the hold lasts until the ask: no block ends it");
+        let door = crate::source_guard::function(&code, "app.rs", "async fn door_call(", "app::sign_in_tests");
+        let arm = &door[crate::source_guard::find(door, &crate::source_guard::tokens("R::RestartSignIn { step, run_started_at } => {")).expect("the door's arm")..];
+        let (shown, restarted) = (crate::source_guard::find(arm, "desktop_shown()?;").unwrap(), crate::source_guard::find(arm, "restart_from_elsewhere(").unwrap());
+        assert!(shown < restarted, "refused while nobody can see this desktop");
     }
 
     #[test]
