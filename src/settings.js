@@ -150,9 +150,12 @@ function overlapChip(a) {
 }
 
 function signInChips(p, a) {
-  const monitoring = a.monitor_connected && ["monitor_reconnect", "monitor_wrong_account", "monitor_uncertain"].includes(a.monitor_error ?? a.error);
+  // Ended on the provider's fixed limit (`monitor_renewal`) reads as such, not as a rejection.
+  const ended = a.monitor_renewal === "ended";
+  const monitoring = !ended && a.monitor_connected && ["monitor_reconnect", "monitor_wrong_account", "monitor_uncertain"].includes(a.monitor_error ?? a.error);
   const cli = p === "claude" ? "claude /login" : "codex login";
   return [
+    ended ? `<em class="chip unexpected" title="${esc(t("monitorEnded"))}">${t("monitorEndedChip")}</em>` : "",
     monitoring ? `<em class="chip unexpected" title="${esc(t("monitorRejectedHint"))}">${t("monitorRejected")}</em>` : "",
     a.cli_rejected ? `<em class="chip unexpected" title="${esc(t("cliRejectedHint", { cli }))}">${t("cliRejected")}</em>` : "",
   ].join("");
