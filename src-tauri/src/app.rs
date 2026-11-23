@@ -1709,6 +1709,10 @@ fn run_sign_ins(app: &AppHandle, groups: Vec<bulk::Group>, by_email: bool, monit
                 step.state = state;
                 step.error = error;
             }
+            // A sign-in that ended waits on nobody, even before the next one starts.
+            if state != StepState::Running {
+                b.still_waiting = false;
+            }
         });
         // Accounts this run signed in: one only just added has its monitoring sign-in next, though
         // the refresh that lists it may still be running.
@@ -4475,9 +4479,11 @@ enum PeerRetry {
     Restarted,
     /// Sign in all accounts runs there again, asking only for what is still missing.
     Retried,
-    /// Nothing: what the card showed has changed there (its sign-in moved on or started again,
-    /// another run goes, or nothing is missing any more), and stopping a run would undo what it did.
+    /// Nothing: what the card showed has changed there (its sign-in moved on or started again, or
+    /// another run goes), and stopping a run would undo what it did.
     MovedOn,
+    /// Nothing: no sign-in is missing there any more, so Sign in all accounts started no run.
+    NothingMissing,
 }
 
 /// What a card's Retry does next (see `after_peer_restart`).
@@ -4503,6 +4509,24 @@ fn after_peer_restart(answer: Result<serde_json::Value, String>) -> Result<After
         Ok(_) => Ok(AfterRestart::Done(PeerRetry::MovedOn)),
         Err(e) if crate::mcp::unknown_there(&e, "restart_sign_in") => Ok(AfterRestart::WholeRun { stop: true }),
         Err(e) => Err(e),
+    }
+}
+
+/// `sign_in_all`'s arguments for a card's Retry: Sign in all accounts there again, with its run's
+/// `monitoring`; only with `stop` does a run still going there stop first (`retry`).
+fn whole_run_arguments(monitoring: bool, stop: bool) -> serde_json::Value {
+    serde_json::json!({ "confirm": true, "monitoring": monitoring, "retry": stop })
+}
+
+/// What a card's Retry did once it asked that computer to run Sign in all accounts again (`stop`:
+/// after stopping a run left waiting there), from its answer.
+fn after_whole_run(ran: Result<serde_json::Value, String>, stop: bool) -> Result<PeerRetry, String> {
+    match ran {
+        Ok(answer) if answer["started"] == false => Ok(PeerRetry::NothingMissing),
+        Ok(_) => Ok(PeerRetry::Retried),
+        // A run goes there now, which this Retry never stops: it moved on.
+        Err(e) if !stop && crate::mcp::code_there(&e, &["monitor_busy"]).is_some() => Ok(PeerRetry::MovedOn),
+        Err(e) => Err(card_error(e)),
     }
 }
 
@@ -4553,17 +4577,10 @@ async fn retry_peer_sign_in(app: AppHandle, machine_id: String, going: bool, sta
         AfterRestart::WholeRun { stop } => {
             let monitoring = app.state::<AppState>().roster_seen.lock().unwrap().peers.iter()
                 .find(|p| p.machine_id == machine_id).and_then(|p| p.run.as_ref()).is_none_or(|r| r.monitoring);
-            let arguments = serde_json::json!({ "confirm": true, "monitoring": monitoring, "retry": stop });
+            let arguments = whole_run_arguments(monitoring, stop);
             let ran = tauri::async_runtime::spawn_blocking(move || pairing::remote_call(&pairing::Ssh, &host, "sign_in_all", &arguments))
                 .await.map_err(|_| "ssh_failed".to_string())?;
-            match ran {
-                // Nothing is missing there: no run started.
-                Ok(answer) if answer["started"] == false => PeerRetry::MovedOn,
-                Ok(_) => PeerRetry::Retried,
-                // A run goes there now, which this Retry never stops: it moved on.
-                Err(e) if !stop && crate::mcp::code_there(&e, &["monitor_busy"]).is_some() => PeerRetry::MovedOn,
-                Err(e) => return Err(card_error(e)),
-            }
+            after_whole_run(ran, stop)?
         }
     };
     // What it did reaches the roster a few seconds later: read it at the live pace meanwhile. On the
@@ -4861,6 +4878,32 @@ mod sign_in_tests {
         }
     }
 
+    /// Sign in all accounts asked for again there: a run started, nothing was missing, a run that goes
+    /// there now (never stopped unless the card meant to), or an error as the card words it.
+    #[test]
+    fn a_card_s_whole_run_says_what_it_did_there() {
+        assert_eq!(after_whole_run(Ok(serde_json::json!({ "started": true, "plan": [] })), false), Ok(PeerRetry::Retried));
+        assert_eq!(after_whole_run(Ok(serde_json::json!({ "started": false, "plan": [] })), true), Ok(PeerRetry::NothingMissing));
+        let busy = crate::mcp::explained("monitor_busy");
+        assert_eq!(after_whole_run(Err(busy.clone()), false), Ok(PeerRetry::MovedOn), "a run going there is someone's: left alone");
+        assert_eq!(after_whole_run(Err(busy.clone()), true), Err(busy));
+        assert_eq!(after_whole_run(Err(crate::mcp::explained("desktop_locked")), false), Err("desktop_locked".into()), "worded by Settings");
+        assert_eq!(after_whole_run(Err("ssh_timeout".into()), true), Err("ssh_timeout".into()));
+        assert_eq!(serde_json::to_value(PeerRetry::NothingMissing).unwrap(), "nothing_missing");
+        // Only a card that meant to stop the run left waiting asks for that.
+        assert_eq!(whole_run_arguments(true, false), serde_json::json!({ "confirm": true, "monitoring": true, "retry": false }));
+        assert_eq!(whole_run_arguments(false, true)["retry"], true);
+        // The card's whole run takes its `stop` from where it was decided, for its arguments and its answer.
+        let code = crate::source_guard::tokens(include_str!("app.rs"));
+        let retry = crate::source_guard::function(&code, "app.rs", "async fn retry_peer_sign_in(", "app::sign_in_tests");
+        let arm = &retry[crate::source_guard::find(retry, "AfterRestart::WholeRun { stop } => {").expect("the whole run's arm")..];
+        for needle in ["let arguments = whole_run_arguments(monitoring, stop);", "after_whole_run(ran, stop)?"] {
+            assert!(crate::source_guard::has(arm, needle), "{needle}
+{arm}");
+        }
+        assert!(!crate::source_guard::has(retry, "\"retry\": true"), "no Retry stops a run but by `stop`");
+    }
+
     /// Before asking anything: a run going on that names its start and its open sign-in asks for
     /// just that one; a run left waiting where that computer cannot do that stops and runs again,
     /// as before; anything else runs again without stopping what goes there now.
@@ -4877,10 +4920,14 @@ mod sign_in_tests {
     }
 
     /// A sign-in whose window was closed waits on nobody while it may still be saving, so a Retry
-    /// from elsewhere hears it is not waiting rather than that it started again.
+    /// from elsewhere hears it is not waiting rather than that it started again; nor does one that
+    /// ended, before the next starts.
     #[test]
     fn a_closed_window_s_sign_in_is_not_waiting() {
         let code = crate::source_guard::tokens(include_str!("app.rs"));
+        let run = crate::source_guard::function(&code, "app.rs", "fn run_sign_ins(", "app::sign_in_tests");
+        let mark = crate::source_guard::statement(run, "let mark = |at: usize, state: StepState, error: Option<String>|").expect("the run's mark");
+        assert!(crate::source_guard::has(mark, "if state != StepState::Running { b.still_waiting = false; }"), "{mark}");
         for (signature, publish) in [("fn run_sign_ins(", "publish_bulk(&h, |b| b.still_waiting = false);"), ("async fn relayed_turn(", "publish_bulk(h, |b| b.still_waiting = false);")] {
             let body = crate::source_guard::function(&code, "app.rs", signature, "app::sign_in_tests");
             let arm = &body[crate::source_guard::find(body, "_ = &mut closed => {").unwrap_or_else(|| panic!("{signature}: the closed window's arm"))..];
@@ -4912,7 +4959,7 @@ mod sign_in_tests {
         let (held, judged, taken, asked) = (at("let running = state.bulk_connect.lock().unwrap();"), at("restartable(running.as_ref(), step, run_started_at)?;"),
             at("let restart = state.bulk_restart.lock().unwrap().clone()"), at("restart.ask(step);"));
         assert!(held < judged && judged < taken && taken < asked, "{body}");
-        assert!(!body.contains("drop(running)"), "the hold lasts until the ask");
+        assert!(!body.contains("drop(running)") && !body[held..asked].contains('}'), "the hold lasts until the ask: no block ends it");
         let door = crate::source_guard::function(&code, "app.rs", "async fn door_call(", "app::sign_in_tests");
         let arm = &door[crate::source_guard::find(door, &crate::source_guard::tokens("R::RestartSignIn { step, run_started_at } => {")).expect("the door's arm")..];
         let (shown, restarted) = (crate::source_guard::find(arm, "desktop_shown()?;").unwrap(), crate::source_guard::find(arm, "restart_from_elsewhere(").unwrap());

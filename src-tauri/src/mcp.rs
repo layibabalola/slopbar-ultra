@@ -562,9 +562,11 @@ pub(crate) fn unknown_there(error: &str, tool: &str) -> bool {
 const UNSUPPORTED_THERE: &str = "does not understand this request";
 
 /// The code, among `codes`, of an error another computer gave in `explain`'s words (as its
-/// `run_tool` prints them for `pairing::remote_call`); None for any other words.
+/// `run_tool` prints them for `pairing::remote_call`); None for any other words. The fork names
+/// the app "SlopBar Ultra" where upstream says "SlopBar", so either computer's words match.
 pub(crate) fn code_there(error: &str, codes: &[&'static str]) -> Option<&'static str> {
-    codes.iter().copied().find(|code| explain(code) == error)
+    let unbranded = |text: &str| text.replace("SlopBar Ultra", "SlopBar");
+    codes.iter().copied().find(|code| unbranded(&explain(code)) == unbranded(error))
 }
 
 /// `explain`, for other modules' tests of what another computer prints.
@@ -1151,6 +1153,14 @@ mod tests {
             assert_eq!(code_there(&explain(e), &codes), None, "{e}");
         }
         assert_eq!(code_there("monitor_busy", &codes), None, "a code itself is not another computer's words");
+        // Words from a computer on the other build (the fork names the app "SlopBar Ultra").
+        for code in codes {
+            let plain = explain(code).replace("SlopBar Ultra", "SlopBar");
+            for words in [plain.clone(), plain.replace("SlopBar", "SlopBar Ultra")] {
+                assert_eq!(code_there(&words, &codes), Some(code), "{words}");
+            }
+        }
+        assert!(explain("desktop_not_shown").contains("SlopBar"), "the case this covers: a sentence that names the app");
     }
 
     /// A name or a list SlopBar words ahead of its advice keeps to its room, whatever its length,

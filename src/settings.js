@@ -1818,10 +1818,11 @@ async function retryPeer(p) {
   const r = p.run;
   try {
     const did = await invoke("retry_peer_sign_in", { machineId: id, going: !r.finished, startedAt: r.started_at ?? null, step: r.open ?? null });
+    const revision = shownRevision(id) ?? r.revision;
     // Its sign-in waits anew: Retry comes back once the card hears so, or after 5 minutes.
-    if (did === "restarted") peerRestarted[id] = { revision: r.revision, until: Date.now() + 300000 };
-    const text = t(did === "restarted" ? "peerSignInRestartSent" : did === "moved_on" ? "peerSignInMovedOn" : "peerSignInRetrySent", { machine: p.machine });
-    peerNotes[id] = { text, revision: shownRevision(id) ?? r.revision };
+    if (did === "restarted") peerRestarted[id] = { revision, until: Date.now() + 300000 };
+    const key = { restarted: "peerSignInRestartSent", moved_on: "peerSignInMovedOn", nothing_missing: "peerSignInNothingMissing" }[did] ?? "peerSignInRetrySent";
+    peerNotes[id] = { text: t(key, { machine: p.machine }), revision };
     // What it did reaches the roster seconds later: followed closely meanwhile.
     peerExpectUntil = Date.now() + 120000;
   } catch (err) {
@@ -1832,6 +1833,8 @@ async function retryPeer(p) {
   } finally {
     peerBusy.delete(id);
   }
+  // What it said shows at once; the roster's news follows.
+  renderPeerRuns();
   loadPeerRuns();
 }
 
