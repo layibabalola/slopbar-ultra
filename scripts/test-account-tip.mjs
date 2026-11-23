@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 
 // i18n.js sets the page language on load.
 globalThis.document ??= { documentElement: {} };
-const { t, setLanguage, setThisMachine, setSharing, windowResetText, placesText, compactPlaces, overlapText, shownReading, duration, currentWindows, coveredMonitoring, resetSince } = await import("../src/i18n.js");
+const { t, setLanguage, setThisMachine, setSharing, windowResetText, placesText, compactPlaces, overlapText, shownReading, duration, currentWindows, coveredMonitoring, resetSince, resetText, groupResets } = await import("../src/i18n.js");
 const { accountTip, accountTipLines, adviceText, cliSignInText } = await import("../src/accounttext.js");
 const { sparkline, sparklineText } = await import("../src/sparkline.js");
 setLanguage("en");
@@ -350,6 +350,21 @@ test("a saved CLI sign-in that ended or ends soon says so before anyone presses 
   } finally {
     setLanguage("en");
   }
+});
+
+test("a Fable reset says it gives back only what Fable used, and resets list usable, then soonest, never-expiring last", () => {
+  const grant = (kind, usable, expires_at = null, count = 1) => ({ kind, title: null, count, usable, expires_at, next_available_at: null });
+  const groups = groupResets([grant("session", false), grant("full", false), grant("fable", false, iso(now + 30 * HOUR), 2), grant("weekly", true), grant("full", false, iso(now + 90 * HOUR))]);
+  assert.deepEqual(groups.map((g) => [g.kind, g.count]), [["weekly", 1], ["fable", 2], ["full", 2], ["session", 1]]);
+  assert.match(resetText(groups[1]), /^Fable reset ×2 · gives back only what Fable used this week · not usable now · expires /);
+  // The same rule as the Rust text (i18n_format.rs): a title names only a reach SlopBar knows.
+  assert.equal(resetText({ ...grant("unknown", false), title: "Full reset (Monthly)" }), "Reset · type unknown · not usable now");
+  for (const lang of ["pt", "es", "fr", "de", "it", "ja", "zh", "ko", "ru"]) {
+    setLanguage(lang);
+    const text = resetText(grant("fable", true));
+    assert.ok(text.startsWith(t("resetFable")) && text.includes(t("resetFableHint")) && t("resetFable") !== "resetFable", `${lang}: ${text}`);
+  }
+  setLanguage("en");
 });
 
 console.log(`${passed} account tooltip and sparkline checks passed`);

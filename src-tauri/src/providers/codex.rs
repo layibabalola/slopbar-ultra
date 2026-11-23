@@ -213,13 +213,24 @@ fn reset_grants(list: CreditList, usable: bool) -> Vec<ResetGrant> {
             .filter(|c| c.status.as_deref() == Some("available"))
             .map(|c| ResetGrant {
                 kind: reset_kind(c.reset_type.as_deref()).into(),
-                title: c.title,
+                title: c.title.as_deref().and_then(title),
                 count: 1,
                 usable,
                 expires_at: c.expires_at,
                 next_available_at: None,
             })
             .collect()
+}
+
+/// A credit's title as shown and given to agents: text written by the provider, so without control
+/// or invisible characters (direction overrides, zero-width marks: `roster::invisible`, as machine
+/// names), its spaces collapsed, at most 60 characters; none when no letter or digit is left (a
+/// title of blanks would hide the kind's name).
+pub(crate) fn title(raw: &str) -> Option<String> {
+    let visible: String = raw.chars().map(|c| if c.is_whitespace() { ' ' } else { c })
+        .filter(|c| !c.is_control() && !crate::roster::invisible(*c)).collect();
+    let text: String = visible.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(60).collect();
+    Some(text.trim_end().to_string()).filter(|t| t.chars().any(char::is_alphanumeric))
 }
 
 fn reset_kind(kind: Option<&str>) -> &'static str {
@@ -242,6 +253,15 @@ fn window_kind(seconds: Option<i64>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credit_titles_lose_invisible_characters_and_stay_short() {
+        assert_eq!(title("Full reset (Monthly)").as_deref(), Some("Full reset (Monthly)"));
+        assert_eq!(title("\u{202E}Full\u{200B} reset\n\tnow\u{FEFF}").as_deref(), Some("Full reset now"));
+        assert_eq!(title("\u{200B}\u{2066} "), None);
+        assert_eq!(title("\u{2800}\u{2800} \u{00B7}"), None, "blanks and marks only");
+        assert_eq!(title(&"x".repeat(200)).map(|t| t.chars().count()), Some(60));
+    }
 
     #[test]
     fn available_resets_with_unrecognized_types_keep_counts_not_assumed_scope() {
