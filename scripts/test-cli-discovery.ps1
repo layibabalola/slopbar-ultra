@@ -160,6 +160,7 @@ try {
   # S0 nothing
   $r = Call add_account @('provider=claude')
   Check ("$($r.error)".Contains($install)) "S0 nothing: add_account fails and names the line that installs Claude Code: $($r.error)"
+  Check ("$($r.code)" -eq 'CLI not found') "S0 nothing: the code another computer recognizes goes beside the words: $($r.code)"
   Check ((Get-SignInFolders).Count -eq 0 -and -not (Get-Started $appId | Where-Object Name -eq 'claude.exe')) 'S0 nothing: no sign-in started'
 
   # S1 unverified

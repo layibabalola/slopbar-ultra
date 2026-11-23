@@ -274,10 +274,10 @@ fn catalog() -> Vec<Tool> {
                 "tool": { "type": "string", "enum": crate::pairing::REMOTE_TOOLS },
                 "arguments": { "type": "object", "description": "The tool's own arguments." },
             }), &["ssh_host", "tool"]), false, true, false, true),
-        tool("setup_sharing", "Set up sharing with Dropbox", "Connects in-use sharing to the user's Dropbox, so each of their computers sees which accounts the others use: gets rclone if no recent one (v1.60 or later) is installed (a fixed, checksum-verified download from rclone's own site, or its GitHub release when that site is down, into SlopBar's folder, never another installer; an rclone that Windows or security software will not run ends the setup instead), runs rclone's own Dropbox sign-in (rclone keeps the token in its own config; SlopBar and agents never see it), turns sharing on with that rclone remote and lists the other computers sharing there. A remote of that name that already works is used as it is; one whose access ended is signed in again, and so is one with reconnect: true (to use another Dropbox account). Only when the user asked to set up sharing: without confirm: true nothing starts and the answer says what would happen. The user signs in and clicks Allow on dropbox.com themselves (never click Allow, sign in or approve for them). rclone's access covers their whole Dropbox; SlopBar only uses its SlopBar folder there. Refused on a computer that shares through a folder (uses_folder). Answers at once: follow it with get_sharing_setup. Dropbox's page opens on the computer being set up, in its own default browser with a notification there (refused while its desktop is locked or not shown). With ssh_host, sets up that computer from this one: its SlopBar gets rclone and opens the page on its screen, so the user signs in there; the token stays with that computer's rclone, and it takes this computer's remote name when this one shares through a Dropbox remote. Only when the user asks for the page on this computer because that computer's screen is out of reach, open_here: true opens it in this computer's browser instead, through an SSH tunnel to that computer's rclone (the token still goes straight to that computer's rclone); if that computer is still getting rclone after about 150 seconds, the call answers with its state, and calling again joins the same setup. cancel stops a running setup (with ssh_host, that computer's).",
+        tool("setup_sharing", "Set up sharing with Dropbox", "Connects in-use sharing to the user's Dropbox, so each of their computers sees which accounts the others use: gets rclone if no recent one (v1.60 or later) is installed (a fixed, checksum-verified download from rclone's own site, or its GitHub release when that site is down, into SlopBar's folder, never another installer; an rclone that Windows or security software will not run ends the setup instead), runs rclone's own Dropbox sign-in (rclone keeps the token in its own config; SlopBar and agents never see it), turns sharing on with that rclone remote and lists the other computers sharing there. A remote of that name that already works is used as it is; one whose access ended is signed in again, and so is one with reconnect: true (to use another Dropbox account). Only when the user asked to set up sharing: without confirm: true nothing starts and the answer says what would happen. The user signs in and clicks Allow on dropbox.com themselves (never click Allow, sign in or approve for them). rclone's access covers their whole Dropbox; SlopBar only uses its SlopBar folder there. Refused on a computer that shares through a folder (uses_folder). Answers at once: follow it with get_sharing_setup. Dropbox's page opens on the computer being set up, in its own default browser with a notification there (refused while its desktop is locked or not shown). With ssh_host, sets up that computer from this one: its SlopBar gets rclone and opens the page on its screen, so the user signs in there; the token stays with that computer's rclone, and it takes this computer's remote name when this one shares through a Dropbox remote. Only when the user asks for the page on this computer because that computer's screen is out of reach, open_here: true opens it in this computer's browser instead, through an SSH tunnel to that computer's rclone (the token still goes straight to that computer's rclone); if that computer is still getting rclone after about 150 seconds, the call answers with its state, and calling again with open_here: true joins the same setup. cancel stops a running setup (with ssh_host, that computer's).",
             schema(json!({
                 "confirm": { "type": "boolean", "description": "true to start; without it nothing starts and the answer says what would happen." },
-                "ssh_host": { "type": "string", "description": "Set up this other computer instead, as ssh reaches it; the sign-in page opens here." },
+                "ssh_host": { "type": "string", "description": "Set up this other computer instead, as ssh reaches it; Dropbox's page opens on its screen (with open_here, in this computer's browser)." },
                 "remote": { "type": "string", "description": "The rclone remote to create or use. Default: the one this computer shares through already (with ssh_host: this computer's Dropbox remote), else \"dropbox\". Keep the same name on every computer." },
                 "open_here": { "type": "boolean", "description": "With ssh_host: open Dropbox's page in this computer's browser through an SSH tunnel, instead of on that computer's screen. Only when the user asks for it." },
                 "reconnect": { "type": "boolean", "description": "Sign in to Dropbox again even when the remote works, to use another Dropbox account (the one the user's other computers use)." },
@@ -492,8 +492,33 @@ fn sanitize_answer(request: &crate::door::Request, value: Value) -> Value {
     clean
 }
 
+/// Whether `text` reads as an error code (`desktop_locked`, `CLI not found`) rather than words: at
+/// most 64 characters, only letters, digits, underscores and spaces.
+pub(crate) fn is_code(text: &str) -> bool {
+    !text.is_empty() && text.len() <= 64 && text.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ' '))
+}
+
+/// The line `slopbar-mcp` prints for another computer when a tool fails: `error`, the words an agent
+/// reads (`explain`), and `code`, the code they were worded from, for the computer that asked to
+/// recognize the error by (see `pairing::RemoteError`). An error that is no code, or one `explain`
+/// leaves as it is, has no `code`: the words are all there is, or are the code. A computer reading
+/// only `error` (every SlopBar before `code` came) gets the same words as ever.
+pub(crate) fn error_line(error: &str) -> Value {
+    // A tool this SlopBar lacks is said in `step`'s own words, as every release printed it: the
+    // computer asking reads them (`unknown_there`) and words them for its own agent.
+    if error.starts_with("Unknown tool: ") {
+        return json!({ "error": error.chars().filter(|c| !c.is_control()).take(MAX_TEXT).collect::<String>() });
+    }
+    let text = explain(error);
+    let mut line = json!({ "error": text });
+    if is_code(error) && text != error {
+        line["code"] = error.into();
+    }
+    line
+}
+
 /// Plain-language text for door and app error codes; anything else is passed on, sanitized.
-fn explain(error: &str) -> String {
+pub(crate) fn explain(error: &str) -> String {
     match error {
         "not_running" => "SlopBar is not running, or the running copy predates this agent door. Start (or restart) SlopBar, then try again; these tools never start it.".into(),
         "door_untrusted" => "The process answering on SlopBar's door is not SlopBar running as this Windows user, so it was not trusted. Restart SlopBar.".into(),
@@ -535,6 +560,7 @@ fn explain(error: &str) -> String {
         "sharing_setup_busy" => "A sharing setup is already running on this computer: follow it with get_sharing_setup, or stop it with setup_sharing cancel: true.".into(),
         "update_slopbar_there" => "The other computer's SlopBar predates the guided sharing setup: update it there (with automatic updates on, it updates itself), then try again.".into(),
         "tunnel_failed" => "The SSH tunnel for the Dropbox sign-in (open_here) did not open: port 53682 is in use on this computer (another rclone sign-in is waiting), or SSH could not connect. The setup on the other computer was stopped; try again once the port is free.".into(),
+        "tunnel_failed_joined" => "The SSH tunnel for the Dropbox sign-in (open_here) did not open: port 53682 is in use on this computer (another rclone sign-in is waiting), or SSH could not connect. The setup already running on the other computer goes on; once the port is free, call setup_sharing again with that ssh_host, open_here: true and confirm: true. Stop it with cancel: true only if the user wants that setup stopped.".into(),
         "bad_state" | "no_sign_in_waiting" => "No Dropbox sign-in is waiting (it finished, failed or was cancelled): see get_sharing_setup.".into(),
         "not_from_a_remote_call" => "A computer reached over SSH cannot reach on to another one.".into(),
         "signin_busy" => "A sign-in is already open (or another computer is completing one of this computer's): try again when it ends.".into(),
@@ -752,9 +778,10 @@ fn serve<W: Write + Send + 'static>(mut input: impl BufRead, out: W) -> std::io:
     }
 }
 
-/// Runs one tool as a tool call would and returns its result or its error text, sanitized as the
-/// MCP server sanitizes it (`call_result`, `result`). `remote_ok` is false for a `--call-b64`
-/// (reached over SSH from another computer).
+/// Runs one tool as a tool call would and returns its result, sanitized as the MCP server
+/// sanitizes it (`call_result`, `result`), or its error: a code, or text for the agent, still to
+/// be worded (see `error_line`). `remote_ok` is false for a `--call-b64` (reached over SSH from
+/// another computer).
 fn run_tool(name: &str, args: Value, pipe: &str, remote_ok: bool) -> Result<Value, String> {
     // Called in from another computer: a sign-in reaches only an app that refuses it while
     // nobody sees the desktop (older ones did not check).
@@ -762,11 +789,11 @@ fn run_tool(name: &str, args: Value, pipe: &str, remote_ok: bool) -> Result<Valu
     // apart, so the check is here, whatever else the call asks; `request` checks the same for an
     // MCP server started over SSH).
     if (!remote_ok || over_ssh()) && name == "sign_in_all" && args.get("everywhere") == Some(&Value::Bool(true)) {
-        return Err(explain("not_from_a_remote_call"));
+        return Err("not_from_a_remote_call".into());
     }
     if !remote_ok && matches!(name, "sign_in_all" | "connect_monitoring_all") && args.get("confirm") == Some(&Value::Bool(true)) {
         if let Err(e) = crate::door::call(pipe, &Request::GetReadiness { wait_seconds: None, since: None }) {
-            return Err(explain(if e == "unsupported_request" { "app_outdated" } else { &e }));
+            return Err(if e == "unsupported_request" { "app_outdated".into() } else { e });
         }
     }
     let message = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } });
@@ -782,15 +809,16 @@ fn run_tool(name: &str, args: Value, pipe: &str, remote_ok: bool) -> Result<Valu
             .and_then(Value::as_str).unwrap_or("failed").to_string()),
         Step::Quiet => Err("failed".into()),
     };
-    outcome.map_err(|e| explain(&e))
+    outcome
 }
 
 /// `slopbar-mcp --call <tool> [key=value…]` or `--call-b64 <base64 {"tool","arguments"}>`: runs
-/// one tool and prints `{"ok": result}` or `{"error": text}` as one ASCII JSON line. This is how
-/// another computer runs this one's tools over SSH (see `pairing::remote_call`); values that
-/// parse as JSON are passed as JSON, anything else as a string. Returns the exit code.
+/// one tool and prints `{"ok": result}` or `error_line`'s `{"error": text, "code": code}` as one
+/// ASCII JSON line. This is how another computer runs this one's tools over SSH (see
+/// `pairing::remote_call`); values that parse as JSON are passed as JSON, anything else as a
+/// string. Returns the exit code.
 pub fn call_cli(args: &[String]) -> i32 {
-    print_answer(cli_outcome(args, &crate::door::pipe_name()))
+    print_explained(cli_outcome(args, &crate::door::pipe_name()))
 }
 
 /// The outcome `call_cli` prints for `args`, asking the app at door `pipe`.
@@ -818,15 +846,29 @@ fn cli_outcome(args: &[String], pipe: &str) -> Result<Value, String> {
     parsed.and_then(|(tool, arguments)| run_tool(&tool, arguments, pipe, remote_ok))
 }
 
+/// Prints `{"ok": value}`, or `{"error": …}` with the error as it is: the door's own codes, for the
+/// computer asking (`--relay`, `--sharing-state`), which reads them.
 fn print_answer(outcome: Result<Value, String>) -> i32 {
-    let (line, code) = match outcome {
-        Ok(value) => (json!({ "ok": value }), 0),
-        Err(text) => (json!({ "error": text }), 1),
-    };
+    match outcome {
+        Ok(value) => print_line(&json!({ "ok": value }), 0),
+        Err(error) => print_line(&json!({ "error": error }), 1),
+    }
+}
+
+/// `print_answer` for a tool's outcome, which an agent reads: an error is worded, with its code
+/// beside it (`error_line`).
+fn print_explained(outcome: Result<Value, String>) -> i32 {
+    match outcome {
+        Ok(value) => print_line(&json!({ "ok": value }), 0),
+        Err(error) => print_line(&error_line(&error), 1),
+    }
+}
+
+fn print_line(line: &Value, exit: i32) -> i32 {
     let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "{}", crate::pairing::ascii_json(&line));
+    let _ = writeln!(out, "{}", crate::pairing::ascii_json(line));
     let _ = out.flush();
-    code
+    exit
 }
 
 /// `slopbar-mcp --sharing-state [seconds]`: the phase of this computer's sharing setup and the
@@ -871,8 +913,7 @@ pub fn relay_cli(args: &[String]) -> i32 {
 pub fn pair_receive() -> i32 {
     let door = crate::pairing::LocalDoor(crate::door::pipe_name());
     let saved = crate::settings::app_dir().and_then(|d| crate::roster::load_passphrase(&d));
-    let outcome = crate::pairing::receive(&door, &mut std::io::stdin().lock(), saved).map(sanitize).map_err(|e| explain(&e));
-    print_answer(outcome)
+    print_explained(crate::pairing::receive(&door, &mut std::io::stdin().lock(), saved).map(sanitize))
 }
 
 #[cfg(test)]
@@ -1108,12 +1149,8 @@ mod tests {
     /// explained text, and this one's `explain` passes it on through its last arm, which cuts at the cap.
     #[test]
     fn every_explained_error_reaches_the_agent_whole_from_any_computer() {
-        let source = include_str!("mcp.rs").replace("\r\n", "\n");
-        let body = &source[source.find("fn explain(error: &str) -> String {").unwrap()..];
-        let body = &body[..body.find("\n}\n").unwrap()];
-        let codes: Vec<&str> = body.lines().map(str::trim).filter(|l| l.starts_with('"') && l.contains(" => "))
-            .flat_map(|l| l.split(" => ").next().unwrap().split('|').map(|c| c.trim().trim_matches('"')))
-            .collect();
+        let codes = worded_codes();
+        let codes: Vec<&str> = codes.iter().map(String::as_str).collect();
         assert!(codes.len() > 40 && codes.contains(&"CLI not found") && codes.contains(&"not_running"), "{codes:?}");
         // The codes that carry text, at their longest: ssh's reason (kept to 200 characters) and an
         // rclone remote's name (64 at most, `rclone::valid_remote`).
@@ -1124,6 +1161,76 @@ mod tests {
             // As another computer prints it and this one explains it again: nothing is cut.
             assert_eq!(explain(&text), text, "{code}");
         }
+    }
+
+    /// What each `slopbar-mcp` entry that another computer reads prints when it fails: a tool's
+    /// outcome as words with its code beside them (`print_explained`, through `error_line`), the
+    /// door's own codes raw for the computer that reads them so (`print_answer`). A test of
+    /// `error_line` alone passes with the printers swapped, and the busy refusal's words would
+    /// still be recognized (`pairing::EARLIER_WORDS`) until they are reworded.
+    #[test]
+    fn each_entry_another_computer_reads_prints_as_that_computer_expects() {
+        use crate::source_guard::{calls, function, tokens};
+        let test = "each_entry_another_computer_reads_prints_as_that_computer_expects";
+        let code = tokens(include_str!("mcp.rs"));
+        for (signature, printer, never) in [
+            ("pub fn call_cli(", "print_explained", "print_answer"),
+            ("pub fn pair_receive(", "print_explained", "print_answer"),
+            ("pub fn sharing_state(", "print_answer", "print_explained"),
+            ("pub fn relay_cli(", "print_answer", "print_explained"),
+        ] {
+            let body = function(&code, "mcp.rs", signature, test);
+            assert_eq!((calls(body, printer, test).len(), calls(body, never, test).len()), (1, 0), "{signature} prints with {printer} only");
+        }
+        let explained = function(&code, "mcp.rs", "fn print_explained(", test);
+        assert_eq!(calls(explained, "error_line", test).len(), 1, "{explained}");
+        let raw = function(&code, "mcp.rs", "fn print_answer(", test);
+        assert!(calls(raw, "error_line", test).is_empty() && calls(raw, "explain", test).is_empty(), "{raw}");
+    }
+
+    /// Every code `explain` words, read from its source.
+    fn worded_codes() -> Vec<String> {
+        let source = include_str!("mcp.rs").replace("\r\n", "\n");
+        let body = &source[source.find("fn explain(error: &str) -> String {").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        body.lines().map(str::trim).filter(|l| l.starts_with('"') && l.contains(" => "))
+            .flat_map(|l| l.split(" => ").next().unwrap().split('|').map(|c| c.trim().trim_matches('"').to_string()).collect::<Vec<_>>())
+            .collect()
+    }
+
+    /// Another computer recognizes a failed call by its code, never by words, which differ between
+    /// versions and brands: every code `explain` words goes out beside the same words as before, and
+    /// slopbar-mcp's own refusals keep their codes until then.
+    #[test]
+    fn a_failed_call_prints_its_words_and_beside_them_its_code() {
+        let codes = worded_codes();
+        assert!(codes.iter().any(|c| c == "sharing_setup_busy"), "{codes:?}");
+        for code in &codes {
+            assert!(is_code(code), "{code}");
+            assert_eq!(error_line(code), json!({ "error": explain(code), "code": code }), "{code}");
+        }
+        // Words, a code with something of its own after it, or a code `explain` leaves as it is: the
+        // words are all there is, or are the code.
+        for error in ["Invalid arguments: confirm is required", "ssh_failed: Connection refused", "remote_missing_here: dropbox", "target: desktop_locked", "monitor_reconnect", "failed"] {
+            assert_eq!(error_line(error), json!({ "error": explain(error) }), "{error}");
+        }
+        // A tool this one lacks, in the words the asking computer reads (and words for its agent).
+        let unknown = error_line("Unknown tool: restart_sign_in");
+        assert_eq!(unknown, json!({ "error": "Unknown tool: restart_sign_in" }));
+        assert!(unknown_there(unknown["error"].as_str().unwrap(), "restart_sign_in"));
+        let long = error_line(&format!("Unknown tool: {}\u{1b}[2J", "n".repeat(3000)));
+        assert!(long["error"].as_str().is_some_and(|e| e.chars().count() == MAX_TEXT && !e.chars().any(char::is_control)), "{long}");
+        assert_eq!(error_line(&"x".repeat(600))["error"].as_str().unwrap().chars().count(), MAX_TEXT);
+        // What run_tool hands `error_line`: its own refusals as codes, and a tool it lacks in the
+        // words every SlopBar since `--call-b64` has used (another computer reads them to say update
+        // it there).
+        assert_eq!(run_tool("sign_in_all", json!({ "everywhere": true }), "unused-pipe", false).unwrap_err(), "not_from_a_remote_call");
+        assert_eq!(run_tool("setup_sharing_later", json!({}), "unused-pipe", false).unwrap_err(), "Unknown tool: setup_sharing_later");
+        // And the door's own codes, worded only when printed: no app answers on this pipe.
+        let missing = format!(r"\\.\pipe\slopbar-test-no-door-{}", std::process::id());
+        let error = run_tool("get_usage", json!({}), &missing, false).unwrap_err();
+        assert!(matches!(error.as_str(), "not_running" | "unsupported_platform"), "{error}");
+        assert_eq!(error_line(&error)["code"], error.as_str());
     }
 
     /// Another computer that does not know a tool says so in words `unknown_there` reads: its older

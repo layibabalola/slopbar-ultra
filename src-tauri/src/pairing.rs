@@ -339,8 +339,58 @@ fn finished(out: Vec<u8>, code: Option<i32>, err: &[u8]) -> Result<Vec<u8>, Stri
 }
 
 /// Runs one of the target's tools through its `slopbar-mcp --call`; its answer or its error.
-pub fn remote_call(remote: &dyn Remote, host: &str, tool: &str, arguments: &Value) -> Result<Value, String> {
-    answer(&run_there(remote, host, &["--call-b64", &asking(tool, arguments)], b"")?)
+pub fn remote_call(remote: &dyn Remote, host: &str, tool: &str, arguments: &Value) -> Result<Value, RemoteError> {
+    read(&run_there(remote, host, &["--call-b64", &asking(tool, arguments)], b"").map_err(RemoteError::here)?)
+}
+
+/// Why a call to another computer failed. `text` is what an agent reads (that computer words its
+/// errors before printing them) and what this becomes as a `String`; `code` is what code compares,
+/// never the words, which differ between versions and brands.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteError {
+    pub code: Option<String>,
+    pub text: String,
+}
+
+/// What a SlopBar from before `code` came (see `mcp::error_line`) printed for the codes this computer
+/// acts on, as their only sign: matched whole. Their wording is fixed in those releases, so it stays
+/// here whatever `explain` says now.
+const EARLIER_WORDS: [(&str, &str); 1] = [
+    ("sharing_setup_busy", "A sharing setup is already running on this computer: follow it with get_sharing_setup, or stop it with setup_sharing cancel: true."),
+];
+
+impl RemoteError {
+    /// An error this computer met on the way (`ssh_failed`, `ssh_timeout`…): already a code.
+    fn here(error: String) -> Self {
+        RemoteError { code: crate::mcp::is_code(&error).then(|| error.clone()), text: error }
+    }
+
+    /// The error another computer printed: its `code` when it gave one, else the code its words
+    /// stand for (`EARLIER_WORDS`), else the words themselves when they are a code (one `explain`
+    /// leaves as it is).
+    fn printed(text: &str, code: Option<&str>) -> Self {
+        let code = code.filter(|c| crate::mcp::is_code(c)).map(str::to_owned)
+            .or_else(|| EARLIER_WORDS.iter().find(|(_, words)| *words == text).map(|(code, _)| (*code).to_owned()))
+            .or_else(|| crate::mcp::is_code(text).then(|| text.to_owned()));
+        RemoteError { code, text: text.to_owned() }
+    }
+
+    /// Whether it failed with `code`.
+    pub fn is(&self, code: &str) -> bool {
+        self.code.as_deref() == Some(code)
+    }
+}
+
+impl std::fmt::Display for RemoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl From<RemoteError> for String {
+    fn from(error: RemoteError) -> String {
+        error.text
+    }
 }
 
 /// How long a relay call may take over SSH beyond the waiting it asks the target to do.
@@ -392,15 +442,22 @@ pub fn remote_readiness(remote: &dyn Remote, host: &str, arguments: &Value) -> R
     Ok(answer)
 }
 
-/// The JSON object a remote `slopbar-mcp` printed last: `{"ok": …}` or `{"error": …}`.
+/// The JSON object a remote `slopbar-mcp` printed last: `{"ok": …}` or `{"error": …}`, its error as
+/// it was printed (see `read` for its code).
 fn answer(out: &[u8]) -> Result<Value, String> {
+    read(out).map_err(String::from)
+}
+
+/// `answer`, with the error's code (`RemoteError`).
+fn read(out: &[u8]) -> Result<Value, RemoteError> {
+    let no_answer = || RemoteError::here("remote_no_answer".into());
     let text = String::from_utf8_lossy(out);
-    let last = text.lines().map(str::trim).rfind(|l| l.starts_with('{')).ok_or("remote_no_answer")?;
-    let mut value: Value = serde_json::from_str(last).map_err(|_| "remote_no_answer".to_string())?;
+    let last = text.lines().map(str::trim).rfind(|l| l.starts_with('{')).ok_or_else(no_answer)?;
+    let mut value: Value = serde_json::from_str(last).map_err(|_| no_answer())?;
     if let Some(error) = value.get("error").and_then(Value::as_str) {
-        return Err(error.to_string());
+        return Err(RemoteError::printed(error, value.get("code").and_then(Value::as_str)));
     }
-    value.get_mut("ok").map(Value::take).ok_or_else(|| "remote_no_answer".into())
+    value.get_mut("ok").map(Value::take).ok_or_else(no_answer)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -724,11 +781,23 @@ pub fn check_remote(tool: &str, arguments: &Value) -> Result<(), String> {
 
 /// How long `setup_sharing` with `ssh_host` waits for another computer to get rclone and start its
 /// Dropbox sign-in. The setup goes on there after that; calling again joins it.
-const SETUP_START: Duration = Duration::from_secs(150);
+const SETUP_START: Duration = if cfg!(test) { Duration::ZERO } else { Duration::from_secs(150) };
 
 /// What `setup_sharing` answers without `confirm: true`. Short: every string a tool returns is cut
 /// at `mcp::MAX_TEXT`, and this one ends with when to confirm.
 const SETUP_SHARING_PREVIEW: &str = "Nothing was started. confirm: true gets rclone unless a recent one is installed (a fixed, checksum-verified download from rclone's site into SlopBar's folder), opens Dropbox's consent page in the default browser (with ssh_host, that computer's) for the user to sign in and click Allow themselves, and turns in-use sharing on through rclone, whose access covers the whole Dropbox; SlopBar uses only its SlopBar folder there. Confirm only if the user asked for this setup.";
+
+/// What `setup_sharing` with `ssh_host` says to do next (each fits `mcp::MAX_TEXT`, like the preview).
+/// The page opens on that computer's screen:
+const SETUP_THERE: &str = "That computer's SlopBar gets rclone if needed and opens Dropbox's page in its own browser, on its screen, with a notification there. The user signs in there with the Dropbox account their other computers use and clicks Allow; follow it with get_sharing_setup with this ssh_host, wait_seconds: 45 and since: the last revision, until phase is done or failed.";
+/// The setup joined there was started with `open_here`, and this call has none, so nothing opens:
+const SETUP_ELSEWHERE: &str = "That setup finishes its Dropbox sign-in through a tunnel, in a browser on another computer, so nothing opens on that computer's screen. If the user wants the page on this computer, call setup_sharing again with this ssh_host, open_here: true and confirm: true. Otherwise follow it with get_sharing_setup with this ssh_host, wait_seconds: 45 and since: the last revision, or stop it with cancel: true if the user wants that.";
+/// The page is ready here:
+const SETUP_HERE: &str = "Dropbox's page is ready in this computer's browser: opened says whether it opened by itself, notified whether a notification here offers it (a page opened while nobody uses SlopBar can stay behind other windows, so tell the user where to look). The user signs in with the Dropbox account their other computers use and clicks Allow on dropbox.com; then call get_sharing_setup with this ssh_host, wait_seconds: 45 and since: the last revision, until phase is done or failed.";
+/// Nothing could be shown here:
+const SETUP_NOT_SHOWN: &str = "Nothing was shown here: the user turned off both opening Dropbox's page (sharing_open_browser) and its notification (notifications.sharing_sign_in). Ask the user before turning one on with update_settings, then call setup_sharing again with this ssh_host, open_here: true and confirm: true (it joins the same setup).";
+/// Still getting rclone there when this call stops waiting:
+const SETUP_STILL_GOING: &str = "Still under way on that computer. Call setup_sharing again with this ssh_host, open_here: true and confirm: true to keep waiting (it joins the same setup), or with cancel: true to stop it.";
 
 /// How long `--sharing-state` waits on the other computer for its sign-in before answering, in
 /// seconds: each ask over SSH starts a shell there, so it asks seldom and the waiting is done there.
@@ -756,9 +825,12 @@ fn own_dropbox_remote(door: &dyn Door) -> Option<String> {
 /// an SSH tunnel to its rclone and this computer's browser on the link, built here from the state
 /// value alone: Dropbox's answer reaches that computer's rclone through the tunnel, no token passes
 /// here, and the state value never appears in a result. `get_sharing_setup` with `ssh_host`
-/// follows either.
+/// follows either. A call made while a setup runs there joins it, starting nothing: with
+/// `open_here` it opens the tunnel and browser here for it as for its own, though a tunnel that
+/// fails stops only a setup this call started; without, nothing opens here, and a setup waiting for
+/// a tunnel says how to finish it here.
 fn setup_remote_sharing(door: &dyn Door, ssh: &dyn Remote, host: &str, args: &Value) -> Result<Value, String> {
-    let cancel_there = || remote_call(ssh, host, "setup_sharing", &json!({ "cancel": true }));
+    let cancel_there = || remote_call(ssh, host, "setup_sharing", &json!({ "cancel": true })).map_err(from_there);
     let close_here = || door.call(&Request::SharingTunnel { host: host.into(), state: None, close: true });
     if args.get("cancel").and_then(Value::as_bool) == Some(true) {
         let _ = close_here();
@@ -777,53 +849,87 @@ fn setup_remote_sharing(door: &dyn Door, ssh: &dyn Remote, host: &str, args: &Va
     if args.get("reconnect").and_then(Value::as_bool) == Some(true) {
         start["reconnect"] = true.into();
     }
-    let started = match remote_call(ssh, host, "setup_sharing", &start) {
-        Ok(state) => Some(state),
+    let (there, joined) = match remote_call(ssh, host, "setup_sharing", &start) {
+        Ok(state) => (state, false),
         // One already runs there (this call came again while it got rclone): this one joins it.
-        Err(e) if e.contains("sharing_setup_busy") => None,
-        Err(e) if e.contains("nknown tool") => return Err("update_slopbar_there".into()),
-        Err(e) => return Err(format!("target: {e}")),
+        Err(e) if e.is("sharing_setup_busy") => {
+            let there = remote_call(ssh, host, "get_sharing_setup", &json!({})).map_err(from_there)?;
+            if !setup_running(&there) {
+                // It ended meanwhile: its own state says how.
+                return Ok(there);
+            }
+            // Only the same setup is joined: one for another remote name is not what this call
+            // asked for, so the refusal stands (it says to follow that one or stop it).
+            if start.get("remote").is_some_and(|asked| there.get("remote").is_some_and(|running| running != asked)) {
+                return Err(from_there(e));
+            }
+            (there, true)
+        }
+        // A SlopBar from before the guided setup: unknown tools are refused in these words.
+        Err(e) if e.text.contains("nknown tool") => return Err("update_slopbar_there".into()),
+        Err(e) => return Err(from_there(e)),
     };
     if !open_here {
-        let mut there = match started {
-            Some(state) => state,
-            None => remote_call(ssh, host, "get_sharing_setup", &json!({}))?,
-        };
-        there["next"] = json!("That computer's SlopBar gets rclone if needed and opens Dropbox's page in its own browser, on its screen, with a notification there. The user signs in there with the Dropbox account their other computers use and clicks Allow; follow it with get_sharing_setup with this ssh_host, wait_seconds: 45 and since: the last revision, until phase is done or failed.");
-        return Ok(there);
+        // Nothing opens here without open_here: a setup joined there that was started with it
+        // (whose page opens only through a tunnel) says how to finish it here instead.
+        let next = if there["via_tunnel"] == true { SETUP_ELSEWHERE } else { SETUP_THERE };
+        return Ok(with_next(there, next));
     }
     let deadline = std::time::Instant::now() + SETUP_START;
     loop {
-        let link = answer(&run_there(ssh, host, &["--sharing-state", STATE_WAIT], b"")?)?;
+        // Its errors are that computer's, as are those of the calls below (its door's own codes,
+        // which this computer would otherwise word as its own).
+        let link = run_there(ssh, host, &["--sharing-state", STATE_WAIT], b"").and_then(|out| answer(&out)).map_err(from_there)?;
         if let Some(state) = link.get("state").and_then(Value::as_str) {
             let shown = match door.call(&Request::SharingTunnel { host: host.into(), state: Some(state.into()), close: false }) {
                 Ok(shown) => shown,
+                // A setup this call joined is not its own to stop: it goes on there.
+                Err(e) if joined => return Err(if e == "tunnel_failed" { "tunnel_failed_joined".into() } else { e }),
                 Err(e) => {
                     let _ = cancel_there();
                     return Err(e);
                 }
             };
             let (opened, notified) = (shown["opened"] == true, shown["notified"] == true);
-            let next = if opened || notified {
-                "Dropbox's page is ready in this computer's browser: opened says whether it opened by itself, notified whether a notification here offers it (a page opened while nobody uses SlopBar can stay behind other windows, so tell the user where to look). The user signs in with the Dropbox account their other computers use and clicks Allow on dropbox.com; then call get_sharing_setup with this ssh_host, wait_seconds: 45 and since: the last revision, until phase is done or failed."
-            } else {
-                "Nothing was shown here: the user turned off both opening Dropbox's page (sharing_open_browser) and its notification (notifications.sharing_sign_in). Ask the user before turning one on with update_settings, then call setup_sharing again with this ssh_host and confirm: true (it joins the same setup)."
-            };
+            let next = if opened || notified { SETUP_HERE } else { SETUP_NOT_SHOWN };
             return Ok(json!({ "phase": "dropbox", "browser": "this computer", "opened": opened, "notified": notified, "next": next }));
         }
         if !setup_running(&link) {
             // Already connected (no sign-in needed), or it stopped: its own state says which.
-            return remote_call(ssh, host, "get_sharing_setup", &json!({}));
+            return remote_call(ssh, host, "get_sharing_setup", &json!({})).map_err(from_there);
         }
-        if std::time::Instant::now() > deadline {
+        if std::time::Instant::now() >= deadline {
             // Still getting rclone there (a slow link): it goes on, and is joined by calling again.
-            let mut there = remote_call(ssh, host, "get_sharing_setup", &json!({}))?;
-            there["next"] = json!("Still under way on that computer. Call setup_sharing again with this ssh_host and confirm: true to keep waiting (it joins the same setup), or with cancel: true to stop it.");
-            return Ok(there);
+            return Ok(still_going(remote_call(ssh, host, "get_sharing_setup", &json!({})).map_err(from_there)?));
         }
         std::thread::sleep(Duration::from_secs(2));
     }
 }
+
+/// A setup's state there when this call stops waiting: what to do next while it is still under
+/// way; as it is once it ended in between (its own state says how).
+fn still_going(there: Value) -> Value {
+    if setup_running(&there) { with_next(there, SETUP_STILL_GOING) } else { there }
+}
+
+/// An error met on another computer, said to be that computer's (`mcp::explain` words "target: …"
+/// as "On the other computer: …"); this computer's own SSH problems stay its own.
+fn from_there(error: impl std::fmt::Display) -> String {
+    let error = error.to_string();
+    if matches!(error.as_str(), "ssh_missing" | "bad_ssh_host") { error } else { format!("target: {error}") }
+}
+
+/// Another computer's answer with what to do next added; one that is no object (only a broken or
+/// misbehaving computer gives one) is passed on as it is.
+fn with_next(mut answer: Value, next: &str) -> Value {
+    if let Some(fields) = answer.as_object_mut() {
+        fields.insert("next".into(), next.into());
+    }
+    answer
+}
+
+/// What to do when another computer's finished setup does not see this one.
+const NOT_SEEN_THERE: &str = "That computer does not see this one among the computers sharing there, so it may be signed in to another Dropbox account. Run setup_sharing with this ssh_host, reconnect: true and confirm: true (and open_here: true if the user wants the page on this computer), and have the user sign in with the Dropbox account this computer uses. A computer that has just started sharing can take a minute to appear.";
 
 /// Marks whether another computer's finished setup sees this one, which shares too, among the
 /// computers sharing there: when it does not, it may be signed in to another Dropbox account.
@@ -832,7 +938,7 @@ fn seen_from_there(answer: &mut Value, me: &str) {
         .is_some_and(|found| found.iter().filter_map(Value::as_str).any(|name| name.eq_ignore_ascii_case(me)));
     answer["sees_this_computer"] = seen.into();
     if !seen {
-        answer["next"] = json!("That computer does not see this one among the computers sharing there, so it may be signed in to another Dropbox account. Run setup_sharing with this ssh_host, reconnect: true and confirm: true, and have the user sign in with the Dropbox account this computer uses. A computer that has just started sharing can take a minute to appear.");
+        answer["next"] = json!(NOT_SEEN_THERE);
     }
 }
 
@@ -883,7 +989,7 @@ pub fn local_tool(name: &str, args: &Value, pipe: &str, remote_ok: bool) -> Resu
             // Waiting for a change is passed on: the other computer's app does the waiting.
             let wait: serde_json::Map<String, Value> = args.as_object().into_iter().flatten()
                 .filter(|(k, _)| matches!(k.as_str(), "wait_seconds" | "since")).map(|(k, v)| (k.clone(), v.clone())).collect();
-            let mut answer = remote_call(&Ssh, host, "get_sharing_setup", &Value::Object(wait))?;
+            let mut answer = remote_call(&Ssh, host, "get_sharing_setup", &Value::Object(wait)).map_err(from_there)?;
             if !setup_running(&answer) {
                 let _ = crate::door::call(pipe, &Request::SharingTunnel { host: host.into(), state: None, close: true });
             }
@@ -905,7 +1011,7 @@ pub fn local_tool(name: &str, args: &Value, pipe: &str, remote_ok: bool) -> Resu
             let arguments = args.get("arguments").cloned().unwrap_or(json!({}));
             check_remote(tool, &arguments)?;
             if tool != "get_machine_readiness" {
-                return remote_call(&Ssh, host, tool, &arguments);
+                return remote_call(&Ssh, host, tool, &arguments).map_err(String::from);
             }
             let answer = remote_readiness(&Ssh, host, &arguments)?;
             remember_answer(host, &answer);
@@ -1081,7 +1187,7 @@ mod tests {
         let glued = scripted(vec![printed(&format!("Hi {}", started("{\"ok\":{\"paired\":true}}\r\n")))]);
         assert_eq!(remote_call(&glued, "box", "get_roster", &json!({})).unwrap(), json!({ "paired": true }), "read once, from pwsh");
         let there = scripted(vec![printed(&started(""))]);
-        assert_eq!(remote_call(&there, "box", "sign_in_all", &json!({ "confirm": true })).unwrap_err(), "remote_no_answer");
+        assert_eq!(remote_call(&there, "box", "sign_in_all", &json!({ "confirm": true })).unwrap_err().text, "remote_no_answer");
         // SSH itself failed or timed out: nothing is tried again.
         for e in ["ssh_failed: Connection refused", "ssh_timeout"] {
             let there = scripted(vec![Err(e.into())]);
@@ -1090,7 +1196,7 @@ mod tests {
         }
         // Neither PowerShell there: no answer, as before.
         let there = scripted(vec![printed(""), printed("")]);
-        assert_eq!(remote_call(&there, "box", "get_app_info", &json!({})).unwrap_err(), "remote_no_answer");
+        assert_eq!(remote_call(&there, "box", "get_app_info", &json!({})).unwrap_err().text, "remote_no_answer");
         assert_eq!(tried(&there).iter().map(|(shell, _)| shell.as_str()).collect::<Vec<_>>(), ["pwsh", "powershell"]);
     }
 
@@ -1120,16 +1226,60 @@ mod tests {
         assert_eq!(answer(b"").unwrap_err(), "remote_no_answer");
     }
 
+    /// What every SlopBar with the guided setup printed for its busy refusal before `code` came
+    /// (mcp.rs, unchanged from 5147f15 until then). A fact about released builds: never reword it.
+    const BUSY_BEFORE_CODES: &str = "A sharing setup is already running on this computer: follow it with get_sharing_setup, or stop it with setup_sharing cancel: true.";
+
+    /// `answered`'s bytes, for `read`.
+    fn printed_line(line: &Value) -> Vec<u8> {
+        answered(line).unwrap()
+    }
+
+    #[test]
+    fn an_error_from_another_computer_is_known_by_its_code_whatever_its_words() {
+        // A current SlopBar prints the words an agent reads, with the code beside them.
+        for code in ["sharing_setup_busy", "desktop_locked", "desktop_not_shown", "signin_busy", "CLI not found", "not_running", "app_outdated", "target_has_other_key"] {
+            let error = read(&printed_line(&crate::mcp::error_line(code))).unwrap_err();
+            assert!(error.is(code), "{error:?}");
+            assert_eq!(error.text, crate::mcp::explain(code), "an agent reads the same words as before");
+            assert_ne!(error.text, code);
+            assert_eq!(String::from(error), crate::mcp::explain(code), "and so do agents and Settings here");
+        }
+        // An earlier one printed only the words: the setup's busy refusal is known by them.
+        let earlier = read(&printed_line(&json!({ "error": BUSY_BEFORE_CODES }))).unwrap_err();
+        assert!(earlier.is("sharing_setup_busy"), "{earlier:?}");
+        assert_eq!(earlier.to_string(), BUSY_BEFORE_CODES);
+        assert_eq!(EARLIER_WORDS.map(|(_, words)| words), [BUSY_BEFORE_CODES]);
+        // Other words stay words, with no code; a code `explain` leaves as it is stays a code.
+        let wrapped = format!("On the other computer: {BUSY_BEFORE_CODES}");
+        for words in ["Unknown tool: setup_sharing", "Invalid arguments: confirm is required", BUSY_BEFORE_CODES.trim_end_matches('.'), wrapped.as_str()] {
+            assert_eq!(read(&printed_line(&json!({ "error": words }))).unwrap_err(), RemoteError { code: None, text: words.into() });
+        }
+        assert!(read(&printed_line(&json!({ "error": "monitor_reconnect" }))).unwrap_err().is("monitor_reconnect"));
+        // A `code` that is not one is ignored.
+        for odd in [json!("sharing_setup_busy: x"), json!("x".repeat(65)), json!(7), Value::Null] {
+            assert_eq!(read(&printed_line(&json!({ "error": "Words.", "code": odd }))).unwrap_err().code, None, "{odd}");
+        }
+        // Met on the way here: already a code, or a code with ssh's reason.
+        assert!(RemoteError::here("ssh_timeout".into()).is("ssh_timeout"));
+        assert_eq!(RemoteError::here("ssh_failed: Connection refused".into()).code, None);
+        assert!(read(b"").unwrap_err().is("remote_no_answer"));
+    }
+
     /// A fake app: records requests, answers settings and roster calls.
     struct FakeApp {
         settings: Value,
         saved: Option<&'static str>,
         remotes: Vec<&'static str>,
+        /// Opening the tunnel for a sign-in fails with this (`SharingTunnel`).
+        tunnel_error: Option<&'static str>,
+        /// Dropbox's page opens by itself once the tunnel is open (else nothing is shown).
+        page_opens: bool,
         seen: RefCell<Vec<Request>>,
     }
 
     impl FakeApp {
-        fn new(settings: Value) -> Self { FakeApp { settings, saved: None, remotes: vec!["dropbox"], seen: RefCell::default() } }
+        fn new(settings: Value) -> Self { FakeApp { settings, saved: None, remotes: vec!["dropbox"], tunnel_error: None, page_opens: true, seen: RefCell::default() } }
         fn key_set(&self) -> Option<String> {
             self.seen.borrow().iter().find_map(|r| match r { Request::SetRosterPassphrase { passphrase: Some(p) } => Some(p.0.clone()), _ => None })
         }
@@ -1141,6 +1291,12 @@ mod tests {
     impl Door for FakeApp {
         fn call(&self, request: &Request) -> Result<Value, String> {
             self.seen.borrow_mut().push(request.clone());
+            if let Request::SharingTunnel { close: false, .. } = request {
+                return match self.tunnel_error {
+                    Some(error) => Err(error.into()),
+                    None => Ok(json!({ "opened": self.page_opens, "notified": false })),
+                };
+            }
             Ok(match request {
                 Request::GetSettings => self.settings.clone(),
                 Request::ListSharingLocations => json!({
@@ -1160,6 +1316,8 @@ mod tests {
         running: bool,
         /// A misbehaving target that echoes what it was sent.
         echo: bool,
+        /// A misbehaving target that refuses with the key it was sent.
+        echo_refusal: bool,
         /// It has PowerShell 7; without it, its shell finds no `pwsh` and only Windows PowerShell
         /// runs the script.
         pwsh: bool,
@@ -1177,8 +1335,14 @@ mod tests {
             let (_, args) = parts(command);
             let out = match tool_asked(&args) {
                 None if args == ["--pair-receive"] => match receive(self.target, &mut &input[..], self.target.saved.map(|s| Passphrase(s.into()))) {
+                    // A misbehaving target that refuses with the key it was sent, as words and code.
+                    Ok(_) if self.echo_refusal => {
+                        let key = serde_json::from_slice::<Value>(input).unwrap()["key"].clone();
+                        json!({ "error": key, "code": key })
+                    }
                     Ok(v) => json!({ "ok": if self.echo { json!({ "leak": String::from_utf8_lossy(input) }) } else { v } }),
-                    Err(e) => json!({ "error": e }),
+                    // As a real target prints it (`mcp::pair_receive`).
+                    Err(e) => crate::mcp::error_line(&e),
                 },
                 Some((tool, _)) if tool == "list_sharing_locations" => {
                     let mut places = self.target.call(&Request::ListSharingLocations).unwrap();
@@ -1200,21 +1364,49 @@ mod tests {
         Ok(format!("{STARTED}\r\n{}\r\n", ascii_json(out)).into_bytes())
     }
 
-    /// Another computer running a sharing setup: its tools and `--sharing-state` answer as scripted.
+    /// Another computer running a sharing setup: its tools and `--sharing-state` answer as scripted,
+    /// and it prints an error as its `slopbar-mcp` would (see `failed`).
     struct SharingTarget {
         /// What `--sharing-state` answers.
         link: Value,
+        /// `--sharing-state` fails with this door code instead (printed raw, as `mcp::sharing_state` does).
+        link_error: Option<&'static str>,
+        /// What `get_sharing_setup` answers.
+        setup: Value,
+        /// `get_sharing_setup` fails with this instead.
+        setup_error: Option<&'static str>,
         /// A setup already runs there: starting another is refused.
         busy: bool,
-        /// Starting is refused with this error (its desktop is locked, say).
+        /// Starting is refused with this before its desktop is looked at (it shares through a
+        /// folder, or the remote name is unusable).
         refuse: Option<&'static str>,
+        /// Someone can see its desktop: a setup whose page opens there is refused while nobody can,
+        /// before a running one is looked at (app.rs `start_sharing_setup`), as one with
+        /// `via_tunnel` never is.
+        desktop: bool,
+        /// Its SlopBar prints an error's code beside its words; else it is one from before that.
+        codes: bool,
+        /// Its SlopBar has the guided setup; else it is one from before that.
+        guided: bool,
         /// It has PowerShell 7 (see `FakeSsh::pwsh`).
         pwsh: bool,
         commands: RefCell<Vec<String>>,
     }
 
     fn target(link: Value) -> SharingTarget {
-        SharingTarget { link, busy: false, refuse: None, pwsh: true, commands: RefCell::default() }
+        SharingTarget { link, link_error: None, setup: json!({ "phase": "done", "found": ["DESK-2"] }), setup_error: None, busy: false, refuse: None, desktop: true, codes: true, guided: true, pwsh: true, commands: RefCell::default() }
+    }
+
+    impl SharingTarget {
+        /// The line its slopbar-mcp prints when a tool fails with `error`: the words an agent reads,
+        /// with the code beside them (`mcp::error_line`), or from an earlier SlopBar the words alone.
+        fn failed(&self, error: &str) -> Value {
+            match (self.codes, error) {
+                (true, _) => crate::mcp::error_line(error),
+                (false, "sharing_setup_busy") => json!({ "error": BUSY_BEFORE_CODES }),
+                (false, _) => json!({ "error": crate::mcp::explain(error) }),
+            }
+        }
     }
 
     fn call_b64(tool: &str, arguments: Value) -> String {
@@ -1229,11 +1421,22 @@ mod tests {
             }
             let (_, args) = parts(command);
             let out = match tool_asked(&args) {
-                None if args == ["--sharing-state", STATE_WAIT] => json!({ "ok": self.link }),
-                Some((tool, _)) if tool == "get_sharing_setup" => json!({ "ok": { "phase": "done", "found": ["DESK-2"] } }),
-                Some((tool, arguments)) if tool == "setup_sharing" => match self.refuse {
+                None if args == ["--sharing-state", STATE_WAIT] => match self.link_error {
                     Some(error) => json!({ "error": error }),
-                    None if self.busy && arguments["cancel"] != true => json!({ "error": "sharing_setup_busy" }),
+                    None => json!({ "ok": self.link }),
+                },
+                // From before the guided setup: its slopbar-mcp refuses a tool it lacks so (see
+                // `mcp::run_tool`).
+                Some((tool, _)) if !self.guided => json!({ "error": format!("Unknown tool: {tool}") }),
+                Some((tool, _)) if tool == "get_sharing_setup" => match self.setup_error {
+                    Some(error) => self.failed(error),
+                    None => json!({ "ok": self.setup }),
+                },
+                Some((_, arguments)) if arguments["cancel"] == true => json!({ "ok": { "phase": "failed", "error": "cancelled" } }),
+                Some((tool, arguments)) if tool == "setup_sharing" => match self.refuse {
+                    Some(error) => self.failed(error),
+                    None if !self.desktop && arguments["via_tunnel"] != true => self.failed("desktop_locked"),
+                    None if self.busy => self.failed("sharing_setup_busy"),
                     None => json!({ "ok": { "phase": "rclone" } }),
                 },
                 _ => panic!("not asked of this computer: {args:?}"),
@@ -1252,16 +1455,19 @@ mod tests {
         assert_eq!(*there.commands.borrow(), [call_b64("setup_sharing", json!({ "confirm": true }))], "no tunnel, no state asked for");
         assert!(matches!(&here.seen.borrow()[..], [Request::ListSharingLocations]), "nothing opens here");
 
-        // One already runs there: its state answers.
-        let here = FakeApp::new(json!({}));
-        let there = SharingTarget { busy: true, ..target(json!({})) };
-        assert_eq!(setup_remote_sharing(&here, &there, "box", &json!({ "remote": "dropbox" })).unwrap()["found"], json!(["DESK-2"]));
-        assert_eq!(there.commands.borrow()[0], call_b64("setup_sharing", json!({ "confirm": true, "remote": "dropbox" })));
+        // A computer sharing through a folder refuses first, whoever can see its desktop.
+        let there = SharingTarget { refuse: Some("uses_folder"), desktop: false, ..target(json!({})) };
+        let error = setup_remote_sharing(&FakeApp::new(json!({})), &there, "box", &json!({})).unwrap_err();
+        assert_eq!(error, format!("target: {}", crate::mcp::explain("uses_folder")));
 
-        // Nobody can see that desktop: refused there, and said to be about that computer.
-        let here = FakeApp::new(json!({}));
-        let there = SharingTarget { refuse: Some("desktop_locked"), ..target(json!({})) };
-        assert_eq!(setup_remote_sharing(&here, &there, "box", &json!({})).unwrap_err(), "target: desktop_locked");
+        // Nobody can see that desktop: refused there in its words, said here to be about that computer.
+        for codes in [true, false] {
+            let here = FakeApp::new(json!({}));
+            let there = SharingTarget { desktop: false, codes, ..target(json!({})) };
+            let error = setup_remote_sharing(&here, &there, "box", &json!({})).unwrap_err();
+            assert_eq!(error, format!("target: {}", crate::mcp::explain("desktop_locked")));
+            assert!(crate::mcp::explain(&error).starts_with("On the other computer: Nothing was started: "), "{error}");
+        }
 
         // Cancelling stops it there (and closes any tunnel here).
         let here = FakeApp::new(json!({}));
@@ -1277,10 +1483,16 @@ mod tests {
         let there = target(json!({ "phase": "dropbox", "state": "Ab-9_x" }));
         let out = setup_remote_sharing(&here, &there, "box", &json!({ "open_here": true })).unwrap();
         assert_eq!(out["phase"], "dropbox");
+        assert_eq!((out["opened"].as_bool(), out["next"].as_str()), (Some(true), Some(SETUP_HERE)));
         assert!(!out.to_string().contains("Ab-9_x"), "{out}");
         assert_eq!(there.commands.borrow()[0], call_b64("setup_sharing", json!({ "confirm": true, "via_tunnel": true })), "that computer's browser is not needed");
         let seen = here.seen.borrow();
         assert!(matches!(&seen[..], [Request::ListSharingLocations, Request::SharingTunnel { host, state: Some(s), close: false }] if host == "box" && s == "Ab-9_x"), "{seen:?}");
+
+        // Neither the page nor its notification may be shown here: said so, with how to go on.
+        let here = FakeApp { page_opens: false, ..FakeApp::new(json!({})) };
+        let out = setup_remote_sharing(&here, &target(json!({ "phase": "dropbox", "state": "Ab-9_x" })), "box", &json!({ "open_here": true })).unwrap();
+        assert_eq!((out["opened"].as_bool(), out["notified"].as_bool(), out["next"].as_str()), (Some(false), Some(false), Some(SETUP_NOT_SHOWN)));
 
         // Already connected there (no sign-in to wait for): its own state answers, and no tunnel opens.
         let here = FakeApp::new(json!({}));
@@ -1288,13 +1500,170 @@ mod tests {
         assert_eq!(setup_remote_sharing(&here, &there, "box", &json!({ "open_here": true, "remote": "dropbox", "reconnect": false })).unwrap()["found"], json!(["DESK-2"]));
         assert!(here.seen.borrow().is_empty());
         assert_eq!(there.commands.borrow()[0], call_b64("setup_sharing", json!({ "confirm": true, "via_tunnel": true, "remote": "dropbox" })));
+    }
 
-        // A setup already running there (still getting rclone when the first call gave up) is
-        // joined: its sign-in opens here once it waits.
+    /// A second setup_sharing with ssh_host (a call that gave up while that computer got rclone,
+    /// made again as its answer says) joins the setup running there, whether that computer's
+    /// SlopBar prints codes or only words: nothing starts twice, and nothing opens here without
+    /// open_here.
+    #[test]
+    fn a_second_setup_joins_the_one_running_there() {
+        let running = |via_tunnel: bool| json!({ "phase": "rclone", "remote": "dropbox", "via_tunnel": via_tunnel, "revision": 4 });
+        let asked = |there: &SharingTarget| there.commands.borrow().iter().map(|c| asked_of(c)).collect::<Vec<_>>();
+        let wait = format!("--sharing-state {STATE_WAIT}");
+        for codes in [true, false] {
+            let busy = |setup: Value| SharingTarget { busy: true, codes, setup, ..target(json!({ "phase": "dropbox", "state": "Ab-9_x" })) };
+
+            // Started to open on that computer's screen: joined there, with what to do next.
+            let here = FakeApp::new(json!({}));
+            let there = busy(running(false));
+            let out = setup_remote_sharing(&here, &there, "box", &json!({})).unwrap();
+            assert_eq!((out["phase"].as_str(), out["revision"].as_u64()), (Some("rclone"), Some(4)), "{codes}: {out}");
+            assert_eq!(out["next"], SETUP_THERE);
+            assert_eq!(asked(&there), ["setup_sharing", "get_sharing_setup"], "nothing started twice");
+            assert_eq!(there.commands.borrow()[1], call_b64("get_sharing_setup", json!({})), "its state now, without waiting");
+            assert!(matches!(&here.seen.borrow()[..], [Request::ListSharingLocations]), "nothing opens here");
+
+            // Joined with open_here: its sign-in opens here once it waits, however it was started,
+            // and with that computer's desktop locked too (open_here's own case): a setup whose page
+            // opens elsewhere is never refused for it.
+            for (via_tunnel, desktop) in [(true, true), (true, false), (false, true)] {
+                let here = FakeApp::new(json!({}));
+                let there = SharingTarget { desktop, ..busy(running(via_tunnel)) };
+                let out = setup_remote_sharing(&here, &there, "box", &json!({ "open_here": true, "confirm": true })).unwrap();
+                assert_eq!((out["phase"].as_str(), out["browser"].as_str()), (Some("dropbox"), Some("this computer")), "{codes} {via_tunnel} {desktop}: {out}");
+                assert!(!out.to_string().contains("Ab-9_x"), "{out}");
+                assert!(here.seen.borrow().iter().any(|r| matches!(r, Request::SharingTunnel { state: Some(s), close: false, .. } if s == "Ab-9_x")));
+                assert_eq!(asked(&there), ["setup_sharing", "get_sharing_setup", wait.as_str()]);
+            }
+
+            // Started with open_here, and joined by a call without it: nothing opens here (the user
+            // may not want the page on this computer); its answer says how to finish it here.
+            let here = FakeApp::new(json!({}));
+            let there = busy(running(true));
+            let out = setup_remote_sharing(&here, &there, "box", &json!({})).unwrap();
+            assert_eq!((out["phase"].as_str(), out["via_tunnel"].as_bool()), (Some("rclone"), Some(true)), "{codes}: {out}");
+            assert_eq!(out["next"], SETUP_ELSEWHERE);
+            assert!(matches!(&here.seen.borrow()[..], [Request::ListSharingLocations]), "nothing opens here");
+            assert_eq!(asked(&there), ["setup_sharing", "get_sharing_setup"]);
+            // A call without open_here asks for the page on that computer's screen, which is
+            // refused while nobody can see it, before the setup running there is looked at.
+            let there = SharingTarget { desktop: false, ..busy(running(true)) };
+            let error = setup_remote_sharing(&FakeApp::new(json!({})), &there, "box", &json!({})).unwrap_err();
+            assert_eq!(error, format!("target: {}", crate::mcp::explain("desktop_locked")));
+
+            // Only the same setup is joined: asked for another remote name, the refusal stands.
+            let busy_words = if codes { crate::mcp::explain("sharing_setup_busy") } else { BUSY_BEFORE_CODES.to_string() };
+            for (name, joins) in [("dropbox", true), ("work-dropbox", false)] {
+                let there = busy(running(false));
+                let out = setup_remote_sharing(&FakeApp::new(json!({})), &there, "box", &json!({ "remote": name }));
+                match joins {
+                    true => assert_eq!(out.unwrap()["next"], SETUP_THERE),
+                    false => assert_eq!(out.unwrap_err(), format!("target: {busy_words}"), "{codes}"),
+                }
+                assert_eq!(asked(&there), ["setup_sharing", "get_sharing_setup"]);
+            }
+
+            // It ended between the refusal and the look: its own state answers, and nothing opens.
+            let here = FakeApp::new(json!({}));
+            let there = busy(json!({ "phase": "done", "found": ["DESK-2"] }));
+            let out = setup_remote_sharing(&here, &there, "box", &json!({ "open_here": true })).unwrap();
+            assert_eq!(out, json!({ "phase": "done", "found": ["DESK-2"] }));
+            assert!(matches!(&here.seen.borrow()[..], [Request::ListSharingLocations]));
+        }
+        // A SlopBar from before the guided setup: update it there.
         let here = FakeApp::new(json!({}));
-        let there = SharingTarget { busy: true, ..target(json!({ "phase": "dropbox", "state": "Ab-9_x" })) };
-        assert_eq!(setup_remote_sharing(&here, &there, "box", &json!({ "open_here": true })).unwrap()["phase"], "dropbox");
-        assert!(here.seen.borrow().iter().any(|r| matches!(r, Request::SharingTunnel { state: Some(_), .. })));
+        let there = SharingTarget { guided: false, codes: false, ..target(json!({})) };
+        assert_eq!(setup_remote_sharing(&here, &there, "box", &json!({})).unwrap_err(), "update_slopbar_there");
+        assert_eq!(asked(&there), ["setup_sharing"]);
+    }
+
+    /// The tunnel here failing (port 53682 taken, SSH, or this computer's desktop locked) stops the
+    /// setup there only when this call started it: one it joined may be someone else's, at that
+    /// computer's screen or another computer's, and goes on.
+    #[test]
+    fn a_tunnel_that_fails_stops_only_the_setup_this_call_started() {
+        let asked = |there: &SharingTarget| there.commands.borrow().iter().map(|c| asked_of(c)).collect::<Vec<_>>();
+        let (wait, waiting) = (format!("--sharing-state {STATE_WAIT}"), json!({ "phase": "dropbox", "state": "Ab-9_x" }));
+        for failure in ["tunnel_failed", "desktop_locked"] {
+            let here = FakeApp { tunnel_error: Some(failure), ..FakeApp::new(json!({})) };
+            let there = target(waiting.clone());
+            assert_eq!(setup_remote_sharing(&here, &there, "box", &json!({ "open_here": true })).unwrap_err(), failure);
+            assert_eq!(asked(&there), ["setup_sharing", wait.as_str(), "setup_sharing"]);
+            assert_eq!(there.commands.borrow()[2], call_b64("setup_sharing", json!({ "cancel": true })), "stopped there");
+
+            let here = FakeApp { tunnel_error: Some(failure), ..FakeApp::new(json!({})) };
+            let there = SharingTarget { busy: true, setup: json!({ "phase": "dropbox", "via_tunnel": false }), ..target(waiting.clone()) };
+            let error = setup_remote_sharing(&here, &there, "box", &json!({ "open_here": true })).unwrap_err();
+            assert_eq!(asked(&there), ["setup_sharing", "get_sharing_setup", wait.as_str()], "{failure}: not stopped there");
+            // Said so: the tunnel's own words would say the setup there was stopped.
+            assert_eq!(error, if failure == "tunnel_failed" { "tunnel_failed_joined" } else { failure });
+        }
+    }
+
+    /// What fails on the other computer while its setup is followed is said to be that computer's:
+    /// its door's own codes (`--sharing-state` prints them raw) would otherwise be worded here as
+    /// this computer's ("SlopBar is not running…").
+    #[test]
+    fn what_fails_on_the_other_computer_is_said_to_be_its() {
+        for (there, args) in [
+            (SharingTarget { link_error: Some("not_running"), ..target(json!({})) }, json!({ "open_here": true })),
+            (SharingTarget { link_error: Some("not_running"), busy: true, setup: json!({ "phase": "rclone", "via_tunnel": true }), ..target(json!({})) }, json!({ "open_here": true })),
+        ] {
+            let error = setup_remote_sharing(&FakeApp::new(json!({})), &there, "box", &args).unwrap_err();
+            assert_eq!(error, "target: not_running");
+            assert!(crate::mcp::explain(&error).starts_with("On the other computer: "), "{error}");
+        }
+        // Stopping it there, refused by a SlopBar from before the guided setup.
+        let there = SharingTarget { guided: false, ..target(json!({})) };
+        assert_eq!(setup_remote_sharing(&FakeApp::new(json!({})), &there, "box", &json!({ "cancel": true })).unwrap_err(), "target: Unknown tool: setup_sharing");
+        // This computer's own SSH problems are not said to be the other computer's.
+        assert_eq!((from_there("ssh_missing"), from_there("bad_ssh_host"), from_there("ssh_timeout")), ("ssh_missing".into(), "bad_ssh_host".into(), "target: ssh_timeout".into()));
+        // The state read while joining, as that computer's slopbar-mcp words its failure.
+        let there = SharingTarget { busy: true, setup_error: Some("not_running"), ..target(json!({})) };
+        let error = setup_remote_sharing(&FakeApp::new(json!({})), &there, "box", &json!({})).unwrap_err();
+        assert_eq!(error, format!("target: {}", crate::mcp::explain("not_running")));
+    }
+
+    /// A call with open_here stops waiting when that computer is still getting rclone (after
+    /// `SETUP_START`; none in tests): its setup goes on there, and its state says to call again,
+    /// for a setup this call started or one it joined.
+    #[test]
+    fn a_setup_still_under_way_there_is_left_running_with_what_to_do_next() {
+        let getting_rclone = json!({ "phase": "rclone", "state": null });
+        for busy in [false, true] {
+            let there = SharingTarget { busy, setup: json!({ "phase": "rclone", "via_tunnel": true }), ..target(getting_rclone.clone()) };
+            let here = FakeApp::new(json!({}));
+            let out = setup_remote_sharing(&here, &there, "box", &json!({ "open_here": true })).unwrap();
+            assert_eq!((out["phase"].as_str(), out["next"].as_str()), (Some("rclone"), Some(SETUP_STILL_GOING)), "{busy}: {out}");
+            let asked: Vec<String> = there.commands.borrow().iter().map(|c| asked_of(c)).collect();
+            let wait = format!("--sharing-state {STATE_WAIT}");
+            let expected: Vec<&str> = if busy { vec!["setup_sharing", "get_sharing_setup", &wait, "get_sharing_setup"] } else { vec!["setup_sharing", &wait, "get_sharing_setup"] };
+            assert_eq!(asked, expected, "nothing stopped there");
+            assert!(matches!(&here.seen.borrow()[..], [Request::ListSharingLocations]), "nothing opens here");
+        }
+    }
+
+    /// Every `next` setup_sharing with ssh_host gives reaches the agent whole (each string a tool
+    /// returns is cut at `mcp::MAX_TEXT`), and each that says to call again keeps open_here: a call
+    /// without it asks for the page on that computer's screen, refused while nobody can see it.
+    #[test]
+    fn what_setting_up_another_computer_says_next_reaches_the_agent_whole() {
+        for next in [SETUP_SHARING_PREVIEW, SETUP_THERE, SETUP_ELSEWHERE, SETUP_HERE, SETUP_NOT_SHOWN, SETUP_STILL_GOING, NOT_SEEN_THERE] {
+            assert!(next.chars().count() <= crate::mcp::MAX_TEXT, "{} characters: {next}", next.chars().count());
+        }
+        for again in [SETUP_ELSEWHERE, SETUP_NOT_SHOWN, SETUP_STILL_GOING] {
+            assert!(again.contains("call setup_sharing again with this ssh_host, open_here: true and confirm: true") || again.contains("Call setup_sharing again with this ssh_host, open_here: true and confirm: true"), "{again}");
+        }
+        // A joined setup whose tunnel here failed goes on there, and is called again the same way.
+        let joined = crate::mcp::explain("tunnel_failed_joined");
+        assert!(joined.contains("goes on") && joined.contains("open_here: true and confirm: true") && !joined.contains("was stopped"), "{joined}");
+        assert!(NOT_SEEN_THERE.contains("open_here: true if the user wants the page on this computer"));
+        assert_eq!(with_next(json!(["not", "an", "object"]), SETUP_THERE), json!(["not", "an", "object"]), "never indexed into");
+        assert_eq!(with_next(json!({ "phase": "rclone" }), SETUP_THERE), json!({ "phase": "rclone", "next": SETUP_THERE }));
+        // When this call stops waiting: advice only while the setup is still under way.
+        assert_eq!(still_going(json!({ "phase": "rclone" }))["next"], SETUP_STILL_GOING);
+        assert_eq!(still_going(json!({ "phase": "failed", "error": "cancelled" })), json!({ "phase": "failed", "error": "cancelled" }));
     }
 
     #[test]
@@ -1364,7 +1733,7 @@ mod tests {
     }
 
     fn ssh(target: &FakeApp, running: bool) -> FakeSsh<'_> {
-        FakeSsh { target, running, echo: false, pwsh: true, commands: RefCell::default(), inputs: RefCell::default() }
+        FakeSsh { target, running, echo: false, echo_refusal: false, pwsh: true, commands: RefCell::default(), inputs: RefCell::default() }
     }
 
     #[test]
@@ -1433,7 +1802,7 @@ mod tests {
         let mut target = FakeApp::new(json!({ "presence_remote": "dropbox", "account_roster": true }));
         target.saved = Some("synthetic other passphrase");
         let mine = || Some(Passphrase("synthetic saved passphrase".into()));
-        assert_eq!(pair(&source, &ssh(&target, true), "box", mine(), "A", false).unwrap_err(), "target: target_has_other_key");
+        assert_eq!(pair(&source, &ssh(&target, true), "box", mine(), "A", false).unwrap_err(), format!("target: {}", crate::mcp::explain("target_has_other_key")));
         assert!(target.key_set().is_none() && target.patches().is_empty(), "nothing changed there");
         let result = pair(&source, &ssh(&target, true), "box", mine(), "A", true).unwrap();
         assert_eq!(result["target"]["replaced_key"], true);
@@ -1474,6 +1843,11 @@ mod tests {
         let result = pair(&source, &link, "box", Some(Passphrase("synthetic saved passphrase".into())), "A", false).unwrap();
         assert!(!result.to_string().contains("synthetic saved passphrase"), "{result}");
         assert!(result.to_string().contains("[key]"));
+        // Nor when it refuses with the key, as its words and as its code (this one reads as a code).
+        let target = FakeApp::new(json!({ "presence_remote": "dropbox", "account_roster": true }));
+        let link = FakeSsh { echo_refusal: true, ..ssh(&target, true) };
+        let error = pair(&source, &link, "box", Some(Passphrase("synthetic saved passphrase".into())), "A", false).unwrap_err();
+        assert_eq!(error, "target: [key]");
     }
 
     #[test]
@@ -1642,8 +2016,8 @@ mod tests {
         // An answer that is not an object passes through untouched; an error stays an error.
         let odd = format!("{STARTED}\r\n{{\"ok\":[1]}}\r\n");
         assert_eq!(remote_readiness(&scripted(vec![printed(&odd)]), "box", &json!({})).unwrap(), json!([1]));
-        let failed = format!("{STARTED}\r\n{{\"error\":\"door_unavailable\"}}\r\n");
-        assert_eq!(remote_readiness(&scripted(vec![printed(&failed)]), "box", &json!({})).unwrap_err(), "door_unavailable");
+        let failed = answered(&crate::mcp::error_line("bad_door_reply")).unwrap();
+        assert_eq!(remote_readiness(&scripted(vec![Ok(failed)]), "box", &json!({})).unwrap_err(), crate::mcp::explain("bad_door_reply"));
     }
 
     #[test]
