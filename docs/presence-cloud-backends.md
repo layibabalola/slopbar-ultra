@@ -68,14 +68,16 @@ MEGA, S3, WebDAV, SFTP and the other rclone backends. rclone keeps its own confi
   saves the records of machines asleep, shut down or retired. Modelled for a refresh every 5
   minutes (`rclone::tests::an_hour_of_presence_exchanges_over_rclone_starts_fewer_processes`),
   presence processes an hour go from 120 to 84 beside five running machines and two asleep ones,
-  60 to 48 beside two running ones, and 60 to 24 beside two asleep ones. A synced folder reads
-  every file, which costs no process.
+  60 to 48 beside two running ones, and 60 to 24 beside two asleep ones. The first read after
+  SlopBar starts downloads every other record. A synced folder reads every file, which costs no
+  process.
 
   The account roster (`SlopBar/roster`, `roster::Syncer`) uses the same three calls, and
   `deletefile <id>.roster` when the roster is turned off. On Dropbox and Google Drive its listing
   adds `--hash`: those clouds list a content hash this computer can check (Dropbox's, or SHA-256)
   with no extra request (checked on Dropbox with rclone v1.74.4: the same two requests with or
-  without it; rclone 1.56 or later, as older ones name the hashes otherwise and so skip nothing).
+  without it; rclone 1.56 or later on Dropbox and 1.65 or later on Google Drive, as older ones list
+  no hash this computer counts and so skip nothing).
   Other remotes are not asked: OneDrive lists only a quickxor, which other bytes can
   be made to match, Box only a SHA-1, and elsewhere rclone would compute hashes by reading every
   file. A roster listed with the hash and size of the copy the last read kept (kept only when its
