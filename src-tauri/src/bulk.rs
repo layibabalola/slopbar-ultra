@@ -45,11 +45,19 @@ pub fn to_connect(snapshot: &Snapshot) -> Vec<Target> {
 
 /// Whether an account's saved CLI sign-in needs a new one that "Sign in all accounts" makes: it
 /// ended or ends within `monitoring::RENEW_DAYS` (`AccountUsage::cli_renewal`), or the provider
-/// rejected it (`cli_rejected`), and the account is not in use, whose sign-in the CLI manages. Never
-/// one known only by a token hash (`token:` ids): there is no account to check a new sign-in
-/// against, so it would only fail and stop the queue.
+/// rejected a Claude one (`rejected_claude_login`), and the account is not in use, whose sign-in the
+/// CLI manages. Never one known only by a token hash (`token:` ids): there is no account to check a
+/// new sign-in against, so it would only fail and stop the queue.
 pub fn needs_cli_sign_in(a: &AccountUsage) -> bool {
-    (a.cli_renewal.is_some() || a.cli_rejected) && !a.active && !a.id.starts_with("token:")
+    (a.cli_renewal.is_some() || rejected_claude_login(a)) && !a.active && !a.id.starts_with("token:")
+}
+
+/// The provider rejected the account's saved Claude login (`cli_rejected`): a new sign-in fixes
+/// that. Only Claude's: SlopBar knows when a saved Claude access token expires and never reads usage
+/// with an expired one, so a rejection is one; a saved Codex token's expiry is unknown, so a
+/// rejection may only mean it aged out, which the CLI renews by itself.
+pub fn rejected_claude_login(a: &AccountUsage) -> bool {
+    a.cli_rejected && a.provider == Provider::Claude
 }
 
 /// The day an account's plan ended, if it has: the user's last paid day is past, or the provider
@@ -349,10 +357,14 @@ mod tests {
         ], "Connect monitoring for all never makes a CLI sign-in");
         assert_eq!(serde_json::to_value(Kind::Renew).unwrap(), "renew");
         assert!(needs_cli_sign_in(&snapshot.accounts[1]) && !needs_cli_sign_in(&snapshot.accounts[3]) && !needs_cli_sign_in(&snapshot.accounts[4]));
-        // A saved login the provider rejected is signed in again the same way, never the one in use.
+        // A saved Claude login the provider rejected is signed in again the same way, never the one
+        // in use; a Codex one may only have aged out, which its CLI renews by itself.
         let mut rejected = account("rejected", false, true);
         rejected.cli_rejected = true;
         assert!(needs_cli_sign_in(&rejected));
+        rejected.provider = Provider::Codex;
+        assert!(!needs_cli_sign_in(&rejected));
+        rejected.provider = Provider::Claude;
         rejected.active = true;
         assert!(!needs_cli_sign_in(&rejected));
     }

@@ -724,10 +724,13 @@ const NEWER_SIGN_IN_DAYS: i64 = crate::monitoring::RENEW_DAYS + crate::monitorin
 /// it differs and the saved one is not certainly newer. The profile is where the account was in
 /// use, so it wins when the order is unknown. The saved one is certainly newer when it was issued
 /// later, or when it is a new sign-in (`store_renewal`) whose end is weeks after the live one's: a
-/// CLI still running in the project on the sign-in it replaced keeps renewing that one and writing
-/// it back, and taking it would undo the new sign-in. Only the saved copy wins by its end, and only
-/// by that margin, so a newer copy of one sign-in whose end moved earlier is never taken for the
-/// older one: writing an older copy over a newer one would leave a refresh token already rotated away.
+/// CLI in the project that renewed the sign-in it replaced before the next sync wrote the new one
+/// there holds a copy issued later, which would otherwise win and undo the new sign-in. (After that
+/// sync the CLI takes up the new one: Claude Code 2.1.330 re-reads its saved sign-in under its own
+/// lock before each renewal and adopts one that changed.) Only the saved copy wins by its end, and
+/// only by that margin, so a newer copy of one sign-in whose end moved earlier is never taken for
+/// the older one: writing an older copy over a newer one would leave a refresh token already
+/// rotated away.
 fn keeps(live: &Slot, saved: &Slot) -> bool {
     let saved_newer = matches!((issued(saved), issued(live)), (Some(s), Some(l)) if s > l)
         || matches!((saved.ends_at(), live.ends_at()), (Some(s), Some(l)) if s - l > chrono::Duration::days(NEWER_SIGN_IN_DAYS));

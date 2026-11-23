@@ -1203,9 +1203,10 @@ function fixButton(fix, i, count) {
   const label = {
     connect_monitoring: () => t("monitorConnect"),
     connect_monitoring_all: () => count ? `${t("bulkConnectButton")} (${count})` : t("bulkConnectButton"),
-    // Everything the run would sign in, as the Accounts page counts it (its monitoring box included).
+    // Everything the run signs in: from Health it fixes the monitoring rows too, whatever the
+    // Accounts page's monitoring box says.
     sign_in_all: () => {
-      const n = signInPlan().steps || count;
+      const n = (bulk.sign_in ?? []).reduce((total, g) => total + g.steps.length, 0) || count;
       return n ? `${t("signInAllButton")} (${n})` : t("signInAllButton");
     },
     refresh: () => t("healthFixRefresh"),
@@ -1247,9 +1248,10 @@ $("health").addEventListener("click", async (e) => {
       const queued = await invoke("connect_monitoring_all");
       if (queued.length) { status.textContent = t("monitorPending"); status.hidden = false; }
     } else if (fix.action === "sign_in_all") {
-      // As the Accounts page's own button, with its "Also connect monitoring" choice; that page
-      // follows the run and can stop or retry it.
-      await invoke("sign_in_all_accounts", { monitoring: $("sign-in-all-monitoring").checked });
+      // With monitoring: the monitoring summary's rows are what it is to fix, and the CLI ones are
+      // best renewed with their monitoring in one sitting. The Accounts page follows the run and
+      // can stop or retry it.
+      await invoke("sign_in_all_accounts", { monitoring: true });
       document.querySelector('.nav[data-page="accounts"]')?.click();
       loadBulk();
     } else if (fix.action === "refresh") {

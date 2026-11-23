@@ -68,9 +68,15 @@ export function cliSignInText(a, now = Date.now()) {
   if (a.active || !a.cli_ends_at) return null;
   const left = new Date(a.cli_ends_at) - now;
   const d = shortDate(a.cli_ends_at);
-  if (left <= 0) return { ended: true, label: t("cliSignInEnded"), hint: t("cliSignInEndedHint", { d }) };
+  // An account known only by its token cannot be signed in again by Sign in all accounts, so its
+  // hint never offers that.
+  const unknown = String(a.id ?? "").startsWith("token:");
+  if (left <= 0) {
+    return { ended: true, label: t("cliSignInEnded"), hint: unknown ? t("cliRejectedHint", { cli: "claude /login" }) : t("cliSignInEndedHint", { d }) };
+  }
   if (left > CLI_WARN_MS) return null;
-  return { ended: false, label: t("cliSignInEnding", { t: duration(Math.max(1, Math.round(left / 60000))) }), hint: t("cliSignInEndingHint", { d }) };
+  const label = t("cliSignInEnding", { t: duration(Math.max(1, Math.round(left / 60000))) });
+  return { ended: false, label, hint: unknown ? label : t("cliSignInEndingHint", { d }) };
 }
 
 /**

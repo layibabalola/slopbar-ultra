@@ -1152,7 +1152,8 @@ fn cli_sign_in_due(app: &AppHandle, target: &bulk::Target) -> bool {
     let active = app.state::<AppState>().snapshot.lock().unwrap().accounts.iter()
         .any(|a| a.provider == target.provider && a.id == target.id && a.active);
     !active && accounts::load_slots().into_iter().find(|s| s.provider == target.provider && s.id == target.id)
-        .is_some_and(|s| accounts::cli_renewal(s.ends_at(), false, chrono::Utc::now()).is_some() || providers::cli_rejected(&s))
+        .is_some_and(|s| accounts::cli_renewal(s.ends_at(), false, chrono::Utc::now()).is_some()
+            || (s.provider == Provider::Claude && providers::cli_rejected(&s)))
 }
 
 /// Updates "Connect monitoring for all" and tells Settings.
@@ -2670,6 +2671,8 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
                         vec![]
                     };
                     a.active = now_active;
+                    // Never for the account in use; again for the one switched away from.
+                    a.cli_renewal = accounts::cli_renewal(a.cli_ends_at, now_active, chrono::Utc::now());
                 }
             }
         }
@@ -3385,7 +3388,7 @@ async fn readiness(app: &AppHandle) -> serde_json::Value {
         "accounts": { "here": snapshot.accounts.len(), "unmonitored": bulk::unmonitored(&snapshot).len() },
         "roster": summary, "waiting": waiting,
         // Sign in all accounts as it runs: email g of emails, done of total, who is signing in
-        // now and for what (add or connect), why it stopped, and each step's outcome.
+        // now and for what (add, renew or connect), why it stopped, and each step's outcome.
         "sign_in": state.bulk_connect.lock().unwrap().clone(),
         // Pass as `since` with `wait_seconds` to hear of the next change.
         "sign_in_revision": state.bulk_revision.load(std::sync::atomic::Ordering::SeqCst),

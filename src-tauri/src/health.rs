@@ -367,7 +367,7 @@ struct SignIns {
 /// `bulk::needs_cli_sign_in` goes by the snapshot's: its saved one ended or ends within
 /// `RENEW_DAYS`, or the provider rejected it, and it is not in use; never a token-only account.
 fn cli_due(a: &AccountUsage, now: DateTime<Utc>) -> bool {
-    (crate::accounts::cli_renewal(a.cli_ends_at, a.active, now).is_some() || (a.cli_rejected && !a.active)) && !a.id.starts_with("token:")
+    (crate::accounts::cli_renewal(a.cli_ends_at, a.active, now).is_some() || crate::bulk::rejected_claude_login(a)) && !a.active && !a.id.starts_with("token:")
 }
 
 /// Saved CLI sign-ins that ended, or end within `WARN_DAYS` (see `accounts::cli_renewal`): one row
@@ -552,16 +552,17 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
 
     // The CLI's own saved login, which SlopBar switches but never renews. The CLI signs in again
     // the one in use; Sign in all accounts makes a new one for an account not in use.
+    // Not in use, it is a warning, as a saved sign-in that ended is: nothing fails until a switch.
     for a in inputs.accounts.iter().filter(|a| a.cli_rejected) {
         let cli = match a.provider { Provider::Claude => "claude /login", Provider::Codex => "codex login" };
-        let (how, fix) = if a.active {
-            (format!("Run `{cli}` to sign the CLI in again; the CLI manages that sign-in."), Fix::OpenSettings { page: "accounts" })
-        } else if a.id.starts_with("token:") {
-            (format!("Switch to it and run `{cli}`, or remove it if it is no longer used."), Fix::OpenSettings { page: "accounts" })
+        let (status, how, fix) = if a.active {
+            (Status::Problem, format!("Run `{cli}` to sign the CLI in again; the CLI manages that sign-in."), Fix::OpenSettings { page: "accounts" })
+        } else if crate::bulk::rejected_claude_login(a) && !a.id.starts_with("token:") {
+            (Status::Warning, "Sign in all accounts signs it in again as a new CLI sign-in for this account, switching nothing; or remove it if it is no longer used.".to_string(), Fix::SignInAll)
         } else {
-            ("Sign in all accounts signs it in again as a new CLI sign-in for this account, switching nothing; or remove it if it is no longer used.".to_string(), Fix::SignInAll)
+            (Status::Warning, format!("Switch to it and run `{cli}`, or remove it if it is no longer used."), Fix::OpenSettings { page: "accounts" })
         };
-        checks.push(check(format!("cli:{}:{}", a.provider.key(), a.id), Status::Problem, format!("{}: CLI sign-in rejected", name(a)),
+        checks.push(check(format!("cli:{}:{}", a.provider.key(), a.id), status, format!("{}: CLI sign-in rejected", name(a)),
             format!("The provider no longer accepts the CLI's saved sign-in for this account. {how}"), Some(fix)));
     }
     checks.extend(cli_sign_ins(inputs.accounts, now));
@@ -1042,12 +1043,18 @@ mod tests {
         let s = find(&case.run(), RENEWAL_SUMMARY).clone();
         assert_eq!(s.fix, Some(Fix::SignInAll), "Sign in all accounts makes both, an email's in one browser window");
         assert!(s.reason.contains("the 1 saved CLI sign-in due"), "{}", s.reason);
-        // A rejected saved login of an account not in use is one Sign in all accounts makes again too.
+        // A rejected saved Claude login of an account not in use is one Sign in all accounts makes
+        // again too, and, like one that ended, only a warning.
         let mut rejected = Case::healthy();
         rejected.accounts[1].cli_rejected = true;
         let c = find(&rejected.run(), "cli:claude:b").clone();
-        assert_eq!(c.fix, Some(Fix::SignInAll));
+        assert_eq!((c.status, c.fix.clone()), (Status::Warning, Some(Fix::SignInAll)));
         assert!(c.reason.contains("Sign in all accounts signs it in again"), "{}", c.reason);
+        // A Codex one may only have aged out: the old advice, no sign-in queued.
+        rejected.accounts[1].provider = Provider::Codex;
+        let c = find(&rejected.run(), "cli:codex:b").clone();
+        assert_eq!((c.status, c.fix.clone()), (Status::Warning, Some(Fix::OpenSettings { page: "accounts" })));
+        assert!(c.reason.contains("codex login"), "{}", c.reason);
     }
 
     #[test]

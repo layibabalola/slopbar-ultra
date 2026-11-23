@@ -263,6 +263,10 @@ test("a saved CLI sign-in that ended or ends soon says so before anyone presses 
   assert.equal(cliSignInText({ ...account, cli_renewal: "ended", cli_ends_at: iso(now - HOUR) }, now), null);
   assert.equal(cliSignInText({ ...spare, cli_renewal: "ended" }, now), null);
   assert.equal(cliSignInText({ ...spare, cli_renewal: "ending", cli_ends_at: iso(now + 5 * 24 * HOUR) }, now), null);
+  // An account known only by its token is never promised a sign-in it cannot get.
+  const token = cliSignInText({ ...spare, id: "token:abc", cli_ends_at: iso(now - HOUR) }, now);
+  assert.equal(token.ended, true);
+  assert.equal(token.hint, t("cliRejectedHint", { cli: "claude /login" }));
   // The compact flyout's tooltip carries it with everything else.
   const lines = accountTipLines({ ...spare, cli_renewal: "ended", cli_ends_at: iso(now - HOUR) }, { now }).flat();
   assert.ok(lines.some((l) => l.startsWith(`${t("cliSignInEnded")}: `)), lines.join("\n"));
