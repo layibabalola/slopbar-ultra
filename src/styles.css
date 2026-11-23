@@ -187,7 +187,8 @@ body.panel #accounts { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollba
 /* Another computer's recent reading covers this account: its monitoring sign-in here is a note. */
 .error.covered { color: var(--text-2); }
 /* A window of another computer's reading that has reset since: its old numbers, dimmed. */
-.win.passed .row, .win.passed .bar { opacity: .5; }
+.win.passed .bar { opacity: .5; }
+.win.passed .row { opacity: .65; }
 .empty { color: var(--text-2); padding: 4px 0 2px; }
 
 /* Accounts: cards like the Settings app's, the signed-in one raised. */

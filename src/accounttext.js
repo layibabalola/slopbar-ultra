@@ -89,7 +89,8 @@ export function accountTipLines(a, { sub = null, trail = null, creditAdvice = ""
       + (timed.has(w) ? ` · ${windowResetText(w, reading.stale, reading.at, reading.shared)}` : "")),
     a.runs_out_at && !a.stale ? t("runsOut", { at: dayTime(a.runs_out_at) }) : "",
     week?.pace_percent != null && !a.stale ? t("tipPace", { p: Math.round(week.pace_percent) }) : "",
-    trail?.length ? sparklineText(trail) : "",
+    // This computer's own trail, never beside another computer's numbers.
+    trail?.length && !reading.shared ? sparklineText(trail) : "",
   ]);
 
   groups.push([

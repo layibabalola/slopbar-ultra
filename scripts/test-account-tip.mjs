@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 
 // i18n.js sets the page language on load.
 globalThis.document ??= { documentElement: {} };
-const { t, setLanguage, setThisMachine, setSharing, windowResetText, placesText, compactPlaces, overlapText, shownReading, duration, currentWindows, coveredMonitoring } = await import("../src/i18n.js");
+const { t, setLanguage, setThisMachine, setSharing, windowResetText, placesText, compactPlaces, overlapText, shownReading, duration, currentWindows, coveredMonitoring, resetSince } = await import("../src/i18n.js");
 const { accountTip, accountTipLines, adviceText } = await import("../src/accounttext.js");
 const { sparkline, sparklineText } = await import("../src/sparkline.js");
 setLanguage("en");
@@ -280,11 +280,28 @@ test("a window of another computer's reading that has reset since keeps its numb
   assert.equal(currentWindows(shownReading({ ...account, windows: [session] }, now), now).length, 1);
 });
 
-test("a monitoring sign-in another computer covers is no problem mark", () => {
-  assert.equal(coveredMonitoring({ ...account, covered_by: "LAPTOP-2", monitor_renewal: "ended" }), true);
-  assert.equal(coveredMonitoring({ ...account, covered_by: "LAPTOP-2", monitor_connected: false }), true);
-  assert.equal(coveredMonitoring({ ...account, covered_by: "LAPTOP-2", monitor_renewal: null }), false, "nothing to make here");
-  assert.equal(coveredMonitoring({ ...account, covered_by: null, monitor_renewal: "ended" }), false);
+test("a monitoring sign-in another computer covers is no problem mark; any other error still is", () => {
+  const covered = { ...account, covered_by: "LAPTOP-2" };
+  assert.equal(coveredMonitoring({ ...covered, monitor_renewal: "ended", error: "monitor_reconnect", stale: true }), true);
+  assert.equal(coveredMonitoring({ ...covered, monitor_connected: false, error: "monitor_setup", stale: true }), true);
+  assert.equal(coveredMonitoring({ ...covered, monitor_renewal: "ended", monitor_error: "monitor_reconnect" }), true, "in use here, read through the CLI");
+  for (const error of ["token_expired", "rate_limited", "http_500", "proxy_script"]) {
+    assert.equal(coveredMonitoring({ ...covered, monitor_connected: false, error, stale: true }), false, error);
+  }
+  assert.equal(coveredMonitoring({ ...covered, monitor_renewal: null }), false, "nothing to make here");
+  assert.equal(coveredMonitoring({ ...account, covered_by: null, monitor_renewal: "ended", error: "monitor_reconnect" }), false);
+});
+
+test("beside another computer's reading, this computer's trail is not described", () => {
+  const shared = { machine: "LAPTOP-2", taken_at: iso(now - 12 * 60000), windows: [{ kind: "weekly", window_seconds: null, used_percent: 61, resets_at: iso(now + 50 * HOUR) }] };
+  const trail = [[now - 2 * HOUR, 12], [now - HOUR, 48]];
+  assert.ok(accountTipLines(account, { now, trail }).flat().includes(sparklineText(trail)));
+  assert.ok(!accountTipLines({ ...account, stale: true, shared }, { now, trail }).flat().includes(sparklineText(trail)));
+  // A Codex window not started when it was read is not "reset since", whatever its age.
+  const unused = { kind: "session", window_seconds: 18000, used_percent: 0, resets_at: iso(now - 3 * HOUR + 18000 * 1000) };
+  const old = shownReading({ ...account, stale: true, shared: { ...shared, taken_at: iso(now - 3 * HOUR), windows: [unused] } }, now);
+  assert.deepEqual(currentWindows(old, now), [unused]);
+  assert.equal(resetSince(old, unused, now), false);
 });
 
 console.log(`${passed} account tooltip and sparkline checks passed`);

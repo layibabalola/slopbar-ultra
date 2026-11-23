@@ -382,7 +382,7 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         // Another of the user's computers read it recently (the shared account roster): its
         // readings show here, so this computer's own sign-in matters less.
         let covered = a.covered_by.as_deref().map(|m| format!(
-            "{m} still reads it, through the account list your computers share, so its readings show here while this computer has none of its own."));
+            "{m} still reads this account's usage, through the account list your computers share, so its readings show here while this computer has none of its own."));
         if !a.monitor_connected {
             let how = if inputs.auto_connect {
                 "Connect monitoring automatically is on (Settings > Data): SlopBar starts its sign-in once it has been in use for 3 minutes, or connect it now."
@@ -411,7 +411,7 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         // Ended or refused here but covered: a warning, since this computer's switching and alerts
         // still go by its own readings alone.
         let (status, reconnect) = match &covered {
-            Some(c) => (Status::Warning, format!("{c} Reconnect for this computer's own readings, which automatic switching and alerts here go by; it is one browser sign-in as this account.")),
+            Some(c) => (Status::Warning, format!("{c} Reconnect for this computer's own readings, which automatic switching and alerts here go by; it is one browser sign-in as this account, switches nothing and needs no account use.")),
             None => {
                 sign_ins.faults += usize::from(matches!(renewal, Renewal::Ended(_) | Renewal::Refused));
                 (Status::Problem, "Reconnecting is one browser sign-in as this account; it switches nothing and needs no account use.".into())
@@ -940,12 +940,12 @@ mod tests {
         let r = case.run();
         let a = find(&r, "monitoring:claude:a");
         assert_eq!((a.status, a.title.as_str()), (Status::Warning, "a@example.invalid: monitoring sign-in ended"));
-        assert!(a.reason.contains("ended 2 days ago") && a.reason.contains("DESK-A still reads it") && a.reason.contains("automatic switching and alerts"), "{}", a.reason);
+        assert!(a.reason.contains("ended 2 days ago") && a.reason.contains("DESK-A still reads this account's usage") && a.reason.contains("automatic switching and alerts"), "{}", a.reason);
         assert_eq!(a.fix, Some(Fix::ConnectMonitoring { provider: Provider::Claude, id: "a".into() }), "reconnecting stays offered");
         assert_eq!(find(&r, "monitoring:claude:b").status, Status::Problem);
         let c = find(&r, "monitoring:claude:c");
         assert_eq!(c.status, Status::Warning);
-        assert!(c.reason.contains("DESK-A still reads it"), "{}", c.reason);
+        assert!(c.reason.contains("DESK-A still reads this account's usage"), "{}", c.reason);
         let s = find(&r, RENEWAL_SUMMARY);
         assert_eq!((s.status, s.title.as_str()), (Status::Problem, "Monitoring sign-ins: 2 ended, 1 not connected (2 covered by your other computers' readings)"));
         assert_eq!((r.status, r.problems, r.warnings), (Status::Problem, 1, 2));
@@ -954,6 +954,22 @@ mod tests {
         let r = case.run();
         assert_eq!((r.status, r.problems, r.warnings), (Status::Warning, 0, 3));
         assert_eq!(find(&r, RENEWAL_SUMMARY).title, "Monitoring sign-ins: 2 ended, 1 not connected (3 covered by your other computers' readings)");
+    }
+
+    #[test]
+    fn a_refused_sign_in_nobody_covers_is_a_problem_and_a_covered_one_ending_soon_counts_as_covered() {
+        let mut case = Case::healthy();
+        case.monitoring.insert("Claude:a".into(), MonitorState { reconnect: true, uncertain: false, ends_at: None });
+        case.monitoring.insert("Claude:b".into(), MonitorState { reconnect: false, uncertain: false, ends_at: Some(now() + Duration::hours(30)) });
+        case.accounts[1].covered_by = Some("DESK-A".into());
+        let r = case.run();
+        assert_eq!(find(&r, "monitoring:claude:a").status, Status::Problem);
+        assert_eq!(find(&r, "monitoring:claude:b").status, Status::Warning);
+        let s = find(&r, RENEWAL_SUMMARY);
+        assert_eq!((s.status, s.title.as_str()), (Status::Problem, "Monitoring sign-ins: 1 needs reconnecting, 1 ends soon (1 covered by your other computers' readings)"));
+        // Covered too: no problem left.
+        case.accounts[0].covered_by = Some("DESK-A".into());
+        assert_eq!(find(&case.run(), RENEWAL_SUMMARY).status, Status::Warning);
     }
 
     #[test]

@@ -2598,8 +2598,12 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
     };
     let decisions = graceful_decisions(app, &list, &settings, decisions);
     for (provider, id) in decisions {
-        // Publish the current numbers first so the switch notice can name both accounts.
-        *state.snapshot.lock().unwrap() = Snapshot { accounts: list.clone(), updated_at: Some(chrono::Utc::now()) };
+        // Publish the current numbers first so the switch notice can name both accounts, with what
+        // sharing and the rosters last read add to them, as the early redraw below has.
+        let mut accounts = list.clone();
+        carry_over(&mut accounts, &previous);
+        apply_shared(&state, &settings, &mut accounts);
+        *state.snapshot.lock().unwrap() = Snapshot { accounts, updated_at: Some(chrono::Utc::now()) };
         if switch_to(app, provider, id.clone(), true).await.is_ok() {
             state.last_switch.lock().unwrap().insert(provider, Instant::now());
             for a in list.iter_mut().filter(|a| a.provider == provider) {
@@ -3282,7 +3286,6 @@ async fn sync_roster(app: &AppHandle, settings: &settings::Settings, accounts: V
     };
     let (sharing, place, h) = (state.sharing.clone(), sharing::Place::of(settings), app.clone());
     let run = state.roster_run.lock().unwrap().clone();
-    let share = settings.share_readings;
     let now = chrono::Utc::now();
     let seen = tauri::async_runtime::spawn_blocking(move || {
         let (id, name) = presence::identity()?;
@@ -3291,7 +3294,9 @@ async fn sync_roster(app: &AppHandle, settings: &settings::Settings, accounts: V
             if let Some(run) = run {
                 sync.offer_run(run);
             }
-            sync.withhold_readings = !share;
+            // Read where the roster's lock is held, as the place is: a sync that started before
+            // readings were turned off cannot write them after the write that took them out.
+            sync.withhold_readings = !h.state::<AppState>().settings.lock().unwrap().share_readings;
             sync.sync(store.as_ref(), &passphrase, (id, name), &accounts, now, force, soon);
             sync.seen.clone()
         })
@@ -3437,7 +3442,10 @@ async fn set_roster_passphrase(app: &AppHandle, passphrase: Option<backup::Passp
     let sharing = state.sharing.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || sharing.with_syncer(|sync| sync.reset())).await;
     *state.roster_seen.lock().unwrap() = roster::Seen::default();
-    Ok(roster_status(app, true).await)
+    let status = roster_status(app, true).await;
+    // What other machines' readings show and cover here follows the rosters this one opens.
+    refresh_soon(app);
+    Ok(status)
 }
 
 #[tauri::command]

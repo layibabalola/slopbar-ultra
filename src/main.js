@@ -161,7 +161,7 @@ function bars(a) {
   const r = shownReading(a);
   const resetWindows = new Set(visibleResetWindows(r.windows));
   return r.windows.map((w) => `
-    <div class="win ${r.from ? "shared" : ""} ${resetSince(r, w) ? "passed" : ""}">
+    <div class="win ${resetSince(r, w) ? "passed" : ""}">
       <div class="row"><span>${esc(windowLabel(w))}</span><b>${Math.round(w.used_percent)}%</b></div>
       <div class="bar" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(Math.min(100, w.used_percent))}"
         aria-label="${esc([`${windowLabel(w)} ${t("used")}`, r.from].filter(Boolean).join(", "))}"><div style="width:${Math.min(100, w.used_percent)}%;background:${color(w.used_percent)}"></div></div>
@@ -191,24 +191,25 @@ function renderDetails(snap) {
     <section>
       <div class="acc-head"><span class="logo ${provider}">${MARK[provider]}</span><span class="name">${PROVIDER_NAME[provider]}</span></div>
       ${list.map((a) => {
-        // Whose reading the bars show and how old, when not this computer's fresh one.
-        const stale = shownReading(a).from || (a.stale && a.fetched_at
+        // Whose reading the bars show and how old, when another computer's: said first, so a narrow
+        // line cuts something else. Otherwise how old this computer's own is, when not fresh.
+        const from = shownReading(a).from;
+        const stale = !from && a.stale && a.fetched_at
           ? t("lastObserved", { t: duration(Math.max(1, Math.round((Date.now() - new Date(a.fetched_at)) / 60000))) })
-          : "");
+          : "";
         // Every row has one detail line, whatever its state, so switching doesn't change heights.
         // Where it's in use: here and on the user's other computers (shared via a synced folder).
         const places = placesText(a);
-        const meta = [places.inUse || (a.alias ? a.email : ""), ...places.seen, a.leased ? t("leased", { purpose: a.leased }) : "", a.used_outside ? t("usedOutside") : "", a.org, stale]
+        const meta = [from, places.inUse || (a.alias ? a.email : ""), ...places.seen, a.leased ? t("leased", { purpose: a.leased }) : "", a.used_outside ? t("usedOutside") : "", a.org, stale]
           .filter(Boolean).join(" · ") || " ";
         // This computer's own trail ends where its readings stopped: not beside another's numbers.
-        const trail = shownReading(a).shared ? null : trails[`${provider}:${a.id}`];
         return `
         <div class="acct ${a.active ? "active" : ""}" data-key="${provider}:${esc(a.id)}">
           <div class="acct-head">
             <span class="provider-mark ${provider}" title="${PROVIDER_NAME[provider]}">${MARK[provider]}</span>
             <span class="who">${esc(accountName(a))}</span>
             ${a.plan ? `<span class="plan">${esc(a.plan)}</span>` : ""}
-            ${sparkline(trail)}
+            ${sparkline(trails[`${provider}:${a.id}`], { silent: !!from })}
             ${a.active
               ? `<span class="in-use ${a.pending ? "pending" : ""}">${t("inUse")}</span>`
               : `<button class="use" data-provider="${provider}" data-id="${esc(a.id)}">${t("use")}</button>`}
@@ -245,7 +246,7 @@ function renderCompactList(snap) {
     const problem = coveredMonitoring(a) ? "" : accountErrorText(PROVIDER_NAME[a.provider], a);
     const used = w ? `${Math.round(w.used_percent)}%` : "—";
     const usedText = w ? [`${windowLabel(w)}: ${used} ${t("used")}`, r.from].filter(Boolean).join(", ") : t("usageUnknown");
-    const tip = accountTip(a, { sub: subs[key], trail: trails[key], creditAdvice: creditAdvice[key] });
+    const tip = accountTip(a, { sub: subs[key], trail: r.shared ? null : trails[key], creditAdvice: creditAdvice[key] });
     // Named machines only: a bare "this PC" would repeat "In use". Two in full, then how many more.
     const where = compactPlaces(a);
     return `
@@ -256,7 +257,7 @@ function renderCompactList(snap) {
           ? `<small class="where"><span class="glyph" aria-hidden="true">\uE977</span>${esc(where)}</small>` : ""}</span>
         ${problem ? `<span class="problem" role="img" aria-label="${esc(problem)}">!</span>` : ""}
         ${overlapBadge(a)}
-        ${sparkline(r.shared ? null : trails[key], { tooltip: false })}
+        ${sparkline(trails[key], { tooltip: false, silent: r.shared })}
         <b class="pct ${r.shared ? "shared" : ""}" style="color:${w ? color(w.used_percent) : "var(--text-2)"}" aria-label="${esc(usedText)}">${r.shared && w ? `<span class="glyph" aria-hidden="true">\uE977</span>` : ""}${used}</b>
         ${a.active
           ? `<span class="in-use ${a.pending ? "pending" : ""}">${t("inUse")}</span>`

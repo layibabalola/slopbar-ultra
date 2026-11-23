@@ -189,6 +189,7 @@ option { background: var(--bg); color: var(--text); }
 .switch:checked:hover { background: color-mix(in srgb, var(--accent) 90%, var(--bg)); }
 .switch:checked::after { background: var(--on-accent); transform: translateX(20px); }
 .switch:checked:active::after { transform: translateX(17px); }
+.switch:disabled { opacity: .5; }
 
 /* Slider */
 input[type="range"] {
@@ -251,6 +252,8 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
 .meter .track i { display: block; height: 100%; border-radius: 2px; }
 .meter.none b { color: var(--faint); font-weight: 400; }
 .meter small { display: block; margin-top: 4px; color: var(--dim); font-size: 12px; line-height: 16px; white-space: nowrap; }
+/* Whose reading it is and how old: a machine name can be long, so it wraps. */
+.meter small.from { white-space: normal; overflow-wrap: anywhere; }
 .remove {
   flex: none; display: grid; place-items: center; width: 32px; height: 32px; border: 0; border-radius: 4px;
   background: transparent; color: var(--dim); opacity: 0;
