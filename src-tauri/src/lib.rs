@@ -67,11 +67,12 @@ mod door;
 mod desktop;
 mod desktop_apps;
 mod pairing;
+mod relay;
 mod instance;
 pub use instance::claim as claim_instance;
 mod mcp;
 pub use mcp::serve_stdio as serve_mcp;
-pub use mcp::{call_cli, pair_receive, sharing_state};
+pub use mcp::{call_cli, pair_receive, relay_cli, sharing_state};
 #[cfg(feature = "desktop")]
 mod dock;
 #[cfg(feature = "desktop")]

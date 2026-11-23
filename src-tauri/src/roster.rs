@@ -171,6 +171,10 @@ pub struct Run {
     pub monitoring: bool,
     pub error: Option<String>,
     pub steps: Vec<RunStep>,
+    /// "Sign in all your computers from here" (see `relay`): its pages open at that machine, and
+    /// Retry from another computer never restarts it.
+    #[serde(default)]
+    pub everywhere: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,7 +347,7 @@ pub fn open(bytes: &[u8], passphrase: &Passphrase, keys: &mut HashMap<String, [u
 /// the interlinear annotation marks): a name from another machine loses them, and its spaces at
 /// either end, so "DESK-1" with one added cannot pass for this PC's "DESK-1". Letters of another
 /// script that look alike are not caught this way; the reading is marked as another machine's.
-fn invisible(c: char) -> bool {
+pub(crate) fn invisible(c: char) -> bool {
     matches!(c, '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}' | '\u{180B}'..='\u{180F}'
         | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}'
         | '\u{FFA0}' | '\u{FFF0}'..='\u{FFFB}' | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E0FFF}')
@@ -981,7 +985,7 @@ mod tests {
     }
 
     fn run(revision: u64, finished: bool, state: &str) -> Run {
-        Run { revision, at: now(), total: 2, done: 0, emails: 1, email: 1, finished, still_waiting: false, monitoring: true,
+        Run { revision, at: now(), total: 2, done: 0, emails: 1, email: 1, finished, still_waiting: false, monitoring: true, everywhere: false,
             error: finished.then(|| "signin_stopped".into()),
             steps: vec![
                 RunStep { provider: Provider::Claude, account: Some("cl-one@example.invalid".into()), kind: "add".into(), state: state.into(), error: None },
