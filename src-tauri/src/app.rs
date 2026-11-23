@@ -62,6 +62,9 @@ pub struct AppState {
     presence_tracks: Mutex<presence::Tracks>,
     /// The other machines' last records, for a read that misses one (see `presence::Recall`).
     presence_recall: Mutex<presence::Recall>,
+    /// The records the last read had the bytes of, which stand in for downloading them again while
+    /// they are listed unchanged (see `presence::Kept`).
+    presence_kept: presence::Kept,
     /// Where in-use status is shared: what settings saves left for the next refresh to withdraw,
     /// and the account roster's sync, its keys and last write, which share one lock (see `sharing`).
     sharing: std::sync::Arc<sharing::Sharing>,
@@ -3634,7 +3637,9 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
                 return None;
             }
             let wrote = store.write(&presence::own(id, name, interval, &mine, now));
-            let listed = store.list();
+            // Over rclone, neither this machine's own record nor one listed unchanged since the last
+            // read is downloaded (`PresenceStore::others`).
+            let listed = store.others(id, &h.state::<AppState>().presence_kept);
             // With the network's proxy's code for whichever it stopped, which Health words.
             let result = health::SharingResult::of(now, &wrote, &listed);
             Some((listed.unwrap_or_default(), result))
@@ -4713,6 +4718,7 @@ pub fn run() {
         sources: Mutex::default(),
         presence_tracks: Mutex::default(),
         presence_recall: Mutex::default(),
+        presence_kept: presence::Kept::default(),
         // What saves left for the next refresh to withdraw, kept between runs (see `sharing`).
         sharing: std::sync::Arc::new(sharing::Sharing::kept_in(settings::app_dir().expect("config directory").join(sharing::DUE_FILE))),
         roster_seen: Mutex::default(),
