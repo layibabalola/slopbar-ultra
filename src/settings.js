@@ -1501,6 +1501,8 @@ for (const h of HOTKEYS) {
 // plan has ended.
 
 let bulk = { to_connect: [], lapsed: { remove: [], in_use: [] }, connecting: null, sign_in: [], signin_profiles: 0, other_computers: 0 };
+/** Until when "Retry this sign-in" rests after a click (ms since 1970; 0 when it does not). */
+let retryRestsUntil = 0;
 const who = (target) => target.account || t("unknownAccount");
 
 /** "Sign in all accounts" as it would run now: its groups (one per email) and sign-ins. */
@@ -1560,9 +1562,20 @@ function renderBulk() {
   }
   else if (c?.finished && c.total) status.textContent = t(c.emails ? "signInAllDone" : "bulkConnectDone", { n: c.total });
   status.hidden = !(running || (c?.finished && (c.total || c.everywhere))) || !status.textContent;
-  // A stopped or failed run, a sign-in left waiting, or computers left out: Retry runs it again with
-  // what is still missing (every computer, for an everywhere run).
-  $("bulk-retry-row").hidden = !((c?.finished && (c.error || (c.everywhere && c.left_out?.length))) || (running && c.still_waiting));
+  // A stopped or failed run, or computers left out: Retry runs it again with what is still missing
+  // (every computer, for an everywhere run). While a sign-in is open: "Retry this sign-in" starts
+  // just it again, in the same window, for a page that cannot finish.
+  const retry = $("bulk-retry");
+  retry.textContent = t(running ? "signInRetryOpen" : "signInRetry");
+  retry.title = running ? t("signInRetryOpenHint") : "";
+  // A sign-in just started again rests the button a moment (one click, one new page); a run that
+  // ended frees it at once.
+  if (running) retry.disabled = Date.now() < retryRestsUntil;
+  else if (retryRestsUntil) {
+    retryRestsUntil = 0;
+    retry.disabled = false;
+  }
+  $("bulk-retry-row").hidden = !((c?.finished && (c.error || (c.everywhere && c.left_out?.length))) || (running && open));
   // Another computer can be asked once this one knows one (paired or checked over SSH, or in the roster).
   $("sign-in-everywhere-row").hidden = !bulk.other_computers;
   $("sign-in-everywhere").textContent = t(running ? "signInAllStop" : "signInEverywhereButton");
@@ -1656,6 +1669,16 @@ $("sign-in-all-monitoring").addEventListener("change", renderBulk);
 $("sign-in-everywhere").addEventListener("click", () => stopping() ? void invoke("stop_sign_ins").finally(loadBulk) : signInEverywhere());
 $("bulk-retry").addEventListener("click", async () => {
   const c = bulk.connecting;
+  // A sign-in open now: only it starts again, and the run goes on. The button rests a moment, so
+  // one click is one new page.
+  const open = c && !c.finished ? (c.steps ?? []).findIndex((s) => s.state === "running") : -1;
+  if (open >= 0) {
+    retryRestsUntil = Date.now() + 5000;
+    $("bulk-retry").disabled = true;
+    try { await invoke("restart_sign_in", { at: open }); } catch (err) { alert(errorText("", String(err))); }
+    setTimeout(renderBulk, 5000);
+    return void loadBulk();
+  }
   if (c?.everywhere && c.finished) return void signInEverywhere(c.monitoring);
   $("bulk-retry").disabled = true;
   try { await invoke("retry_sign_ins"); } catch (err) { alert(errorText("", String(err))); }
