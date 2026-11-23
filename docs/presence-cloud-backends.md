@@ -46,8 +46,9 @@ MEGA, S3, WebDAV, SFTP and the other rclone backends. rclone keeps its own confi
   `PATH` can be writable by anyone). All of them read the same rclone config.
 - **Calls.** SlopBar runs only these, and only on `<remote>:SlopBar/presence` and, with the account
   roster on, `<remote>:SlopBar/roster`:
-  - `lsjson --files-only --no-mimetype` to list records;
-  - `cat <file>` to read each one;
+  - `lsjson --files-only --no-mimetype` to list records (with `--hash` on Dropbox and Google
+    Drive, below);
+  - `cat <file>` to read each record a refresh needs (below);
   - `rcat <id>.json` to write this machine's record in one step: rclone replaces the file whole
     (a cloud swaps in the finished upload; local, SFTP and FTP remotes get a partial file renamed
     into place, rclone v1.63 and later). Uploading `<id>.tmp` and then `moveto <id>.json`, as
@@ -58,11 +59,25 @@ MEGA, S3, WebDAV, SFTP and the other rclone backends. rclone keeps its own confi
   A read that still misses a record (an older SlopBar writing the old way, a failed listing)
   keeps that machine's last record while it is live by its own time (`presence::Recall`).
 
+  A refresh does not download this machine's own record (`PresenceStore::others`): every reader
+  leaves out the record of this machine's id, and only a forgery would put another machine's
+  record under its name. On Dropbox and Google Drive the listing adds `--hash`, as the roster's
+  does (below), and a record listed with the hash and size of the copy the last read kept (kept
+  only when its bytes had the hash it was listed with; in memory, at most 64 records of up to
+  16 KiB) is not downloaded again. A running machine rewrites its record at every refresh, so this
+  saves the records of machines asleep, shut down or retired. Modelled for a refresh every 5
+  minutes (`rclone::tests::an_hour_of_presence_exchanges_over_rclone_starts_fewer_processes`),
+  presence processes an hour go from 120 to 84 beside five running machines and two asleep ones,
+  60 to 48 beside two running ones, and 60 to 24 beside two asleep ones. The first read after
+  SlopBar starts downloads every other record. A synced folder reads every file, which costs no
+  process.
+
   The account roster (`SlopBar/roster`, `roster::Syncer`) uses the same three calls, and
   `deletefile <id>.roster` when the roster is turned off. On Dropbox and Google Drive its listing
   adds `--hash`: those clouds list a content hash this computer can check (Dropbox's, or SHA-256)
   with no extra request (checked on Dropbox with rclone v1.74.4: the same two requests with or
-  without it; rclone 1.56 or later, as older ones name the hashes otherwise and so skip nothing).
+  without it; rclone 1.56 or later on Dropbox and 1.65 or later on Google Drive, as older ones list
+  no hash this computer counts and so skip nothing).
   Other remotes are not asked: OneDrive lists only a quickxor, which other bytes can
   be made to match, Box only a SHA-1, and elsewhere rclone would compute hashes by reading every
   file. A roster listed with the hash and size of the copy the last read kept (kept only when its
