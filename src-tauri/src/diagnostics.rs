@@ -415,6 +415,31 @@ struct History {
     suppressed: u64,
     clean_shutdown: bool,
 }
+/// A journal as read back: its events one by one, so that one this build cannot read (written by a
+/// newer build, with names this one does not know) is dropped and counted, not the whole history.
+#[derive(Deserialize)]
+struct StoredHistory {
+    version: u8,
+    run: u64,
+    next_account: u32,
+    accounts: HashMap<String, u32>,
+    events: Vec<serde_json::Value>,
+    dropped: u64,
+    #[serde(default)]
+    suppressed: u64,
+    clean_shutdown: bool,
+}
+
+impl History {
+    fn read(bytes: &[u8]) -> Option<History> {
+        let stored: StoredHistory = serde_json::from_slice(bytes).ok()?;
+        let total = stored.events.len();
+        let events: VecDeque<Record> = stored.events.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+        let unread = (total - events.len()) as u64;
+        Some(History { version: stored.version, run: stored.run, next_account: stored.next_account, accounts: stored.accounts,
+            events, dropped: stored.dropped.saturating_add(unread), suppressed: stored.suppressed, clean_shutdown: stored.clean_shutdown })
+    }
+}
 type ObservationKey = (Option<Provider>, Option<u32>, Family);
 type ObservationValue = (Event, DateTime<Utc>);
 #[derive(Default)]
@@ -434,7 +459,8 @@ struct State {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Family {
-    ProviderEvidence(Origin, crate::providers::evidence::Endpoint),
+    /// The last bool: the evidence carries Claude's reset status (`Evidence::carries_reset_status`).
+    ProviderEvidence(Origin, crate::providers::evidence::Endpoint, bool),
     Token,
     Usage(Origin),
     Sample,
@@ -448,7 +474,7 @@ enum Family {
 fn observation(event: &Event) -> Option<(Family, Event)> {
     let mut signature = event.clone();
     let family = match &mut signature {
-        Event::ProviderEvidence { origin, evidence } => Family::ProviderEvidence(*origin, evidence.endpoint),
+        Event::ProviderEvidence { origin, evidence } => Family::ProviderEvidence(*origin, evidence.endpoint, evidence.carries_reset_status()),
         Event::Token { .. } => Family::Token,
         Event::Usage {
             origin, elapsed_ms, ..
@@ -574,7 +600,7 @@ impl Recorder {
                 .ok()
                 .filter(|m| m.len() <= MAX_BYTES)
                 .and_then(|_| private_store::load_secret(&self.path).ok())
-                .and_then(|b| serde_json::from_slice::<History>(&b).ok())
+                .and_then(|b| History::read(&b))
                 .filter(|h| {
                     h.version == 1
                         && h.accounts.len() <= MAX_ACCOUNTS
@@ -1295,7 +1321,7 @@ mod tests {
                 windows: vec![crate::model::UsageWindow { kind: canary.into(), used_percent: 61.25, window_seconds: None, resets_at: None }] }),
             covered_by: Some(canary.into()),
             used_outside: true,
-            runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None,
+            runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None,
         };
         let snapshot = Snapshot {
             accounts: vec![a],
@@ -1343,6 +1369,40 @@ mod tests {
             }
         }
         assert_eq!(s.history.events.len(), 4);
+    }
+    #[test]
+    fn a_journal_keeps_the_events_this_build_can_read() {
+        use crate::providers::evidence::{capture, Endpoint};
+        let mut s = State::default();
+        let now = Utc::now();
+        Recorder::push_at(&mut s, Some(Provider::Claude), Some("synthetic"), Event::Action { action: Action::ConnectStarted, code: Code::Ok, elapsed_ms: 0 }, now);
+        Recorder::push_at(&mut s, Some(Provider::Claude), Some("synthetic"), Event::ProviderEvidence {
+            origin: Origin::Monitoring, evidence: capture(Endpoint::ClaudeUsage, 200, &serde_json::json!({ "cedar_ember": null })),
+        }, now);
+        let mut journal = serde_json::to_value(&s.history).unwrap();
+        // A newer build's event, with names this one does not know, between the two.
+        let mut newer = journal["events"][1].clone();
+        newer["event"]["evidence"]["fields"][0]["field"] = serde_json::json!("a_field_from_a_newer_build");
+        journal["events"].as_array_mut().unwrap().insert(1, newer);
+        let read = History::read(&serde_json::to_vec(&journal).unwrap()).expect("the journal still reads");
+        assert_eq!((read.events.len(), read.dropped), (2, s.history.dropped + 1));
+        assert!(read.events == s.history.events);
+        assert!(History::read(b"not a journal").is_none());
+    }
+    #[test]
+    fn asked_and_plain_claude_readings_are_deduplicated_apart() {
+        use crate::providers::evidence::{capture, Endpoint};
+        let mut s = State::default();
+        let now = Utc::now();
+        let status = serde_json::json!({ "cedar_ember": { "eligible": false, "ineligible_reason": "surface", "grants": [] } });
+        for _ in 0..10 {
+            for raw in [serde_json::json!({ "cedar_ember": null }), status.clone()] {
+                Recorder::push_at(&mut s, Some(Provider::Claude), Some("synthetic"), Event::ProviderEvidence {
+                    origin: Origin::Monitoring, evidence: capture(Endpoint::ClaudeUsage, 200, &raw),
+                }, now);
+            }
+        }
+        assert_eq!(s.history.events.len(), 2, "an hourly asked reading does not make every plain one news");
     }
     #[test]
     fn pseudonyms_history_and_unclean_exit_survive_restart() {

@@ -77,7 +77,7 @@ mod tests {
             active, sources: vec![], windows: percent.map(|used_percent| UsageWindow {
                 kind: "session".into(), window_seconds: None, used_percent, resets_at: None,
             }).into_iter().collect(), credits: None, resets: vec![], error: None, monitor_error: None, stale: false,
-            fetched_at: Some(chrono::Utc::now()), monitor_connected: true, monitor_ends_at: None, monitor_renewal: None, billing: Default::default(), remote: vec![], overlap: vec![], shared: None, covered_by: None, used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None,
+            fetched_at: Some(chrono::Utc::now()), monitor_connected: true, monitor_ends_at: None, monitor_renewal: None, billing: Default::default(), remote: vec![], overlap: vec![], shared: None, covered_by: None, used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None,
         }
     }
 

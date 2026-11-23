@@ -983,5 +983,31 @@ fn revoked(status: u16, body: &Value) -> bool {
     })
 }
 
+/// An access token for a live check: no Debug or Display, so it cannot reach output by mistake.
+#[cfg(test)]
+pub(crate) struct LiveToken(String);
+
+#[cfg(test)]
+impl LiveToken {
+    pub(crate) fn bearer(&self) -> &str { &self.0 }
+}
+
+/// Live checks only (see `providers::claude::tests::live_resets`): the access tokens of one
+/// provider's monitoring sign-ins saved in `dir` that stay good for another five minutes. It only
+/// reads: nothing is renewed, saved or revoked, so the running app's sign-ins stay exactly as they
+/// are.
+#[cfg(test)]
+pub(crate) fn live_access(dir: &std::path::Path, provider: Provider) -> Vec<LiveToken> {
+    let soon = Utc::now() + chrono::Duration::minutes(5);
+    let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
+    entries.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "session"))
+        .filter_map(|e| private_store::load_secret(&e.path()).ok())
+        .filter_map(|b| serde_json::from_slice::<Session>(&b).ok())
+        .filter(|s| s.version == 1 && s.provider == provider && !s.reconnect && !s.access_rejected
+            && !s.access_token.is_empty() && s.expires_at.is_some_and(|t| t > soon))
+        .map(|s| LiveToken(s.access_token))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests;
