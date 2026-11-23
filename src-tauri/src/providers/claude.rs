@@ -85,28 +85,43 @@ pub async fn fetch(client: &reqwest::Client, token: &str, slot: &crate::accounts
             Err(_) => observe(super::evidence::Evidence::outcome(super::evidence::Endpoint::ClaudeProfile, None)),
         }
     }
-    let read = |url: &'static str| client.get(url).bearer_auth(token).header("anthropic-beta", "oauth-2025-04-20").send();
-    let mut resp = read(if ask_resets { RESET_STATUS_URL } else { USAGE_URL }).await;
-    let failed = |r: &reqwest::Result<reqwest::Response>| r.as_ref().map_or(true, |r| !r.status().is_success() && r.status().as_u16() != 429);
-    let refused = ask_resets && failed(&resp);
-    if refused {
-        observe(super::evidence::Evidence::outcome(super::evidence::Endpoint::ClaudeUsage, resp.as_ref().ok().map(|r| r.status().as_u16())));
-        resp = read(USAGE_URL).await;
-    }
-    let resp = resp.map_err(|e| crate::net::failure_text(&e))?;
-    if resp.status() == 401 {
-        return Err("token_invalid".into());
-    }
-    if resp.status() == 429 {
-        return Err(super::rate_limited(&resp));
-    }
-    if !resp.status().is_success() {
-        return Err(format!("http_{}", resp.status().as_u16()));
-    }
-    let status = resp.status().as_u16();
-    let raw: Value = match resp.json().await {
-        Ok(raw) => raw,
-        Err(_) => { observe(super::evidence::Evidence::outcome(super::evidence::Endpoint::ClaudeUsage, Some(status))); return Err("bad_response".into()); }
+    // At most two requests: an asking one that `asking_refused` turns down is read again plainly.
+    let mut refused = false;
+    let mut url = if ask_resets { RESET_STATUS_URL } else { USAGE_URL };
+    let (status, raw) = loop {
+        let asking = url == RESET_STATUS_URL;
+        let refuse = |status: Option<u16>| {
+            observe(super::evidence::Evidence::outcome(super::evidence::Endpoint::ClaudeUsage, status));
+            USAGE_URL
+        };
+        let resp = match client.get(url).bearer_auth(token).header("anthropic-beta", "oauth-2025-04-20").send().await {
+            Ok(resp) => resp,
+            Err(_) if asking => { refused = true; url = refuse(None); continue; }
+            Err(e) => return Err(crate::net::failure_text(&e)),
+        };
+        let status = resp.status().as_u16();
+        if asking && !resp.status().is_success() && asking_refused(Some(status), false) {
+            refused = true;
+            url = refuse(Some(status));
+            continue;
+        }
+        if status == 401 {
+            return Err("token_invalid".into());
+        }
+        if status == 429 {
+            return Err(super::rate_limited(&resp));
+        }
+        if !resp.status().is_success() {
+            return Err(format!("http_{status}"));
+        }
+        match resp.json::<Value>().await {
+            Ok(raw) if serde_json::from_value::<Usage>(raw.clone()).is_ok() => break (status, raw),
+            // A plain reading that is no reading says so in its evidence, as before.
+            Ok(raw) if !asking => { observe(super::evidence::capture(super::evidence::Endpoint::ClaudeUsage, status, &raw)); return Err("bad_response".into()); }
+            Err(_) if !asking => { observe(super::evidence::Evidence::outcome(super::evidence::Endpoint::ClaudeUsage, Some(status))); return Err("bad_response".into()); }
+            // An asking reply that is no usage reading: the parameter must not cost the numbers.
+            _ => { refused = true; url = refuse(Some(status)); }
+        }
     };
     observe(super::evidence::capture(super::evidence::Endpoint::ClaudeUsage, status, &raw));
     // Only a reply that carries the status says which resets the account holds: one without it (a
@@ -134,6 +149,19 @@ pub async fn fetch(client: &reqwest::Client, token: &str, slot: &crate::accounts
         })
         .collect();
     Ok(ClaudeUsage { windows, resets, withheld, refused, billing: plan, extra_usage })
+}
+
+/// Whether a reading that asked for the reset status is turned down and taken again without the
+/// parameter: no answer (`status` None), any error status but a 429 (a rejected token included:
+/// only a plain reading may call a token invalid), or a success whose body is no usage `reading`.
+/// A 429 is not: it is the provider asking to slow down, answered by backing off.
+fn asking_refused(status: Option<u16>, reading: bool) -> bool {
+    match status {
+        None => true,
+        Some(429) => false,
+        Some(s) if (200..300).contains(&s) => !reading,
+        Some(_) => true,
+    }
 }
 
 /// Extra usage (`extra_usage`: is_enabled, monthly_limit, used_credits, utilization), read
@@ -325,6 +353,17 @@ mod tests {
         let many = status(Value::Array((0..40).map(|i| serde_json::json!({ "id": format!("g{i}"), "resets_left": 999, "type": "full" })).collect()));
         let held = resets(&many);
         assert_eq!((held.len(), held.iter().map(|r| u64::from(r.count)).sum::<u64>()), (16, 16 * 999));
+    }
+
+    #[test]
+    fn an_asking_reading_that_is_no_reading_is_taken_again_plainly_but_a_429_is_not() {
+        assert!(asking_refused(None, false), "no answer");
+        for status in [400, 401, 403, 404, 500, 502, 503] {
+            assert!(asking_refused(Some(status), false), "{status}");
+        }
+        assert!(!asking_refused(Some(429), false), "the provider asks to slow down: back off, do not ask twice");
+        assert!(!asking_refused(Some(200), true));
+        assert!(asking_refused(Some(200), false), "a body that is no usage reading");
     }
 
     #[test]

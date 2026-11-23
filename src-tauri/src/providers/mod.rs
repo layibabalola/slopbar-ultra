@@ -166,7 +166,11 @@ pub async fn fetch_all(
             merge(entry, result, asked, Utc::now());
             acc.windows = entry.windows.clone();
             acc.credits = entry.credits.clone();
-            acc.resets = unexpired(entry.resets.clone(), Utc::now());
+            // Titles cleaned again as shown, for those a reading by an older build kept as they came.
+            acc.resets = unexpired(entry.resets.clone(), Utc::now()).into_iter().map(|mut r| {
+                r.title = match slot.provider { Provider::Codex => r.title.as_deref().and_then(codex::title), Provider::Claude => None };
+                r
+            }).collect();
             acc.resets_withheld = entry.resets_withheld;
             acc.resets_read_at = entry.resets_read_at;
             acc.extra_usage = entry.extra_usage.clone();
@@ -612,7 +616,10 @@ mod tests {
     /// Claude Code to be answered what Claude withholds from it, never asks at a limit wall and never
     /// claims a reset. No code names Claude Code's client identity (a `claude-cli/` or `claude-code/`
     /// User-Agent, an `x-app` header), sets a User-Agent outside the Codex provider (which sends
-    /// `codex-cli`, from before this rule), asks `at_wall` or calls `reset_rate_limits`.
+    /// `codex-cli`, from before this rule), asks `at_wall` or calls `reset_rate_limits`; and, as an
+    /// allowlist that a name built at run time cannot pass, the code that calls Anthropic sends no
+    /// header but `anthropic-beta` and `Accept`, and POSTs only to renew and to revoke a monitoring
+    /// sign-in.
     #[test]
     fn no_request_claims_to_be_claude_code_or_spends_a_reset() {
         fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -621,21 +628,37 @@ mod tests {
                 if path.is_dir() { sources(&path, out) } else if path.extension().is_some_and(|x| x == "rs") { out.push(path) }
             }
         }
+        // A whole word: `at_wall` is found in `?at_wall=1`, not in `format_wall_time`.
+        fn word(code: &str, needle: &str) -> bool {
+            let part = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            code.match_indices(needle).any(|(i, _)| !part(code[..i].chars().next_back()) && !part(code[i + needle.len()..].chars().next()))
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = vec![];
-        sources(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        sources(&src, &mut files);
         assert!(files.len() > 50, "the crate's sources");
         // Spelled in pieces, so that this test is not its own finding.
-        let forbidden = [concat!("\"claude", "-cli"), concat!("\"claude", "-code/"), concat!("\"x", "-app\""), concat!("at", "_wall"), concat!("reset", "_rate_limits")];
+        let quoted = [concat!("claude", "-cli"), concat!("claude", "-code/"), concat!("\"x", "-app\""), concat!("\"user", "-agent\"")];
+        let words = [concat!("at", "_wall"), concat!("reset", "_rate_limits"), concat!("user", "_agent"), concat!("default", "_headers")];
         for path in &files {
+            let rel = path.strip_prefix(&src).unwrap().to_string_lossy().replace('\\', "/");
             let code = crate::source_guard::tokens(&std::fs::read_to_string(path).unwrap()).to_lowercase();
-            for needle in forbidden {
-                assert!(!code.contains(needle), "{}: {needle} (the owner's hold on impersonating Claude Code)", path.display());
+            let codex = rel == "providers/codex.rs";
+            for needle in quoted.iter().filter(|n| !(codex && n.contains("agent"))) {
+                assert!(!code.contains(needle), "{rel}: {needle} (the owner's hold on impersonating Claude Code)");
             }
-            if !path.ends_with("codex.rs") {
-                for needle in [concat!("\"user", "-agent\""), concat!("user", "_agent")] {
-                    assert!(!code.contains(needle), "{}: {needle}: only the Codex provider sets a User-Agent", path.display());
-                }
+            for needle in words.iter().filter(|n| !(codex && n.contains("agent"))) {
+                assert!(!word(&code, needle), "{rel}: {needle} (the owner's hold on impersonating Claude Code)");
             }
+        }
+        for (rel, posts) in [("providers/claude.rs", 0), ("accounts.rs", 0), ("monitoring.rs", 2)] {
+            let code = crate::source_guard::tokens(&std::fs::read_to_string(src.join(rel)).unwrap()).to_lowercase();
+            for (i, _) in code.match_indices(".header(") {
+                let arg = &code[i + ".header(".len()..];
+                assert!(arg.starts_with("\"anthropic-beta\"") || arg.starts_with("\"accept\""), "{rel}: a header other than anthropic-beta or Accept: {}", arg.chars().take(40).collect::<String>());
+            }
+            assert!(code.match_indices(".headers(").all(|(i, _)| code[i + ".headers(".len()..].starts_with(')')), "{rel}: a header map set on a request");
+            assert_eq!(code.matches(".post(").count(), posts, "{rel}: a POST to Anthropic other than renewing or revoking a monitoring sign-in");
         }
     }
 
@@ -663,9 +686,12 @@ mod tests {
         // A failure keeps them too; one of a reading that asked stops asking for an hour.
         merge(&mut entry, Some(Err("http_500".into())), false, later);
         assert_eq!((entry.resets.len(), entry.resets_tried_at), (2, Some(now)));
+        entry.windows[0].used_percent = 95.0;
+        assert!(ask_resets(Provider::Claude, Some(&entry), later), "near a limit, with the last ask answered");
         merge(&mut entry, Some(Err("rate_limited:30".into())), true, later);
         assert_eq!((entry.resets.len(), entry.resets_tried_at, entry.error.as_deref()), (2, Some(later), Some("rate_limited")));
-        assert!(!ask_resets(Provider::Claude, Some(&entry), later + chrono::Duration::minutes(30)));
+        assert!(!ask_resets(Provider::Claude, Some(&entry), later + chrono::Duration::minutes(30)), "the failed ask pauses even the near-limit asking");
+        assert!(ask_resets(Provider::Claude, Some(&entry), later + chrono::Duration::minutes(61)));
         // A status that lists none clears them; one that says Claude withholds them says so.
         merge(&mut entry, Some(Ok(claude(Some(vec![]), true, false, 41.0))), true, later);
         assert!(entry.resets.is_empty() && entry.resets_withheld && !entry.resets_refused);

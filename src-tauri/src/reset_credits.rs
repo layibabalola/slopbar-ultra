@@ -72,7 +72,8 @@ pub struct Expiring {
     pub id: String,
     pub email: Option<String>,
     pub alias: Option<String>,
-    /// The credit's kind ("full", "session", "weekly", "fable" or "unknown"; Codex's are "unknown").
+    /// The credit's kind ("full", "session", "weekly", "fable" or "unknown"; Codex's come from its
+    /// credits' details and are mostly "unknown").
     pub reset_kind: String,
     pub count: u32,
     pub expires_at: DateTime<Utc>,

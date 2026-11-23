@@ -285,16 +285,17 @@ pub struct ResetGrant {
 
 impl ResetGrant {
     /// Whether a reset of this kind refills the limit of a window (`UsageWindow::kind`) that ran
-    /// out. A Claude 5-hour limit takes a session or full reset; a weekly one a weekly, full or Fable
-    /// one (a Fable reset gives back what Fable used of the week, to the weekly limit only). Codex
-    /// names no kinds (its are "unknown"): any of its resets.
+    /// out. A Claude 5-hour limit takes a session or full reset; the weekly one a weekly, full or
+    /// Fable one (a Fable reset gives back what Fable used of the week, to the weekly limit only); a
+    /// model's own weekly limit (Opus, Sonnet) none that SlopBar can promise, as which limits a reset
+    /// clears is not kept. Codex: any of its resets (their kinds come from its credits' details and
+    /// are mostly "unknown").
     pub fn refills(&self, provider: Provider, window: &str) -> bool {
         if provider == Provider::Codex { return true; }
         match self.kind.as_str() {
-            "full" => true,
+            "full" => window == "session" || window == "weekly",
             "session" => window == "session",
-            "weekly" => window.starts_with("weekly"),
-            "fable" => window == "weekly",
+            "weekly" | "fable" => window == "weekly",
             _ => false,
         }
     }

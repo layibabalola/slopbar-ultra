@@ -423,21 +423,48 @@ struct StoredHistory {
     run: u64,
     next_account: u32,
     accounts: HashMap<String, u32>,
-    events: Vec<serde_json::Value>,
+    events: StoredEvents,
     dropped: u64,
     #[serde(default)]
     suppressed: u64,
     clean_shutdown: bool,
 }
 
+/// The journal's events, each read alone and kept when this build can read it.
+struct StoredEvents {
+    events: VecDeque<Record>,
+    unread: u64,
+}
+
+impl<'de> Deserialize<'de> for StoredEvents {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Events;
+        impl<'de> serde::de::Visitor<'de> for Events {
+            type Value = StoredEvents;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a list of events")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<StoredEvents, A::Error> {
+                let mut read = StoredEvents { events: VecDeque::new(), unread: 0 };
+                while let Some(event) = seq.next_element::<serde_json::Value>()? {
+                    match serde_json::from_value::<Record>(event) {
+                        Ok(record) => read.events.push_back(record),
+                        Err(_) => read.unread += 1,
+                    }
+                }
+                Ok(read)
+            }
+        }
+        deserializer.deserialize_seq(Events)
+    }
+}
+
 impl History {
     fn read(bytes: &[u8]) -> Option<History> {
         let stored: StoredHistory = serde_json::from_slice(bytes).ok()?;
-        let total = stored.events.len();
-        let events: VecDeque<Record> = stored.events.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
-        let unread = (total - events.len()) as u64;
         Some(History { version: stored.version, run: stored.run, next_account: stored.next_account, accounts: stored.accounts,
-            events, dropped: stored.dropped.saturating_add(unread), suppressed: stored.suppressed, clean_shutdown: stored.clean_shutdown })
+            events: stored.events.events, dropped: stored.dropped.saturating_add(stored.events.unread), suppressed: stored.suppressed,
+            clean_shutdown: stored.clean_shutdown })
     }
 }
 type ObservationKey = (Option<Provider>, Option<u32>, Family);

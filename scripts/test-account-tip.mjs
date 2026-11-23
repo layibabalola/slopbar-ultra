@@ -354,8 +354,8 @@ test("a saved CLI sign-in that ended or ends soon says so before anyone presses 
 
 test("a Fable reset says it gives back only what Fable used, and resets list usable, then soonest, never-expiring last", () => {
   const grant = (kind, usable, expires_at = null, count = 1) => ({ kind, title: null, count, usable, expires_at, next_available_at: null });
-  const groups = groupResets([grant("full", false), grant("fable", false, iso(now + 30 * HOUR), 2), grant("weekly", true), grant("full", false, iso(now + 90 * HOUR))]);
-  assert.deepEqual(groups.map((g) => [g.kind, g.count]), [["weekly", 1], ["fable", 2], ["full", 2]]);
+  const groups = groupResets([grant("session", false), grant("full", false), grant("fable", false, iso(now + 30 * HOUR), 2), grant("weekly", true), grant("full", false, iso(now + 90 * HOUR))]);
+  assert.deepEqual(groups.map((g) => [g.kind, g.count]), [["weekly", 1], ["fable", 2], ["full", 2], ["session", 1]]);
   assert.match(resetText(groups[1]), /^Fable reset ×2 · gives back only what Fable used this week · not usable now · expires /);
   // The same rule as the Rust text (i18n_format.rs): a title names only a reach SlopBar knows.
   assert.equal(resetText({ ...grant("unknown", false), title: "Full reset (Monthly)" }), "Reset · type unknown · not usable now");

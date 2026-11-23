@@ -460,7 +460,8 @@ pub fn recommend(accounts: &[AccountUsage], settings: &Settings, provider: Provi
             let claimable = acc.resets.iter().find(|r| r.usable && r.count > 0
                 && acc.windows.iter().any(|w| w.used_percent >= LIMIT_PERCENT && r.refills(acc.provider, &w.kind)));
             let reason = match claimable {
-                Some(r) => format!("{reason}; it holds a usable {} reset only the user can claim", r.kind),
+                Some(r) if r.kind == "fable" => format!("{reason}; it holds a usable fable reset that only the user can claim (it gives back only what Fable used this week)"),
+                Some(r) => format!("{reason}; it holds a usable {} reset that only the user can claim", r.kind),
                 None => reason,
             };
             excluded.push(Excluded { id: acc.id.clone(), label, active: acc.active, reason, shared });
@@ -615,11 +616,11 @@ mod tests {
         let rec = recommend(&[full.clone(), spare.clone()], &settings, Provider::Claude, Some(10.0), Some(2.0), now);
         assert_eq!(rec.recommended.as_deref(), Some("spare"));
         let reason = &rec.excluded.iter().find(|e| e.id == "full").unwrap().reason;
-        assert!(reason.ends_with("; it holds a usable fable reset only the user can claim"), "{reason}");
+        assert!(reason.ends_with("; it holds a usable fable reset that only the user can claim (it gives back only what Fable used this week)"), "{reason}");
         // One that does not refill the limit reached, or is not usable now, is not mentioned.
         full.resets = vec![grant("session", true), grant("weekly", false)];
         let rec = recommend(&[full.clone(), spare], &settings, Provider::Claude, Some(10.0), Some(2.0), now);
-        assert!(!rec.excluded[0].reason.contains("reset only the user can claim"), "{}", rec.excluded[0].reason);
+        assert!(!rec.excluded[0].reason.contains("only the user can claim"), "{}", rec.excluded[0].reason);
         // Withheld: said, so that none listed is not read as none held.
         full.resets.clear();
         full.resets_withheld = true;
