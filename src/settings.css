@@ -407,6 +407,8 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
 }
 .health-check .title { min-width: 0; }
 .health-check .title label { display: flex; align-items: center; gap: 8px; }
+/* A fix's button keeps its label on one line; the reason beside it wraps instead. */
+.health-check .btn { flex: none; white-space: nowrap; }
 .health-dot { width: 10px; height: 10px; flex: none; border-radius: 50%; background: var(--ok); }
 .health-dot.warning { background: var(--warn); }
 .health-dot.problem { background: var(--bad); }
