@@ -891,18 +891,16 @@ mod tests {
         kept.replace(vec![("a.json".into(), "dropbox:ab".into(), b"{ }".to_vec())]);
         assert_eq!((kept.get("a.json", 2, "dropbox:aa"), kept.get("b.json", 3, "dropbox:bb")), (None, None));
         assert_eq!(kept.get("a.json", 3, "dropbox:ab"), Some(b"{ }".to_vec()));
-        // Bounded, whatever the folder holds: records up to KEEP_BYTES, KEEP_RECORDS of them.
+        // Bounded, whatever the folder holds: records up to KEEP_BYTES...
         let big = vec![b' '; KEEP_BYTES + 1];
-        let many: Vec<_> = (0..KEEP_RECORDS + 36).map(|n| (format!("{n:03}.json"), format!("dropbox:{n}"), b"{}".to_vec()))
-            .chain([("big.json".to_string(), "dropbox:big".to_string(), big.clone()), ("edge.json".into(), "dropbox:edge".into(), vec![b' '; KEEP_BYTES])])
-            .collect();
-        kept.replace(many);
+        kept.replace(vec![("big.json".into(), "dropbox:big".into(), big.clone()), ("edge.json".into(), "dropbox:edge".into(), vec![b' '; KEEP_BYTES])]);
         assert_eq!(kept.get("big.json", big.len() as u64, "dropbox:big"), None, "too big to keep");
+        assert!(kept.get("edge.json", KEEP_BYTES as u64, "dropbox:edge").is_some(), "KEEP_BYTES itself is kept");
+        // ...and KEEP_RECORDS of them.
+        let many: Vec<_> = (0..KEEP_RECORDS + 36).map(|n| (format!("{n:03}.json"), format!("dropbox:{n}"), b"{}".to_vec())).collect();
+        kept.replace(many);
         let held = (0..KEEP_RECORDS + 36).filter(|n| kept.get(&format!("{n:03}.json"), 2, &format!("dropbox:{n}")).is_some()).count();
         assert_eq!(held, KEEP_RECORDS, "the first KEEP_RECORDS only");
-        assert_eq!(kept.get("edge.json", KEEP_BYTES as u64, "dropbox:edge"), None, "past the count");
-        kept.replace(vec![("edge.json".into(), "dropbox:edge".into(), vec![b' '; KEEP_BYTES])]);
-        assert!(kept.get("edge.json", KEEP_BYTES as u64, "dropbox:edge").is_some(), "KEEP_BYTES itself is kept");
     }
 
     #[test]
