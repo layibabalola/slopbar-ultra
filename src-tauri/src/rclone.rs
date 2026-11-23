@@ -35,6 +35,10 @@ pub struct Ran {
 /// Runs rclone with these arguments (and optional stdin). Tests substitute a fake.
 pub trait Runner: Send + Sync {
     fn run(&self, args: &[&str], input: Option<&[u8]>) -> std::io::Result<Ran>;
+    /// The kind of the remote its commands reach ("dropbox"…), when it is known.
+    fn kind(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The real rclone executable, and the remote its commands reach (none for commands that stay on
@@ -127,6 +131,27 @@ pub fn apply_env(cmd: &mut std::process::Command, env: Vec<(&'static str, Option
 
 impl Runner for Cli {
     fn run(&self, args: &[&str], input: Option<&[u8]>) -> std::io::Result<Ran> {
+        let ran = self.run_once(args, input);
+        // A listing, upload or deletion that failed may have gone through the proxy of a cloud the
+        // remote no longer is (pointed elsewhere since): its kind is looked up again for the next
+        // one. Not for a download, which follows a listing that worked: a download failing on its
+        // own (its cloud's file hosts unreachable) waits for the listing's failure, or KIND_KEPT.
+        let first = args.first().is_some_and(|verb| matches!(*verb, "lsjson" | "rcat" | "deletefile"));
+        if let (Some(remote), true) = (&self.remote, first) {
+            if !ran.as_ref().is_ok_and(|r| matches!(r.code, Some(0) | Some(DIR_NOT_FOUND) | Some(FILE_NOT_FOUND))) {
+                forget_kind(remote);
+            }
+        }
+        ran
+    }
+
+    fn kind(&self) -> Option<String> {
+        kind_of(&self.exe, self.remote.as_deref()?)
+    }
+}
+
+impl Cli {
+    fn run_once(&self, args: &[&str], input: Option<&[u8]>) -> std::io::Result<Ran> {
         use std::process::Stdio;
         let mut cmd = crate::sources::command(&self.exe.to_string_lossy());
         // Through the proxy Windows names for the remote's cloud, or not at all.
@@ -292,24 +317,40 @@ impl Rclone<Cli> {
     }
 }
 
-/// How long a remote's kind is kept before `listremotes` is asked again: long enough for one sync
-/// (presence, then rosters), short enough that a remote pointed at another cloud is seen soon.
-const KIND_KEPT: Duration = Duration::from_secs(60);
+/// How long a remote's kind is kept before `listremotes` (a process) is asked again: every command
+/// needs it (its proxy follows the cloud), and Settings syncs the rosters every minute while it is
+/// open. A remote pointed at another cloud meanwhile shows at its first failed command, which
+/// forgets the kind (`forget_kind`).
+const KIND_KEPT: Duration = Duration::from_secs(30 * 60);
+
+type Kinds = std::sync::Mutex<std::collections::HashMap<String, (String, Instant)>>;
+
+fn kinds() -> &'static Kinds {
+    static KINDS: std::sync::OnceLock<Kinds> = std::sync::OnceLock::new();
+    KINDS.get_or_init(Default::default)
+}
 
 /// `remote`'s kind ("dropbox"…), from `listremotes --long` (names and kinds only), kept a while.
 fn kind_of(exe: &std::path::Path, remote: &str) -> Option<String> {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static KINDS: OnceLock<Mutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
-    let kinds = KINDS.get_or_init(Default::default);
-    if let Some((kind, at)) = kinds.lock().unwrap_or_else(|e| e.into_inner()).get(remote) {
-        if at.elapsed() < KIND_KEPT {
+    kept_kind(remote, Instant::now(), || listed(&Cli::local(exe.to_path_buf()))?.into_iter().find(|r| r.name == remote).map(|r| r.kind))
+}
+
+/// `remote`'s kind as kept since `look` last found it, under `KIND_KEPT` before `now`; else `look`'s.
+fn kept_kind(remote: &str, now: Instant, look: impl FnOnce() -> Option<String>) -> Option<String> {
+    if let Some((kind, at)) = kinds().lock().unwrap_or_else(|e| e.into_inner()).get(remote) {
+        if now.saturating_duration_since(*at) < KIND_KEPT {
             return Some(kind.clone());
         }
     }
-    let kind = listed(&Cli::local(exe.to_path_buf()))?.into_iter().find(|r| r.name == remote)?.kind;
-    kinds.lock().unwrap_or_else(|e| e.into_inner()).insert(remote.to_string(), (kind.clone(), Instant::now()));
+    // Not holding the lock while `listremotes` runs.
+    let kind = look()?;
+    kinds().lock().unwrap_or_else(|e| e.into_inner()).insert(remote.to_string(), (kind.clone(), now));
     Some(kind)
+}
+
+/// Looks `remote`'s kind up again at its next command.
+fn forget_kind(remote: &str) {
+    kinds().lock().unwrap_or_else(|e| e.into_inner()).remove(remote);
 }
 
 impl<R: Runner> Rclone<R> {
@@ -338,24 +379,54 @@ impl<R: Runner> Rclone<R> {
     /// The files directly in `dir` on the remote named `*.<ext>` and at most `max` bytes, with
     /// their contents and modification times. A missing folder is an empty one.
     pub fn files(&self, dir: &str, ext: &str, max: u64) -> std::io::Result<Vec<(String, Vec<u8>, Option<DateTime<Utc>>)>> {
+        Ok(self.files_listed(dir, ext, max, false, &|_, _, _| None)?.files.into_iter().map(|f| (f.name, f.bytes, f.modified)).collect())
+    }
+
+    /// `files`, with the names listed whose download failed, and, with `hashes` on a remote whose
+    /// listing carries a content hash this computer can check at no cost (`HASHED_KINDS`: Dropbox,
+    /// Google Drive), each file's hash. A file listed with one goes to `known` first, with its name
+    /// and size: the bytes it gives back stand in for that file's `cat`, one rclone process fewer.
+    /// A file downloaded keeps its listed hash only when its bytes have it (the file can change
+    /// between the listing and the download). Without a hash every file is downloaded.
+    pub fn files_listed(&self, dir: &str, ext: &str, max: u64, hashes: bool, known: Known) -> std::io::Result<Listed> {
         let path = format!("{}:{dir}", self.remote);
-        let ran = self.runner.run(&["lsjson", "--files-only", "--no-mimetype", &path], None)?;
+        // `--hash` makes a remote that cannot list hashes compute them, reading every file (a local
+        // or SFTP remote): asked only of the clouds whose listing already holds one that counts.
+        let hashes = hashes && self.runner.kind().is_some_and(|kind| HASHED_KINDS.contains(&kind.as_str()));
+        let mut args = vec!["lsjson", "--files-only", "--no-mimetype"];
+        if hashes {
+            args.push("--hash");
+        }
+        args.push(&path);
+        let ran = self.runner.run(&args, None)?;
         match ran.code {
             Some(0) => {}
             // Nobody has written yet.
-            Some(DIR_NOT_FOUND) => return Ok(vec![]),
+            Some(DIR_NOT_FOUND) => return Ok(Listed::default()),
             code => return Err(std::io::Error::other(format!("rclone lsjson failed ({code:?})"))),
         }
         let entries: Vec<Entry> = serde_json::from_slice(&ran.stdout).map_err(std::io::Error::other)?;
         let suffix = format!(".{ext}");
-        Ok(entries
-            .into_iter()
-            .filter(|e| !e.is_dir && e.name.ends_with(&suffix) && (0..=max as i64).contains(&e.size) && !e.name.contains('/'))
-            .filter_map(|e| {
-                let ran = self.run(&["cat", &self.path_in(dir, &e.name)], None).ok()?;
-                Some((e.name, ran.stdout, e.mod_time))
-            })
-            .collect())
+        let mut listed = Listed::default();
+        for e in entries.into_iter().filter(|e| !e.is_dir && e.name.ends_with(&suffix) && (0..=max as i64).contains(&e.size) && !e.name.contains('/')) {
+            let mut hash = hashes.then(|| e.hash()).flatten();
+            let kept = hash.as_deref().and_then(|h| known(&e.name, e.size as u64, h));
+            let bytes = match kept {
+                Some(bytes) => bytes,
+                None => match self.run(&["cat", &self.path_in(dir, &e.name)], None) {
+                    Ok(ran) => {
+                        hash = hash.filter(|h| holds(h, &ran.stdout));
+                        ran.stdout
+                    }
+                    Err(_) => {
+                        listed.unread.push(e.name);
+                        continue;
+                    }
+                },
+            };
+            listed.files.push(RemoteFile { name: e.name, bytes, modified: e.mod_time, hash });
+        }
+        Ok(listed)
     }
 
     /// Uploads straight over `<dir>/<name>`, which rclone replaces in one step: a cloud storage
@@ -378,6 +449,29 @@ impl<R: Runner> Rclone<R> {
     }
 }
 
+/// Given a file's name, size and content hash as listed, the bytes the caller kept from a download
+/// of it with that hash, if any (`Rclone::files_listed`).
+pub type Known<'a> = &'a dyn Fn(&str, u64, &str) -> Option<Vec<u8>>;
+
+/// One file as `Rclone::files_listed` found it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteFile {
+    pub name: String,
+    pub bytes: Vec<u8>,
+    pub modified: Option<DateTime<Utc>>,
+    /// Its keyed content hashes as the listing gave them (`kind:value`, comma-separated), when they
+    /// were asked for and the bytes have them.
+    pub hash: Option<String>,
+}
+
+/// What `Rclone::files_listed` found: the files it has the bytes of, and those listed whose
+/// download failed.
+#[derive(Debug, Default)]
+pub struct Listed {
+    pub files: Vec<RemoteFile>,
+    pub unread: Vec<String>,
+}
+
 #[derive(Deserialize)]
 struct Entry {
     #[serde(rename = "Name")]
@@ -388,6 +482,49 @@ struct Entry {
     mod_time: Option<DateTime<Utc>>,
     #[serde(rename = "IsDir", default)]
     is_dir: bool,
+    /// With `--hash`: each hash the remote lists, by kind ("dropbox", "md5"…).
+    #[serde(rename = "Hashes", default)]
+    hashes: std::collections::BTreeMap<String, String>,
+}
+
+/// The remotes asked for hashes (`--hash`): clouds whose listing carries one of `KEYED_HASHES` at
+/// no cost. OneDrive lists only a quickxor and Box only a SHA-1, so they download every file.
+const HASHED_KINDS: [&str; 2] = ["dropbox", "drive"];
+
+/// The hash kinds a file is known by: ones nobody can match with other bytes (unlike OneDrive's
+/// quickxor, which whoever can write the folder could), and that this computer checks against the
+/// bytes it downloads (`holds`), so a hash listed before the file changed never stands for bytes
+/// read after.
+const KEYED_HASHES: [&str; 3] = ["dropbox", "sha256", "sha512"];
+
+impl Entry {
+    /// Its keyed hashes as one string, in kind order; none when the listing gave none.
+    fn hash(&self) -> Option<String> {
+        let all: Vec<String> = self.hashes.iter().filter(|(k, v)| KEYED_HASHES.contains(&k.as_str()) && !v.is_empty()).map(|(k, v)| format!("{k}:{v}")).collect();
+        (!all.is_empty()).then(|| all.join(","))
+    }
+}
+
+/// Whether `bytes` have every hash in `hash` (as `Entry::hash` writes them).
+fn holds(hash: &str, bytes: &[u8]) -> bool {
+    use sha2::{Digest, Sha256, Sha512};
+    let hex = |digest: &[u8]| digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    hash.split(',').all(|pair| match pair.split_once(':') {
+        Some(("dropbox", v)) => v.eq_ignore_ascii_case(&hex(&dropbox_hash(bytes))),
+        Some(("sha256", v)) => v.eq_ignore_ascii_case(&hex(&Sha256::digest(bytes))),
+        Some(("sha512", v)) => v.eq_ignore_ascii_case(&hex(&Sha512::digest(bytes))),
+        _ => false,
+    })
+}
+
+/// Dropbox's content hash: the SHA-256 of the SHA-256s of each 4 MiB block, one after another.
+fn dropbox_hash(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut blocks = Sha256::new();
+    for block in bytes.chunks(4 * 1024 * 1024) {
+        blocks.update(Sha256::digest(block));
+    }
+    blocks.finalize().into()
 }
 
 impl<R: Runner> PresenceStore for Rclone<R> {
@@ -418,9 +555,26 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         files: Mutex<BTreeMap<String, Vec<u8>>>,
+        /// The remote's kind (`Runner::kind`): with `--hash`, Dropbox lists its block hash and Drive
+        /// MD5, SHA-1 and SHA-256, as theirs do, except for the files in `hashless`, and for those in
+        /// `stale` the hash of other bytes (the file changed between the listing and the download).
+        kind: Option<String>,
+        hashless: Mutex<Vec<String>>,
+        stale: Mutex<Vec<String>>,
+        /// Each upload's modification time, in seconds after a fixed time: every upload takes the
+        /// next second of `clock` (set it back for two uploads in one second). A file put in `files`
+        /// by hand lists at the fixed time.
+        times: Mutex<BTreeMap<String, i64>>,
+        clock: std::sync::atomic::AtomicI64,
+        /// Files whose `cat` fails, as a download that broke off would.
+        unreadable: Mutex<Vec<String>>,
         calls: Mutex<Vec<String>>,
         remotes: String,
         fail: Option<i32>,
+    }
+
+    fn dropbox() -> Fake {
+        Fake { kind: Some("dropbox".into()), ..Fake::default() }
     }
 
     impl Runner for Fake {
@@ -433,18 +587,39 @@ mod tests {
             let mut files = self.files.lock().unwrap();
             match args {
                 ["listremotes", "--long"] => ok(self.remotes.clone().into_bytes()),
-                ["lsjson", "--files-only", "--no-mimetype", dir] => {
+                ["lsjson", "--files-only", "--no-mimetype", rest @ ..] => {
+                    let (hashes, dir) = match rest {
+                        ["--hash", dir] => (true, dir),
+                        [dir] => (false, dir),
+                        other => panic!("unexpected lsjson: {other:?}"),
+                    };
                     let prefix = format!("{dir}/");
+                    let (times, hashless) = (self.times.lock().unwrap(), self.hashless.lock().unwrap());
+                    let base: DateTime<Utc> = "2026-10-21T07:00:00Z".parse().unwrap();
                     let list: Vec<_> = files
                         .iter()
-                        .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|n| serde_json::json!({
-                            "Path": n, "Name": n, "Size": v.len(), "ModTime": "2026-10-21T07:00:00Z", "IsDir": false })))
+                        .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|n| {
+                            let at = base + chrono::Duration::seconds(times.get(k).copied().unwrap_or(0));
+                            let mut entry = serde_json::json!({ "Path": n, "Name": n, "Size": v.len(), "ModTime": at, "IsDir": false });
+                            if hashes {
+                                use sha2::{Digest, Sha256};
+                                let hex = |d: &[u8]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                                let bytes: &[u8] = if self.stale.lock().unwrap().contains(k) { b"other bytes" } else { v };
+                                entry["Hashes"] = match (hashless.contains(k), self.kind.as_deref()) {
+                                    (true, _) => serde_json::json!({}),
+                                    (_, Some("drive")) => serde_json::json!({ "md5": "synthetic-md5", "sha1": "synthetic-sha1", "sha256": hex(&Sha256::digest(bytes)) }),
+                                    _ => serde_json::json!({ "dropbox": hex(&Sha256::digest(Sha256::digest(bytes))) }),
+                                };
+                            }
+                            entry
+                        }))
                         .collect();
                     if list.is_empty() {
                         return Ok(Ran { code: Some(DIR_NOT_FOUND), stdout: vec![] });
                     }
                     ok(serde_json::to_vec(&list).unwrap())
                 }
+                ["cat", path] if self.unreadable.lock().unwrap().iter().any(|p| p == path) => Ok(Ran { code: Some(1), stdout: vec![] }),
                 ["cat", path] => ok(files.get(*path).cloned().unwrap_or_default()),
                 ["deletefile", path] => {
                     files.remove(*path);
@@ -452,10 +627,27 @@ mod tests {
                 }
                 ["rcat", path] => {
                     files.insert(path.to_string(), input.unwrap_or_default().to_vec());
+                    let at = self.clock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    self.times.lock().unwrap().insert(path.to_string(), at);
                     ok(vec![])
                 }
                 other => panic!("unexpected rclone call: {other:?}"),
             }
+        }
+
+        fn kind(&self) -> Option<String> {
+            self.kind.clone()
+        }
+    }
+
+    impl Fake {
+        /// How many of each command ran since the call count was `from`.
+        fn ran(&self, from: usize, command: &str) -> usize {
+            self.calls.lock().unwrap()[from..].iter().filter(|c| c.split(' ').next() == Some(command)).count()
+        }
+
+        fn count(&self) -> usize {
+            self.calls.lock().unwrap().len()
         }
     }
 
@@ -510,6 +702,324 @@ mod tests {
         assert!(!text.contains('@') && !text.contains("synthetic-a") && !text.contains("DESK-1"), "{text}");
         store.remove("11111111-1111-4111-8111-111111111111.roster").unwrap();
         assert!(RosterStore::list(&store).unwrap().is_empty());
+    }
+
+    const ME: &str = "11111111-1111-4111-8111-111111111111";
+    const BUSY: &str = "22222222-2222-4222-8222-222222222222";
+    const IDLE: &str = "33333333-3333-4333-8333-333333333333";
+
+    /// An account read at `at` with its weekly window at `percent`.
+    fn read_at(id: &str, percent: f64, at: DateTime<Utc>) -> crate::model::AccountUsage {
+        let mut a = account(id);
+        a.windows = vec![crate::model::UsageWindow { kind: "weekly".into(), window_seconds: None, used_percent: percent, resets_at: None }];
+        a.fetched_at = Some(at);
+        a
+    }
+
+    /// Another machine writing its roster, with one reading, as its own sync would.
+    fn peer_writes(store: &Rclone<Fake>, key: &crate::backup::SealKey, id: &str, machine: &str, percent: f64, at: DateTime<Utc>, run: Option<crate::roster::Run>) {
+        let accounts = [read_at("synthetic-b:org", percent, at)];
+        let mut roster = crate::roster::own(id, machine, &accounts, at);
+        roster.readings = crate::roster::readings(&accounts, at);
+        roster.run = run;
+        crate::roster::RosterStore::put(store, &crate::roster::file_name(id).unwrap(), &crate::roster::seal(&roster, key).unwrap()).unwrap();
+    }
+
+    /// A roster listed with the content hash of the bytes the last read kept of it is not
+    /// downloaded again, at any pace: those bytes are its bytes, so its machine and readings stay as
+    /// they are and are listed now. A file that changed, in any way, is downloaded; so is every file
+    /// at a forced read (sync_roster), and any file listed with no hash.
+    #[test]
+    fn roster_reads_download_only_files_whose_content_changed() {
+        use crate::roster::Syncer;
+        let store = Rclone::with("cloud", dropbox());
+        let passphrase = crate::backup::Passphrase("synthetic roster passphrase".into());
+        let key = crate::backup::SealKey::new(&passphrase).unwrap();
+        let t0: DateTime<Utc> = "2026-11-22T12:00:00Z".parse().unwrap();
+        let at = |s: i64| t0 + chrono::Duration::seconds(s);
+        let min = |m: i64| 60 * m;
+        peer_writes(&store, &key, BUSY, "BUSY-PC", 10.0, at(0), None);
+        peer_writes(&store, &key, IDLE, "IDLE-PC", 20.0, at(0), None);
+        let mine = [account("synthetic-a:org")];
+        let mut me = Syncer::default();
+        let cats = |me: &mut Syncer, s: i64, force: bool, soon: bool| {
+            let from = store.runner.count();
+            me.sync(&store, &passphrase, (ME, "DESK-1"), &mine, at(s), force, soon);
+            assert!(store.runner.calls.lock().unwrap()[from..].iter().filter(|c| c.starts_with("lsjson ")).all(|c| c.contains(" --hash ")), "a cloud that lists hashes is asked for them");
+            store.runner.ran(from, "cat")
+        };
+        assert_eq!(cats(&mut me, 0, false, false), 2, "the first read since SlopBar started downloads both, before its first write");
+        assert_eq!(cats(&mut me, min(10), false, false), 1, "its own roster, new since");
+        assert_eq!(cats(&mut me, min(20), false, false), 0, "nothing changed: the listing alone");
+        let shown = |me: &Syncer| me.seen.peers.iter().map(|p| (p.machine.clone(), p.readings.len(), p.listed_at)).collect::<Vec<_>>();
+        assert_eq!(shown(&me), [("BUSY-PC".to_string(), 1, at(min(20))), ("IDLE-PC".to_string(), 1, at(min(20)))], "kept as read, and listed now");
+        peer_writes(&store, &key, BUSY, "BUSY-PC", 30.0, at(min(25)), None);
+        assert_eq!(cats(&mut me, min(30), false, false), 1, "only the one that changed");
+        let percent = |me: &Syncer, machine: &str| me.seen.peers.iter().find(|p| p.machine == machine).unwrap().readings[0].reading.windows[0].used_percent;
+        assert_eq!(percent(&me, "BUSY-PC"), 30.0);
+        // Settings watching reads every 30 seconds, and downloads only what changed; a forced read
+        // downloads everything.
+        assert_eq!(cats(&mut me, min(31), false, true), 0);
+        assert_eq!(cats(&mut me, min(32), true, false), 3);
+        // A run going on elsewhere: the read that finds it, then the live pace, which downloads only
+        // what changed too.
+        let run = |at: DateTime<Utc>| Some(crate::roster::Run { revision: 1, at, total: 1, done: 0, emails: 1, email: 1,
+            finished: false, still_waiting: false, monitoring: true, everywhere: false, error: None, steps: vec![] });
+        peer_writes(&store, &key, BUSY, "BUSY-PC", 30.0, at(min(33)), run(at(min(33))));
+        assert_eq!(cats(&mut me, min(42), false, false), 1);
+        assert_eq!(cats(&mut me, min(42) + 15, false, false), 0, "read at the live pace: nothing changed");
+        assert_eq!(me.seen.read_at, Some(at(min(42) + 15)));
+        peer_writes(&store, &key, BUSY, "BUSY-PC", 31.0, at(min(43)), run(at(min(43))));
+        assert_eq!(cats(&mut me, min(43), false, false), 1);
+        // Its machine goes quiet mid-run (stopped, or gone for good): after QUIET_MINUTES it holds
+        // no other machine at the live pace any more.
+        assert_eq!(cats(&mut me, min(43) + 15, false, false), 0);
+        cats(&mut me, min(64), false, false);
+        assert_eq!(me.seen.read_at, Some(at(min(64))));
+        cats(&mut me, min(64) + 15, false, false);
+        cats(&mut me, min(70), false, false);
+        assert_eq!(me.seen.read_at, Some(at(min(64))), "quiet for 21 minutes: the slow pace");
+        // A rewrite in the same second at the same size is still a change: its hash is another.
+        let idle_path = format!("cloud:SlopBar/roster/{IDLE}.roster");
+        let before = store.runner.times.lock().unwrap()[&idle_path];
+        let size = store.runner.files.lock().unwrap()[&idle_path].len();
+        store.runner.clock.store(before - 1, std::sync::atomic::Ordering::SeqCst);
+        peer_writes(&store, &key, IDLE, "IDLE-PC", 25.0, at(min(71)), None);
+        assert_eq!((store.runner.times.lock().unwrap()[&idle_path], store.runner.files.lock().unwrap()[&idle_path].len()), (before, size));
+        assert_eq!((cats(&mut me, min(74), false, false), percent(&me, "IDLE-PC")), (1, 25.0));
+        // A file listed with no hash is downloaded at every read.
+        store.runner.hashless.lock().unwrap().push(idle_path.clone());
+        assert_eq!(cats(&mut me, min(84), false, false), 1);
+        assert_eq!(cats(&mut me, min(94), false, false), 1);
+        store.runner.hashless.lock().unwrap().clear();
+        assert_eq!(cats(&mut me, min(104), false, false), 1, "listed with a hash again: read once more (nothing was kept of it without one), then known");
+        assert_eq!(cats(&mut me, min(114), false, false), 0);
+        // A file whose listed hash its downloaded bytes do not have (it changed between the listing
+        // and the download) is kept under no hash: downloaded again at the next read.
+        store.runner.stale.lock().unwrap().push(idle_path.clone());
+        peer_writes(&store, &key, IDLE, "IDLE-PC", 26.0, at(min(115)), None);
+        assert_eq!(cats(&mut me, min(124), false, false), 1);
+        assert_eq!(cats(&mut me, min(134), false, false), 1, "its bytes never stood for that hash");
+        store.runner.stale.lock().unwrap().clear();
+        assert_eq!(cats(&mut me, min(144), false, false), 1);
+        assert_eq!(cats(&mut me, min(154), false, false), 0);
+        // Google Drive lists MD5, SHA-1 and SHA-256: known by its SHA-256. Remotes whose listing
+        // carries none this computer counts are not asked for hashes and download every file: those
+        // with none at all (S3, WebDAV, SFTP, local: rclone would compute them by reading every
+        // file), OneDrive (a quickxor, which other bytes can be made to match) and Box (a SHA-1).
+        for (kind, asked, downloads) in [("drive", true, 1 + 1), ("sftp", false, 1 + 2 + 2), ("onedrive", false, 1 + 2 + 2), ("box", false, 1 + 2 + 2)] {
+            let plain = Rclone::with("cloud", Fake { kind: Some(kind.into()), ..Fake::default() });
+            peer_writes(&plain, &key, IDLE, "IDLE-PC", 20.0, at(0), None);
+            let mut other = Syncer::default();
+            for m in [0, 10, 20] {
+                other.sync(&plain, &passphrase, (ME, "DESK-1"), &mine, at(min(m)), false, false);
+            }
+            let calls = plain.runner.calls.lock().unwrap().clone();
+            assert!(calls.iter().filter(|c| c.starts_with("lsjson ")).all(|c| c.contains("--hash") == asked), "{kind}: {calls:?}");
+            assert_eq!(calls.iter().filter(|c| c.starts_with("cat ")).count(), downloads, "{kind}: {calls:?}");
+        }
+    }
+
+    /// The hashes the clouds list, checked against the bytes as they compute them: Dropbox's is the
+    /// SHA-256 of each 4 MiB block's SHA-256 (checked on a real roster: a file under 4 MiB lists
+    /// SHA-256(SHA-256(bytes))).
+    #[test]
+    fn listed_hashes_are_checked_against_the_bytes() {
+        use sha2::{Digest, Sha256};
+        let hex = |d: &[u8]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let small = b"synthetic roster bytes".to_vec();
+        assert!(holds(&format!("dropbox:{}", hex(&Sha256::digest(Sha256::digest(&small)))), &small));
+        assert!(holds(&format!("dropbox:{}", hex(&Sha256::digest(Sha256::digest(&small))).to_uppercase()), &small), "hex in either case");
+        let big = vec![7u8; 4 * 1024 * 1024 + 3];
+        let blocks: Vec<u8> = big.chunks(4 * 1024 * 1024).flat_map(|b| Sha256::digest(b).to_vec()).collect();
+        assert!(holds(&format!("dropbox:{}", hex(&Sha256::digest(&blocks))), &big));
+        assert!(holds(&format!("sha256:{}", hex(&Sha256::digest(&small))), &small));
+        assert!(!holds(&format!("sha256:{}", hex(&Sha256::digest(b"other"))), &small));
+        assert!(!holds(&format!("dropbox:{},sha256:{}", hex(&Sha256::digest(Sha256::digest(&small))), hex(&Sha256::digest(b"other"))), &small), "every hash must hold");
+        assert!(!holds("md5:whatever", &small), "a kind this computer does not check never holds");
+    }
+
+    /// This machine's own roster as the cloud has it: an older copy put back at the same size is
+    /// another hash, so it is downloaded and written again at the next sync; a copy listed but not
+    /// downloaded (a download that broke off) is neither gone nor changed.
+    #[test]
+    fn this_machines_roster_put_back_is_caught_by_its_hash_and_one_unread_is_not_rewritten() {
+        use crate::roster::Syncer;
+        let store = Rclone::with("cloud", dropbox());
+        let passphrase = crate::backup::Passphrase("synthetic roster passphrase".into());
+        let t0: DateTime<Utc> = "2026-11-22T12:00:00Z".parse().unwrap();
+        let at = |m: i64| t0 + chrono::Duration::minutes(m);
+        let own_path = format!("cloud:SlopBar/roster/{ME}.roster");
+        let mut me = Syncer::default();
+        let sync = |me: &mut Syncer, percent: f64, m: i64, force: bool| {
+            let from = store.runner.count();
+            me.sync(&store, &passphrase, (ME, "DESK-1"), &[read_at("synthetic-a:org", percent, at(m))], at(m), force, false);
+            (store.runner.ran(from, "cat"), store.runner.ran(from, "rcat"))
+        };
+        sync(&mut me, 10.0, 0, false);
+        let old = store.runner.files.lock().unwrap()[&own_path].clone();
+        assert_eq!(sync(&mut me, 60.0, 15, false), (1, 1), "a changed reading is written, and its file read back once (new, at the slow pace)");
+        assert_eq!(sync(&mut me, 60.0, 25, false), (0, 0), "known: not downloaded");
+        // The older copy put back, at the same size and time: another hash, downloaded, written again.
+        let time = store.runner.times.lock().unwrap()[&own_path];
+        assert_eq!(old.len(), store.runner.files.lock().unwrap()[&own_path].len());
+        store.runner.files.lock().unwrap().insert(own_path.clone(), old.clone());
+        store.runner.times.lock().unwrap().insert(own_path.clone(), time);
+        assert_eq!(sync(&mut me, 60.0, 35, false), (1, 0), "found at the read");
+        assert_eq!(sync(&mut me, 60.0, 40, false), (0, 1), "written again at the next sync");
+        assert_eq!(me.seen.own_rewritten, 1);
+        // Put back again at once: found without a download (its listed hash is that of the copy kept
+        // when it was found the first time), and written over once 15 minutes have passed since the
+        // last time. A read meanwhile whose download breaks off (another copy, listed so not gone,
+        // unread so not changed) leaves it due.
+        let watch = |me: &mut Syncer, m: i64| {
+            let from = store.runner.count();
+            me.sync(&store, &passphrase, (ME, "DESK-1"), &[read_at("synthetic-a:org", 60.0, at(m))], at(m), false, true);
+            (store.runner.ran(from, "cat"), store.runner.ran(from, "rcat"))
+        };
+        store.runner.files.lock().unwrap().insert(own_path.clone(), old.clone());
+        assert_eq!(watch(&mut me, 45), (0, 0), "found, from the copy kept");
+        let key = crate::backup::SealKey::new(&passphrase).unwrap();
+        let theirs = crate::roster::seal(&crate::roster::own(ME, "DESK-1-COPY", &[account("synthetic-a:org")], at(46)), &key).unwrap();
+        store.runner.files.lock().unwrap().insert(own_path.clone(), theirs);
+        store.runner.unreadable.lock().unwrap().push(own_path.clone());
+        assert_eq!(watch(&mut me, 50), (1, 0), "unread: still due, and not yet");
+        assert_eq!(watch(&mut me, 55), (1, 1), "written over 15 minutes after the last time");
+        assert_eq!(me.seen.own_rewritten, 2);
+        // Its download keeps breaking off: nothing more is written, read after read, though the next
+        // wait (an hour) passes; a forced read writes, as every forced sync does, and downloads all.
+        for m in [60, 70, 80] {
+            assert_eq!(watch(&mut me, m), (1, 0), "{m}");
+        }
+        assert_eq!(sync(&mut me, 60.0, 81, true), (1, 1));
+        for m in [91, 101, 111, 121] {
+            assert_eq!(sync(&mut me, 60.0, m, false), (1, 0), "{m}");
+        }
+        assert_eq!(me.seen.own_rewritten, 2);
+    }
+
+    /// rclone processes one machine's roster syncs start in an hour, by command, beside two other
+    /// machines, with a refresh every 5 minutes. `every_file` is the read before this change: every
+    /// file downloaded at every read.
+    fn an_hour(every_file: bool, hour: Hour) -> [usize; 3] {
+        use crate::roster::{RosterStore, Syncer};
+        /// The store as reads were before: no kept file stands in for a download.
+        struct EveryFile<'a>(&'a Rclone<Fake>);
+        impl RosterStore for EveryFile<'_> {
+            fn listing(&self, _: crate::rclone::Known) -> std::io::Result<crate::rclone::Listed> { self.0.listing(&|_, _, _| None) }
+            fn put(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> { RosterStore::put(self.0, name, bytes) }
+            fn remove(&self, name: &str) -> std::io::Result<()> { RosterStore::remove(self.0, name) }
+        }
+        let store = Rclone::with("cloud", dropbox());
+        let passphrase = crate::backup::Passphrase("synthetic roster passphrase".into());
+        let key = crate::backup::SealKey::new(&passphrase).unwrap();
+        let t0: DateTime<Utc> = "2026-11-22T12:00:00Z".parse().unwrap();
+        let at = |s: i64| t0 + chrono::Duration::seconds(s);
+        peer_writes(&store, &key, IDLE, "IDLE-PC", 20.0, at(-3600), None);
+        peer_writes(&store, &key, BUSY, "BUSY-PC", 1.0, at(-3600), None);
+        let mut me = Syncer::default();
+        // Measured an hour after the app started, so its first read and write are behind it.
+        me.sync(&store, &passphrase, (ME, "DESK-1"), &[read_at("synthetic-a:org", 1.0, at(-3600))], at(-3600), false, false);
+        let run = |s: i64| Some(crate::roster::Run { revision: s.max(1) as u64, at: at(s), total: 9, done: 0, emails: 3, email: 1,
+            finished: false, still_waiting: false, monitoring: true, everywhere: false, error: None, steps: vec![] });
+        let mut ran = [0; 3];
+        // Every minute: a refresh every 5, and with Settings open on Accounts, its poll every minute.
+        for s in (-3540..=3600i64).step_by(60) {
+            let m = s / 60;
+            match hour {
+                // The busy machine writes a changed reading every 15 minutes (its gap), at 10, 25, 40…
+                Hour::Busy if m.rem_euclid(15) == 10 => peer_writes(&store, &key, BUSY, "BUSY-PC", (m + 61) as f64, at(s), None),
+                // A run there: a step or its heartbeat every 3 minutes.
+                Hour::Running if m.rem_euclid(3) == 0 => peer_writes(&store, &key, BUSY, "BUSY-PC", 1.0, at(s), run(s)),
+                _ => {}
+            }
+            let percent = if hour == Hour::Busy { (m + 61) as f64 } else { 1.0 };
+            let accounts = [read_at("synthetic-a:org", percent, at(s))];
+            let polls: &[bool] = match (hour, m.rem_euclid(5) == 0) {
+                (Hour::Watching, true) => &[true, false],
+                (Hour::Watching, false) => &[true],
+                (_, true) => &[false],
+                (_, false) => &[],
+            };
+            for &soon in polls {
+                let from = store.runner.count();
+                if every_file {
+                    me.sync(&EveryFile(&store), &passphrase, (ME, "DESK-1"), &accounts, at(s), false, soon);
+                } else {
+                    me.sync(&store, &passphrase, (ME, "DESK-1"), &accounts, at(s), false, soon);
+                }
+                if s > 0 {
+                    for (i, command) in ["lsjson", "cat", "rcat"].iter().enumerate() {
+                        ran[i] += store.runner.ran(from, command);
+                    }
+                }
+            }
+        }
+        ran
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Hour {
+        /// Nothing changes anywhere.
+        Quiet,
+        /// This machine's reading and one other machine's change all along.
+        Busy,
+        /// Quiet, with Settings open on Accounts (it polls every minute, watching).
+        Watching,
+        /// Another machine runs "Sign in all accounts" all hour; Settings closed.
+        Running,
+    }
+
+    /// The saving, measured: rclone processes an hour of roster syncs starts, before (every file
+    /// downloaded at every read) and after (only files whose content changed). The listings and
+    /// uploads are the same; the downloads go from one per file per read to one per changed file.
+    /// `listremotes` (`kind_of`, kept `KIND_KEPT`) is not counted here.
+    #[test]
+    fn an_hour_of_roster_reads_over_rclone_starts_fewer_processes() {
+        let mut said = Vec::new();
+        for (hour, reads, after_cats, uploads) in [(Hour::Quiet, 6, 0, 0), (Hour::Busy, 6, 8, 4), (Hour::Watching, 60, 0, 0), (Hour::Running, 12, 12, 0)] {
+            let (before, after) = (an_hour(true, hour), an_hour(false, hour));
+            said.push(format!("{hour:?} {before:?} -> {after:?}"));
+            assert_eq!((before[0], before[2]), (after[0], after[2]), "{hour:?}: the same listings and uploads");
+            assert_eq!(before[0], reads, "{hour:?}: listings");
+            assert_eq!(before[1], 3 * reads, "{hour:?}: before, every file at every read");
+            assert_eq!(after[1], after_cats, "{hour:?}: after, the changed files only");
+            assert_eq!(after[2], uploads, "{hour:?}: uploads");
+        }
+        eprintln!("roster rclone processes an hour [lsjson, cat, rcat], before -> after: {}", said.join("; "));
+    }
+
+    /// A remote's kind (one `listremotes` each time it is looked up) is kept half an hour, so a sync
+    /// every minute with Settings open does not look it up every time; a command that fails forgets
+    /// it, so a remote pointed at another cloud is looked up again at once.
+    #[test]
+    fn a_remotes_kind_is_kept_half_an_hour_and_forgotten_when_a_command_fails() {
+        // A name of this test's own: the kinds are kept for the whole process.
+        let remote = "kept-kind-test";
+        let t0 = Instant::now();
+        let looked = std::cell::Cell::new(0);
+        let look = |kind: &'static str| {
+            let looked = &looked;
+            move || {
+                looked.set(looked.get() + 1);
+                Some(kind.to_string())
+            }
+        };
+        let minutes = |m: u64| t0 + Duration::from_secs(60 * m);
+        assert_eq!(kept_kind(remote, t0, look("dropbox")).as_deref(), Some("dropbox"));
+        assert_eq!(kept_kind(remote, minutes(29), look("drive")).as_deref(), Some("dropbox"));
+        assert_eq!(looked.get(), 1, "kept: no listremotes");
+        assert_eq!(kept_kind(remote, minutes(31), look("drive")).as_deref(), Some("drive"));
+        // A listing on the remote that fails (here rclone is missing) forgets it; a download that
+        // fails does not (it follows a listing that worked).
+        let dir = crate::test_support::TempDir::new();
+        let missing = dir.0.join(if cfg!(windows) { "rclone.exe" } else { "rclone" });
+        let cli = Cli::routed(missing, remote, crate::test_support::router(None, &[]));
+        assert!(cli.run(&["cat", "kept-kind-test:SlopBar/roster/x.roster"], None).is_err());
+        assert_eq!(kept_kind(remote, minutes(31) + Duration::from_secs(30), look("box")).as_deref(), Some("drive"));
+        assert!(cli.run(&["lsjson", "--files-only", "--no-mimetype", "kept-kind-test:SlopBar/roster"], None).is_err());
+        assert_eq!(kept_kind(remote, minutes(32), look("onedrive")).as_deref(), Some("onedrive"));
+        assert_eq!(looked.get(), 3);
     }
 
     #[test]

@@ -1791,7 +1791,8 @@ async function loadPeerRuns() {
   const watching = !document.hidden && $("page-accounts").classList.contains("active");
   peerRuns = await invoke("peer_sign_ins", { watching }).catch(() => peerRuns);
   renderPeerRuns();
-  const live = peerRuns.some((p) => !p.run.finished) || Date.now() < peerExpectUntil;
+  // Not a run whose computer went quiet: one that stopped for good would keep this at 15 s.
+  const live = peerRuns.some((p) => !p.run.finished && !p.quiet) || Date.now() < peerExpectUntil;
   peerTimer = setTimeout(loadPeerRuns, watching && live ? 15000 : 60000);
 }
 document.addEventListener("visibilitychange", () => { if (!document.hidden) loadPeerRuns(); });
