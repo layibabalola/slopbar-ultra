@@ -48,7 +48,9 @@ MEGA, S3, WebDAV, SFTP and the other rclone backends. rclone keeps its own confi
   roster on, `<remote>:SlopBar/roster`:
   - `lsjson --files-only --no-mimetype` to list records (with `--hash` on Dropbox and Google
     Drive, below);
-  - `cat <file>` to read each record a refresh needs (below);
+  - `cat <file>` to read each record a refresh needs (below), and on Dropbox and Google Drive
+    `cat --files-from-raw - --separator <random> <folder>` to read up to 16 of them in one call
+    (below);
   - `rcat <id>.json` to write this machine's record in one step: rclone replaces the file whole
     (a cloud swaps in the finished upload; local, SFTP and FTP remotes get a partial file renamed
     into place, rclone v1.63 and later). Uploading `<id>.tmp` and then `moveto <id>.json`, as
@@ -64,16 +66,36 @@ MEGA, S3, WebDAV, SFTP and the other rclone backends. rclone keeps its own confi
   record under its name. On Dropbox and Google Drive the listing adds `--hash`, as the roster's
   does (below), and a record listed with the hash and size of the copy the last read kept (kept
   only when its bytes had the hash it was listed with; in memory, at most 64 records of up to
-  16 KiB) is not downloaded again. A running machine rewrites its record at every refresh, so this
-  saves the records of machines asleep, shut down or retired. Modelled for a refresh every 5
-  minutes (`rclone::tests::an_hour_of_presence_exchanges_over_rclone_starts_fewer_processes`),
-  presence processes an hour go from 120 to 84 beside five running machines and two asleep ones,
-  60 to 48 beside two running ones, and 60 to 24 beside two asleep ones. The first read after
-  SlopBar starts downloads every other record. A synced folder reads every file, which costs no
-  process.
+  16 KiB) is not downloaded again. A running machine rewrites its record at every refresh, so
+  that saves the records of machines asleep, shut down or retired; the running machines' records
+  are due at every read. When several are due there, one call downloads up to 16 of them:
+  `cat --files-from-raw -` with their names on its input (only names SlopBar writes,
+  `<id>.json`, capitals too), which prints each file followed by a separator random for each call
+  (rclone 1.63 or later), by name on Dropbox (checked with rclone 1.74.4). A piece of that output
+  is taken only for the record whose listed size and hash it has, so one that changed since the
+  listing, or holds the separator, is downloaded alone. When the call fails having given some,
+  the records it did not give are not read that time, and `Recall` keeps their machines while
+  they are live; so are all of a call's records when it is killed at 20 seconds, whatever it
+  printed, and the next read then asks for half as many in a call as that one did (down to one at
+  a time). When it fails having printed nothing, its records are downloaded alone, as are those
+  of the calls it would have made after it in that read; if that works, the call was refused (an
+  rclone older than 1.63 refuses `--separator`), and after two reads in a row like that none is
+  made (one such read can be the network's moment; a read with a call rclone took, one that
+  printed something, ended well or ran out of time, starts the count again). Both hold until an
+  hour after the last read that ran out of time or was refused, or until SlopBar restarts; then
+  the call is made in full again. A filter set in rclone's environment (`RCLONE_MAX_SIZE`…)
+  refuses the batched call and a `cat` of one file alike, so presence over rclone reads nothing
+  there, with or without batching. Output is not limited in size, as a `cat` of one file is not:
+  a file that grows after the listing is read until rclone ends or is killed (rclone refuses
+  `--max-size` beside `--files-from-raw`). Modelled for a refresh every 5 minutes
+  (`rclone::tests::an_hour_of_presence_exchanges_over_rclone_starts_fewer_processes`), presence
+  processes an hour go from 120 to 36 beside five running machines and two asleep ones (84 with
+  each record downloaded alone), 60 to 36 beside two running ones, and 60 to 24 beside two asleep
+  ones. The first read after SlopBar starts downloads every other record. A synced folder reads
+  every file, which costs no process.
 
-  The account roster (`SlopBar/roster`, `roster::Syncer`) uses the same three calls, and
-  `deletefile <id>.roster` when the roster is turned off. On Dropbox and Google Drive its listing
+  The account roster (`SlopBar/roster`, `roster::Syncer`) uses `lsjson`, `cat <file>` and `rcat`
+  as above (never the batched `cat`), and `deletefile <id>.roster` when the roster is turned off. On Dropbox and Google Drive its listing
   adds `--hash`: those clouds list a content hash this computer can check (Dropbox's, or SHA-256)
   with no extra request (checked on Dropbox with rclone v1.74.4: the same two requests with or
   without it; rclone 1.56 or later on Dropbox and 1.65 or later on Google Drive, as older ones list
@@ -94,7 +116,8 @@ MEGA, S3, WebDAV, SFTP and the other rclone backends. rclone keeps its own confi
 
   A clean quit rewrites this machine's record with no accounts.
 - **Each call.** rclone runs with no window, `--ask-password=false` (it never waits on an
-  encrypted config's prompt), `--contimeout 10s --timeout 15s`, and a hard 20-second kill. Calls
+  encrypted config's prompt), `--contimeout 10s --timeout 15s`, and a hard 20-second kill (a
+  batched `cat` has the same 20 seconds for all its files). Calls
   run off the async runtime. rclone's stderr is discarded and its output is never logged.
 - **The setting.** `settings.json` stores only the remote's name, `presence_remote`. A chosen
   remote takes precedence over `presence_folder`. A missing rclone means no sharing; it never
