@@ -117,6 +117,8 @@ pub async fn fetch_all(
                 stale: false,
                 fetched_at: None,
                 monitor_connected: monitor.connected(slot),
+                monitor_ends_at: None,
+                monitor_renewal: None,
                 billing: slot.billing(),
                 remote: vec![], overlap: vec![],
                 used_outside: false,
@@ -161,6 +163,18 @@ pub async fn fetch_all(
             acc
         })
         .collect();
+    // Where each monitoring sign-in stands, read after this refresh's renewals: when it ends, and
+    // whether it needs a new sign-in (`monitoring::renewal`).
+    let connected: Vec<(Provider, String)> = out.iter().filter(|a| a.monitor_connected).map(|a| (a.provider, a.id.clone())).collect();
+    let states = monitor.health(&connected).await;
+    let now = Utc::now();
+    for a in out.iter_mut().filter(|a| a.monitor_connected) {
+        let state = states.get(&format!("{}:{}", a.provider.name(), a.id));
+        a.monitor_ends_at = state.and_then(|s| s.ends_at);
+        // An account not in use carries its monitoring error as its error.
+        let error = a.monitor_error.as_deref().or(a.error.as_deref());
+        a.monitor_renewal = monitoring::renewal(state, error, now).kind();
+    }
     // A stable order: switching accounts must not reshuffle the list.
     out.sort_by_key(|a| (a.provider != Provider::Claude, a.email.clone(), a.id.clone()));
     out
@@ -435,6 +449,39 @@ mod tests {
         assert_eq!(results[0].windows[0].used_percent, 87.0);
         assert_eq!(results[0].windows[0].resets_at, original_reset);
         assert_eq!(results[0].fetched_at, measured_at);
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_says_when_monitoring_ends_and_whether_it_needs_a_new_sign_in() {
+        let dir = TempDir::new();
+        let monitor = Monitor::new(dir.0.clone());
+        // One the provider refused after its end, one ending within days, one ending much later.
+        let ended = Utc::now() - chrono::Duration::days(1);
+        let soon = Utc::now() + chrono::Duration::days(2);
+        let later = Utc::now() + chrono::Duration::days(20);
+        let (mut accounts, mut cache) = (vec![], Cache::new());
+        for (id, ends) in [("ended:org", ended), ("soon:org", soon), ("later:org", later)] {
+            let cli = slot(id, "cli-access", &format!("cli-refresh-{id}"), 0);
+            let mut login = slot(id, &format!("monitor-access-{id}"), &format!("monitor-refresh-{id}"),
+                (Utc::now() + chrono::Duration::hours(1)).timestamp_millis());
+            login.data["credentials"]["claudeAiOauth"]["refreshTokenExpiresAt"] = serde_json::json!(ends.timestamp_millis());
+            monitor.connect(&cli, &login, &[]).await.unwrap();
+            // Its last reading stands in for this refresh's: nothing goes to the network.
+            let mut entry = observed(10.0);
+            entry.blocked_until = Some(Utc::now() + chrono::Duration::hours(1));
+            cache.insert(monitoring::key(&cli), entry);
+            accounts.push(cli);
+        }
+        monitor.reject(&accounts[0], "monitor-access-ended:org").await.unwrap();
+        let results = fetch_all(&crate::net::builder().build().unwrap(), &accounts, &Active::new(), &mut cache, &Settings::default(), &monitor).await;
+        let by = |id: &str| results.iter().find(|a| a.id == id).unwrap();
+        assert!(results.iter().all(|a| a.monitor_connected), "an ended sign-in is still saved, so still connected");
+        use crate::model::RenewalKind;
+        assert_eq!(by("ended:org").monitor_renewal, Some(RenewalKind::Ended));
+        assert_eq!(by("ended:org").monitor_ends_at.map(|t| t.timestamp_millis()), Some(ended.timestamp_millis()));
+        assert_eq!(by("soon:org").monitor_renewal, Some(RenewalKind::Ending), "ends within RENEW_DAYS");
+        assert_eq!(by("later:org").monitor_renewal, None);
+        assert_eq!(by("later:org").monitor_ends_at.map(|t| t.timestamp_millis()), Some(later.timestamp_millis()));
     }
 
     #[tokio::test]

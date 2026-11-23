@@ -40,6 +40,17 @@ pub struct AccountUsage {
     pub stale: bool,
     pub fetched_at: Option<DateTime<Utc>>,
     pub monitor_connected: bool,
+    /// When the monitoring sign-in ends: the date the provider set when it was made (Claude: about
+    /// 30 days later). Renewing never moves it; only a new sign-in does. None when the provider
+    /// gives none (Codex) or monitoring is not connected.
+    #[serde(default)]
+    pub monitor_ends_at: Option<DateTime<Utc>>,
+    /// Monitoring is connected but needs a new sign-in, and why (see `monitoring::renewal`): it
+    /// "ended" (the provider's fixed limit), was "refused" (it can no longer be renewed for another
+    /// reason) or is "ending" (within `monitoring::RENEW_DAYS`, at `monitor_ends_at`). "Connect
+    /// monitoring for all" and "Sign in all accounts" sign it in again, as they do an unmonitored one.
+    #[serde(default)]
+    pub monitor_renewal: Option<RenewalKind>,
     /// What the saved login says about the plan's billing (see `Slot::billing`).
     #[serde(default)]
     pub billing: BillingHints,
@@ -85,6 +96,18 @@ pub struct AccountUsage {
     /// Set on the CLI's account and the desktop app's account when they differ on this machine.
     #[serde(default)]
     pub seats: Option<SeatDrift>,
+}
+
+/// Why a connected account's monitoring needs a new sign-in (`AccountUsage::monitor_renewal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenewalKind {
+    /// It ended on the provider's fixed limit: Claude ends each sign-in about 30 days after it is made.
+    Ended,
+    /// It can no longer be renewed, with no end near.
+    Refused,
+    /// It ends within `monitoring::RENEW_DAYS`.
+    Ending,
 }
 
 /// The CLI and the desktop app on this machine are signed in to different accounts.

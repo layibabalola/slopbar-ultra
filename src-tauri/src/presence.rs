@@ -596,6 +596,8 @@ mod tests {
             stale: false,
             fetched_at: None,
             monitor_connected: true,
+            monitor_ends_at: None,
+            monitor_renewal: None,
             billing: Default::default(),
             remote: vec![], overlap: vec![],
             used_outside: false,

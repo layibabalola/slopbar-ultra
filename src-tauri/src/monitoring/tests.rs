@@ -1129,6 +1129,7 @@ mod http {
             expires_at: None,
             scopes: vec!["user:profile".into(), "user:inference".into()],
             refresh_expires_at: None,
+            ends_at: None,
             uncertain_attempts: 0,
             uncertain_retry_at: None,
             reconnect: false,
@@ -1520,4 +1521,63 @@ mod http {
             );
         }
     }
+}
+
+#[test]
+fn renewal_tells_an_ended_sign_in_from_a_refused_or_ending_one() {
+    use crate::health::MonitorState;
+    let hours = |h: i64| now() + chrono::Duration::hours(h);
+    let state = |reconnect: bool, ends: Option<i64>| MonitorState { reconnect, ends_at: ends.map(hours) };
+    // Refused once the end the provider gave had passed, or up to EARLY_DAYS before it: its fixed
+    // limit, not a fault.
+    assert_eq!(renewal(Some(&state(true, Some(-2))), None, now()), Renewal::Ended(hours(-2)));
+    assert_eq!(renewal(Some(&state(true, Some(24 * EARLY_DAYS))), None, now()), Renewal::Ended(hours(24 * EARLY_DAYS)));
+    // Refused well before that end, or with none given (Codex gives none): a refusal.
+    assert_eq!(renewal(Some(&state(true, Some(24 * EARLY_DAYS + 1))), None, now()), Renewal::Refused);
+    assert_eq!(renewal(Some(&state(true, None)), None, now()), Renewal::Refused);
+    // The errors only a new sign-in clears count the same, with or without a saved state.
+    for e in SIGN_IN_ERRORS {
+        assert_eq!(renewal(None, Some(e), now()), Renewal::Refused, "{e}");
+    }
+    assert_eq!(renewal(Some(&state(false, Some(-1))), Some("monitor_uncertain"), now()), Renewal::Ended(hours(-1)));
+    // Ending within RENEW_DAYS is due; later, or with no end, is fine.
+    assert_eq!(renewal(Some(&state(false, Some(24 * RENEW_DAYS))), None, now()), Renewal::Ending(hours(24 * RENEW_DAYS)));
+    assert_eq!(renewal(Some(&state(false, Some(24 * RENEW_DAYS + 1))), None, now()), Renewal::Fine);
+    assert_eq!(renewal(Some(&state(false, None)), None, now()), Renewal::Fine);
+    // A passed end the provider has not refused yet is left to the next renewal, which it decides.
+    assert_eq!(renewal(Some(&state(false, Some(-1))), None, now()), Renewal::Fine);
+    assert_eq!(renewal(None, Some("monitor_network"), now()), Renewal::Fine, "a network failure is retried, not signed in again");
+    assert!(Renewal::Ending(now()).due() && Renewal::Ended(now()).due() && Renewal::Refused.due() && !Renewal::Fine.due());
+    assert_eq!(Renewal::Fine.kind(), None);
+    assert_eq!(Renewal::Ended(now()).kind(), Some(crate::model::RenewalKind::Ended));
+}
+
+async fn ends_at(monitor: &Monitor) -> Option<DateTime<Utc>> {
+    monitor.health(&[(Provider::Claude, cli().id)]).await.into_values().next().and_then(|s| s.ends_at)
+}
+
+#[tokio::test]
+async fn a_sign_in_s_end_only_moves_earlier_and_survives_renewals_that_give_none() {
+    let dir = TempDir::new();
+    let monitor = Monitor::new(dir.0.clone());
+    let days = |d: i64| now() + chrono::Duration::days(d);
+    let mut fresh = login();
+    fresh.data["credentials"]["claudeAiOauth"]["refreshTokenExpiresAt"] = json!(days(30).timestamp_millis());
+    monitor.connect(&cli(), &fresh, &[]).await.unwrap();
+    assert_eq!(ends_at(&monitor).await, Some(days(30)), "the end the sign-in was given");
+    let renew = |access: &str, refresh: &str, left_days: Option<i64>| {
+        let mut r = reply(access, Some(refresh)).unwrap();
+        r.refresh_token_expires_in = left_days.map(|d| (d * 86400) as u64);
+        Scripted::new([Ok(r)])
+    };
+    // Each renewal's access token lasts an hour, so each of these renews once.
+    monitor.token_with(&cli(), &renew("access-2", "refresh-2", Some(20)), None, now()).await.unwrap();
+    assert_eq!(ends_at(&monitor).await, Some(days(20)), "an earlier end moves it");
+    let later = now() + chrono::Duration::hours(2);
+    monitor.token_with(&cli(), &renew("access-3", "refresh-3", Some(40)), None, later).await.unwrap();
+    assert_eq!(ends_at(&monitor).await, Some(days(20)), "a later one does not");
+    let later = now() + chrono::Duration::hours(4);
+    monitor.token_with(&cli(), &renew("access-4", "refresh-4", None), None, later).await.unwrap();
+    assert_eq!(ends_at(&monitor).await, Some(days(20)), "a renewal that gives none keeps it");
+    assert_eq!(ends_at(&Monitor::new(dir.0.clone())).await, Some(days(20)), "and so does a restart");
 }
