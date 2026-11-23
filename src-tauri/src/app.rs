@@ -771,11 +771,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
                 let plan = gather_everywhere(&app, monitoring).await?;
                 let mut shown = value(&plan)?;
                 shown["started"] = false.into();
-                shown["next"] = "Nothing was started. With confirm: true a notification on this computer asks the person here to review it, and Settings starts \
-                    it only on their OK; then this computer's sign-ins and every other computer's in plan open in this computer's browser one at a time, an email's together \
-                    in one fresh profile (Google once per email), while nothing opens on the other computers' screens. left_out names computers or \
-                    sign-ins left out and why; in_use names accounts in use whose CLI sign-in ends, which no sitting renews (claude /login at that \
-                    computer). Follow it with get_machine_readiness (this computer) and its sign_in, whose steps carry machine.".into();
+                shown["next"] = EVERYWHERE_PREVIEW.into();
                 return Ok(shown);
             }
             desktop_shown()?;
@@ -789,13 +785,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
             let mut shown = value(&plan)?;
             shown["started"] = false.into();
             shown["asked"] = asked.into();
-            shown["next"] = if asked {
-                "A notification on this computer asks the person here to review it: Settings then checks every computer again and starts only on their OK. Then follow it with get_machine_readiness and its sign_in."
-            } else if any {
-                "The notification asking the person here could not be shown (notifications off?): they start it themselves in Settings > Accounts, Sign in all your computers from here."
-            } else {
-                "Nothing to sign in on any computer reached; left_out says which were not reached and why."
-            }.into();
+            shown["next"] = if asked { EVERYWHERE_ASKED } else if any { EVERYWHERE_UNASKED } else { EVERYWHERE_NOTHING }.into();
             Ok(shown)
         }
         R::SignInAll { confirm, monitoring, retry, everywhere: false } => {
@@ -2026,6 +2016,19 @@ struct Everywhere {
 
 /// How long a gathered plan may be started.
 const EVERYWHERE_FRESH: Duration = Duration::from_secs(600);
+
+/// What `sign_in_all` with everywhere tells the agent next: for a preview, after asking the person
+/// here, when the notification could not be shown, and with nothing to sign in. Each fits
+/// `mcp::MAX_TEXT`, so it reaches the agent whole.
+const EVERYWHERE_PREVIEW: &str = "Nothing was started. confirm: true asks the person here, with a notification, to review it; Settings starts it only \
+    on their OK. Then its sign-ins open in this computer's browser one at a time, an email's together in one fresh profile, and nothing opens on \
+    the other computers' screens. left_out: computers or sign-ins left out, and why. in_use: accounts in use whose CLI sign-in ends, which no \
+    sitting renews (claude /login there). Progress: get_machine_readiness's sign_in.";
+const EVERYWHERE_ASKED: &str = "A notification on this computer asks the person here to review it: Settings then checks every computer again and \
+    starts only on their OK. Then follow it with get_machine_readiness and its sign_in.";
+const EVERYWHERE_UNASKED: &str = "The notification asking the person here could not be shown (notifications off?): they start it themselves in \
+    Settings > Accounts, Sign in all your computers from here.";
+const EVERYWHERE_NOTHING: &str = "Nothing to sign in on any computer reached; left_out says which were not reached and why.";
 
 /// The `Host` names in the user's ~/.ssh/config, lowercased, without patterns: another computer
 /// the roster names but nothing here remembers a host for is tried at its name when one matches.
@@ -4404,6 +4407,19 @@ mod sign_in_tests {
 
 #[cfg(test)]
 mod sign_in_open_tests;
+
+#[cfg(test)]
+mod everywhere_text_tests {
+    #[test]
+    fn what_sign_in_all_everywhere_tells_an_agent_reaches_it_whole() {
+        // Every string an agent gets is cut at mcp::MAX_TEXT.
+        for text in [super::EVERYWHERE_PREVIEW, super::EVERYWHERE_ASKED, super::EVERYWHERE_UNASKED, super::EVERYWHERE_NOTHING] {
+            let n = text.chars().count();
+            assert!(n <= crate::mcp::MAX_TEXT, "{n} characters: {text}");
+            assert!(!text.contains("  "), "one space between words: {text}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod exit_tests {
