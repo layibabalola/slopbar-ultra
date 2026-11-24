@@ -100,7 +100,7 @@ test("the computers card names each computer's busiest week and the groups that 
     "DESK-1 (this PC)", "busiest week 25% · last 8 days 10%",
     "LAPTOP-2", "busiest week 30% · last 8 days 10%",
     "TOWER-3", "busiest week 95% · last 8 days 10% · needs its own Max 20x",
-    "NEW-4", "last 8 days 5% · 1 of 4 weeks measured · some use not counted (for example a plan of unknown size, an account SlopBar does not have, or readings that failed); not grouped",
+    "NEW-4", "last 8 days 5% · 1 of 4 weeks measured · some use not counted (for example a plan of unknown size or with no weekly limit, an account SlopBar does not have, or readings that failed until the week reset); not grouped",
   ]);
   // Before two computers are measured it says when groups will show; after, that none fit.
   const waiting = { machines: [{ ...report.machines[0], groups: [], computers: [computer("DESK-1", { here: true, measured: false, weeks: 2 })] }] };
