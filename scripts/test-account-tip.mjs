@@ -203,7 +203,7 @@ test("an overlap marks this PC by its place, never by a name a clone may share",
 test("an account shared within its limits is a planned share, said plainly", () => {
   const conflict = overlapText(used({ active: true, overlap: ["DESK-1", "LAPTOP-2"] }));
   assert.equal(conflict.shared, false);
-  assert.equal(conflict.lines[1], "Limits drain about 2× as fast, and SlopBar has not seen this account keep 20% to spare under its weekly limits over enough recent weeks. Switch one machine to another account.");
+  assert.equal(conflict.lines[1], "Limits drain about 2× as fast, and this account has no room to share: it came within 20% of a weekly limit in recent weeks or at this week's pace, or SlopBar has not watched it long enough. Switch one machine to another account.");
   const o = overlapText(used({ active: true, overlap: ["DESK-1", "LAPTOP-2", "TOWER-3"], room_to_share: true }));
   assert.equal(o.shared, true);
   assert.equal(o.chip, "Shared by 3 computers");
