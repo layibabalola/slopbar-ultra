@@ -349,13 +349,25 @@ pub fn plan_notices(lang: &str, due: &[Value], now: DateTime<Utc>) -> Vec<Notice
             }
             kind => {
                 let wasteful = kind == "renewal_wasteful";
+                // The user's own choice to let it lapse: a reminder, never a verdict.
+                let lapsing = kind == "renewal_lapsing";
+                // What the Advisor advises for the plan: cancel it, use another plan instead, or a smaller tier.
+                let advised = a.get("advised").filter(|m| m.is_object());
+                let action = advised.map(|m| text(m, "action"));
+                // The verdict says why to cancel or downgrade; a share rests on the other plan's room
+                // instead, and a plan in use could read "Well used" beside "then cancel this plan".
                 let verdict = match a.get("verdict").and_then(Value::as_str) {
-                    Some(v) if wasteful && !v.is_empty() => t(lang, &format!("subVerdict_{v}"), &[]),
+                    Some(v) if wasteful && !v.is_empty() && action != Some("share") => t(lang, &format!("subVerdict_{v}"), &[]),
                     _ => String::new(),
                 };
                 let cost = num(a, "monthly_cost").map(|c| t(lang, "perMonth", &[("v", &fmt::money(lang, c))])).unwrap_or_default();
                 let body = [name, verdict, cost].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
-                let body = if wasteful { format!("{body}\n{}", t(lang, "nRenewWasteHint", &[])) } else { body };
+                let hint = match action {
+                    Some("share") => t(lang, "nRenewShareHint", &[("account", &advised.and_then(|m| m.get("share")).map(|s| value_name(lang, s)).unwrap_or_default())]),
+                    Some("downgrade") => t(lang, "nRenewDowngradeHint", &[("plan", advised.map(|m| text(m, "to")).unwrap_or_default())]),
+                    _ => t(lang, "nRenewWasteHint", &[]),
+                };
+                let body = if wasteful { format!("{body}\n{hint}") } else if lapsing { format!("{body}\n{}", t(lang, "nRenewLapsingHint", &[])) } else { body };
                 // Only a renewal within a day goes to the phone.
                 let tomorrow = time(a, "at").is_some_and(|at| (at - now).num_milliseconds() <= DAY_MS + 60 * 60 * 1000);
                 out.push(subscriptions(t(lang, "nRenewTitle", &[("provider", provider), ("t", &until("at"))]), body,
@@ -937,6 +949,17 @@ mod tests {
         assert_eq!((title.as_str(), body.as_str()), ("Claude extra usage at 75%", "b@x · $300 of $400 this month"));
         let (title, body, ..) = get(4);
         assert_eq!((title.as_str(), body.as_str()), ("Codex Pro 200 allowance drops after Nov 30", "At recent use these would hit the weekly limit: Work, c@x"));
+        // The hint follows the Advisor's move: a share names the plan to use, a downgrade the tier.
+        let advised = |m: Value| json!({ "kind": "renewal_wasteful", "provider": "claude", "id": "y", "email": "b@x", "alias": null, "at": "2026-10-25T10:00:00Z", "verdict": "underused", "monthly_cost": 200.0, "advised": m });
+        let body = |m: Value| match plan_notices("en", &[advised(m)], now).remove(0) { Notice::Plain { body, .. } => body, _ => panic!() };
+        assert_eq!(body(json!({ "action": "share", "to": null, "share": { "id": "z", "email": "c@x", "alias": "Home" } })),
+            "b@x · $200/month\nUse Home instead, then cancel this plan on the provider's billing page.");
+        assert_eq!(body(json!({ "action": "downgrade", "to": "Max 5x" })), "b@x · Mostly idle · $200/month\nMax 5x would cover this plan's use: change to it on the provider's billing page.");
+        assert!(body(json!({ "action": "cancel", "to": null })).ends_with("\nNot needed? Cancel it on the provider's billing page."));
+        // A plan the user is letting lapse: their own choice, so no verdict, only the reminder.
+        let lapsing = json!({ "kind": "renewal_lapsing", "provider": "codex", "id": "z", "email": "c@x", "alias": null, "at": "2026-10-25T10:00:00Z", "verdict": "healthy", "monthly_cost": 200.0 });
+        let Notice::Plain { title, body, .. } = plan_notices("en", &[lapsing], now).remove(0) else { panic!() };
+        assert_eq!((title.as_str(), body.as_str()), ("Codex plan renews in 3d", "c@x · $200/month\nYou're letting this plan lapse: if you haven't cancelled it yet, cancel it before it renews."));
     }
 
     #[test]

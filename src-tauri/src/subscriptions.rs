@@ -310,7 +310,10 @@ pub struct Assessment {
     pub limit_weeks: u8,
     /// A model-specific weekly window that reached its limit ("weekly_opus").
     pub sub_window_limited: Option<String>,
-    /// Paying for another period looks unneeded on this evidence.
+    /// Paying for another period of this plan as it is looks unneeded: exactly when the plan Advisor
+    /// cancels, shares or downgrades it (`Entry::advised`), set by `report`. Never from one plan's
+    /// verdict alone (`assess` leaves it false): the Advisor keeps some unused or underused plans to
+    /// cover the busiest weeks, and calling those unneeded would contradict it.
     pub renew_wasteful: bool,
     pub basis: Basis,
 }
@@ -347,10 +350,9 @@ pub fn assess(h: &AccountHistory, now: DateTime<Utc>) -> Assessment {
     } else {
         Verdict::Healthy
     };
-    let renew_wasteful = verdict == Verdict::Unused || verdict == Verdict::Underused && confidence == Confidence::High;
     let basis = if weeks.iter().any(|r| r.local) { Basis::LocalCodex } else { Basis::Observed };
     Assessment { verdict, confidence, weeks_counted: counted, weeks_needed: 2, average_peak, median_peak,
-        limit_weeks, sub_window_limited, renew_wasteful, basis }
+        limit_weeks, sub_window_limited, renew_wasteful: false, basis }
 }
 
 fn median(values: &[f64]) -> Option<f64> {
@@ -512,8 +514,12 @@ fn this_week(acc: &AccountUsage, now: DateTime<Utc>) -> Option<ThisWeek> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RenewalWarning {
-    /// Renews within `WASTEFUL_DAYS` while it looks unused or underused.
+    /// Renews within `WASTEFUL_DAYS` while the plan Advisor advises changing it (`Entry::advised`).
     Wasteful,
+    /// Renews within `WASTEFUL_DAYS` while the user is letting it lapse and that renewal is the
+    /// charge they meant to stop (`Entry::lapsing_charge`): a reminder of their own choice, in case
+    /// it was not cancelled at the provider yet. Never a claim that the plan is unneeded.
+    Lapsing,
     /// Renews within a day.
     Soon,
 }
@@ -555,12 +561,17 @@ pub fn allowance_change(acc: &AccountUsage, h: &AccountHistory, now: DateTime<Ut
     Some(AllowanceChange { last_day, peak_percent: peak, projected_percent: (projected * 10.0).round() / 10.0, would_hit_limit: projected >= 100.0 })
 }
 
-fn renewal_warning(renewal: Option<&Renewal>, ends_at: Option<DateTime<Utc>>, a: &Assessment, now: DateTime<Utc>) -> Option<RenewalWarning> {
+/// `advised`: the plan Advisor cancels, shares or downgrades the plan; `lapsing`: the renewal is the
+/// charge a plan the user is letting lapse was meant to stop. A verdict alone never makes a renewal
+/// wasteful.
+fn renewal_warning(renewal: Option<&Renewal>, ends_at: Option<DateTime<Utc>>, advised: bool, lapsing: bool, now: DateTime<Utc>) -> Option<RenewalWarning> {
     let left = renewal?.at - now;
     if ends_at.is_some() || left <= chrono::Duration::zero() { return None; }
-    let wasteful = a.renew_wasteful || matches!(a.verdict, Verdict::Unused | Verdict::Underused);
-    if wasteful && left <= chrono::Duration::days(WASTEFUL_DAYS) {
+    let soon = left <= chrono::Duration::days(WASTEFUL_DAYS);
+    if advised && soon {
         Some(RenewalWarning::Wasteful)
+    } else if lapsing && soon {
+        Some(RenewalWarning::Lapsing)
     } else if left <= chrono::Duration::hours(24) {
         Some(RenewalWarning::Soon)
     } else {
@@ -585,6 +596,11 @@ pub struct Entry {
     pub renewal: Option<Renewal>,
     /// The renewal is close enough to warn about (see `RenewalWarning`).
     pub renewal_warning: Option<RenewalWarning>,
+    /// The plan Advisor's move for this plan (cancel, share or downgrade, as `advisor` lists it),
+    /// which every per-plan line follows; None when it advises no change to it.
+    pub advised: Option<crate::advisor::Move>,
+    /// Judged unused or underused, but the Advisor keeps it, and why.
+    pub kept: Option<crate::advisor::KeptBecause>,
     /// The provider's subscription end, and when it last checked it.
     pub provider_until: Option<DateTime<Utc>>,
     pub provider_checked: Option<DateTime<Utc>>,
@@ -633,6 +649,13 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// The next renewal is the charge the user meant to stop: they are letting the plan lapse with
+    /// a last paid day on or before it (`cancel_after`, which Settings sets to the day before the
+    /// renewal), and the provider shows no end yet, so it may not have been cancelled there.
+    pub fn lapsing_charge(&self) -> bool {
+        self.ends_at.is_none() && self.cancel_after.zip(self.renewal.as_ref()).is_some_and(|(last, r)| r.at.date_naive() >= last)
+    }
+
     /// The busiest recent week in percent of this plan's allowance: the latest `RECENT` weeks that
     /// count, and the week in progress.
     pub(crate) fn recent_peak(&self) -> Option<f64> {
@@ -651,7 +674,8 @@ pub struct ProviderSummary {
     pub monthly_total: f64,
     /// Plans whose cost is not known, so the total leaves them out.
     pub unpriced: usize,
-    /// Monthly cost of the plans whose renewal looks unneeded.
+    /// What the plan Advisor's moves save a month (`advisor::ProviderAdvice::monthly_saving`): the
+    /// one figure of what could be saved, so no screen offers savings the Advisor would not make.
     pub possible_savings: f64,
     /// How many plans the provider's usage needs (`pool`).
     pub pool: Pool,
@@ -710,7 +734,7 @@ fn with_local(h: &AccountHistory, extra: &[WindowRecord]) -> AccountHistory {
 
 pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local: Option<&crate::codex_local::Local>, now: DateTime<Utc>) -> Report {
     let empty = AccountHistory::default();
-    let accounts: Vec<Entry> = snapshot.accounts.iter().map(|acc| {
+    let mut accounts: Vec<Entry> = snapshot.accounts.iter().map(|acc| {
         let prefs = settings.subscriptions.get(&pref_key(acc.provider, &acc.id)).cloned().unwrap_or_default();
         let h = history.accounts.get(&history_key(acc.provider, &acc.id)).unwrap_or(&empty);
         // Before this PC's Codex rollouts fill gaps: a share rests on weeks SlopBar watched.
@@ -731,7 +755,6 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
             && activity.as_ref().is_some_and(|a| a.days_idle.is_some_and(|d| d >= LOCAL_IDLE_DAYS)) {
             assessment.verdict = Verdict::Unused;
             assessment.confidence = Confidence::Low;
-            assessment.renew_wasteful = true;
             assessment.basis = Basis::LocalCodex;
         }
         let renewal = if paid { next_renewal(acc, &prefs, now) } else { None };
@@ -744,7 +767,10 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
         let pool_changed = h.plan_since.map(|t| monday(t.date_naive()));
         let credits = (acc.provider == Provider::Codex).then(|| credit_info(acc.credits.as_deref(), h.credits.as_ref())).flatten();
         Entry {
-            renewal_warning: if paid { renewal_warning(renewal.as_ref(), ends_at, &assessment, now) } else { None },
+            // Once the Advisor has run (below).
+            renewal_warning: None,
+            advised: None,
+            kept: None,
             provider: acc.provider,
             id: acc.id.clone(),
             email: acc.email.clone(),
@@ -780,18 +806,19 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
             share,
         }
     }).collect();
-    let providers: Vec<ProviderSummary> = Provider::ALL.into_iter().filter(|p| accounts.iter().any(|a| a.provider == *p)).map(|provider| {
+    let mut providers: Vec<ProviderSummary> = Provider::ALL.into_iter().filter(|p| accounts.iter().any(|a| a.provider == *p)).map(|provider| {
         let paid: Vec<&Entry> = accounts.iter().filter(|a| a.provider == provider && a.plan_kind == PlanKind::Personal).collect();
+        let exhausted = paid.iter().filter(|a| a.assessment.verdict == Verdict::ExhaustedWeekly).count();
         ProviderSummary {
             provider,
             paid: paid.len(),
-            exhausted: paid.iter().filter(|a| a.assessment.verdict == Verdict::ExhaustedWeekly).count(),
+            exhausted,
             unused: paid.iter().filter(|a| a.assessment.verdict == Verdict::Unused).count(),
             monthly_total: paid.iter().filter_map(|a| a.monthly_cost).sum(),
             unpriced: paid.iter().filter(|a| a.monthly_cost.is_none()).count(),
-            // A plan already cancelled saves nothing more.
-            possible_savings: paid.iter().filter(|a| a.assessment.renew_wasteful && a.ends_at.is_none()).filter_map(|a| a.monthly_cost).sum(),
-            pool: pool(provider, &paid, now),
+            // Once the Advisor has run (below).
+            possible_savings: 0.0,
+            pool: pool(provider, &paid, pool_buffer(exhausted), now),
             cost_per_use: blended_cost(&paid),
             credit_balance: accounts.iter().filter(|a| a.provider == provider).filter_map(|a| a.credits.as_ref()?.balance)
                 .fold(None, |t, b| Some(t.unwrap_or(0.0) + b)),
@@ -800,7 +827,25 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
         }
     }).collect();
     let advice = crate::advisor::advise(&accounts, &providers);
+    follow_advice(&mut accounts, &mut providers, &advice, now);
     Report { accounts, providers, generated_at: now, advice, spend: None, machines: vec![] }
+}
+
+/// Every per-plan claim follows the plan Advisor, which weighs each plan against the whole pool: a
+/// plan it does not cancel, share or downgrade is never called unneeded or warned about as a
+/// wasteful renewal (it may keep an unused plan to cover the busiest weeks), and what could be
+/// saved is what its moves save.
+fn follow_advice(accounts: &mut [Entry], providers: &mut [ProviderSummary], advice: &[crate::advisor::ProviderAdvice], now: DateTime<Utc>) {
+    for e in accounts.iter_mut() {
+        let a = advice.iter().find(|a| a.provider == e.provider);
+        e.advised = a.and_then(|a| a.moves.iter().find(|m| m.id == e.id)).cloned();
+        e.kept = a.and_then(|a| a.kept.iter().find(|k| k.id == e.id)).map(|k| k.because);
+        e.assessment.renew_wasteful = e.advised.is_some();
+        e.renewal_warning = renewal_warning(e.renewal.as_ref(), e.ends_at, e.advised.is_some(), e.lapsing_charge(), now);
+    }
+    for p in providers.iter_mut() {
+        p.possible_savings = advice.iter().find(|a| a.provider == p.provider).map_or(0.0, |a| a.monthly_saving);
+    }
 }
 
 fn sum_extra(accounts: &[Entry], provider: Provider, f: impl Fn(&crate::model::ExtraUsage) -> Option<f64>) -> Option<f64> {
@@ -876,6 +921,15 @@ pub const POOL_WEEKS: usize = 8;
 pub const POOL_MIN_WEEKS: u8 = 2;
 pub const POOL_PERCENTILE: f64 = 0.9;
 pub const POOL_BUFFER: f64 = 0.2;
+
+/// The spare kept over the busiest weeks: `POOL_BUFFER`, doubled while any of the provider's paid
+/// plans keeps running out (its use is cut short, so real demand is higher than measured). The
+/// pool's size and the Advisor's floor both use it, so a plan the Advisor keeps for the busiest
+/// weeks never reads as one to spare in "your usage fits in N plans".
+pub fn pool_buffer(exhausted: usize) -> f64 {
+    if exhausted > 0 { 2.0 * POOL_BUFFER } else { POOL_BUFFER }
+}
+
 /// A week counts only when accounts holding at least this share of the plans were watched in it.
 const POOL_COVERAGE: f64 = 0.5;
 
@@ -917,8 +971,11 @@ pub struct Pool {
     pub demand_p90: Option<f64>,
     /// This week's use so far across the plans, in plan-weeks.
     pub live_demand: Option<f64>,
-    /// Plans that cover `demand_p90` with `POOL_BUFFER` to spare.
+    /// Plans that cover `demand_p90` with `buffer_percent` to spare.
     pub plans_needed: Option<u32>,
+    /// The spare `plans_needed` keeps, in percent: 20, or 40 while any paid plan keeps running out,
+    /// as the Advisor's floor (`pool_buffer`).
+    pub buffer_percent: f64,
     /// How far `plans_needed` exceeds `demand_p90`, in percent.
     pub spare_percent: Option<f64>,
     pub confidence: Confidence,
@@ -930,7 +987,7 @@ pub struct Pool {
 /// pool from its 90th percentile. A week counts when accounts holding at least half the plans
 /// (of those SlopBar knew by then) were watched in it; an account missing from a counted week is
 /// filled in with the median of its own counted weeks, and the confidence says so.
-fn pool(provider: Provider, paid: &[&Entry], now: DateTime<Utc>) -> Pool {
+fn pool(provider: Provider, paid: &[&Entry], buffer: f64, now: DateTime<Utc>) -> Pool {
     let weighted: Vec<(&Entry, f64)> = paid.iter().filter_map(|e| Some((*e, e.plan_weight?))).collect();
     let plans_held = weighted.iter().map(|(_, w)| w).sum::<f64>();
     let medians: Vec<Option<f64>> = weighted.iter().map(|(e, _)| median(&e.pool_weeks.values().copied().collect::<Vec<_>>())).collect();
@@ -969,11 +1026,11 @@ fn pool(provider: Provider, paid: &[&Entry], now: DateTime<Utc>) -> Pool {
         let p = percentile(&demands, POOL_PERCENTILE);
         live_demand.map_or(p, |l| p.max(l))
     });
-    let plans_needed = demand_p90.map(|d| ((d * (1.0 + POOL_BUFFER) - 1e-9).ceil() as u32).max(1));
+    let plans_needed = demand_p90.map(|d| ((d * (1.0 + buffer) - 1e-9).ceil() as u32).max(1));
     let spare_percent = demand_p90.zip(plans_needed).filter(|(d, _)| *d > 0.0).map(|(d, n)| (n as f64 / d - 1.0) * 100.0);
     let confidence = if weeks_used >= RECENT as u8 && estimated == 0 { Confidence::High } else { Confidence::Low };
     Pool { unit: reference_plan(provider), plans_held, unweighted: paid.len() - weighted.len(), weeks_used,
-        weeks_needed: POOL_MIN_WEEKS, weeks_estimated: estimated, demand_p90, live_demand, plans_needed, spare_percent, confidence,
+        weeks_needed: POOL_MIN_WEEKS, weeks_estimated: estimated, demand_p90, live_demand, plans_needed, buffer_percent: (buffer * 100.0).round(), spare_percent, confidence,
         basis: if local { Basis::LocalCodex } else { Basis::Observed } }
 }
 
@@ -1297,10 +1354,11 @@ mod tests {
     }
 
     #[test]
-    fn weeks_watched_near_zero_are_unused_and_wasteful_to_renew() {
+    fn weeks_watched_near_zero_are_unused() {
         let (h, now) = weeks(&[2.0, 0.0, 4.0, 1.0], 100);
         let a = assess(&h, now);
-        assert_eq!((a.verdict, a.confidence, a.renew_wasteful), (Verdict::Unused, Confidence::High, true));
+        // Whether renewing is wasteful is the Advisor's call, never one plan's verdict.
+        assert_eq!((a.verdict, a.confidence, a.renew_wasteful), (Verdict::Unused, Confidence::High, false));
     }
 
     #[test]
@@ -1337,10 +1395,10 @@ mod tests {
     }
 
     #[test]
-    fn a_low_median_is_underused_and_only_confident_evidence_says_renewal_is_wasteful() {
+    fn a_low_median_is_underused_with_confidence_from_the_weeks_watched() {
         let (h, now) = weeks(&[20.0, 10.0, 22.0, 30.0], 100);
         let a = assess(&h, now);
-        assert_eq!((a.verdict, a.confidence, a.renew_wasteful), (Verdict::Underused, Confidence::High, true));
+        assert_eq!((a.verdict, a.confidence, a.renew_wasteful), (Verdict::Underused, Confidence::High, false));
         let (h, now) = weeks(&[20.0, 10.0, 22.0], 100);
         let a = assess(&h, now);
         assert_eq!((a.verdict, a.confidence, a.renew_wasteful), (Verdict::Underused, Confidence::Low, false));
@@ -1397,8 +1455,7 @@ mod tests {
             idle_polls(&mut h, start, 24 * 28, codex);
             let now = start + days(28) + Duration::hours(1);
             assert_eq!(h.windows.iter().filter(|r| r.resets_at <= now).count(), 4, "four idle weeks, not a record per poll");
-            let a = assess(&h, now);
-            assert_eq!((a.verdict, a.renew_wasteful), (Verdict::Unused, true));
+            assert_eq!(assess(&h, now).verdict, Verdict::Unused);
         }
     }
 
@@ -1536,7 +1593,10 @@ mod tests {
         assert_eq!((a.monthly_cost, a.cost_entered, a.assessment.verdict), (Some(180.0), true, Verdict::Unused));
         assert!(report.accounts[1].renewal.is_none() && report.accounts[1].monthly_cost.is_none());
         let s = &report.providers[0];
-        assert_eq!((s.paid, s.unused, s.monthly_total, s.possible_savings), (1, 1, 180.0, 180.0));
+        // Unused, and the provider's last plan: the Advisor keeps the provider but moves it to the
+        // smallest tier that covers its use, and that is what could be saved.
+        assert_eq!((s.paid, s.unused, s.monthly_total, s.possible_savings), (1, 1, 180.0, 160.0));
+        assert_eq!((a.advised.as_ref().and_then(|m| m.to.as_deref()), a.kept, a.assessment.renew_wasteful), (Some("Pro"), None, true));
     }
 
     fn codex_pro(id: &str, used: f64, resets_in: Duration, now: DateTime<Utc>) -> AccountUsage {
@@ -1689,19 +1749,200 @@ mod tests {
     }
 
     #[test]
-    fn renewal_warnings_name_unneeded_plans_three_days_out_and_any_plan_a_day_out() {
+    fn renewal_warnings_name_plans_the_advisor_changes_three_days_out_and_any_plan_a_day_out() {
         let now = at("2026-10-20T12:00:00Z");
-        let (unused, _) = weeks(&[0.0; 4], 100);
-        let unused = assess(&unused, at("2026-10-02T00:00:00Z"));
-        let (busy, _) = weeks(&[70.0; 4], 100);
-        let busy = assess(&busy, at("2026-10-02T00:00:00Z"));
         let r = |hours: i64| Renewal { at: now + Duration::hours(hours), source: DateSource::Provider };
-        assert_eq!(renewal_warning(Some(&r(70)), None, &unused, now), Some(RenewalWarning::Wasteful));
-        assert_eq!(renewal_warning(Some(&r(73)), None, &unused, now), None);
-        assert_eq!(renewal_warning(Some(&r(70)), None, &busy, now), None);
-        assert_eq!(renewal_warning(Some(&r(20)), None, &busy, now), Some(RenewalWarning::Soon));
-        assert_eq!(renewal_warning(Some(&r(20)), Some(now + Duration::hours(20)), &unused, now), None, "cancelled");
-        assert_eq!(renewal_warning(None, None, &unused, now), None);
+        assert_eq!(renewal_warning(Some(&r(70)), None, true, false, now), Some(RenewalWarning::Wasteful));
+        assert_eq!(renewal_warning(Some(&r(73)), None, true, false, now), None);
+        // A plan the Advisor keeps, however idle, only gets the reminder the day before.
+        assert_eq!(renewal_warning(Some(&r(70)), None, false, false, now), None);
+        assert_eq!(renewal_warning(Some(&r(20)), None, false, false, now), Some(RenewalWarning::Soon));
+        // One the user is letting lapse is reminded of three days out, in case it was not cancelled.
+        assert_eq!(renewal_warning(Some(&r(70)), None, false, true, now), Some(RenewalWarning::Lapsing));
+        assert_eq!(renewal_warning(Some(&r(73)), None, false, true, now), None);
+        assert_eq!(renewal_warning(Some(&r(20)), Some(now + Duration::hours(20)), true, true, now), None, "cancelled");
+        assert_eq!(renewal_warning(None, None, true, true, now), None);
+    }
+
+    /// Claude plans ("20x" or "5x" for Max, "pro" for Pro, "max" for a Max of unknown size), each
+    /// with four watched weeks peaking at the given share, renewing on the same day.
+    fn claude_parts(fleet: &[(&str, &str, f64)], renews: DateTime<Utc>, now: DateTime<Utc>) -> (Snapshot, History, Settings) {
+        let mut history = History::default();
+        let mut settings = Settings::default();
+        let accounts = fleet.iter().map(|(id, tier, peak)| {
+            let mut acc = reading("weekly", 1.0, now + days(3));
+            acc.id = (*id).into();
+            acc.email = Some(format!("{id}@example.invalid"));
+            acc.plan = Some(if *tier == "pro" { "pro" } else { "max" }.into());
+            acc.billing.tier = matches!(*tier, "20x" | "5x").then(|| format!("default_claude_max_{tier}"));
+            acc.fetched_at = Some(now);
+            history.accounts.insert(format!("Claude:{id}"), crate::plan_alerts::tests::watched(*peak, now));
+            settings.subscriptions.insert(format!("claude:{id}"), crate::settings::Subscription { next_billing: Some(renews.date_naive()), ..Default::default() });
+            acc
+        }).collect();
+        (Snapshot { accounts, updated_at: Some(now) }, history, settings)
+    }
+
+    /// Claude Max 20x plans, as `claude_parts`, reported.
+    fn claude_fleet(fleet: &[(&str, f64)], renews: DateTime<Utc>, now: DateTime<Utc>) -> Report {
+        let fleet: Vec<(&str, &str, f64)> = fleet.iter().map(|(id, peak)| (*id, "20x", *peak)).collect();
+        let (snapshot, history, settings) = claude_parts(&fleet, renews, now);
+        report(&snapshot, &history, &settings, None, now)
+    }
+
+    /// No per-plan claim contradicts the Advisor: renewing looks wasteful, and a renewal is warned
+    /// about as wasteful, exactly for the plans it moves, and what could be saved is what it saves.
+    fn agrees_with_the_advisor(r: &Report) {
+        for e in &r.accounts {
+            let moved = r.advice.iter().flat_map(|a| &a.moves).find(|m| m.provider == e.provider && m.id == e.id);
+            assert_eq!(e.advised.as_ref().map(|m| (m.action, m.to.clone())), moved.map(|m| (m.action, m.to.clone())), "{}", e.id);
+            assert_eq!(e.assessment.renew_wasteful, moved.is_some(), "{}", e.id);
+            if e.renewal_warning == Some(RenewalWarning::Wasteful) { assert!(moved.is_some(), "{}", e.id); }
+            assert!(e.kept.is_none() || moved.is_none(), "{} is kept and moved", e.id);
+        }
+        for p in &r.providers {
+            let advice = r.advice.iter().find(|a| a.provider == p.provider);
+            assert_eq!(p.possible_savings, advice.map_or(0.0, |a| a.monthly_saving), "{:?}", p.provider);
+            // Each plan says it is kept, and why, exactly as the advice lists it.
+            let mut listed: Vec<(&str, crate::advisor::KeptBecause)> = advice.map_or(vec![], |a| a.kept.iter().map(|k| (k.id.as_str(), k.because)).collect());
+            let mut said: Vec<(&str, crate::advisor::KeptBecause)> = r.accounts.iter().filter(|e| e.provider == p.provider).filter_map(|e| Some((e.id.as_str(), e.kept?))).collect();
+            listed.sort_by_key(|(id, _)| *id);
+            said.sort_by_key(|(id, _)| *id);
+            assert_eq!(said, listed, "{:?}", p.provider);
+            assert_eq!(said.iter().filter(|(_, b)| b.for_capacity()).count(), advice.map_or(0, |a| a.kept_for_capacity), "{:?}", p.provider);
+        }
+    }
+
+    #[test]
+    fn a_plan_the_advisor_keeps_is_never_called_unneeded_nor_counted_as_a_saving() {
+        use crate::advisor::{Action, KeptBecause};
+        let now = at("2026-10-21T09:00:00Z");
+        let renews = at("2026-10-23T00:00:00Z");
+        // Two plans run out most weeks and one is idle: the busiest weeks (2 plans) plus 40% need
+        // all three, so the idle one is kept, and nothing could be saved.
+        let r = claude_fleet(&[("full1", 100.0), ("full2", 100.0), ("idle", 0.0)], renews, now);
+        let idle = r.accounts.iter().find(|e| e.id == "idle").unwrap();
+        assert_eq!(idle.assessment.verdict, Verdict::Unused);
+        assert_eq!((idle.advised.is_none(), idle.kept, idle.assessment.renew_wasteful), (true, Some(KeptBecause::BusiestWeeks), false));
+        assert_eq!(idle.renewal_warning, None, "renews in under three days, but the Advisor keeps it");
+        assert_eq!(r.providers[0].possible_savings, 0.0);
+        agrees_with_the_advisor(&r);
+        // The day before, it gets the reminder every paid plan gets, never the wasteful one.
+        let r = claude_fleet(&[("full1", 100.0), ("full2", 100.0), ("idle", 0.0)], renews, renews - Duration::hours(10));
+        assert_eq!(r.accounts.iter().find(|e| e.id == "idle").unwrap().renewal_warning, Some(RenewalWarning::Soon));
+        agrees_with_the_advisor(&r);
+
+        // With room to spare, the idle plan is cancelled and a light one downgraded: those are
+        // called wasteful to renew, and the saving is the Advisor's, the downgrade's price gap included.
+        let r = claude_fleet(&[("busy", 75.0), ("idle", 0.0), ("light", 15.0)], renews, now);
+        let by = |id: &str| r.accounts.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(by("idle").advised.as_ref().map(|m| m.action), Some(Action::Cancel));
+        assert_eq!(by("light").advised.as_ref().map(|m| (m.action, m.to.as_deref())), Some((Action::Downgrade, Some("Max 5x"))));
+        assert!(by("idle").assessment.renew_wasteful && by("light").assessment.renew_wasteful && !by("busy").assessment.renew_wasteful);
+        assert_eq!((by("idle").renewal_warning, by("light").renewal_warning, by("busy").renewal_warning), (Some(RenewalWarning::Wasteful), Some(RenewalWarning::Wasteful), None));
+        assert_eq!(r.providers[0].possible_savings, 300.0);
+        agrees_with_the_advisor(&r);
+        // Every idle plan of a fleet with nothing busy: all but one go, and the provider's last
+        // moves to the smallest tier that covers its use (1% this week).
+        let r = claude_fleet(&[("x", 0.0), ("y", 0.0), ("z", 0.0)], renews, now);
+        assert_eq!(r.accounts.iter().map(|e| e.advised.as_ref().map(|m| (m.action, m.to.clone()))).collect::<Vec<_>>(),
+            [Some((Action::Cancel, None)), Some((Action::Cancel, None)), Some((Action::Downgrade, Some("Pro".to_string())))]);
+        assert_eq!(r.providers[0].possible_savings, 580.0);
+        agrees_with_the_advisor(&r);
+        // Alone, unused for weeks but busy again this week: nothing smaller covers this week, and the
+        // provider's last plan is never cancelled, so it is kept as the last.
+        let (mut snapshot, history, settings) = claude_parts(&[("solo", "20x", 0.0)], renews, now);
+        snapshot.accounts[0].windows[0].used_percent = 60.0;
+        let r = report(&snapshot, &history, &settings, None, now);
+        assert_eq!((r.accounts[0].assessment.verdict, r.accounts[0].kept, r.providers[0].possible_savings), (Verdict::Unused, Some(KeptBecause::LastPlan), 0.0));
+        agrees_with_the_advisor(&r);
+        // The kept plans are named in the advice too, with why.
+        let json = serde_json::to_value(&r.advice[0]).unwrap();
+        assert_eq!((json["kept_for_capacity"].as_u64(), json["kept"][0]["because"].as_str()), (Some(0), Some("last_plan")), "the last plan is not kept for capacity");
+        assert_eq!(serde_json::to_value(&r.accounts[0]).unwrap()["kept"].as_str(), Some("last_plan"));
+    }
+
+    #[test]
+    fn every_plan_says_what_the_advisor_does_with_it_and_why_it_keeps_one() {
+        use crate::advisor::{Action, KeptBecause};
+        let now = at("2026-10-21T09:00:00Z");
+        let renews = at("2026-10-30T00:00:00Z");
+        // Two light Max 20x plans: the lighter one's use moves onto the other, which carries it and
+        // is kept as it is (no smaller tier fits both plus 20%).
+        let r = claude_fleet(&[("light", 20.0), ("lighter", 15.0)], renews, now);
+        let by = |id: &str| r.accounts.iter().find(|e| e.id == id).unwrap().clone();
+        let guest = by("lighter").advised.unwrap();
+        assert_eq!((guest.action, guest.share.map(|s| s.id)), (Action::Share, Some("light".to_string())));
+        assert_eq!((by("light").advised.is_none(), by("light").kept), (true, Some(KeptBecause::Carries)));
+        assert_eq!((r.providers[0].possible_savings, r.advice[0].kept_for_capacity), (200.0, 0));
+        agrees_with_the_advisor(&r);
+
+        // An underused Pro beside a busy Max: nothing smaller to move it to.
+        let (snapshot, history, settings) = claude_parts(&[("busy", "20x", 75.0), ("small", "pro", 10.0)], renews, now);
+        let r = report(&snapshot, &history, &settings, None, now);
+        let small = r.accounts.iter().find(|e| e.id == "small").unwrap();
+        assert_eq!((small.assessment.verdict, small.advised.is_none(), small.kept), (Verdict::Underused, true, Some(KeptBecause::Smallest)));
+        agrees_with_the_advisor(&r);
+
+        // A Max of unknown size, unused, and a plan being let lapse, idle too: neither is the
+        // Advisor's to judge, so neither is called unneeded.
+        let (mut snapshot, history, mut settings) = claude_parts(&[("busy", "20x", 60.0), ("odd", "max", 0.0), ("lapsing", "20x", 0.0)], renews, now);
+        settings.subscriptions.get_mut("claude:lapsing").unwrap().cancel_after = Some(renews.date_naive());
+        // ...and a Codex plan idle for weeks on this PC beside one busy this week, with too little
+        // history for the pool: cancelling the idle one would leave less than this week's use plus 20%.
+        snapshot.accounts.push(codex_pro("u1:acct-idle", 0.0, days(7), now));
+        snapshot.accounts.push(codex_pro("u2:acct-busy", 90.0, days(3), now));
+        let r = report(&snapshot, &history, &settings, Some(&local_codex(now)), now);
+        let by = |id: &str| r.accounts.iter().find(|e| e.id == id).unwrap().clone();
+        for id in ["odd", "lapsing"] {
+            let e = by(id);
+            assert_eq!((e.assessment.verdict, e.advised.is_none(), e.kept, e.assessment.renew_wasteful), (Verdict::Unused, true, None, false), "{id}");
+        }
+        // Nine days before the charge it was meant to stop, the lapsing plan has no warning yet.
+        assert!(by("lapsing").lapsing_charge() && by("lapsing").renewal_warning.is_none());
+        assert_eq!(by("u1:acct-idle").assessment.verdict, Verdict::Unused);
+        assert_eq!((by("u1:acct-idle").advised.is_none(), by("u1:acct-idle").kept), (true, Some(KeptBecause::ThisWeek)));
+        let codex = r.advice.iter().find(|a| a.provider == Provider::Codex).unwrap();
+        assert_eq!((codex.evidence, codex.kept_for_capacity), (crate::advisor::Evidence::ClearOnly, 1));
+        assert!(r.providers.iter().all(|p| p.possible_savings == 0.0), "{:?}", r.providers.iter().map(|p| p.possible_savings).collect::<Vec<_>>());
+        agrees_with_the_advisor(&r);
+    }
+
+    #[test]
+    fn a_plan_being_let_lapse_is_reminded_of_three_days_before_the_charge_it_was_meant_to_stop() {
+        let renews = at("2026-10-23T00:00:00Z");
+        let now = at("2026-10-21T09:00:00Z");
+        let (snapshot, history, mut settings) = claude_parts(&[("busy", "20x", 90.0), ("going", "20x", 60.0)], renews, now);
+        // As Settings writes it: the last paid day is the day before the renewal.
+        settings.subscriptions.get_mut("claude:going").unwrap().cancel_after = Some(renews.date_naive() - days(1));
+        let r = report(&snapshot, &history, &settings, None, now);
+        let going = r.accounts.iter().find(|e| e.id == "going").unwrap();
+        // Busy or not, it is the user's own choice: never called wasteful, never counted as a saving.
+        assert_eq!((going.renewal_warning, going.assessment.renew_wasteful, going.advised.is_none()), (Some(RenewalWarning::Lapsing), false, true));
+        assert_eq!(r.providers[0].possible_savings, 0.0);
+        agrees_with_the_advisor(&r);
+        // A last paid day after this renewal: one more period is paid for on purpose.
+        settings.subscriptions.get_mut("claude:going").unwrap().cancel_after = Some(renews.date_naive() + days(30));
+        let r = report(&snapshot, &history, &settings, None, now);
+        assert_eq!(r.accounts.iter().find(|e| e.id == "going").unwrap().renewal_warning, None);
+    }
+
+    #[test]
+    fn the_pool_keeps_the_advisors_spare_so_a_plan_kept_for_the_busiest_weeks_is_not_shown_as_spare() {
+        let now = at("2026-10-21T09:00:00Z");
+        // One plan runs out every week, one is busy, one idle: the busiest weeks are 1.65 plans.
+        // Plus 20% would fit in 2 of the 3 held; while a plan runs out the Advisor keeps 40%
+        // (2.31), so it keeps the idle plan (a Max 5x would leave 2.25), and the pool says all 3
+        // are needed.
+        let r = claude_fleet(&[("full", 100.0), ("busy", 65.0), ("idle", 0.0)], at("2026-10-30T00:00:00Z"), now);
+        let p = &r.providers[0].pool;
+        assert_eq!((p.plans_needed, p.buffer_percent), (Some(3), 40.0));
+        assert_eq!(r.advice[0].floor, Some(2.31));
+        assert_eq!(r.accounts.iter().find(|e| e.id == "idle").unwrap().kept, Some(crate::advisor::KeptBecause::BusiestWeeks));
+        agrees_with_the_advisor(&r);
+        // With nothing running out, both keep 20%.
+        let r = claude_fleet(&[("busy", 60.0), ("idle", 0.0)], at("2026-10-30T00:00:00Z"), now);
+        assert_eq!((r.providers[0].pool.plans_needed, r.providers[0].pool.buffer_percent), (Some(1), 20.0));
     }
 
     #[test]
