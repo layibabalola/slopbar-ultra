@@ -995,7 +995,7 @@ pub(crate) fn busiest(h: &AccountHistory, pro_200: bool, now: DateTime<Utc>) -> 
 
 /// A week's peak is the week's own only when this computer read it this close to its reset: use
 /// after the last reading (this PC asleep, its SlopBar closed) is missing from it.
-const END_READ_SECONDS: i64 = 12 * 3600;
+pub(crate) const END_READ_SECONDS: i64 = 12 * 3600;
 
 /// Never ran out: in every one of its busiest recent weeks (`busiest`, model caps included) the
 /// account stayed under its limits, whichever computers its use came from, and there are enough

@@ -11,7 +11,8 @@
 //!   organization names are written. While readings are shared (`Settings::share_readings`) the
 //!   record also carries the computer's own weekly use (`load`, see `machine_load`): per provider,
 //!   totals in plans only, never an account code or id. Readers take it leniently: a `load` they
-//!   cannot read is dropped, never the record.
+//!   cannot read (another version, a malformed value, a number out of range, nesting too deep) is
+//!   dropped, never the record.
 //! - **Inference**, for monitored accounts nobody claims: usage that keeps rising while the
 //!   account is signed in nowhere SlopBar can see means it is used outside this PC (another
 //!   machine, the web or the desktop app).
@@ -68,9 +69,12 @@ pub struct Presence {
     pub load: Option<crate::machine_load::Load>,
 }
 
+/// A record's `load`, taken as raw JSON (which checks its syntax only) and then read on its own: a
+/// number out of range or nesting too deep fails that second read, which drops the load and keeps
+/// the record.
 fn lenient_load<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<crate::machine_load::Load>, D::Error> {
-    let raw = serde_json::Value::deserialize(d)?;
-    Ok(crate::machine_load::Load::from_value(&raw))
+    let raw = <Box<serde_json::value::RawValue>>::deserialize(d)?;
+    Ok(serde_json::from_str::<serde_json::Value>(raw.get()).ok().and_then(|v| crate::machine_load::Load::from_value(&v)))
 }
 
 impl Presence {
@@ -176,8 +180,8 @@ pub trait PresenceStore: Send + Sync {
 #[derive(Debug, Default)]
 pub struct Kept(std::sync::Mutex<HashMap<String, (String, Vec<u8>)>>);
 
-/// A record is kept for the next read only up to this size, and at most this many records: one is a
-/// few hundred bytes (about 130 more per account), and whoever can write the folder could otherwise
+/// A record is kept for the next read only up to this size, and at most this many records: one is
+/// about 1-2 KB (some 130 bytes per account, and a few hundred for its load), and whoever can write the folder could otherwise
 /// have this computer hold `MAX_RECORD` bytes between refreshes for every file they put there. Any
 /// other record is downloaded at every read, as every record was.
 const KEEP_BYTES: usize = 16 * 1024;

@@ -32,7 +32,9 @@ tauri-build = { version = "2", features = [], optional = true }
 [dependencies]
 tauri = { version = "2", features = [], optional = true }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+# raw_value: a presence record's `load` is taken as raw JSON and read on its own, so a number out of
+# range or nesting too deep there drops the load, never the record (`presence::lenient_load`).
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 # SlopBar's own requests (net.rs): Windows' own certificate checks (rustls-platform-verifier) and the
 # system's proxy, as the updater's reqwest does; one reqwest in the build.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "system-proxy"] }
