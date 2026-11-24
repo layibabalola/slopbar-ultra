@@ -623,6 +623,10 @@ pub struct Entry {
     /// The week SlopBar started watching the account.
     #[serde(skip)]
     pool_since: Option<NaiveDate>,
+    /// The week the plan last changed (`AccountHistory::plan_since`): its weeks before it are left out
+    /// of `pool_weeks`, being shares of another allowance.
+    #[serde(skip)]
+    pool_changed: Option<NaiveDate>,
     /// What sharing this plan rests on (`advisor`).
     #[serde(skip)]
     pub(crate) share: ShareBasis,
@@ -737,6 +741,7 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
         // Only from when SlopBar watched it: before then, rollout weeks exist only for the accounts
         // used on this PC, and leaving the rest out would make the fleet look less busy.
         let pool_since = h.first_seen.map(|t| monday(t.date_naive()));
+        let pool_changed = h.plan_since.map(|t| monday(t.date_naive()));
         let credits = (acc.provider == Provider::Codex).then(|| credit_info(acc.credits.as_deref(), h.credits.as_ref())).flatten();
         Entry {
             renewal_warning: if paid { renewal_warning(renewal.as_ref(), ends_at, &assessment, now) } else { None },
@@ -771,6 +776,7 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
             pool_weeks,
             pool_local,
             pool_since,
+            pool_changed,
             share,
         }
     }).collect();
@@ -929,7 +935,13 @@ fn pool(provider: Provider, paid: &[&Entry], now: DateTime<Utc>) -> Pool {
             let (e, w) = weighted[i];
             match e.pool_weeks.get(week) {
                 Some(p) => p / 100.0 * w,
-                None => { filled = true; medians[i].unwrap_or(0.0) / 100.0 * w }
+                None => {
+                    filled = true;
+                    // A week before the plan changed was a share of another allowance and is left out:
+                    // counted as the whole plan, so no cut rests on the gap (its median would read the
+                    // weeks on the new plan only, or nothing yet).
+                    if e.pool_changed.is_some_and(|c| *week < c) { w } else { medians[i].unwrap_or(0.0) / 100.0 * w }
+                }
             }
         }).sum();
         estimated += filled as u8;
@@ -1725,6 +1737,18 @@ mod tests {
         assert_eq!((p.plans_needed, p.confidence), (Some(2), Confidence::High));
         assert!((p.spare_percent.unwrap() - 100.0).abs() < 1e-9);
         assert_eq!(p.live_demand, Some(0.0));
+    }
+
+    #[test]
+    fn weeks_before_a_change_of_plan_count_as_the_whole_plan_in_the_pool() {
+        let (snapshot, mut history, now) = fleet(&[("a", "20x", &[50.0, 60.0, 40.0, 70.0]), ("b", "5x", &[20.0; 4])]);
+        // b changed plan three days ago: its three earlier weeks were shares of another allowance.
+        history.accounts.get_mut("Claude:b").unwrap().plan_since = Some(now - days(3));
+        let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
+        // Those weeks count as b's whole plan (0.25), not as its one week on the new plan (0.05):
+        // 0.5 + 0.25, 0.6 + 0.25, 0.4 + 0.25, then 0.7 + 0.05; the busiest is 0.85.
+        assert!((p.demand_p90.unwrap() - 0.85).abs() < 1e-9, "{p:?}");
+        assert_eq!((p.weeks_estimated, p.confidence), (3, Confidence::Low));
     }
 
     #[test]

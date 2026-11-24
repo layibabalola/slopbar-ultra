@@ -62,6 +62,10 @@ pub struct AppState {
     presence_tracks: Mutex<presence::Tracks>,
     /// The other machines' last records, for a read that misses one (see `presence::Recall`).
     presence_recall: Mutex<presence::Recall>,
+    /// A read of the other computers' records has succeeded since SlopBar started, and the refreshes
+    /// that switched nothing automatically while none had (see `blind_refresh`).
+    presence_seen: std::sync::atomic::AtomicBool,
+    blind_refreshes: std::sync::atomic::AtomicU32,
     /// The records the last read had the bytes of, which stand in for downloading them again while
     /// they are listed unchanged (see `presence::Kept`).
     presence_kept: presence::Kept,
@@ -3906,9 +3910,11 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
     // What the last refresh worked out, for the early redraw: before a switch below publishes this
     // refresh's bare numbers.
     let previous = state.snapshot.lock().unwrap().accounts.clone();
-    // The first refresh after a start has no last refresh to know the other computers by: with
-    // sharing on, automatic switching waits a refresh rather than move onto an account in use there.
-    let blind = previous.is_empty() && presence::store(&settings).is_some();
+    // With sharing on, automatic switching waits until a read of the other computers has succeeded
+    // since the start (the last refresh's knowledge of them is then real), rather than move onto an
+    // account in use there; at most `BLIND_REFRESHES` refreshes, so failing reads cannot stop it.
+    let blind = presence::store(&settings).is_some() && blind_refresh(
+        state.presence_seen.load(std::sync::atomic::Ordering::Relaxed), &state.blind_refreshes);
     let decisions = if blind { vec![] } else {
         let last = state.last_switch.lock().unwrap().clone();
         let leased = state.leases.lock().unwrap().accounts();
@@ -4004,6 +4010,7 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
             // Each other computer's last load stands while its record does (`machine_load::Peers`).
             state.machine_peers.lock().unwrap().note(&read_from, &every, result.read, now);
             shared = Some(result);
+            if result.read { state.presence_seen.store(true, std::sync::atomic::Ordering::Relaxed); }
             covered = result.wrote || found.iter().any(|p| p.live);
             presence::apply(&mut list, &found, &every, me, now);
         }
@@ -4081,6 +4088,16 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
     }
     scan_usage_index(app);
     snapshot
+}
+
+/// Refreshes that switch nothing automatically while no read of the other computers has succeeded.
+const BLIND_REFRESHES: u32 = 3;
+
+/// Whether this refresh's automatic switching waits: no read of the other computers has succeeded
+/// since the start (`seen`), and fewer than `BLIND_REFRESHES` refreshes have waited (`waited`, counted
+/// here).
+fn blind_refresh(seen: bool, waited: &std::sync::atomic::AtomicU32) -> bool {
+    !seen && waited.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < BLIND_REFRESHES
 }
 
 /// Gives freshly fetched accounts what the last refresh worked out from sharing and forecasts,
@@ -5707,6 +5724,8 @@ pub fn run() {
         sources: Mutex::default(),
         presence_tracks: Mutex::default(),
         presence_recall: Mutex::default(),
+        presence_seen: std::sync::atomic::AtomicBool::new(false),
+        blind_refreshes: std::sync::atomic::AtomicU32::new(0),
         presence_kept: presence::Kept::default(),
         machine_ledger: Mutex::new(machine_load::load()),
         machine_peers: Mutex::default(),
@@ -6000,6 +6019,16 @@ mod window_tests {
 mod balance_tests {
     use super::*;
     use crate::model::{AccountUsage, RemoteSeat};
+
+    #[test]
+    fn switching_waits_for_a_read_of_the_other_computers_but_not_for_ever() {
+        let waited = std::sync::atomic::AtomicU32::new(0);
+        // A read has succeeded: never waits, and counts nothing.
+        assert!(!blind_refresh(true, &waited));
+        assert_eq!(waited.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // None yet: the first three refreshes wait, the fourth switches as the reads keep failing.
+        assert_eq!((0..4).map(|_| blind_refresh(false, &waited)).collect::<Vec<_>>(), [true, true, true, false]);
+    }
 
     fn account(id: &str, active: bool, percent: f64) -> AccountUsage {
         serde_json::from_value(serde_json::json!({
