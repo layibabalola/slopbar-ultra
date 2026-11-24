@@ -844,7 +844,13 @@ fn follow_advice(accounts: &mut [Entry], providers: &mut [ProviderSummary], advi
         e.renewal_warning = renewal_warning(e.renewal.as_ref(), e.ends_at, e.advised.is_some(), e.lapsing_charge(), now);
     }
     for p in providers.iter_mut() {
-        p.possible_savings = advice.iter().find(|a| a.provider == p.provider).map_or(0.0, |a| a.monthly_saving);
+        let a = advice.iter().find(|a| a.provider == p.provider);
+        p.possible_savings = a.map_or(0.0, |a| a.monthly_saving);
+        // While even 20% over the busiest weeks is more than the plans hold, the Advisor's shortage
+        // asks for that first: the pool says the same, not the 40% its floor keeps for cuts.
+        if a.and_then(|a| a.shortage.as_ref()).is_some_and(|s| s.cause == crate::advisor::ShortageCause::OverCapacity) {
+            (p.pool.plans_needed, p.pool.spare_percent, p.pool.buffer_percent) = sizing(p.pool.demand_p90, POOL_BUFFER);
+        }
     }
 }
 
@@ -974,7 +980,8 @@ pub struct Pool {
     /// Plans that cover `demand_p90` with `buffer_percent` to spare.
     pub plans_needed: Option<u32>,
     /// The spare `plans_needed` keeps, in percent: 20, or 40 while any paid plan keeps running out,
-    /// as the Advisor's floor (`pool_buffer`).
+    /// as the Advisor's floor (`pool_buffer`); 20 again while the plans hold less than even that,
+    /// as the Advisor's shortage asks for first (`follow_advice`).
     pub buffer_percent: f64,
     /// How far `plans_needed` exceeds `demand_p90`, in percent.
     pub spare_percent: Option<f64>,
@@ -1026,12 +1033,19 @@ fn pool(provider: Provider, paid: &[&Entry], buffer: f64, now: DateTime<Utc>) ->
         let p = percentile(&demands, POOL_PERCENTILE);
         live_demand.map_or(p, |l| p.max(l))
     });
-    let plans_needed = demand_p90.map(|d| ((d * (1.0 + buffer) - 1e-9).ceil() as u32).max(1));
-    let spare_percent = demand_p90.zip(plans_needed).filter(|(d, _)| *d > 0.0).map(|(d, n)| (n as f64 / d - 1.0) * 100.0);
+    let (plans_needed, spare_percent, buffer_percent) = sizing(demand_p90, buffer);
     let confidence = if weeks_used >= RECENT as u8 && estimated == 0 { Confidence::High } else { Confidence::Low };
     Pool { unit: reference_plan(provider), plans_held, unweighted: paid.len() - weighted.len(), weeks_used,
-        weeks_needed: POOL_MIN_WEEKS, weeks_estimated: estimated, demand_p90, live_demand, plans_needed, buffer_percent: (buffer * 100.0).round(), spare_percent, confidence,
+        weeks_needed: POOL_MIN_WEEKS, weeks_estimated: estimated, demand_p90, live_demand, plans_needed, buffer_percent, spare_percent, confidence,
         basis: if local { Basis::LocalCodex } else { Basis::Observed } }
+}
+
+/// Plans of the reference tier that cover `demand` with `buffer` to spare, how far they exceed it
+/// in percent, and the buffer in percent.
+fn sizing(demand: Option<f64>, buffer: f64) -> (Option<u32>, Option<f64>, f64) {
+    let needed = demand.map(|d| ((d * (1.0 + buffer) - 1e-9).ceil() as u32).max(1));
+    let spare = demand.zip(needed).filter(|(d, _)| *d > 0.0).map(|(d, n)| (n as f64 / d - 1.0) * 100.0);
+    (needed, spare, (buffer * 100.0).round())
 }
 
 /// Nearest-rank percentile: with fewer than ten weeks the 90th is the busiest week.
@@ -1943,6 +1957,13 @@ mod tests {
         // With nothing running out, both keep 20%.
         let r = claude_fleet(&[("busy", 60.0), ("idle", 0.0)], at("2026-10-30T00:00:00Z"), now);
         assert_eq!((r.providers[0].pool.plans_needed, r.providers[0].pool.buffer_percent), (Some(1), 20.0));
+        // Three plans that run out every week hold less than even 20% over the busiest weeks (3.6):
+        // the Advisor's shortage asks for one more plan first, and the pool says 4 too, not the 5
+        // that 40% would need.
+        let r = claude_fleet(&[("a", 100.0), ("b", 100.0), ("c", 100.0)], at("2026-10-30T00:00:00Z"), now);
+        let s = r.advice[0].shortage.as_ref().unwrap();
+        assert_eq!((s.cause, s.fix.count, s.fix.capacity_after), (crate::advisor::ShortageCause::OverCapacity, 1, 4.0));
+        assert_eq!((r.providers[0].pool.plans_needed, r.providers[0].pool.buffer_percent), (Some(4), 20.0));
     }
 
     #[test]
