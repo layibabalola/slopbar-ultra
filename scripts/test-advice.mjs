@@ -74,7 +74,7 @@ test("the advisor card totals the moves, lists room for more use, and shows a sh
   assert.ok(!short.includes("no plan changes advised"), short);
   const upgrade = text(adviceCard({ advice: [advice({ shortage: { cause: "hitting_limits", shortfall: 0.5, exhausted: 2,
     fix: { action: "upgrade", id: "b", email: "b@example.invalid", alias: null, from: "Max 5x", to: "Max 20x", count: 1, monthly_cost: 100, capacity_after: 2 } } })] }, { on, names, snapshot: { accounts: [] } }));
-  assert.ok(upgrade.includes("Claude: 2 plans keep reaching their weekly limit with under 40% to spare"), upgrade);
+  assert.ok(upgrade.includes("Claude: plans keep reaching their weekly limit with under 40% to spare (2 of them)"), upgrade);
   assert.ok(upgrade.includes("cheapest fix: move b@example.invalid from Max 5x to Max 20x, $100/month more"), upgrade);
   // A provider turned off is left out, and an empty report draws nothing.
   assert.equal(adviceCard({ advice: [advice()] }, { on: () => false, names, snapshot: null }), "");
