@@ -65,7 +65,8 @@ pub struct Notifications {
     /// expire unused (see `reset_credits`).
     pub reset_credits: bool,
     /// An account in use on more than one of the user's machines at once (see
-    /// `presence::overlap`), once per overlap. Needs in-use sharing.
+    /// `presence::overlap`), once per overlap; never one shared within its limits
+    /// (`AccountUsage::room_to_share`). Needs in-use sharing.
     pub multi_machine: bool,
     /// A sharing setup (here, or one this computer finishes for another) waiting for the user to
     /// allow access in Dropbox; clicking it opens Dropbox's page (see `sharing_setup`).

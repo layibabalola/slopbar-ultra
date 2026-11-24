@@ -1,8 +1,9 @@
 //! Automatic account switching: when the signed-in account of a provider reaches the
 //! configured share of any usage window, move to the account `headroom::recommend` ranks first
 //! among those well below it: the one whose weekly reset or renewal comes soonest, so capacity
-//! that would be lost is used first. Accounts in use on another machine, on a plan that is
-//! ending or lapsed, or without a fresh reading are never targets.
+//! that would be lost is used first. Accounts in use on another machine (except one this
+//! machine's desktop app shares within its limits, `AccountUsage::room_to_share`), on a plan that
+//! is ending or lapsed, or without a fresh reading are never targets.
 //!
 //! An account with its own percentage (`Settings::rotate_at`) is rotated off at that percentage
 //! even with automatic switching off, and is a target only well below it, so an account kept for

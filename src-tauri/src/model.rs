@@ -71,8 +71,9 @@ pub struct AccountUsage {
     pub remote: Vec<RemoteSeat>,
     /// Every machine the account is in use on right now (this one first, then live other
     /// machines by name), when that is more than one; empty otherwise (see `presence::overlap`).
-    /// Two machines on one account drain its limits twice as fast, and the provider may sign
-    /// one of them out.
+    /// Their use adds up, so two machines on one account drain its limits twice as fast: with
+    /// `room_to_share` that is a planned share within its limits, without it a conflict that
+    /// Health, a notification and recommend_account flag.
     #[serde(default)]
     pub overlap: Vec<String>,
     /// Another of the user's computers' reading of this account, newer than this computer's own,
