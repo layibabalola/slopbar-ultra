@@ -40,7 +40,8 @@ export function adviceMove(m, snapshot) {
 export function shortageText(a, name) {
   const s = a.shortage;
   if (!s) return null;
-  const head = s.cause === "over_capacity" ? t("advShortOver", { provider: name, n: amount(s.shortfall), unit: a.unit })
+  // With too little history the demand is this week's use so far, not the busiest weeks.
+  const head = s.cause === "over_capacity" ? t(a.evidence === "clear_only" ? "advShortOverNow" : "advShortOver", { provider: name, n: amount(s.shortfall), unit: a.unit })
     : t("advShortLimits", { provider: name, n: s.exhausted });
   const f = s.fix;
   const fix = f.action === "upgrade" ? t("advFixUpgrade", { account: advisedAccount(f), from: f.from, plan: f.to, v: money(f.monthly_cost) })
@@ -93,14 +94,16 @@ export function machinesCard(report, { on, names }) {
         const label = (c) => (c.here ? (c.machine ? t("thisPc", { machine: c.machine }) : t("thisPcUnnamed")) : c.machine);
         // Group members come as names; this PC is marked as in the list of computers.
         const named = (n) => { const c = m.computers.find((x) => String(x.machine).toLowerCase() === String(n).toLowerCase()); return c ? label(c) : n; };
-        const measured = m.computers.filter((c) => c.measured).length;
+        // Computers that can be grouped: measured, with no use on plans of unknown size.
+        const measured = m.computers.filter((c) => c.measured && !c.uncounted).length;
         const verdict = m.groups?.length ? m.groups.map((g) => t("mcGroup", { list: g.machines.map(named).join(", "), unit: m.unit, p: pct(g.combined_percent) }))
           : [measured >= 2 ? t("mcNone", { unit: m.unit }) : t("mcWait", { needed: m.weeks_needed, n: measured })];
         const rows = m.computers.map((c) => {
           const parts = [];
           if (c.busiest_percent != null) parts.push(t("mcBusiest", { p: pct(c.busiest_percent) }));
           if (c.live_percent != null) parts.push(t("mcLive", { p: pct(c.live_percent) }));
-          if (!c.measured) parts.push(t("mcWeeks", { n: c.weeks, needed: m.weeks_needed }));
+          // Enough weeks but not the latest: measured needs the last completed week too.
+          if (!c.measured) parts.push(c.weeks >= m.weeks_needed ? t("mcLatest") : t("mcWeeks", { n: c.weeks, needed: m.weeks_needed }));
           if (c.needs_own) parts.push(t("mcOwn", { unit: m.unit }));
           if (c.uncounted) parts.push(t("mcUncounted"));
           return `

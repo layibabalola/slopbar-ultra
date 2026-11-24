@@ -247,7 +247,8 @@ fn advise_provider(summary: &ProviderSummary, accounts: &[Entry]) -> ProviderAdv
     let sharers: Vec<Sharer> = match evidence {
         Evidence::Pool => {
             let mut s: Vec<Sharer> = candidates.iter().filter(|c| !moves.iter().any(|m: &Move| m.id == c.entry.id) && can_share(c)).map(Sharer::of).collect();
-            s.sort_by(|a, b| b.busiest.total_cmp(&a.busiest).then_with(|| a.c.entry.id.cmp(&b.c.entry.id)));
+            // By tier, then the busiest first: a stable order for the search and its ties.
+            s.sort_by(|a, b| b.c.weight.total_cmp(&a.c.weight).then_with(|| b.busiest.total_cmp(&a.busiest)).then_with(|| a.c.entry.id.cmp(&b.c.entry.id)));
             s
         }
         Evidence::ClearOnly => vec![],
@@ -263,6 +264,8 @@ fn advise_provider(summary: &ProviderSummary, accounts: &[Entry]) -> ProviderAdv
     if evidence == Evidence::Pool {
         for c in candidates.iter().filter(|c| c.entry.assessment.verdict == Verdict::Underused && !shared_away(&c.entry.id)) {
             let need = match hosted(&c.entry.id) {
+                // Codex's tier sizes are price guesses: a plan carrying others stays as it is.
+                Some(_) if provider == Provider::Codex => continue,
                 Some(g) => combined(&sharers, &g.members()) * (1.0 + POOL_BUFFER),
                 None => { let Some(peak) = c.entry.recent_peak() else { kept += 1; continue }; peak / 100.0 * c.weight * (1.0 + POOL_BUFFER) }
             };
@@ -387,14 +390,17 @@ fn combined(sharers: &[Sharer], members: &[usize]) -> f64 {
         .fold(0.0, f64::max)
 }
 
-/// The plan to keep for `members`, when one can carry them all: its allowance covers their use
-/// added up plus 20% in every weekly limit, every other member's use is the user's own (use from
-/// outside the user's computers would not move with them), and for Codex all are one tier (its
-/// tiers' sizes are price guesses). The cheapest such plan, then the one renewing last (cancelling
-/// the others saves sooner), then the busiest, then by id.
-fn host(sharers: &[Sharer], members: &[usize], provider: Provider) -> Option<usize> {
+/// The plan to keep for `members`, when one can carry them all: all are one tier, its allowance
+/// covers their use added up plus 20% in every weekly limit, and every other member's use is the
+/// user's own (use from outside the user's computers would not move with them). One tier, because
+/// a share across tiers would turn one plan's percent into another's by their sizes, which neither
+/// provider states for its weekly limits (Codex's are price guesses; Anthropic's published hours
+/// put a Max 5x nearer 0.58 of a Max 20x than the 0.25 its 5-hour limits suggest), and a guess too
+/// small runs the plan kept out. Of those, the cheapest, then the one renewing last (cancelling the
+/// others saves sooner), then the busiest, then by id. (`provider` is kept for the call sites.)
+fn host(sharers: &[Sharer], members: &[usize], _provider: Provider) -> Option<usize> {
     if let [only] = members { return Some(*only); }
-    if provider == Provider::Codex && members.iter().any(|&m| sharers[m].c.plan != sharers[members[0]].c.plan) { return None; }
+    if members.iter().any(|&m| sharers[m].c.plan != sharers[members[0]].c.plan) { return None; }
     let need = combined(sharers, members) * (1.0 + POOL_BUFFER);
     let outside: Vec<usize> = members.iter().copied().filter(|&m| sharers[m].c.entry.share.outside).collect();
     let renews = |s: &Sharer| s.c.entry.renewal.as_ref().map_or(DateTime::<Utc>::MAX_UTC, |r| r.at);
@@ -430,9 +436,14 @@ fn plan_shares(s: &Search) -> Vec<Group> {
     let n = s.sharers.len();
     if n < 2 { return vec![]; }
     let parts = if n <= SEARCH_MAX {
+        // Each group's plan to keep, worked out once: groups are the sets of up to `SEARCH_MAX`.
+        let hosts: Vec<Option<usize>> = (0..1usize << n).map(|mask| match members_of(mask) {
+            m if m.is_empty() => None,
+            m => host(s.sharers, &m, s.provider),
+        }).collect();
         let mut best = None;
-        search(s, 0, &mut vec![], &mut best);
-        best.map(|(_, _, parts)| parts).unwrap_or_default()
+        search(s, &hosts, 0, &mut vec![], &mut best);
+        best.map(|(_, _, parts)| parts.into_iter().map(members_of).collect()).unwrap_or_default()
     } else {
         greedy(s)
     };
@@ -456,13 +467,27 @@ fn evaluate(s: &Search, parts: &[Vec<usize>]) -> Option<(f64, usize, f64)> {
     Some((saving, guests, freed))
 }
 
-type Best = Option<(f64, usize, Vec<Vec<usize>>)>;
+/// The sharers in a group given as a bit set.
+fn members_of(mask: usize) -> Vec<usize> {
+    (0..usize::BITS as usize).filter(|i| mask >> i & 1 == 1).collect()
+}
 
-/// Tries every way to group the sharers from `i` on, given `parts` so far, keeping the best. A
-/// group that no plan of it can carry is never grown: more members only add use.
-fn search(s: &Search, i: usize, parts: &mut Vec<Vec<usize>>, best: &mut Best) {
+type Best = Option<(f64, usize, Vec<usize>)>;
+
+/// Tries every way to group the sharers from `i` on, given `parts` so far (bit sets), keeping the
+/// best; `hosts` holds each group's plan to keep. A group no plan of it can carry is never grown:
+/// all its members are one tier, so more members only add use.
+fn search(s: &Search, hosts: &[Option<usize>], i: usize, parts: &mut Vec<usize>, best: &mut Best) {
     if i == s.sharers.len() {
-        let Some((saving, guests, freed)) = evaluate(s, parts) else { return };
+        let (mut saving, mut guests, mut freed) = (0.0, 0, 0.0);
+        for &p in parts.iter().filter(|p| p.count_ones() > 1) {
+            let Some(h) = hosts[p] else { return };
+            for m in members_of(p).into_iter().filter(|&m| m != h) {
+                saving += s.sharers[m].c.cost;
+                freed += s.sharers[m].c.weight;
+                guests += 1;
+            }
+        }
         if !(s.fits)(s.capacity - freed) { return; }
         if best.as_ref().is_none_or(|(b, g, _)| saving > b + 1e-9 || saving > b - 1e-9 && guests < *g) {
             *best = Some((saving, guests, parts.clone()));
@@ -470,12 +495,15 @@ fn search(s: &Search, i: usize, parts: &mut Vec<Vec<usize>>, best: &mut Best) {
         return;
     }
     for g in 0..parts.len() {
-        parts[g].push(i);
-        if host(s.sharers, &parts[g], s.provider).is_some() { search(s, i + 1, parts, best); }
-        parts[g].pop();
+        let grown = parts[g] | 1 << i;
+        if hosts[grown].is_some() {
+            let was = std::mem::replace(&mut parts[g], grown);
+            search(s, hosts, i + 1, parts, best);
+            parts[g] = was;
+        }
     }
-    parts.push(vec![i]);
-    search(s, i + 1, parts, best);
+    parts.push(1 << i);
+    search(s, hosts, i + 1, parts, best);
     parts.pop();
 }
 
@@ -624,8 +652,12 @@ mod tests {
     }
 
     /// Claude Max plans ("20x" or "5x") with the given weeks.
+    /// Claude plans ("20x" or "5x" for Max, "pro" for Pro) with the given weeks.
     fn claude_weeks(fleet: &[(&str, &str, &[f64])], now: DateTime<Utc>) -> ProviderAdvice {
-        advice_for("claude", fleet.iter().map(|(id, tier, peaks)| (plan("claude", id, "max", Some(&format!("default_claude_max_{tier}")), 1.0, now), history_of(peaks, now))).collect(), now)
+        advice_for("claude", fleet.iter().map(|(id, tier, peaks)| {
+            let acc = if *tier == "pro" { plan("claude", id, "pro", None, 1.0, now) } else { plan("claude", id, "max", Some(&format!("default_claude_max_{tier}")), 1.0, now) };
+            (acc, history_of(peaks, now))
+        }).collect(), now)
     }
 
     fn shares(a: &ProviderAdvice) -> Vec<(&str, &str, f64)> {
@@ -668,22 +700,24 @@ mod tests {
     }
 
     #[test]
-    fn every_grouping_is_tried_so_no_plan_is_stranded_as_a_host() {
+    fn shares_stay_within_one_tier_and_pack_into_the_fewest_plans() {
         let now = at("2026-11-25T12:00:00Z");
-        // Placing the busiest first would keep the Max 5x at 80% for itself and free one Max 20x ($200);
-        // keeping one Max 20x for all three frees both others ($300).
+        // Four Max 20x plans at 20%: one carries all four (0.8, plus 20% is 0.96).
+        let a = claude_weeks(&[("a", "20x", &[20.0; 4]), ("b", "20x", &[20.0; 4]), ("c", "20x", &[20.0; 4]), ("d", "20x", &[20.0; 4])], now);
+        assert_eq!(shares(&a), [("b", "a", 200.0), ("c", "a", 200.0), ("d", "a", 200.0)]);
+        assert_eq!(a.moves[0].share.as_ref().unwrap().combined_percent, 80.0);
+        // Five at 30%, 25%, 25%, 20%, 20%: two plans carry them all (0.55 + 0.65), however they are placed.
+        let a = claude_weeks(&[("a", "20x", &[30.0; 4]), ("b", "20x", &[25.0; 4]), ("c", "20x", &[25.0; 4]), ("d", "20x", &[20.0; 4]), ("e", "20x", &[20.0; 4])], now);
+        assert_eq!((shares(&a).len(), a.capacity_after), (3, 2.0));
+        // Only plans of one tier share: the Max 5x stays out, the two Max 20x share.
         let a = claude_weeks(&[("a", "5x", &[80.0; 4]), ("b", "20x", &[15.0; 4]), ("c", "20x", &[10.0; 4])], now);
-        assert_eq!(shares(&a), [("c", "b", 200.0), ("a", "b", 100.0)]);
-        assert_eq!(a.moves[0].share.as_ref().unwrap().combined_percent, 45.0);
-        // 45% + 96% of a Max 5x + 22%: only one Max 20x can go, and the dearer plan is the one freed.
+        assert_eq!(shares(&a), [("c", "b", 200.0)]);
         let a = claude_weeks(&[("a", "20x", &[45.0; 4]), ("b", "5x", &[96.0; 4]), ("c", "20x", &[22.0; 4])], now);
         assert_eq!(shares(&a), [("c", "a", 200.0)]);
-        // A cheaper plan that can carry both is the one kept.
-        let a = claude_weeks(&[("big", "20x", &[5.0, 6.0, 8.0, 6.0]), ("small", "5x", &[40.0; 4])], now);
-        assert_eq!(shares(&a), [("big", "small", 200.0)]);
-        // A smaller plan's use fits on a bigger one: Max 5x at 40% is 0.1 of a Max 20x.
-        let a = claude_weeks(&[("a", "20x", &[30.0; 4]), ("b", "5x", &[40.0; 4])], now);
-        assert_eq!(shares(&a), [("b", "a", 100.0)]);
+        // Across tiers nothing is shared, whichever plan could carry the other on paper: neither provider
+        // says how one tier's weekly percent compares with another's.
+        assert!(shares(&claude_weeks(&[("big", "20x", &[5.0, 6.0, 8.0, 6.0]), ("small", "5x", &[40.0; 4])], now)).is_empty());
+        assert!(shares(&claude_weeks(&[("a", "20x", &[30.0; 4]), ("b", "5x", &[40.0; 4])], now)).is_empty());
     }
 
     #[test]
@@ -793,8 +827,8 @@ mod tests {
     /// Advice followed: cancelled and shared plans gone, each kept plan carrying its guests' weeks, a
     /// downgraded one on its new tier with the same use. Claude Max plans with four equal weeks each.
     fn applied(fleet: &[(String, &'static str, f64)], a: &ProviderAdvice) -> Vec<(String, &'static str, f64)> {
-        let weight = |tier: &str| if tier == "20x" { 1.0 } else { 0.25 };
-        let tier_of = |plan: &str| if plan == "Max 20x" { "20x" } else { "5x" };
+        let weight = |tier: &str| match tier { "20x" => 1.0, "5x" => 0.25, _ => 0.05 };
+        let tier_of = |plan: &str| match plan { "Max 20x" => "20x", "Max 5x" => "5x", _ => "pro" };
         let mut out: Vec<(String, &'static str, f64)> = vec![];
         for (id, tier, peak) in fleet {
             if a.moves.iter().any(|m| &m.id == id && matches!(m.action, Action::Cancel | Action::Share)) { continue; }
@@ -827,13 +861,42 @@ mod tests {
                         checked += 1;
                         let next = build(&applied(&fleet, &first));
                         assert!(next.shortage.is_none(), "{fleet:?} → {:?} → {next:?}", first.moves);
-                        assert!(next.moves.iter().all(|m| m.action != Action::Share || first.moves.iter().all(|f| f.id != m.share.as_ref().unwrap().id || f.action == Action::Downgrade)),
-                            "a share is never undone: {fleet:?}");
+                        // Followed, the advice may find more to save (a downgrade can bring two plans to one tier),
+                        // but never cancels or shares away a plan it kept to carry others.
+                        let hosts: Vec<&str> = first.moves.iter().filter_map(|m| m.share.as_ref()).map(|s| s.id.as_str()).collect();
+                        assert!(next.moves.iter().all(|m| m.action == Action::Downgrade || !hosts.contains(&m.id.as_str())), "{fleet:?} → {:?} → {:?}", first.moves, next.moves);
                     }
                 }
             }
         }
         assert!(checked > 20, "the grid exercises advice ({checked})");
+    }
+
+    #[test]
+    fn a_codex_plan_kept_for_another_keeps_its_tier() {
+        // Pro 100's size beside Pro 200 is a price guess: the plan carrying both stays on Pro 200.
+        let now = at("2026-12-02T12:00:00Z");
+        let codex = |id: &str, peak: f64| (plan("codex", id, "pro", None, 1.0, now), history_of(&[peak; 4], now));
+        let a = advice_for("codex", vec![codex("a", 20.0), codex("b", 15.0)], now);
+        assert_eq!(a.moves.iter().map(|m| (m.id.as_str(), m.action)).collect::<Vec<_>>(), [("b", Action::Share)]);
+        assert_eq!(a.moves[0].share.as_ref().map(|s| s.plan.as_str()), Some("Pro 200"));
+    }
+
+    #[test]
+    fn many_plans_of_uneven_use_are_placed_one_at_a_time_and_still_fit() {
+        let now = at("2026-11-25T12:00:00Z");
+        let ids: Vec<String> = (0..12).map(|i| format!("p{i:02}")).collect();
+        let peaks = [40.0, 35.0, 30.0, 30.0, 25.0, 20.0, 15.0, 12.0, 10.0, 8.0, 6.0, 6.0];
+        let weeks: Vec<[f64; 4]> = peaks.iter().map(|p| [*p; 4]).collect();
+        let fleet: Vec<(&str, &str, &[f64])> = ids.iter().zip(&weeks).map(|(id, w)| (id.as_str(), "20x", &w[..])).collect();
+        let a = claude_weeks(&fleet, now);
+        // 2.37 plans of use, 2.84 with 20%: no fewer than three plans can carry it, and the greedy keeps few.
+        let kept = 12 - shares(&a).len();
+        assert!((3..=4).contains(&kept), "{kept} kept: {:?}", shares(&a));
+        assert!(a.capacity_after + 1e-9 >= a.floor.unwrap());
+        for m in a.moves.iter().filter(|m| m.action == Action::Share) {
+            assert!(m.share.as_ref().unwrap().combined_percent * 1.2 <= 100.0 + 1e-6, "{m:?}");
+        }
     }
 
     #[test]

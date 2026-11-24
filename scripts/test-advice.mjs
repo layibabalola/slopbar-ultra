@@ -43,7 +43,7 @@ test("a share names the plan to use, how full it gets, and the computers to swit
     "$200/month",
     "Mostly idle · busiest week 20%",
   ]);
-  assert.equal(lines[4], "together 50% of its Max 20x at their busiest · switch LAPTOP-2 to busy@example.invalid first · their 5-hour limit is shared too");
+  assert.equal(lines[4], "together 50% of its Max 20x at their busiest · switch LAPTOP-2 to busy@example.invalid first · their 5-hour limit is shared too (not checked)");
   // This PC is named while sharing is on, unnamed otherwise.
   assert.deepEqual(computersOn({ accounts: [account("x", { active: true })] }, "claude", "x"), ["DESK-1 (this PC)"]);
   setSharing({});
@@ -63,7 +63,7 @@ test("cancels and downgrades read as before, and nothing is left unescaped", () 
 test("the advisor card totals the moves, lists room for more use, and shows a shortage's cheapest fix", () => {
   const card = text(adviceCard({ advice: [advice({ moves: [move("light", "share", { share: { id: "busy", email: "busy@example.invalid", alias: "Busy", plan: "Max 20x", combined_percent: 50 } })],
     monthly_saving: 200, room: [{ id: "busy", email: "busy@example.invalid", alias: "Busy", plan: "Max 20x", busiest_percent: 50, free_percent: 33.33 }] })] }, { on, names, snapshot: { accounts: [] } }));
-  assert.ok(card.includes("Claude: 1 changes save $200/month"), card);
+  assert.ok(card.includes("Claude: save $200/month, changes: 1"), card);
   assert.ok(card.includes("Room for more use: Busy (about 33% of its plan free)"), card);
   assert.ok(card.includes("Use Busy instead, then cancel Max 20x ·"), card);
   const short = text(adviceCard({ advice: [advice({ capacity_now: 8, capacity_after: 8, spare_after: 0.03, spare_after_percent: 0.38, kept_for_capacity: 1,
@@ -76,6 +76,10 @@ test("the advisor card totals the moves, lists room for more use, and shows a sh
     fix: { action: "upgrade", id: "b", email: "b@example.invalid", alias: null, from: "Max 5x", to: "Max 20x", count: 1, monthly_cost: 100, capacity_after: 2 } } })] }, { on, names, snapshot: { accounts: [] } }));
   assert.ok(upgrade.includes("Claude: plans keep reaching their weekly limit with under 40% to spare (2 of them)"), upgrade);
   assert.ok(upgrade.includes("cheapest fix: move b@example.invalid from Max 5x to Max 20x, $100/month more"), upgrade);
+  // With too little history the shortage is against this week's use so far.
+  const thin = text(adviceCard({ advice: [advice({ evidence: "clear_only", weeks_used: 1, shortage: { cause: "over_capacity", shortfall: 0.2, exhausted: 0,
+    fix: { action: "add", id: null, email: null, alias: null, from: null, to: "Max 5x", count: 1, monthly_cost: 100, capacity_after: 1.25 } } })] }, { on, names, snapshot: { accounts: [] } }));
+  assert.ok(thin.includes("Claude: this week's use so far plus 20% needs 0.2 × Max 20x more than you hold"), thin);
   // A provider turned off is left out, and an empty report draws nothing.
   assert.equal(adviceCard({ advice: [advice()] }, { on: () => false, names, snapshot: null }), "");
   assert.equal(adviceCard({}, { on, names, snapshot: null }), "");
@@ -102,6 +106,12 @@ test("the computers card names each computer's busiest week and the groups that 
   assert.ok(text(machinesCard(waiting, { on, names })).includes("Groups show once two computers have 4 weeks measured (0 so far)."));
   const none = { machines: [{ ...report.machines[0], groups: [] }] };
   assert.ok(text(machinesCard(none, { on, names })).includes("No two computers fit one Max 20x with 20% to spare."));
+  // Enough weeks but not the latest one says so, not "5 of 4".
+  const latest = { machines: [{ ...report.machines[0], groups: [], computers: [computer("DESK-1", { here: true, measured: false, weeks: 5 })] }] };
+  assert.ok(text(machinesCard(latest, { on, names })).includes("last completed week not measured"));
+  // A computer whose use is partly uncounted is never grouped, so it does not count toward "no two fit".
+  const partial = { machines: [{ ...report.machines[0], groups: [], computers: [computer("DESK-1", { here: true }), computer("LAPTOP-2", { uncounted: true })] }] };
+  assert.ok(text(machinesCard(partial, { on, names })).includes("Groups show once two computers have 4 weeks measured (1 so far)."));
   assert.equal(machinesCard({ machines: [] }, { on, names }), "");
   assert.equal(machinesCard(report, { on: () => false, names }), "");
 });

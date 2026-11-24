@@ -60,6 +60,13 @@ pub struct AccountHistory {
     /// clock hour (the latest), for the sparklines in the flyout and Settings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trail: Vec<TrailPoint>,
+    /// The plan last seen on the account (`plan_label`), and when it changed to it: weeks before
+    /// that are shares of another tier's allowance. None while it has not changed since SlopBar
+    /// first noted the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_since: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -133,6 +140,10 @@ fn save_to(path: &std::path::Path, history: &History) -> Result<(), String> {
 pub fn observe(h: &mut AccountHistory, acc: &AccountUsage, now: DateTime<Utc>) {
     if acc.stale || acc.error.is_some() { return; }
     h.first_seen.get_or_insert(now);
+    if let Some(label) = plan_label(acc) {
+        if h.plan.as_ref().is_some_and(|p| *p != label) { h.plan_since = Some(now); }
+        h.plan = Some(label);
+    }
     if let Some(balance) = acc.credits.as_deref().and_then(parse_balance) { note_credits(h, balance, now); }
     note_trail(h, acc, now);
     for w in &acc.windows {
@@ -989,39 +1000,44 @@ const END_READ_SECONDS: i64 = 12 * 3600;
 /// Never ran out: in every one of its busiest recent weeks (`busiest`, model caps included) the
 /// account stayed under its limits, whichever computers its use came from, and there are enough
 /// weeks to go on: `assess`'s high confidence (the latest `RECENT` completed weeks, watched for most
-/// of their hours), and at least `RECENT` of the latest `POOL_WEEKS` weeks read within
-/// `END_READ_SECONDS` of their reset, so a week whose end went unread cannot pass for a light one.
-/// Only such accounts are paired by the plan advisor. `h` must be the history SlopBar polled
-/// itself, without weeks from this PC's Codex rollouts.
+/// of their hours), and at least `RECENT` distinct weeks among the latest `POOL_WEEKS` whose end was
+/// read within `END_READ_SECONDS` of their reset (idle stretches end when use begins, so they are
+/// no evidence), so a week whose end went unread cannot pass for a light one. Any reading at a limit
+/// in those weeks, however briefly watched, ends it, and so does a change of plan within them (their
+/// shares were of another allowance). Only such accounts are paired by the plan advisor. `h` must
+/// be the history SlopBar polled itself, without weeks from this PC's Codex rollouts.
 pub(crate) fn room(h: &AccountHistory, busiest: &[(String, f64)], now: DateTime<Utc>) -> bool {
     let since = now - chrono::Duration::weeks(POOL_WEEKS as i64);
-    let ends_read = h.windows.iter()
-        .filter(|r| r.kind == "weekly" && !r.local && r.resets_at <= now && r.resets_at > since && r.counts()
+    let ends_read: BTreeSet<NaiveDate> = h.windows.iter()
+        .filter(|r| r.kind == "weekly" && !r.local && !r.idle && r.resets_at <= now && r.resets_at > since && r.counts()
             && (r.resets_at - r.last_obs).num_seconds() <= END_READ_SECONDS)
-        .count();
-    assess(h, now).confidence == Confidence::High && ends_read >= RECENT
+        .map(|r| monday((r.resets_at - chrono::Duration::seconds(1)).date_naive()))
+        .collect();
+    let limited = h.windows.iter().any(|r| KINDS.contains(&r.kind.as_str()) && r.resets_at > since && r.hit_limit());
+    assess(h, now).confidence == Confidence::High && ends_read.len() >= RECENT && !limited
+        && h.plan_since.is_none_or(|t| t <= since)
         && !busiest.is_empty() && busiest.iter().all(|(_, p)| *p < LIMIT_PERCENT)
 }
 
-/// Sets each account's `room_to_share`: it never ran out (`room`), and its busiest recent weeks,
-/// or the week in progress at its pace once `PACE_DAYS` have passed, leave the 20% spare every
-/// share keeps (`POOL_BUFFER`) in every weekly limit. The computers on such an account share it
-/// within its limits; an account that came close to a limit is no planned share, however many
-/// weeks it never quite ran out.
+/// Sets each account's `room_to_share`: it never ran out (`room`), its busiest recent weeks, or the
+/// week in progress at its pace once `PACE_DAYS` have passed, leave the 20% spare every share keeps
+/// (`POOL_BUFFER`) in every weekly limit, and this week is not forecast to run out before its reset
+/// (`runs_out_at`, set just before). The computers on such an account share it within its limits;
+/// one that came close to a limit, or is running out now, is no planned share.
 pub fn attach_room(snapshot: &mut Snapshot, history: &History, now: DateTime<Utc>) {
     for acc in snapshot.accounts.iter_mut() {
-        acc.room_to_share = history.accounts.get(&history_key(acc.provider, &acc.id)).is_some_and(|h| {
+        acc.room_to_share = acc.runs_out_at.is_none() && history.accounts.get(&history_key(acc.provider, &acc.id)).is_some_and(|h| {
             let basis = ShareBasis::of(acc, h, now);
             basis.room && basis.load().iter().all(|(_, p)| p * (1.0 + POOL_BUFFER) <= 100.0 + 1e-9)
         });
     }
 }
 
-/// The week in progress for each weekly window kind of a fresh reading, in percent: its use so
-/// far, or its pace (use over the share of the week gone) once `PACE_DAYS` have passed when that
-/// is higher. Empty for a stale or failed reading, which says nothing about this week.
+/// The week in progress for each weekly window kind, in percent: its use so far, or its pace (use
+/// over the share of the week gone) once `PACE_DAYS` have passed when that is higher. A stale or
+/// failed reading keeps its last windows, read when they were (`fetched_at`): they are the least
+/// this week has used, and a share must not look roomier for a reading that failed.
 fn live_weeks(acc: &AccountUsage, now: DateTime<Utc>) -> Vec<(String, f64)> {
-    if acc.stale || acc.error.is_some() { return vec![]; }
     let read_at = acc.fetched_at.unwrap_or(now).min(now);
     acc.windows.iter()
         .filter(|w| KINDS.contains(&w.kind.as_str()) && w.window_seconds.is_none_or(|s| s == WEEK_SECONDS))
@@ -1813,6 +1829,39 @@ mod tests {
         assert!(room(&h, &busiest(&h, false, now), now));
         for r in h.windows.iter_mut().skip(2) { r.last_obs = r.resets_at - days(2); }
         assert!(!room(&h, &busiest(&h, false, now), now), "two of five ends read");
+        // Idle stretches end when use begins, so their end is always "read": they are no evidence.
+        let (mut h, now) = weeks(&[20.0; 5], 100);
+        for r in h.windows.iter_mut().skip(2) { r.last_obs = r.resets_at - days(2); }
+        for i in 0..3 {
+            let end = now - Duration::hours(1) - days(7 * i) - days(3);
+            h.windows.push(WindowRecord { kind: "weekly".into(), resets_at: end, peak: 0.0, first_obs: end - days(3), last_obs: end,
+                hours: 72, days: 3, idle: true, local: false });
+        }
+        assert!(!room(&h, &busiest(&h, false, now), now), "idle stretches do not stand in for unread week ends");
+        // A reading at a limit ends room, however briefly the week was watched.
+        let (mut h, now) = weeks(&[20.0; 5], 100);
+        let end = now - Duration::hours(1) - days(21);
+        h.windows.push(WindowRecord { kind: "weekly_sonnet".into(), resets_at: end, peak: 100.0, first_obs: end - Duration::hours(2), last_obs: end - Duration::hours(1),
+            hours: 2, days: 1, idle: false, local: false });
+        assert!(!room(&h, &busiest(&h, false, now), now), "a glimpse at a limit is proof enough");
+    }
+
+    #[test]
+    fn a_change_of_plan_leaves_no_room_until_its_weeks_are_on_the_new_plan() {
+        let (mut h, now) = weeks(&[20.0; 5], 100);
+        // A history from before SlopBar noted plans.
+        h.plan = None;
+        // Noted on Max 20x, then read on Max 5x: its weeks were shares of the bigger allowance.
+        let read = |tier: &str| AccountUsage { billing: BillingHints { tier: Some(format!("default_claude_max_{tier}")), ..Default::default() },
+            plan: Some("max".into()), fetched_at: Some(now), ..reading("weekly", 10.0, now + days(3)) };
+        observe(&mut h, &read("20x"), now - days(60));
+        assert_eq!((h.plan.as_deref(), h.plan_since), (Some("Max 20x"), None), "the first plan noted is no change");
+        assert!(room(&h, &busiest(&h, false, now), now));
+        observe(&mut h, &read("5x"), now - days(2));
+        assert_eq!((h.plan.as_deref(), h.plan_since), (Some("Max 5x"), Some(now - days(2))));
+        assert!(!room(&h, &busiest(&h, false, now), now));
+        // Eight weeks on, the change is behind every week that counts.
+        assert!(h.plan_since.is_some_and(|t| t <= now + days(56) - chrono::Duration::weeks(POOL_WEEKS as i64)));
     }
 
     #[test]
@@ -1840,10 +1889,11 @@ mod tests {
         // Four days in, 40% is a pace of 70%.
         let acc = AccountUsage { fetched_at: Some(now), ..reading("weekly", 40.0, now + days(3)) };
         assert_eq!(live_weeks(&acc, now), weekly(70.0));
-        // A stale reading says nothing about this week; the busiest week still counts.
+        // A stale reading keeps its last windows: the least this week has used, never nothing.
         let stale = live_weeks(&AccountUsage { stale: true, ..acc.clone() }, now);
-        assert_eq!(ShareBasis { busiest: weekly(50.0), live: stale, ..Default::default() }.load(), weekly(50.0));
+        assert_eq!(ShareBasis { busiest: weekly(50.0), live: stale, ..Default::default() }.load(), weekly(70.0));
         assert_eq!(ShareBasis { busiest: weekly(50.0), live: live_weeks(&acc, now), ..Default::default() }.load(), weekly(70.0));
+        assert_eq!(ShareBasis { busiest: weekly(50.0), live: vec![], ..Default::default() }.load(), weekly(50.0));
         // A window whose reset has passed belongs to the next reading.
         let passed = AccountUsage { fetched_at: Some(now), ..reading("weekly", 40.0, now - Duration::minutes(1)) };
         assert!(live_weeks(&passed, now).is_empty());
@@ -1870,6 +1920,14 @@ mod tests {
         let mut busy = Snapshot { accounts: vec![read("a1", 50.0, days(3))], updated_at: Some(now) };
         attach_room(&mut busy, &history, now);
         assert!(!busy.accounts[0].room_to_share);
+        // Forecast to run out before its reset: no planned share, whatever its weeks.
+        let mut running_out = Snapshot { accounts: vec![AccountUsage { runs_out_at: Some(now + days(1)), ..read("a1", 10.0, days(3)) }], updated_at: Some(now) };
+        attach_room(&mut running_out, &history, now);
+        assert!(!running_out.accounts[0].room_to_share);
+        // A failed reading is judged on its last windows, not as a week with nothing used.
+        let mut failed = Snapshot { accounts: vec![AccountUsage { stale: true, error: Some("http_429".into()), ..read("a1", 50.0, days(3)) }], updated_at: Some(now) };
+        attach_room(&mut failed, &history, now);
+        assert!(!failed.accounts[0].room_to_share);
     }
 
     #[test]
