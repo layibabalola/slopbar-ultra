@@ -3687,6 +3687,14 @@ fn set_panel_height(app: AppHandle, height: f64) {
     *app.state::<AppState>().panel_height.lock().unwrap() = height;
     panel::page_ready();
     panel::place(&app);
+    panel::keep_drawn(&app);
+}
+
+/// The flyout's page has drawn a frame since the app asked it to, for request `ask`
+/// (`panel::warm`).
+#[tauri::command]
+fn panel_drawn(ask: u64) {
+    panel::drawn(ask);
 }
 
 #[tauri::command]
@@ -3700,7 +3708,11 @@ pub(crate) fn dock_clicked(app: AppHandle) {
     if let Some(anchor) = dock::anchor(&app) {
         *app.state::<AppState>().panel_anchor.lock().unwrap() = Some(anchor);
     }
-    panel::toggle(&app);
+    // On the main thread, where the flyout's building and off-screen drawing end (`panel`), so a
+    // click never falls between their checks. The native widget's clicks come from a thread of its
+    // own; the web widget's are on the main thread already, and run at once.
+    let h = app.clone();
+    let _ = app.run_on_main_thread(move || panel::toggle(&h));
 }
 
 /// The Windows accent color as WinUI uses it on light and dark backgrounds
@@ -5835,6 +5847,7 @@ pub fn run() {
             open_settings,
             take_settings_page,
             set_panel_height,
+            panel_drawn,
             set_menu_labels,
             switch_account,
             add_account,
