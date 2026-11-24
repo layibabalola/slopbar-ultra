@@ -6,7 +6,8 @@ was written, and hashed account ids with where each account is signed in. While 
 shared (`share_readings`, on by default), it also holds each computer's weekly use, as a share of
 a plan: per provider and weekly limit, that computer's busiest 7 days and the 8 days to today in
 plans of the provider's largest common tier (rounded up to 0.01 plan), how many weeks it was
-measured and whether some use could not be counted, never an account code or id (`load`, see
+measured, whether some use could not be counted and which plan tiers that use was on (for example
+"Max 20x"), never an account code or id (`load`, see
 `src-tauri/src/machine_load.rs`). Readers take the `load` as raw JSON and read it on its own, so
 one they cannot read is dropped, never the record. It never holds emails, tokens or organization
 names. See `src-tauri/src/presence.rs`.

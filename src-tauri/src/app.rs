@@ -424,12 +424,12 @@ fn machine_advice(state: &AppState, snapshot: &Snapshot, settings: &settings::Se
 
 /// Notes accounts in use here at `at` for this computer's own use (`machine_load::mark`): one
 /// switched to or from, leased or released, is charged though the next refresh finds it no
-/// longer in use. Saved at once, so a restart before that refresh (an update's) keeps it; under the
-/// ledger's lock, so no older copy is written over it.
+/// longer in use. Saved at once when a mark moved, so a restart before that refresh (an update's)
+/// keeps it; under the ledger's lock, so no older copy is written over it.
 fn mark_in_use(state: &AppState, accounts: &[(Provider, String)], at: chrono::DateTime<chrono::Utc>) {
     let saved = {
         let mut ledger = state.machine_ledger.lock().unwrap();
-        machine_load::mark(&mut ledger, accounts, at);
+        if !machine_load::mark(&mut ledger, accounts, at) { return; }
         machine_load::save(&ledger)
     };
     if saved.is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::MachineLoadSave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
@@ -3062,10 +3062,16 @@ async fn leases_changed(app: &AppHandle) {
 /// Ends expired leases and those whose process exited.
 async fn prune_leases(app: &AppHandle) {
     let state = app.state::<AppState>();
-    // Leased until now, whichever end: charged to this computer (`mark_in_use`).
-    let leased = state.leases.lock().unwrap().accounts();
-    mark_in_use(&state, &leased, chrono::Utc::now());
-    let ended = state.leases.lock().unwrap().prune(chrono::Utc::now(), leases::process_alive);
+    let (ended, gone) = {
+        let mut held = state.leases.lock().unwrap();
+        let before = held.accounts();
+        let ended = held.prune(chrono::Utc::now(), leases::process_alive);
+        let after = held.accounts();
+        (ended, before.into_iter().filter(|a| !after.contains(a)).collect::<Vec<_>>())
+    };
+    // Leased until now, then ended: charged to this computer (`mark_in_use`). Those still leased
+    // are in use at every refresh; a call that ended none writes nothing.
+    if !gone.is_empty() { mark_in_use(&state, &gone, chrono::Utc::now()); }
     if ended { leases_changed(app).await; }
 }
 

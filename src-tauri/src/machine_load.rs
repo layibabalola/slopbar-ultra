@@ -17,7 +17,8 @@
 //! up, over any 8 UTC days in a row: any 7 days lie within 8, so a burst across two windows (one
 //! account's weeks, or accounts used in turn) counts whole, overstated by a day at most. That
 //! `Load` goes out in the computer's presence record (`presence::Presence::load`) while readings are
-//! shared: totals only, never an account code or id. The other computers' loads are remembered
+//! shared: totals and the plan tiers they were on, never an account code or id. The other
+//! computers' loads are remembered
 //! (`Peers`), and `advise` groups the computers measured long enough into the fewest plans that
 //! carry them with 20% to spare.
 
@@ -70,6 +71,8 @@ const NAME_MAX: usize = 63;
 /// `SEAT_MAX` characters (a presence code has 32).
 const SEATS_MAX: usize = 64;
 const SEAT_MAX: usize = 64;
+/// A peer's load names at most this many tiers per provider (each provider has four).
+const TIERS_MAX: usize = 8;
 
 // ---------------------------------------------------------------------------------------------
 // The ledger: this computer's windows, accounts in use, refresh days and uncounted days
@@ -91,9 +94,9 @@ pub struct Ledger {
     /// The accounts in use on the UTC day being watched and whether each had a reading that day:
     /// one in use whose readings fail all day leaves that day pending (`Pending`).
     pub today: Option<Watch>,
-    /// Days an account in use had no fresh reading, until a later one of the window it had running
-    /// shows that day's use (readings add up within a window) or the window resets unread, which
-    /// leaves the day a gap. Uncounted meanwhile.
+    /// Days an account in use had no fresh reading, until one of the window it had running on the
+    /// next UTC day shows that day's use (readings add up within a window); with none that day, or
+    /// the window reset first, the day is a gap (`resolve`). Uncounted meanwhile.
     pub pending: Vec<Pending>,
     /// The latest reset of a window left out of the file to keep it within `MAX_FILE`: use until
     /// then may be missing.
@@ -108,7 +111,7 @@ pub struct Watch {
 }
 
 /// A day account `key` was in use without one fresh reading, waiting for a fresh reading of the
-/// window it had running then (the one resetting first, at `until`) on a later day before it resets.
+/// window it had running then (the one resetting first, at `until`) on the next UTC day.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pending {
     pub key: String,
@@ -279,16 +282,21 @@ fn stored_percent(p: f64) -> f64 {
 /// Notes that these accounts were in use here at `at`: an account switched to or from, leased or
 /// released, or found in use by the last refresh. The next `observe` charges the window of each
 /// that `at` falls in, though it is no longer in use by then: an account used and left between two
-/// refreshes is charged all the same.
-pub fn mark(ledger: &mut Ledger, accounts: &[(Provider, String)], at: DateTime<Utc>) {
+/// refreshes is charged all the same. Whether any account's last time in use moved.
+pub fn mark(ledger: &mut Ledger, accounts: &[(Provider, String)], at: DateTime<Utc>) -> bool {
+    let mut moved = false;
     for (provider, id) in accounts {
-        mark_key(ledger, &account_key(*provider, id), at);
+        moved |= mark_key(ledger, &account_key(*provider, id), at);
     }
+    moved
 }
 
-fn mark_key(ledger: &mut Ledger, key: &str, at: DateTime<Utc>) {
-    let last = ledger.used.entry(key.to_string()).or_insert(at);
-    *last = (*last).max(at);
+fn mark_key(ledger: &mut Ledger, key: &str, at: DateTime<Utc>) -> bool {
+    match ledger.used.get_mut(key) {
+        Some(last) if *last >= at => false,
+        Some(last) => { *last = at; true }
+        None => { ledger.used.insert(key.to_string(), at); true }
+    }
 }
 
 fn gap(ledger: &mut Ledger, provider: Provider, day: NaiveDate) {
@@ -314,16 +322,20 @@ fn close_watch(ledger: &mut Ledger, today: NaiveDate) {
     }
 }
 
-/// A fresh reading of account `key` taken at `at` with these windows: the days pending on a window
-/// it shows, before its reset and on a later day, are resolved, since its use since adds up in it.
+/// A fresh reading of account `key` taken at `at` with these windows: a day pending on a window it
+/// shows, before its reset, is resolved when the reading is from the next UTC day. That day's use
+/// then counts on the day after, a shift of one day, which a span of `SPAN_DAYS` (one more than a
+/// week) still holds; a later reading would move it further than a span reaches, so a computer
+/// could read light.
 fn resolve(ledger: &mut Ledger, key: &str, windows: &[crate::model::UsageWindow], at: DateTime<Utc>) {
-    ledger.pending.retain(|p| !(p.key == key && at.date_naive() > p.day && at < p.until
+    ledger.pending.retain(|p| !(p.key == key && at.date_naive() == p.day + Duration::days(1) && at < p.until
         && windows.iter().any(|w| KINDS.contains(&w.kind.as_str()) && w.resets_at.is_some_and(|r| (r - p.until).num_seconds().abs() < SAME_WINDOW_SECONDS))));
 }
 
-/// Days still pending once their window has reset unread stay gaps.
+/// Days still pending once the next UTC day is over, or their window has reset unread, stay gaps.
 fn expire_pending(ledger: &mut Ledger, now: DateTime<Utc>) {
-    let (expired, waiting): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut ledger.pending).into_iter().partition(|p| p.until <= now);
+    let (expired, waiting): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut ledger.pending).into_iter()
+        .partition(|p| p.until <= now || now.date_naive() > p.day + Duration::days(1));
     ledger.pending = waiting;
     for p in expired {
         if let Some((provider, _)) = parse_key(&p.key) { gap(ledger, provider, p.day); }
@@ -351,8 +363,8 @@ fn weekly(w: &crate::model::UsageWindow) -> bool {
 /// desktop app here signed in to an account SlopBar does not have (`unseen`, from
 /// `desktop_apps::unseen`, whatever the CLI here), an account in use with limits of another length
 /// than a week, or one whose fresh reading has no weekly limit at all. An account in use whose
-/// readings fail all day leaves the day pending (`close_watch`) until a later fresh reading of its
-/// window resolves it.
+/// readings fail all day leaves the day pending (`close_watch`) until a fresh reading of its window
+/// on the next day resolves it (`resolve`).
 pub fn observe(ledger: &mut Ledger, snapshot: &Snapshot, wanted: &[(Provider, String)], unseen: &[Provider], providers: &Providers, now: DateTime<Utc>) {
     ledger.version = VERSION;
     let today = now.date_naive();
@@ -447,7 +459,7 @@ fn prune(ledger: &mut Ledger, now: DateTime<Utc>) {
 
 /// A computer's use as its presence record carries it (`presence::Presence::load`): per provider,
 /// totals only, in plans of the provider's reference plan (`subscriptions::reference_plan`, weight
-/// 1), rounded up to 0.01 plan; never an account code or id.
+/// 1), rounded up to 0.01 plan, and the plan tiers they were on; never an account code or id.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Load {
     pub v: u32,
@@ -464,6 +476,10 @@ pub struct ProviderLoad {
     pub busiest: BTreeMap<String, f64>,
     /// The same for the 8 days to today, the windows still running at their pace.
     pub live: BTreeMap<String, f64>,
+    /// The plan tiers its windows in the lookback were charged at, by name (`plan_label`): those
+    /// with a known weight only (`subscriptions::tier_of`). Use on tiers of more than one size
+    /// rests on their assumed sizes (`MachineAdvice::mixed`).
+    pub tiers: BTreeSet<String>,
     /// Measured weeks among the latest `LOOK_WEEKS` completed ones (`evidence`).
     pub weeks: u8,
     pub measured: bool,
@@ -490,8 +506,8 @@ impl Load {
         let at = raw.get("at")?.as_str()?.parse::<DateTime<Utc>>().ok()?;
         let mut providers = BTreeMap::new();
         for (key, entry) in raw.get("providers").and_then(|p| p.as_object()).into_iter().flatten() {
-            if !Provider::ALL.iter().any(|p| p.key() == key) { continue; }
-            if let Some(entry) = provider_entry(entry) { providers.insert(key.clone(), entry); }
+            let Some(provider) = Provider::ALL.into_iter().find(|p| p.key() == key) else { continue };
+            if let Some(entry) = provider_entry(provider, entry) { providers.insert(key.clone(), entry); }
         }
         Some(Load { v: LOAD_VERSION, at, providers })
     }
@@ -500,8 +516,10 @@ impl Load {
 /// One provider's entry of a peer's load, or None when it says nothing to rely on: no `busiest`
 /// object, a `live` that is not one, or a known kind whose value is not a number of plans (0 or
 /// more). Kinds this SlopBar does not know are left out. Without a `measured` it is not measured,
-/// and without an `uncounted` some of its use is taken as uncounted.
-fn provider_entry(entry: &serde_json::Value) -> Option<ProviderLoad> {
+/// and without an `uncounted` some of its use is taken as uncounted. Without `tiers` as a list of
+/// the provider's tiers of known weight (`subscriptions::tier_weight`), what its use was weighed by
+/// is not known either: uncounted.
+fn provider_entry(provider: Provider, entry: &serde_json::Value) -> Option<ProviderLoad> {
     let entry = entry.as_object()?;
     let kinds = |field: &str, required: bool| -> Option<BTreeMap<String, f64>> {
         let Some(map) = entry.get(field) else { return (!required).then(BTreeMap::new) };
@@ -512,12 +530,15 @@ fn provider_entry(entry: &serde_json::Value) -> Option<ProviderLoad> {
         }
         Some(out)
     };
+    let tiers: Option<BTreeSet<String>> = entry.get("tiers").and_then(|t| t.as_array()).filter(|t| t.len() <= TIERS_MAX)
+        .and_then(|t| t.iter().map(|v| v.as_str().filter(|l| subscriptions::tier_weight(provider, l).is_some()).map(String::from)).collect());
     Some(ProviderLoad {
         busiest: kinds("busiest", true)?,
         live: kinds("live", false)?,
         weeks: entry.get("weeks").and_then(|w| w.as_u64()).map_or(0, |w| w.min(LOOK_WEEKS as u64) as u8),
         measured: entry.get("measured").and_then(|m| m.as_bool()).unwrap_or(false),
-        uncounted: entry.get("uncounted").and_then(|m| m.as_bool()).unwrap_or(true),
+        uncounted: entry.get("uncounted").and_then(|m| m.as_bool()).unwrap_or(true) || tiers.is_none(),
+        tiers: tiers.unwrap_or_default(),
     })
 }
 
@@ -558,7 +579,8 @@ fn provider_load(ledger: &Ledger, provider: Provider, now: DateTime<Utc>) -> Pro
     let gaps = ledger.gaps.get(provider.key()).is_some_and(|g| g.range(first..).next().is_some())
         || ledger.pending.iter().any(|p| p.day >= first && parse_key(&p.key).is_some_and(|(q, _)| q == provider));
     let trimmed = ledger.trimmed.is_some_and(|t| t.date_naive() >= first);
-    let mut out = ProviderLoad { uncounted: gaps || trimmed || mine.iter().any(|t| t.weight.is_none()), ..Default::default() };
+    let tiers = mine.iter().filter_map(|t| subscriptions::tier_of(provider, t.weight?)).map(String::from).collect();
+    let mut out = ProviderLoad { uncounted: gaps || trimmed || mine.iter().any(|t| t.weight.is_none()), tiers, ..Default::default() };
     for kind in KINDS {
         let of_kind: Vec<&Touched> = mine.iter().copied().filter(|t| t.kind == kind).collect();
         if of_kind.is_empty() { continue; }
@@ -695,10 +717,11 @@ pub struct MachineAdvice {
     pub unit: String,
     /// Measured weeks a computer needs (`WEEKS_NEEDED`).
     pub weeks_needed: u8,
-    /// The user holds paid plans of more than one tier of the provider: use on a smaller tier counts
-    /// in plans of the larger by `subscriptions::plan_weight`, which the providers' own figures do
-    /// not settle (Anthropic's weekly hours put a Max 5x nearer 0.6 of a Max 20x than 0.25), so
-    /// such a computer could read light. The computers are listed and no group is formed.
+    /// The provider's plans in play are of more than one tier (`mixed`: those held here and those any
+    /// computer's use was charged at): use on a smaller tier counts in plans of the larger by
+    /// `subscriptions::plan_weight`, which the providers' own figures do not settle (Anthropic's
+    /// weekly hours put a Max 5x nearer 0.6 of a Max 20x than 0.25), so such a computer could read
+    /// light. The computers are listed and no group is formed.
     pub mixed: bool,
     /// This computer first, then the others by name.
     pub computers: Vec<Computer>,
@@ -759,9 +782,9 @@ struct Named<'a> {
     seats: Vec<(Provider, String)>,
 }
 
-/// Loads of one name added up for a provider: each kind's busiest and live summed, the fewest
-/// weeks, measured only if every one is, uncounted if any is or any record has no load for it.
-/// None when none has.
+/// Loads of one name added up for a provider: each kind's busiest and live summed, every tier,
+/// the fewest weeks, measured only if every one is, uncounted if any is or any record has no load
+/// for it. None when none has.
 fn merged(parts: &[Option<&ProviderLoad>]) -> Option<ProviderLoad> {
     if let [Some(one)] = parts { return Some((*one).clone()); }
     let known: Vec<&ProviderLoad> = parts.iter().flatten().copied().collect();
@@ -775,6 +798,7 @@ fn merged(parts: &[Option<&ProviderLoad>]) -> Option<ProviderLoad> {
     Some(ProviderLoad {
         busiest: sum(&|l| &l.busiest),
         live: sum(&|l| &l.live),
+        tiers: known.iter().flat_map(|l| l.tiers.iter().cloned()).collect(),
         weeks: known.iter().map(|l| l.weeks).min().unwrap_or(0),
         measured: !unknown && known.iter().all(|l| l.measured),
         uncounted: unknown || known.iter().any(|l| l.uncounted),
@@ -820,7 +844,7 @@ pub fn advise(own: &Load, here: &str, peers: &Peers, accounts: &[AccountUsage], 
         if !loads.iter().flatten().any(|l| l.busiest.values().any(|v| *v > 0.0)) { continue; }
         let seats: Vec<Vec<&String>> = named.iter().map(|n| n.seats.iter().filter(|(p, _)| *p == provider).map(|(_, h)| h).collect()).collect();
         let (unit, weight) = unit(provider, accounts, settings, now);
-        let mixed = mixed(provider, accounts);
+        let mixed = mixed(provider, accounts, &loads);
         // Each computer's use per kind, in plans of `unit`.
         let shares = |of: &BTreeMap<String, f64>| -> Vec<f64> { KINDS.iter().map(|k| of.get(*k).copied().unwrap_or(0.0) / weight).collect() };
         let fits_one = |loads: &[f64]| loads.iter().all(|v| v * (1.0 + POOL_BUFFER) <= 1.0 + 1e-9);
@@ -862,14 +886,18 @@ pub fn advise(own: &Load, here: &str, peers: &Peers, accounts: &[AccountUsage], 
     out
 }
 
-/// Whether the user holds the provider's paid plans (`subscriptions::PlanKind::Personal`) of more
-/// than one tier (`subscriptions::plan_label`): their sizes, compared by `plan_weight`, are an
-/// assumption the providers' own figures do not settle (`MachineAdvice::mixed`).
-fn mixed(provider: Provider, accounts: &[AccountUsage]) -> bool {
-    let tiers: BTreeSet<String> = accounts.iter()
+/// Whether the provider's plans in play are of more than one tier: the paid plans held here
+/// (`subscriptions::PlanKind::Personal`) and the tiers every computer's use was charged at
+/// (`ProviderLoad::tiers`, this computer's own included), tiers of known weight only. Their sizes,
+/// compared by `plan_weight`, are an assumption the providers' own figures do not settle
+/// (`MachineAdvice::mixed`). A plan of unknown weight ("Max" with no size) is no tier here: use on
+/// one is uncounted already.
+fn mixed(provider: Provider, accounts: &[AccountUsage], loads: &[Option<ProviderLoad>]) -> bool {
+    let held = accounts.iter()
         .filter(|a| a.provider == provider && subscriptions::plan_kind(a.plan.as_deref()) == subscriptions::PlanKind::Personal)
-        .filter_map(subscriptions::plan_label).collect();
-    tiers.len() > 1
+        .filter_map(|a| subscriptions::plan_label(a).filter(|l| subscriptions::tier_weight(provider, l).is_some()));
+    let charged = loads.iter().flatten().flat_map(|l| l.tiers.iter().cloned());
+    held.chain(charged).collect::<BTreeSet<String>>().len() > 1
 }
 
 /// Whether `members` added up, plus `POOL_BUFFER`, fit one plan in every weekly limit.
@@ -1067,6 +1095,13 @@ mod tests {
         let next = first + Duration::minutes(5);
         refresh(&mut l, vec![read(&x, 10.0, end, true, next), read(&y, 45.0, end, false, next)], next);
         assert_eq!(weekly(&load_of(&l, Provider::Claude, next)).0, Some(0.55), "x's 10% and all of y's 45%");
+        // A mark says whether it moved anything, so the app saves only then.
+        let mut m = Ledger::default();
+        let y_key = || vec![(Provider::Claude, "y".to_string())];
+        assert!(mark(&mut m, &y_key(), first));
+        assert!(!mark(&mut m, &y_key(), first) && !mark(&mut m, &y_key(), first - hours(1)) && !mark(&mut m, &[], first + hours(2)),
+            "the same time, an earlier one, or nothing");
+        assert!(mark(&mut m, &y_key(), first + Duration::minutes(1)));
         // A mark from before a window began is not in it, and once no window can hold it, it goes.
         let mut l = Ledger::default();
         mark(&mut l, &[(Provider::Claude, "y".into())], first - days(8));
@@ -1221,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn a_day_whose_readings_failed_is_resolved_by_a_later_reading_of_its_window() {
+    fn a_day_whose_readings_failed_is_resolved_by_a_reading_of_its_window_the_next_day() {
         let (x, end) = (max20("x"), at("2026-11-26T00:00:00Z"));
         let now = at("2026-11-23T10:00:00Z");
         let uncounted = |l: &Ledger, when: DateTime<Utc>| load_of(l, Provider::Claude, when).uncounted;
@@ -1232,19 +1267,35 @@ mod tests {
         refresh(&mut l, vec![failing.clone()], now);
         refresh(&mut l, vec![failing.clone()], now + hours(6));
         assert!(!uncounted(&l, now + hours(6)), "the day is not over");
-        // Next day, still failing: that day is pending on the window, and uncounted meanwhile.
+        // A fresh reading of that window the next day holds the day's use, a day late: resolved.
+        let mut next = l.clone();
+        refresh(&mut next, vec![read(&x, 30.0, end, true, now + days(1))], now + days(1));
+        assert!(next.pending.is_empty() && next.gaps.is_empty() && !uncounted(&next, now + days(1)));
+        // Still failing the next day: the day is pending on the window, uncounted meanwhile.
         refresh(&mut l, vec![failing.clone()], now + days(1));
         assert_eq!(l.pending, [Pending { key: account_key(Provider::Claude, "x"), day: now.date_naive(), until: end }]);
         assert!(uncounted(&l, now + days(1)));
-        // A fresh reading of that window before it resets holds those days' use: resolved, both.
-        let mut resolved = l.clone();
-        refresh(&mut resolved, vec![read(&x, 30.0, end, true, now + days(2))], now + days(2));
-        assert!(resolved.pending.is_empty() && resolved.gaps.is_empty() && !uncounted(&resolved, now + days(2)));
+        // A reading the day after resolves only the day before it: the first day, two days back,
+        // would move further than a span reaches, and stays a gap.
+        let mut later = l.clone();
+        refresh(&mut later, vec![read(&x, 30.0, end, true, now + days(2))], now + days(2));
+        assert!(later.pending.is_empty() && uncounted(&later, now + days(2)));
+        assert_eq!(later.gaps["claude"].iter().copied().collect::<Vec<_>>(), [now.date_naive()]);
+        // No refresh at all the next day (asleep): a gap.
+        let mut asleep = Ledger::default();
+        refresh(&mut asleep, vec![failing.clone()], now);
+        refresh(&mut asleep, vec![read(&x, 30.0, end, true, now + days(2))], now + days(2));
+        assert_eq!(asleep.gaps["claude"].iter().copied().collect::<Vec<_>>(), [now.date_naive()]);
         // Never read again before it reset: those days stay gaps.
         refresh(&mut l, vec![read(&x, 5.0, end + days(7), true, end + hours(10))], end + hours(10));
         assert!(l.pending.is_empty());
         assert_eq!(l.gaps["claude"].iter().copied().collect::<Vec<_>>(), [now.date_naive(), now.date_naive() + days(1)]);
         assert!(uncounted(&l, end + hours(10)));
+        // Its window resetting before the next day's reading: a gap.
+        let mut reset = Ledger::default();
+        refresh(&mut reset, vec![AccountUsage { stale: true, error: Some("http_500".into()), ..read(&x, 10.0, end, true, end - hours(20)) }], end - hours(14));
+        refresh(&mut reset, vec![read(&x, 5.0, end + days(7), true, end + hours(10))], end + hours(10));
+        assert_eq!(reset.gaps["claude"].iter().copied().collect::<Vec<_>>(), [(end - hours(14)).date_naive()]);
         // One good reading on the day is enough; with no window known running, the day is a gap at once.
         let mut l = Ledger::default();
         refresh(&mut l, vec![failing.clone()], now);
@@ -1255,6 +1306,39 @@ mod tests {
         refresh(&mut l, vec![AccountUsage { windows: vec![], ..failing.clone() }], now);
         refresh(&mut l, vec![read(&x, 12.0, end, true, now + days(1))], now + days(1));
         assert!(l.pending.is_empty() && l.gaps["claude"].contains(&now.date_naive()));
+    }
+
+    /// Review round 3's case: x in use on days 0-3, then y on days 4-9 while its sign-in had lapsed,
+    /// reconnected on day 10; 10% a day on days 0-6, so 70% in the busiest week. Read on day 10, y's
+    /// rise would land days after it happened and the computer would read about 45%: those days
+    /// are gaps instead, and the computer is uncounted (never grouped).
+    #[test]
+    fn use_read_days_late_leaves_the_computer_uncounted() {
+        let (x, y) = (max20("x"), max20("y"));
+        let (x_end, y_end) = (at("2026-11-09T00:00:00Z"), at("2026-11-13T00:00:00Z"));
+        let day = |d: i64| at("2026-11-02T12:00:00Z") + days(d);
+        let mut l = Ledger::default();
+        for d in 0..=10 {
+            let now = day(d);
+            let mut accounts = vec![];
+            if now < x_end { accounts.push(read(&x, 10.0 * (d.min(3) + 1) as f64, x_end, d <= 3, now)); }
+            match d {
+                4 => accounts.push(read(&y, 0.0, y_end, true, now - hours(3))),
+                5..=9 => accounts.push(AccountUsage { stale: true, error: Some("token_expired".into()), ..read(&y, 0.0, y_end, true, day(4) - hours(3)) }),
+                10 => accounts.push(read(&y, 30.0, y_end, true, now)),
+                _ => {}
+            }
+            refresh(&mut l, accounts, now);
+        }
+        let load = load_of(&l, Provider::Claude, day(10));
+        assert!(load.uncounted, "{load:?}");
+        assert_eq!(l.gaps["claude"].iter().copied().collect::<Vec<_>>(), (5..=8).map(|d| day(d).date_naive()).collect::<Vec<_>>(),
+            "day 9 is resolved by day 10's reading, the days before are not");
+        // Grouped with nothing, light as it reads.
+        let mut peers = Peers::default();
+        peers.note(&place(), &[peer("b", "LAPTOP-2", day(10), Some(loaded(&[("weekly", 0.1)], true)), &[])], true, day(10));
+        let own = Load { providers: BTreeMap::from([("claude".to_string(), ProviderLoad { measured: true, ..load })]), ..loaded(&[], true) };
+        assert!(advise(&own, "DESK-1", &peers, &[x.clone(), y.clone()], &Settings::default(), day(10))[0].groups.is_empty());
     }
 
     #[test]
@@ -1294,6 +1378,33 @@ mod tests {
         assert!(two.computers.iter().all(|c| c.measured && !c.needs_own), "listed as they are");
         let json = serde_json::to_value(&two).unwrap();
         assert_eq!(json["mixed"], true);
+        // A plan of no known size ("Max" without its size) is no tier of its own.
+        let untiered = account(Provider::Claude, "m", "max", None);
+        assert!(!advise_with(&[max20("x"), untiered]).mixed);
+        // Another computer charged at a tier this one does not hold: mixed all the same.
+        let mut smaller = loaded(&[("weekly", 0.2)], true);
+        smaller.providers.get_mut("claude").unwrap().tiers = BTreeSet::from(["Max 5x".to_string()]);
+        let mut theirs = Peers::default();
+        theirs.note(&place(), &[peer("A", "A", now, Some(smaller), &[])], true, now);
+        let advice = advise(&own, "DESK-1", &theirs, &[max20("x")], &Settings::default(), now).remove(0);
+        assert_eq!((advice.mixed, advice.groups.len()), (true, 0));
+    }
+
+    #[test]
+    fn a_load_names_the_tiers_its_use_was_charged_at() {
+        let (x, y, end) = (max20("x"), max5("y"), at("2026-11-26T00:00:00Z"));
+        let now = at("2026-11-23T10:00:00Z");
+        let mut l = Ledger::default();
+        refresh(&mut l, vec![read(&x, 10.0, end, true, now), read(&y, 10.0, end, true, now), read(&account(Provider::Claude, "f", "free", None), 5.0, end, true, now)], now);
+        let load = summary(&l, &Providers::default(), now);
+        let json = serde_json::to_value(&load).unwrap();
+        assert_eq!(json["providers"]["claude"]["tiers"], serde_json::json!(["Max 20x", "Max 5x"]), "a plan of unknown weight is no tier");
+        assert_eq!(Load::from_value(&json), Some(load.clone()));
+        // Records under one name add their tiers up.
+        let mut other = load.providers["claude"].clone();
+        other.tiers = BTreeSet::from(["Pro".to_string()]);
+        let both = merged(&[Some(&load.providers["claude"]), Some(&other)]).unwrap();
+        assert_eq!(both.tiers.iter().map(String::as_str).collect::<Vec<_>>(), ["Max 20x", "Max 5x", "Pro"]);
     }
 
     #[test]
@@ -1340,7 +1451,7 @@ mod tests {
         let p: crate::presence::Presence = serde_json::from_str(&record_with(twice)).unwrap();
         assert_eq!(p.load.unwrap().providers["claude"].busiest["weekly"], 0.2);
         let odd = serde_json::json!({ "v": 2, "at": "2026-11-23T10:00:00Z", "future": true, "providers": {
-            "claude": { "busiest": { "weekly": 0.123, "weekly_haiku": "x" }, "live": { "weekly": 1000 }, "weeks": 300, "measured": true, "uncounted": false },
+            "claude": { "busiest": { "weekly": 0.123, "weekly_haiku": "x" }, "live": { "weekly": 1000 }, "tiers": ["Max 20x"], "weeks": 300, "measured": true, "uncounted": false },
             "codex": { "busiest": { "weekly": -3 }, "uncounted": false }, "gemini": { "busiest": { "weekly": 0.5 } } } });
         let load = Load::from_value(&odd).unwrap();
         assert_eq!(load.providers.keys().collect::<Vec<_>>(), ["claude"], "an unknown provider left out, a negative use is no use to rely on");
@@ -1354,13 +1465,29 @@ mod tests {
             let load = Load::from_value(&serde_json::json!({ "v": 2, "at": "2026-11-23T10:00:00Z", "providers": { "claude": entry } })).unwrap();
             assert!(load.providers.is_empty(), "{entry}");
         }
-        let silent = Load::from_value(&serde_json::json!({ "v": 2, "at": "2026-11-23T10:00:00Z", "providers": { "claude": { "busiest": { "weekly": 0.1 } } } })).unwrap();
+        let silent = Load::from_value(&serde_json::json!({ "v": 2, "at": "2026-11-23T10:00:00Z", "providers": { "claude": { "busiest": { "weekly": 0.1 }, "tiers": ["Max 20x"] } } })).unwrap();
         assert!(silent.providers["claude"].uncounted && !silent.providers["claude"].measured);
+        // The tiers its use was charged at: without them as a list of tiers of known weight (a
+        // missing list, not a list, a name that is not one, an untiered "Max", too many), what its
+        // use was weighed by is unknown: uncounted, the rest of the entry kept.
+        for tiers in [None, Some(serde_json::json!("Max 20x")), Some(serde_json::json!(["Max 20x", 5])), Some(serde_json::json!(["Max"])),
+            Some(serde_json::json!(["Plus"])), Some(serde_json::json!(vec!["Pro"; 9]))] {
+            let mut entry = serde_json::json!({ "busiest": { "weekly": 0.1 }, "measured": true, "uncounted": false });
+            if let Some(t) = &tiers { entry["tiers"] = t.clone(); }
+            let load = Load::from_value(&serde_json::json!({ "v": 2, "at": "2026-11-23T10:00:00Z", "providers": { "claude": entry } })).unwrap();
+            let claude = &load.providers["claude"];
+            assert!(claude.uncounted && claude.tiers.is_empty() && claude.busiest["weekly"] == 0.1, "{tiers:?}");
+        }
+        let tiered = Load::from_value(&serde_json::json!({ "v": 2, "at": "2026-11-23T10:00:00Z", "providers": { "claude":
+            { "busiest": { "weekly": 0.1 }, "tiers": ["Max 5x", "Pro", "Max 5x"], "uncounted": false } } })).unwrap();
+        assert_eq!((tiered.providers["claude"].tiers.iter().map(String::as_str).collect::<Vec<_>>(), tiered.providers["claude"].uncounted), (vec!["Max 5x", "Pro"], false));
         assert_eq!((plans(f64::NAN), plans(f64::INFINITY), plans(-0.0)), (100.0, 100.0, 0.0));
     }
 
+    /// A Claude load charged at Max 20x.
     fn loaded(busiest: &[(&str, f64)], measured: bool) -> Load {
-        let entry = ProviderLoad { busiest: busiest.iter().map(|(k, v)| (k.to_string(), *v)).collect(), live: BTreeMap::new(), weeks: if measured { 6 } else { 2 }, measured, uncounted: false };
+        let entry = ProviderLoad { busiest: busiest.iter().map(|(k, v)| (k.to_string(), *v)).collect(), live: BTreeMap::new(),
+            tiers: BTreeSet::from(["Max 20x".to_string()]), weeks: if measured { 6 } else { 2 }, measured, uncounted: false };
         Load { v: LOAD_VERSION, at: at("2026-11-23T09:00:00Z"), providers: BTreeMap::from([("claude".to_string(), entry)]) }
     }
 
@@ -1667,13 +1794,14 @@ mod tests {
         before(lease, "lease_account in app.rs", ".take(provider, &id, purpose, minutes, pid, chrono::Utc::now())?;", "mark_in_use(&state, &[(provider, id.clone())], lease.created_at);");
         assert!(has(&app, ".release(&lease_id).ok_or(\"no_such_lease\")?; mark_in_use(&app.state::<AppState>(), &[(released.provider, released.id.clone())], chrono::Utc::now());"),
             "{}", lost("ReleaseLease in app.rs", "the mark of a released lease", TEST));
+        // Only leases that ended are marked: a call that ended none writes nothing.
         let prune = function(&app, "app.rs", "async fn prune_leases(", TEST);
-        before(prune, "prune_leases in app.rs", "mark_in_use(&state, &leased, chrono::Utc::now());", ".prune(chrono::Utc::now(), leases::process_alive)");
-        // Every mark is saved at once, under the ledger's lock, and a failed save is recorded.
+        before(prune, "prune_leases in app.rs", ".prune(chrono::Utc::now(), leases::process_alive)", "if !gone.is_empty() { mark_in_use(&state, &gone, chrono::Utc::now()); }");
+        // A mark that moved is saved at once, under the ledger's lock, and a failed save is recorded.
         let mark = function(&app, "app.rs", "fn mark_in_use(", TEST);
         let failed = "if saved.is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::MachineLoadSave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }";
-        assert!(has(mark, "let saved = { let mut ledger = state.machine_ledger.lock().unwrap(); machine_load::mark(&mut ledger, accounts, at); machine_load::save(&ledger) };")
-            && has(mark, failed), "{}", lost("mark_in_use in app.rs", "the save of each mark", TEST));
+        assert!(has(mark, "let saved = { let mut ledger = state.machine_ledger.lock().unwrap(); if !machine_load::mark(&mut ledger, accounts, at) { return; } machine_load::save(&ledger) };")
+            && has(mark, failed), "{}", lost("mark_in_use in app.rs", "the save of each mark that moved", TEST));
         let refresh = function(&app, "app.rs", "async fn refresh_locked(", TEST);
         before(refresh, "refresh_locked in app.rs", "machine_load::mark(&mut state.machine_ledger.lock().unwrap(), &was, chrono::Utc::now());",
             "state.leases.lock().unwrap().prune(chrono::Utc::now(), leases::process_alive);");
