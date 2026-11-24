@@ -845,16 +845,29 @@ pub fn reference_plan(provider: Provider) -> &'static str {
 /// usage, so Pro = 1/20 and Max 5x = 1/4 of Max 20x); otherwise the list price ratio (ChatGPT
 /// Plus = 0.1, Pro 100 = 0.5 and Pro 500 = 2.5 of Pro 200).
 pub fn plan_weight(acc: &AccountUsage) -> Option<f64> {
-    Some(match (acc.provider, plan_label(acc)?.as_str()) {
-        (Provider::Claude, "Pro") => 0.05,
-        (Provider::Claude, "Max 5x") => 0.25,
-        (Provider::Claude, "Max 20x") => 1.0,
-        (Provider::Codex, "Plus") => 0.1,
-        (Provider::Codex, "Pro 100") => 0.5,
-        (Provider::Codex, "Pro 200") => 1.0,
-        (Provider::Codex, "Pro 500") => 2.5,
-        _ => return None,
-    })
+    tier_weight(acc.provider, &plan_label(acc)?)
+}
+
+/// Every tier with a known weight (`plan_weight`): its provider, its name as `plan_label` gives it,
+/// and its weight. Each provider's weights differ, so a weight names its tier (`tier_of`).
+const TIER_WEIGHTS: [(Provider, &str, f64); 7] = [
+    (Provider::Claude, "Pro", 0.05),
+    (Provider::Claude, "Max 5x", 0.25),
+    (Provider::Claude, "Max 20x", 1.0),
+    (Provider::Codex, "Plus", 0.1),
+    (Provider::Codex, "Pro 100", 0.5),
+    (Provider::Codex, "Pro 200", 1.0),
+    (Provider::Codex, "Pro 500", 2.5),
+];
+
+/// The weight of the provider's tier named `label` (`plan_label`), when it is known.
+pub(crate) fn tier_weight(provider: Provider, label: &str) -> Option<f64> {
+    TIER_WEIGHTS.iter().find(|(p, l, _)| *p == provider && *l == label).map(|(_, _, w)| *w)
+}
+
+/// The provider's tier of this weight (`tier_weight`).
+pub(crate) fn tier_of(provider: Provider, weight: f64) -> Option<&'static str> {
+    TIER_WEIGHTS.iter().find(|(p, _, w)| *p == provider && (w - weight).abs() < 1e-9).map(|(_, l, _)| *l)
 }
 
 /// Pool sizing looks at this many of the latest weeks, needs `POOL_MIN_WEEKS` of them, takes the

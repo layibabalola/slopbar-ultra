@@ -10,7 +10,8 @@
 //!   `provider|slot id`, which every machine computes the same way; no emails, tokens or
 //!   organization names are written. While readings are shared (`Settings::share_readings`) the
 //!   record also carries the computer's own weekly use (`load`, see `machine_load`): per provider,
-//!   totals in plans only, never an account code or id. Readers take it leniently: a `load` they
+//!   totals in plans and the plan tiers they were on, never an account code or id. Readers take it
+//!   leniently: a `load` they
 //!   cannot read (another version, a malformed value, a number out of range, nesting too deep) is
 //!   dropped, never the record.
 //! - **Inference**, for monitored accounts nobody claims: usage that keeps rising while the
