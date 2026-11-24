@@ -32,9 +32,13 @@ const FIRST_PAINT: Duration = Duration::from_millis(1500);
 const PREPARE_AFTER: Duration = Duration::from_secs(2);
 /// Longest wait for the page to draw while the flyout is off-screen (`warm`).
 const WARM_DRAW: Duration = Duration::from_millis(1500);
+/// The same wait while a click waits for the flyout (it draws in 25-85 ms on ULTRA-MAGNUS).
+const WARM_DRAW_CLICKED: Duration = Duration::from_millis(300);
 /// How long a hidden flyout's new size must hold before it is drawn at it: a refresh can lay the
 /// page out several times in a row.
 const WARM_SETTLE: Duration = Duration::from_millis(300);
+/// How long after a blur an open flyout checks whether it really lost the foreground (`on_blur`).
+const BLUR_SETTLE: Duration = Duration::from_millis(80);
 
 /// The page has reported its height since the window was built (see `page_ready`).
 static READY: AtomicBool = AtomicBool::new(false);
@@ -57,15 +61,19 @@ static DRAWN: AtomicBool = AtomicBool::new(false);
 static WARM_SIZE: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 /// Counts the hidden flyout's size reports, so only the last of a burst draws it (`keep_drawn`).
 static WARM_GEN: AtomicU64 = AtomicU64::new(0);
+/// Numbers `warm`'s requests for a frame, so a late answer to an earlier one counts for nothing.
+static WARM_ASK: AtomicU64 = AtomicU64::new(0);
 
 /// The flyout's page has laid itself out (it reports its height through `set_panel_height`).
 pub fn page_ready() {
     READY.store(true, Ordering::Release);
 }
 
-/// The flyout's page has drawn a frame since `warm` asked it to (`panel_drawn`).
-pub fn drawn() {
-    DRAWN.store(true, Ordering::Release);
+/// The flyout's page has drawn a frame since `warm` asked it to (`panel_drawn`), for request `ask`.
+pub fn drawn(ask: u64) {
+    if ask == WARM_ASK.load(Ordering::Acquire) {
+        DRAWN.store(true, Ordering::Release);
+    }
 }
 
 /// Builds the flyout hidden, so the first click opens it at once.
@@ -85,6 +93,7 @@ async fn build(app: &AppHandle) {
     READY.store(false, Ordering::Release);
     SHOWN.store(false, Ordering::Release);
     SUSPENDED.store(false, Ordering::Release);
+    OPEN.store(false, Ordering::Release);
     *WARM_SIZE.lock().unwrap() = None;
     let built = crate::app::on_demand_window(app, LABEL).await;
     if built.is_some() {
@@ -138,11 +147,18 @@ pub fn keep_drawn(app: &AppHandle) {
 /// or while it is on screen (an agent's `inspect` draws it off-screen the same way).
 async fn warm(app: &AppHandle) {
     let Some(win) = app.get_webview_window(LABEL) else { return };
-    if WARMING.swap(true, Ordering::AcqRel) {
+    // Checked first: a click that closes an open flyout must not wait for a drawing.
+    if SHOWN.load(Ordering::Acquire) || WARMING.swap(true, Ordering::AcqRel) {
         return;
     }
     let mut drew = true;
     for _ in 0..3 {
+        // A click is waiting: once drawn at some size, the flyout opens as drawn so far rather
+        // than wait for more. Never drawn yet, it is drawn first, briefly (`WARM_DRAW_CLICKED`):
+        // opened undrawn, it appeared as a see-through panel.
+        if SHOW_WHEN_BUILT.load(Ordering::Acquire) && WARM_SIZE.lock().unwrap().is_some() {
+            break;
+        }
         let size = win.outer_size().ok().map(|s| (s.width, s.height));
         if !needs_drawing(SHOWN.load(Ordering::Acquire), *WARM_SIZE.lock().unwrap(), size) {
             break;
@@ -173,13 +189,16 @@ fn needs_drawing(opened: bool, drawn_at: Option<(u32, u32)>, size: Option<(u32, 
 }
 
 /// Shows the hidden flyout off-screen beside its monitor (`inspect::show_off_screen`), asks its
-/// page for a frame, waits for it (`WARM_DRAW` at most), then hides it again. False when it was not
-/// drawn: it was on screen already (opened, or an agent's `inspect`), or the page did not answer.
+/// page for a frame, waits for it (`WARM_DRAW` at most, less once a click waits), then hides it
+/// again. False when it was not drawn: it was on screen already (opened, or an agent's `inspect`),
+/// Settings or the switcher is in front (their typing is left alone), it took another DPI there,
+/// or the page did not answer.
 #[cfg(windows)]
 async fn draw_hidden(app: &AppHandle, win: &tauri::WebviewWindow) -> bool {
     use crate::inspect::{hide_again, on_main, show_off_screen, SendController};
     use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsWindowVisible};
     let Ok(hwnd) = win.hwnd() else { return false };
     // Kept as a number: a raw window handle cannot be held across an await.
     let hwnd = hwnd.0 as isize;
@@ -190,14 +209,37 @@ async fn draw_hidden(app: &AppHandle, win: &tauri::WebviewWindow) -> bool {
     let Ok(controller) = rx.await else { return false };
     // Drawn as it will open: in the taskbar's theme.
     follow_taskbar_theme(win);
+    // A new number first, so a late answer to the last request cannot count for this one.
+    let ask = WARM_ASK.fetch_add(1, Ordering::AcqRel) + 1;
     DRAWN.store(false, Ordering::Release);
+    // Settings and the switcher, whose typing a drawing leaves alone: the flyout's webview reports
+    // focus changes as it is drawn. (Only they: the foreground is often the flyout itself, hidden.)
+    let typing: Vec<isize> = [crate::app::SETTINGS_LABEL, crate::app::SWITCHER_LABEL]
+        .into_iter()
+        .filter_map(|label| app.get_webview_window(label)?.hwnd().ok())
+        .map(|h| h.0 as isize)
+        .collect();
     // Checked where it is shown, on the main thread, so nothing shows it in between.
     let shown = on_main(win, {
         let controller = controller.clone();
         move || unsafe {
             let controller = controller;
             let hwnd = hwnd as HWND;
-            (IsWindowVisible(hwnd) == 0).then(|| show_off_screen(hwnd, &controller.0))
+            if IsWindowVisible(hwnd) != 0 {
+                return None;
+            }
+            let front = GetForegroundWindow();
+            if typing.contains(&(front as isize)) && IsWindowVisible(front) != 0 {
+                return None;
+            }
+            let dpi = GetDpiForWindow(hwnd);
+            let saved = show_off_screen(hwnd, &controller.0);
+            // Drawn at another scale it would be drawn again as it opens.
+            if GetDpiForWindow(hwnd) != dpi {
+                hide_again(hwnd, &controller.0, saved);
+                return None;
+            }
+            Some(saved)
         }
     })
     .await
@@ -205,18 +247,28 @@ async fn draw_hidden(app: &AppHandle, win: &tauri::WebviewWindow) -> bool {
     .flatten();
     let Some(saved) = shown else { return false };
     let started = Instant::now();
-    let _ = app.emit_to(LABEL, "panel-warm", ());
-    while !DRAWN.load(Ordering::Acquire) && started.elapsed() < WARM_DRAW {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = app.emit_to(LABEL, "panel-warm", ask);
+    while !DRAWN.load(Ordering::Acquire) {
+        let waited = started.elapsed();
+        if waited >= WARM_DRAW || (SHOW_WHEN_BUILT.load(Ordering::Acquire) && waited >= WARM_DRAW_CLICKED) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    let drawn = DRAWN.load(Ordering::Acquire);
     // The frame reaches the window just after the page has drawn it.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    if drawn {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let h = app.clone();
     let _ = on_main(win, move || unsafe {
         let controller = controller;
-        hide_again(hwnd as HWND, &controller.0, saved)
+        hide_again(hwnd as HWND, &controller.0, saved);
+        // Where it opens from: a height reported meanwhile left its place alone (`place`).
+        place(&h);
     })
     .await;
-    DRAWN.load(Ordering::Acquire)
+    drawn
 }
 
 #[cfg(not(windows))]
@@ -244,7 +296,10 @@ pub fn place(app: &AppHandle) {
     let Some(win) = app.get_webview_window(LABEL) else { return };
     let state = app.state::<AppState>();
     let height = *state.panel_height.lock().unwrap();
+    // Before any click, the widget's own place: drawn ahead of its first open, the flyout is drawn
+    // at the monitor (and DPI) it will open on.
     let anchor = *state.panel_anchor.lock().unwrap();
+    let anchor = anchor.or_else(|| crate::dock::anchor(app));
 
     let monitor = anchor
         .and_then(|(x, y)| app.monitor_from_point(x, y).ok().flatten())
@@ -269,6 +324,12 @@ pub fn place(app: &AppHandle) {
     let y = if anchor_y >= ay + ah / 2.0 { ay + ah - h - margin } else { ay + margin };
 
     let _ = win.set_size(LogicalSize::new(WIDTH, height));
+    // Being drawn off-screen (`warm`, or an agent's `inspect`), it stays there: moved to its place,
+    // it would show above the taskbar. It is put there once hidden again.
+    #[cfg(windows)]
+    if win.hwnd().is_ok_and(|h| crate::inspect::off_screen(h.0 as _)) {
+        return;
+    }
     let _ = win.set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32));
 }
 
@@ -335,13 +396,27 @@ pub fn close(app: &AppHandle) {
     hide(app);
 }
 
-/// Losing focus closes an open flyout. A closed one reports focus changes too (as it is built,
-/// and each time it is drawn off-screen): closing it then would only mark it closed just now, and
-/// the click right after would be taken for the one that closed it (`toggle`) and do nothing.
+/// Losing the foreground closes an open flyout. Its webview also reports blurs that are not that:
+/// as it is built, and after each off-screen drawing, whose reports can come in up to 100 ms after
+/// it, when a click that waited for the drawing has just opened the flyout (which then vanished).
+/// So a closed flyout ignores blurs (closing it then would only mark it closed just now, and the
+/// next click would be taken for the one that closed it, `toggle`), and an open one closes only
+/// if it is not the foreground window a moment later, as the switcher does.
 pub fn on_blur(app: &AppHandle) {
-    if OPEN.load(Ordering::Acquire) {
-        hide(app);
+    if !OPEN.load(Ordering::Acquire) {
+        return;
     }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(BLUR_SETTLE).await;
+        let h = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let Some(win) = h.get_webview_window(LABEL) else { return };
+            if OPEN.load(Ordering::Acquire) && !crate::dock::is_foreground(&win) {
+                hide(&h);
+            }
+        });
+    });
 }
 
 /// Tells the flyout's webview it is (or is no longer) on screen. Showing the window alone can leave
@@ -432,8 +507,13 @@ mod tests {
             // Heights: not before the settings (rows or cards), and added up from the parts.
             "else if (!current) return;",
             "invoke(\"set_panel_height\", { height: flyoutHeight()",
-            // The drawn frame `warm` waits for: two animation frames.
-            "listen(\"panel-warm\", () => requestAnimationFrame(() => requestAnimationFrame(() => invoke(\"panel_drawn\"))));",
+            // The drawn frame `warm` waits for: two animation frames, answering the request's number,
+            // with the entrance finished first.
+            "listen(\"panel-warm\", ({ payload: ask }) => {",
+            "for (const a of $details.getAnimations()) a.finish();",
+            "requestAnimationFrame(() => requestAnimationFrame(() => invoke(\"panel_drawn\", { ask })));",
+            // The roster line's row counts in the height.
+            "if ($rosterWaiting.hidden !== before) layout();",
         ] {
             assert!(js.contains(needle), "src/main.js no longer has: {needle}");
         }

@@ -488,8 +488,12 @@ if (!IS_DOCK) {
     if (payload) { opened = true; catchUp(); }
   });
   // Before its first open the app draws the closed flyout off-screen, and waits for this frame,
-  // so that open shows a drawn flyout (panel.rs, `warm`).
-  listen("panel-warm", () => requestAnimationFrame(() => requestAnimationFrame(() => invoke("panel_drawn"))));
+  // so that open shows a drawn flyout (panel.rs, `warm`). Drawn as it rests: its entrance, still
+  // running just after the page loads, is finished first (it replays as the flyout opens).
+  listen("panel-warm", ({ payload: ask }) => {
+    for (const a of $details.getAnimations()) a.finish();
+    requestAnimationFrame(() => requestAnimationFrame(() => invoke("panel_drawn", { ask })));
+  });
 }
 setInterval(() => { if (IS_DOCK || panelOpen) invoke("get_usage").then(render); }, 60_000);
 
@@ -503,8 +507,11 @@ async function checkHealth() {
   if (report?.problems) { $health.title = t("healthIssues", { n: report.problems }); $health.setAttribute("aria-label", $health.title); }
   // Accounts other computers' rosters name that are not signed in here (Settings > Accounts signs them in).
   const waiting = report?.checks?.find((c) => c.id === "roster_waiting")?.count ?? 0;
+  const before = $rosterWaiting.hidden;
   $rosterWaiting.hidden = !waiting;
   $rosterWaiting.textContent = waiting ? t("rosterWaiting", { n: waiting }) : "";
+  // The line takes a row of the flyout: its height changes with it.
+  if ($rosterWaiting.hidden !== before) layout();
 }
 $health.addEventListener("click", () => invoke("open_settings", { page: "health" }));
 $rosterWaiting.addEventListener("click", () => invoke("open_settings", { page: "accounts" }));
@@ -512,7 +519,9 @@ listen("usage-updated", (e) => {
   if (deferWhileClosed()) return;
   render(e.payload);
   loadTrails();
-  loadSubs();
+  // Subscriptions only feed the compact rows' tooltips: a flyout not opened yet loads them as it
+  // opens (catchUp), not at every refresh.
+  if (opened) loadSubs(); else missedUsage = true;
   checkHealth();
 });
 listen("monitoring-login", () => { if (!deferWhileClosed()) checkHealth(); });

@@ -184,9 +184,10 @@ unsafe impl Send for SendController {}
 #[cfg(windows)]
 unsafe impl Sync for SendController {}
 
-/// Where a window shown off-screen was, and its extended style, for `hide_again`.
+/// Where a window shown off-screen was, and the extended-style bits `show_off_screen` changed,
+/// for `hide_again`.
 #[cfg(windows)]
-pub(crate) struct Saved { x: i32, y: i32, ex_style: isize }
+pub(crate) struct Saved { x: i32, y: i32, added: isize, removed: isize }
 
 /// Runs `f` on the main thread, where the window and its webview live.
 #[cfg(windows)]
@@ -197,10 +198,11 @@ pub(crate) async fn on_main<T: Send + 'static>(window: &tauri::WebviewWindow, f:
 }
 
 /// Where a window (`window`, on monitor `on`) can be shown unseen: just outside that monitor, on
-/// the first side (left, right, below, above) where it covers no monitor and is nearer to `on`
-/// than to any other. A window on no monitor takes the nearest one's DPI, so it is drawn at the
-/// scale it has where it opens; left of every monitor, it took the leftmost one's, which differs on
-/// a laptop beside an external screen. None when no side qualifies.
+/// the first side (left, right, below) where it covers no monitor and is nearer to `on` than to
+/// any other. A window on no monitor takes the nearest one's DPI, so it is drawn at the scale it
+/// has where it opens; left of every monitor, it took the leftmost one's, which differs on a
+/// laptop beside an external screen. Not above: a window that grows there (the flyout's height
+/// can change while it is drawn) grows down into the monitor. None when no side qualifies.
 pub(crate) fn off_screen_spot(window: Rect, on: Rect, monitors: &[Rect]) -> Option<(i32, i32)> {
     const GAP: i32 = 100;
     let (w, h) = (window.right - window.left, window.bottom - window.top);
@@ -212,7 +214,7 @@ pub(crate) fn off_screen_spot(window: Rect, on: Rect, monitors: &[Rect]) -> Opti
         let dy = i64::from((m.top - a.bottom).max(a.top - m.bottom).max(0));
         dx * dx + dy * dy
     };
-    [(on.left - w - GAP, window.top), (on.right + GAP, window.top), (window.left, on.bottom + GAP), (window.left, on.top - h - GAP)]
+    [(on.left - w - GAP, window.top), (on.right + GAP, window.top), (window.left, on.bottom + GAP)]
         .into_iter()
         .find(|&(x, y)| {
             let spot = at(x, y);
@@ -241,6 +243,14 @@ unsafe fn monitors_of(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<(Rec
     Some((Rect { left: m.left, top: m.top, right: m.right, bottom: m.bottom }, all))
 }
 
+/// Whether `hwnd` is shown but on no monitor: drawn off-screen right now (`show_off_screen`).
+#[cfg(windows)]
+pub(crate) fn off_screen(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
+    use windows_sys::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONULL};
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+    unsafe { IsWindowVisible(hwnd) != 0 && MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL).is_null() }
+}
+
 /// Shows a hidden window off-screen beside its monitor (`off_screen_spot`), without activating it
 /// or giving it a taskbar button, and tells its webview it is on screen, so it lays out and draws.
 /// `hide_again` undoes it.
@@ -251,17 +261,22 @@ pub(crate) unsafe fn show_off_screen(hwnd: windows_sys::Win32::Foundation::HWND,
     let mut rect: RECT = std::mem::zeroed();
     wm::GetWindowRect(hwnd, &mut rect);
     let ex_style = wm::GetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE);
-    // A tool window gets no taskbar button, so the taskbar does not flicker either.
-    wm::SetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE, (ex_style | wm::WS_EX_TOOLWINDOW as isize | wm::WS_EX_NOACTIVATE as isize) & !(wm::WS_EX_APPWINDOW as isize));
+    // A tool window gets no taskbar button, so the taskbar does not flicker either. Only the bits
+    // changed here are put back, so a style the app sets meanwhile is kept.
+    let wanted = wm::WS_EX_TOOLWINDOW as isize | wm::WS_EX_NOACTIVATE as isize;
+    let (added, removed) = (wanted & !ex_style, wm::WS_EX_APPWINDOW as isize & ex_style);
+    wm::SetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE, (ex_style | added) & !removed);
     let window = Rect { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+    let width = rect.right - rect.left;
     let (left, top) = monitors_of(hwnd)
         .and_then(|(on, all)| off_screen_spot(window, on, &all))
-        // Left of every monitor.
-        .unwrap_or((wm::GetSystemMetrics(wm::SM_XVIRTUALSCREEN) - (rect.right - rect.left) - 100, rect.top));
+        // Left of every monitor, far enough that the window stays off them should taking another
+        // monitor's DPI there make it up to three times as wide.
+        .unwrap_or((wm::GetSystemMetrics(wm::SM_XVIRTUALSCREEN) - 3 * width - 100, rect.top));
     wm::SetWindowPos(hwnd, std::ptr::null_mut(), left, top, 0, 0, wm::SWP_NOSIZE | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE);
     wm::ShowWindow(hwnd, wm::SW_SHOWNOACTIVATE);
     let _ = controller.SetIsVisible(true);
-    Saved { x: rect.left, y: rect.top, ex_style }
+    Saved { x: rect.left, y: rect.top, added, removed }
 }
 
 #[cfg(windows)]
@@ -270,7 +285,8 @@ pub(crate) unsafe fn hide_again(hwnd: windows_sys::Win32::Foundation::HWND, cont
     let _ = controller.SetIsVisible(false);
     wm::ShowWindow(hwnd, wm::SW_HIDE);
     wm::SetWindowPos(hwnd, std::ptr::null_mut(), saved.x, saved.y, 0, 0, wm::SWP_NOSIZE | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE);
-    wm::SetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE, saved.ex_style);
+    let ex_style = wm::GetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE);
+    wm::SetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE, (ex_style & !saved.added) | saved.removed);
 }
 
 /// Runs a script in the page and returns its result as JSON text.
@@ -361,11 +377,11 @@ mod tests {
         let middle = r(2731, 0, 5291, 1440);
         let third = r(5291, 0, 7851, 1440);
         assert_eq!(off_screen_spot(there, middle, &[left, middle, third]), Some((4000, 1540)));
-        // Stacked under another, with screens on both sides: above is the other one, so nowhere.
-        let below = r(2731, 1440, 5291, 2880);
-        let shown = r(4000, 1940, 4592, 2860);
-        let sides = [r(0, 1440, 2731, 2880), below, r(5291, 1440, 8022, 2880), r(2731, 0, 5291, 1440), r(2731, 2880, 5291, 4320)];
-        assert_eq!(off_screen_spot(shown, below, &sides), None);
+        // Screens left, right and below, nothing above: never above (a window growing there grows
+        // into the monitor), so nowhere.
+        let top_row = r(2731, 0, 5291, 1440);
+        let sides = [r(0, 0, 2731, 1440), top_row, r(5291, 0, 8022, 1440), r(2731, 1440, 5291, 2880)];
+        assert_eq!(off_screen_spot(there, top_row, &sides), None);
         // One monitor: left of it.
         assert_eq!(off_screen_spot(flyout, left, &[left]), Some((-692, 500)));
     }
