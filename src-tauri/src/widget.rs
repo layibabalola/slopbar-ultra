@@ -819,7 +819,7 @@ mod tests {
         assert_eq!(v.overlap, [false, true]);
         assert!(!v.details[0].contains("machines"));
         assert!(v.details[1].contains("In use on 2 machines at once: this PC, LAPTOP-2"), "{}", v.details[1]);
-        assert!(v.details[1].contains("Limits drain about 2× as fast, and SlopBar has not seen this account keep 20% to spare under its weekly limits over enough recent weeks."), "{}", v.details[1]);
+        assert!(v.details[1].contains("Limits drain about 2× as fast, and this account has no room to share: it came within 20% of a weekly limit in recent weeks or at this week's pace, or SlopBar has not watched it long enough."), "{}", v.details[1]);
         assert!(!v.details[1].contains("sign"), "no sign-out is promised: {}", v.details[1]);
         // On DESK-1 itself, the tooltip says which of the two this is.
         let here = view(&snap(vec![codex]), None, 0, &OnDesk1);

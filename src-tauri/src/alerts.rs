@@ -811,7 +811,7 @@ mod tests {
         assert_eq!(titles(&out), ["Claude account in use on 2 machines"]);
         let Notice::Plain { body, page, .. } = &out[0] else { panic!() };
         assert_eq!(body, "me@example.invalid is in use on DESK-1 (this PC), LAPTOP-2 at once. Limits drain about 2× as fast, \
-            and SlopBar has not seen it keep 20% to spare under its weekly limits over enough recent weeks.");
+            and it has no room to share: it came within 20% of a weekly limit in recent weeks or at this week's pace, or SlopBar has not watched it long enough.");
         assert_eq!(*page, Some("accounts"));
         // Not in use here: a peer that shares this machine's name (a cloned machine) is not this PC.
         let mut elsewhere = a.clone();

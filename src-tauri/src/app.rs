@@ -3899,7 +3899,10 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
     // What the last refresh worked out, for the early redraw: before a switch below publishes this
     // refresh's bare numbers.
     let previous = state.snapshot.lock().unwrap().accounts.clone();
-    let decisions = {
+    // The first refresh after a start has no last refresh to know the other computers by: with
+    // sharing on, automatic switching waits a refresh rather than move onto an account in use there.
+    let blind = previous.is_empty() && presence::store(&settings).is_some();
+    let decisions = if blind { vec![] } else {
         let last = state.last_switch.lock().unwrap().clone();
         let leased = state.leases.lock().unwrap().accounts();
         // Decided with what the last refresh knew of the other computers (`carry_over`): the fetch

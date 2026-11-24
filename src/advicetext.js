@@ -67,8 +67,10 @@ export function adviceCard(report, { on, names, snapshot }) {
         const short = a.moves.length ? null : shortageText(a, name);
         const head = a.moves.length ? t("advSave", { provider: name, v: money(a.monthly_saving), n: a.moves.length }) : short ? short.head : t("advNone", { provider: name });
         if (short) lines.push(short.fix);
-        if (a.spare_after != null) lines.push(t("advAfter", { held: amount(a.capacity_after), unit: a.unit, spare: a.spare_after_percent != null ? pct(a.spare_after_percent) : "—" }));
-        if (a.kept_for_capacity) lines.push(t("advKept", { n: a.kept_for_capacity }));
+        // With too little history the advisor measures against this week's use so far.
+        const now = a.evidence === "clear_only";
+        if (a.spare_after != null) lines.push(t(now ? "advAfterNow" : "advAfter", { held: amount(a.capacity_after), unit: a.unit, spare: a.spare_after_percent != null ? pct(a.spare_after_percent) : "—" }));
+        if (a.kept_for_capacity) lines.push(t(now ? "advKeptNow" : "advKept", { n: a.kept_for_capacity }));
         const room = (a.room ?? []).map((r) => t("advRoomItem", { account: advisedAccount(r), p: pct(r.free_percent) }));
         return `
           <p class="hint sub-pool"><b>${esc(head)}</b>${lines.length ? ` · ${esc(lines.join(" · "))}` : ""}</p>
@@ -80,8 +82,9 @@ export function adviceCard(report, { on, names, snapshot }) {
 }
 
 /**
- * Each computer's own use per provider (its busiest week in % of one plan, this week, how many weeks
- * are measured) and the groups of computers that could share one plan (the app's `machine_load`).
+ * Each computer's own use per provider (its busiest week in % of one plan, the last 8 days, how many
+ * weeks are measured) and the groups of computers that could share one plan (the app's
+ * `machine_load`); none while the plans held are of different sizes (`mixed`).
  */
 export function machinesCard(report, { on, names }) {
   const list = (report?.machines ?? []).filter((m) => on(m.provider) && m.computers?.length);
@@ -94,16 +97,20 @@ export function machinesCard(report, { on, names }) {
         const label = (c) => (c.here ? (c.machine ? t("thisPc", { machine: c.machine }) : t("thisPcUnnamed")) : c.machine);
         // Group members come as names; this PC is marked as in the list of computers.
         const named = (n) => { const c = m.computers.find((x) => String(x.machine).toLowerCase() === String(n).toLowerCase()); return c ? label(c) : n; };
-        // Computers that can be grouped: measured, with no use on plans of unknown size.
+        // Computers that can be grouped: measured, with all their use counted.
         const measured = m.computers.filter((c) => c.measured && !c.uncounted).length;
-        const verdict = m.groups?.length ? m.groups.map((g) => t("mcGroup", { list: g.machines.map(named).join(", "), unit: m.unit, p: pct(g.combined_percent) }))
+        const verdict = m.mixed ? [t("mcMixed")]
+          : m.groups?.length ? m.groups.map((g) => t("mcGroup", { list: g.machines.map(named).join(", "), unit: m.unit, p: pct(g.combined_percent) }))
           : [measured >= 2 ? t("mcNone", { unit: m.unit }) : t("mcWait", { needed: m.weeks_needed, n: measured })];
         const rows = m.computers.map((c) => {
           const parts = [];
+          // A computer whose SlopBar shares no numbers (an older one, or with Share usage readings off).
+          const silent = c.busiest_percent == null && c.live_percent == null && !c.weeks;
+          if (silent) parts.push(t("mcNoLoad"));
           if (c.busiest_percent != null) parts.push(t("mcBusiest", { p: pct(c.busiest_percent) }));
           if (c.live_percent != null) parts.push(t("mcLive", { p: pct(c.live_percent) }));
           // Enough weeks but not the latest: measured needs the last completed week too.
-          if (!c.measured) parts.push(c.weeks >= m.weeks_needed ? t("mcLatest") : t("mcWeeks", { n: c.weeks, needed: m.weeks_needed }));
+          if (!c.measured && !silent) parts.push(c.weeks >= m.weeks_needed ? t("mcLatest") : t("mcWeeks", { n: c.weeks, needed: m.weeks_needed }));
           if (c.needs_own) parts.push(t("mcOwn", { unit: m.unit }));
           if (c.uncounted) parts.push(t("mcUncounted"));
           return `

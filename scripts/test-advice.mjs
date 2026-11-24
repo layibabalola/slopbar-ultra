@@ -80,6 +80,7 @@ test("the advisor card totals the moves, lists room for more use, and shows a sh
   const thin = text(adviceCard({ advice: [advice({ evidence: "clear_only", weeks_used: 1, shortage: { cause: "over_capacity", shortfall: 0.2, exhausted: 0,
     fix: { action: "add", id: null, email: null, alias: null, from: null, to: "Max 5x", count: 1, monthly_cost: 100, capacity_after: 1.25 } } })] }, { on, names, snapshot: { accounts: [] } }));
   assert.ok(thin.includes("Claude: this week's use so far plus 20% needs 0.2 × Max 20x more than you hold"), thin);
+  assert.ok(thin.includes("afterwards 1 × Max 20x, 100% over this week's use so far"), thin);
   // A provider turned off is left out, and an empty report draws nothing.
   assert.equal(adviceCard({ advice: [advice()] }, { on: () => false, names, snapshot: null }), "");
   assert.equal(adviceCard({}, { on, names, snapshot: null }), "");
@@ -99,11 +100,11 @@ test("the computers card names each computer's busiest week and the groups that 
     "DESK-1 (this PC)", "busiest week 25% · last 8 days 10%",
     "LAPTOP-2", "busiest week 30% · last 8 days 10%",
     "TOWER-3", "busiest week 95% · last 8 days 10% · needs its own Max 20x",
-    "NEW-4", "last 8 days 5% · 1 of 4 weeks measured · some use not counted (a plan of unknown size, an account SlopBar does not have, or readings that failed all day)",
+    "NEW-4", "last 8 days 5% · 1 of 4 weeks measured · some use not counted (for example a plan of unknown size, an account SlopBar does not have, or readings that failed); not grouped",
   ]);
   // Before two computers are measured it says when groups will show; after, that none fit.
   const waiting = { machines: [{ ...report.machines[0], groups: [], computers: [computer("DESK-1", { here: true, measured: false, weeks: 2 })] }] };
-  assert.ok(text(machinesCard(waiting, { on, names })).includes("Groups show once two computers have 4 weeks measured (0 so far)."));
+  assert.ok(text(machinesCard(waiting, { on, names })).includes("Groups show once two computers have 4 weeks measured and all their use counted (0 so far)."));
   const none = { machines: [{ ...report.machines[0], groups: [] }] };
   assert.ok(text(machinesCard(none, { on, names })).includes("No two computers fit one Max 20x with 20% to spare."));
   // Enough weeks but not the latest one says so, not "5 of 4".
@@ -111,7 +112,15 @@ test("the computers card names each computer's busiest week and the groups that 
   assert.ok(text(machinesCard(latest, { on, names })).includes("last completed week not measured"));
   // A computer whose use is partly uncounted is never grouped, so it does not count toward "no two fit".
   const partial = { machines: [{ ...report.machines[0], groups: [], computers: [computer("DESK-1", { here: true }), computer("LAPTOP-2", { uncounted: true })] }] };
-  assert.ok(text(machinesCard(partial, { on, names })).includes("Groups show once two computers have 4 weeks measured (1 so far)."));
+  assert.ok(text(machinesCard(partial, { on, names })).includes("Groups show once two computers have 4 weeks measured and all their use counted (1 so far)."));
+  // A computer whose SlopBar shares no numbers says so, rather than "0 of 4 weeks".
+  const silent = { machines: [{ ...report.machines[0], groups: [], computers: [computer("OLD-5", { busiest_percent: null, live_percent: null, weeks: 0, measured: false })] }] };
+  const silentText = text(machinesCard(silent, { on, names }));
+  assert.ok(silentText.includes("its use is not shared") && !silentText.includes("0 of 4"), silentText);
+  // Plans of different sizes: no groups, and why.
+  const mixed = { machines: [{ ...report.machines[0], mixed: true }] };
+  const mixedText = text(machinesCard(mixed, { on, names }));
+  assert.ok(mixedText.includes("No groups: your plans are of different sizes") && !mixedText.includes("could share one"), mixedText);
   assert.equal(machinesCard({ machines: [] }, { on, names }), "");
   assert.equal(machinesCard(report, { on: () => false, names }), "");
 });

@@ -436,13 +436,12 @@ fn plan_shares(s: &Search) -> Vec<Group> {
     let n = s.sharers.len();
     if n < 2 { return vec![]; }
     let parts = if n <= SEARCH_MAX {
-        // Each group's plan to keep, worked out once: groups are the sets of up to `SEARCH_MAX`.
-        let hosts: Vec<Option<usize>> = (0..1usize << n).map(|mask| match members_of(mask) {
-            m if m.is_empty() => None,
-            m => host(s.sharers, &m, s.provider),
-        }).collect();
+        // Each group's members and plan to keep, worked out once: groups are the sets of up to
+        // `SEARCH_MAX`.
+        let members: Vec<Vec<usize>> = (0..1usize << n).map(members_of).collect();
+        let hosts: Vec<Option<usize>> = members.iter().map(|m| if m.is_empty() { None } else { host(s.sharers, m, s.provider) }).collect();
         let mut best = None;
-        search(s, &hosts, 0, &mut vec![], &mut best);
+        search(s, &Sets { members: &members, hosts: &hosts }, 0, &mut vec![], &mut best);
         best.map(|(_, _, parts)| parts.into_iter().map(members_of).collect()).unwrap_or_default()
     } else {
         greedy(s)
@@ -474,15 +473,22 @@ fn members_of(mask: usize) -> Vec<usize> {
 
 type Best = Option<(f64, usize, Vec<usize>)>;
 
+/// Each group (a bit set of sharers): its members and its plan to keep.
+struct Sets<'a> {
+    members: &'a [Vec<usize>],
+    hosts: &'a [Option<usize>],
+}
+
 /// Tries every way to group the sharers from `i` on, given `parts` so far (bit sets), keeping the
-/// best; `hosts` holds each group's plan to keep. A group no plan of it can carry is never grown:
-/// all its members are one tier, so more members only add use.
-fn search(s: &Search, hosts: &[Option<usize>], i: usize, parts: &mut Vec<usize>, best: &mut Best) {
+/// best. A group no plan of it can carry is never grown: all its members are one tier, so more
+/// members only add use.
+fn search(s: &Search, sets: &Sets, i: usize, parts: &mut Vec<usize>, best: &mut Best) {
+    let hosts = sets.hosts;
     if i == s.sharers.len() {
         let (mut saving, mut guests, mut freed) = (0.0, 0, 0.0);
         for &p in parts.iter().filter(|p| p.count_ones() > 1) {
             let Some(h) = hosts[p] else { return };
-            for m in members_of(p).into_iter().filter(|&m| m != h) {
+            for &m in sets.members[p].iter().filter(|&&m| m != h) {
                 saving += s.sharers[m].c.cost;
                 freed += s.sharers[m].c.weight;
                 guests += 1;
@@ -498,12 +504,12 @@ fn search(s: &Search, hosts: &[Option<usize>], i: usize, parts: &mut Vec<usize>,
         let grown = parts[g] | 1 << i;
         if hosts[grown].is_some() {
             let was = std::mem::replace(&mut parts[g], grown);
-            search(s, hosts, i + 1, parts, best);
+            search(s, sets, i + 1, parts, best);
             parts[g] = was;
         }
     }
     parts.push(1 << i);
-    search(s, hosts, i + 1, parts, best);
+    search(s, sets, i + 1, parts, best);
     parts.pop();
 }
 

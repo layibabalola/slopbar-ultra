@@ -752,7 +752,7 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
                 None)
         } else {
             check(id, Status::Warning, format!("{}: in use on {n} computers at once", name(a)),
-                format!("In use on {list} at the same time: its limits drain about {n}x as fast. SlopBar has not seen it keep 20% to spare under its weekly limits over enough recent weeks, so this is not a planned share. Switch one of those computers to another account (recommend_account names a free one)."),
+                format!("In use on {list} at the same time: its limits drain about {n}x as fast. It has no room to share (it came within 20% of a weekly limit in recent weeks or at this week's pace, or SlopBar has not watched it long enough), so this is not a planned share. Switch one of those computers to another account (recommend_account names a free one)."),
                 Some(Fix::OpenSettings { page: "accounts" }))
         });
     }
@@ -1587,7 +1587,7 @@ mod tests {
         assert!(c.title.ends_with("in use on 2 computers at once"), "{}", c.title);
         assert!(c.reason.starts_with("In use on DESK-1, LAPTOP-2 at the same time: its limits drain about 2x as fast."), "{}", c.reason);
         // Why it is no planned share, and nothing SlopBar has no ground for: no sign-out is promised.
-        assert!(c.reason.contains("SlopBar has not seen it keep 20% to spare under its weekly limits over enough recent weeks, so this is not a planned share."), "{}", c.reason);
+        assert!(c.reason.contains("It has no room to share (it came within 20% of a weekly limit in recent weeks or at this week's pace, or SlopBar has not watched it long enough), so this is not a planned share."), "{}", c.reason);
         assert!(!c.reason.contains("sign"), "{}", c.reason);
         assert_eq!(c.fix, Some(Fix::OpenSettings { page: "accounts" }));
     }
