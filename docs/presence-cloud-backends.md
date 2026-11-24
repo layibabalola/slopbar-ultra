@@ -2,8 +2,12 @@
 
 SlopBar can show which accounts are in use on the user's other computers. Each SlopBar keeps one
 small presence record per machine. The record holds the machine id, the computer name, when it
-was written, and hashed account ids with where each account is signed in. It never holds emails,
-tokens or organization names. See `src-tauri/src/presence.rs`.
+was written, and hashed account ids with where each account is signed in. While readings are
+shared (`share_readings`, on by default), it also holds each computer's weekly use, as a share of
+a plan: per provider and weekly limit, that computer's busiest 7 days and the week in progress in
+plans of the provider's largest common tier (rounded up to 0.01 plan), and how many weeks it was
+measured, never an account code or id (`load`, see `src-tauri/src/machine_load.rs`). It never
+holds emails, tokens or organization names. See `src-tauri/src/presence.rs`.
 
 Records go through the `PresenceStore` trait (`list`, `write`, `clear`). The reader, the staleness
 rules and the UI only see that trait.

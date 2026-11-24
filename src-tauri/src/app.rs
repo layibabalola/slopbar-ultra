@@ -1,4 +1,4 @@
-use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, desktop, desktop_apps, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, pairing, panel, phone, pins, plan_alerts, presence, providers, rclone, refresh_wait, relay, reset_credits, roster, settings, sharing, sharing_setup, signin, sources, subscriptions, unexpected, updates, usage_index, wind_down};
+use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, desktop, desktop_apps, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, machine_load, migrate, model, monitoring, notify, pairing, panel, phone, pins, plan_alerts, presence, providers, rclone, refresh_wait, relay, reset_credits, roster, settings, sharing, sharing_setup, signin, sources, subscriptions, unexpected, updates, usage_index, wind_down};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -65,6 +65,11 @@ pub struct AppState {
     /// The records the last read had the bytes of, which stand in for downloading them again while
     /// they are listed unchanged (see `presence::Kept`).
     presence_kept: presence::Kept,
+    /// The account weekly windows this computer had in use and the days it refreshed, for its own
+    /// use whatever the account (see `machine_load`).
+    machine_ledger: Mutex<machine_load::Ledger>,
+    /// The other computers' last loads, from their presence records (see `machine_load::Peers`).
+    machine_peers: Mutex<machine_load::Peers>,
     /// Where in-use status is shared: what settings saves left for the next refresh to withdraw,
     /// and the account roster's sync, its keys and last write, which share one lock (see `sharing`).
     sharing: std::sync::Arc<sharing::Sharing>,
@@ -397,7 +402,19 @@ fn subscription_report(state: &AppState) -> subscriptions::Report {
     let now = chrono::Utc::now();
     let mut report = subscriptions::report(&snapshot, &state.usage_history.lock().unwrap(), &settings, local.as_deref(), now);
     report.spend = Some(ledger::summary(&state.ledger.lock().unwrap(), &settings.spend, now));
+    report.machines = machine_advice(state, &snapshot, &settings, now);
     report
+}
+
+/// Which of the user's computers could share one plan (see `machine_load`): only while in-use
+/// status is shared, which carries the other computers' use.
+fn machine_advice(state: &AppState, snapshot: &Snapshot, settings: &settings::Settings, now: chrono::DateTime<chrono::Utc>) -> Vec<machine_load::MachineAdvice> {
+    if settings.presence_folder.is_none() && settings.presence_remote.is_none() {
+        return vec![];
+    }
+    let own = machine_load::summary(&state.machine_ledger.lock().unwrap(), &settings.providers, now);
+    let me = presence::identity().map_or_else(presence::machine_name, |(_, name)| name.clone());
+    machine_load::advise(&own, &me, &state.machine_peers.lock().unwrap(), &snapshot.accounts, settings, now)
 }
 
 /// Charges renewals that have passed and this month's extra usage to the spend ledger.
@@ -657,7 +674,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::GetPlanAdvice => {
             let report = subscription_report(&app.state::<AppState>());
             let credits = reset_credits::advise(&app.state::<AppState>().snapshot.lock().unwrap().accounts, chrono::Utc::now());
-            Ok(serde_json::json!({ "providers": report.advice, "reset_credits": credits, "generated_at": report.generated_at }))
+            Ok(serde_json::json!({ "providers": report.advice, "reset_credits": credits, "machines": report.machines, "generated_at": report.generated_at }))
         }
         R::GetBurnAlerts => {
             let state = app.state::<AppState>();
@@ -3914,6 +3931,8 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
         let mine = list.clone();
         let (place, h) = (sharing::Place::of(&settings), app.clone());
         let read_from = place.clone();
+        // This computer's use as of the last refresh, while readings are shared (`machine_load`).
+        let load = machine_load::published(&state.machine_ledger.lock().unwrap(), &settings, now);
         let exchanged = tauri::async_runtime::spawn_blocking(move || {
             let Some((id, name)) = presence::identity() else { return Some((vec![], health::SharingResult::failed(now))) };
             // A save that moved sharing since this refresh read the settings: nothing is written to
@@ -3921,7 +3940,7 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
             if !sharing::still(&place, &sharing::Place::of(&h.state::<AppState>().settings.lock().unwrap())) {
                 return None;
             }
-            let wrote = store.write(&presence::own(id, name, interval, &mine, now));
+            let wrote = store.write(&presence::own(id, name, interval, &mine, now).with_load(load));
             // Over rclone, neither this machine's own record nor one listed unchanged since the last
             // read is downloaded (`PresenceStore::others`).
             let listed = store.others(id, &h.state::<AppState>().presence_kept);
@@ -3935,6 +3954,8 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
             // missed, while that record is live (`presence::Recall`).
             let found = presence::peers(files.iter().cloned(), own, now);
             let every = presence::peers(state.presence_recall.lock().unwrap().fill(&read_from, result.read.then_some(files.as_slice()), own, now), own, now);
+            // Each other computer's last load stands while its record does (`machine_load::Peers`).
+            state.machine_peers.lock().unwrap().note(&read_from, &every, me, now);
             shared = Some(result);
             covered = result.wrote || found.iter().any(|p| p.live);
             presence::apply(&mut list, &found, &every, me, now);
@@ -3978,6 +3999,14 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
         // Whether several computers on an account share it within its limits (`overlap`'s tone).
         subscriptions::attach_room(&mut snapshot, &history, now);
     }
+    // This computer's use whatever the account: the windows it had in use (`machine_load`).
+    let wanted = profile_accounts(&state);
+    let machine_ledger = {
+        let mut ledger = state.machine_ledger.lock().unwrap();
+        machine_load::observe(&mut ledger, &snapshot, &wanted, &settings.providers, chrono::Utc::now());
+        ledger.clone()
+    };
+    let _ = machine_load::save(&machine_ledger);
     if subscriptions::save(&history).is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::HistorySave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
     state.diagnostics.record(None, None, diagnostics::Event::PollFinished { elapsed_ms: diagnostics::millis(started), accounts: snapshot.accounts.len(),
         native_sources: found.iter().filter(|s| s.distro.is_none()).count(), wsl_sources: found.iter().filter(|s| s.distro.is_some()).count() });
@@ -5625,6 +5654,8 @@ pub fn run() {
         presence_tracks: Mutex::default(),
         presence_recall: Mutex::default(),
         presence_kept: presence::Kept::default(),
+        machine_ledger: Mutex::new(machine_load::load()),
+        machine_peers: Mutex::default(),
         // What saves left for the next refresh to withdraw, kept between runs (see `sharing`).
         sharing: std::sync::Arc::new(sharing::Sharing::kept_in(settings::app_dir().expect("config directory").join(sharing::DUE_FILE))),
         roster_seen: Mutex::default(),
