@@ -3687,6 +3687,13 @@ fn set_panel_height(app: AppHandle, height: f64) {
     *app.state::<AppState>().panel_height.lock().unwrap() = height;
     panel::page_ready();
     panel::place(&app);
+    panel::keep_drawn(&app);
+}
+
+/// The flyout's page has drawn a frame since the app asked it to (`panel::warm`).
+#[tauri::command]
+fn panel_drawn() {
+    panel::drawn();
 }
 
 #[tauri::command]
@@ -5835,6 +5842,7 @@ pub fn run() {
             open_settings,
             take_settings_page,
             set_panel_height,
+            panel_drawn,
             set_menu_labels,
             switch_account,
             add_account,
