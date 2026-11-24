@@ -979,21 +979,38 @@ pub(crate) fn busiest(h: &AccountHistory, pro_200: bool, now: DateTime<Utc>) -> 
     }).collect()
 }
 
-/// Room to share: in every one of its busiest recent weeks (`busiest`, model caps included) the
+/// A week's peak is the week's own only when this computer read it this close to its reset: use
+/// after the last reading (this PC asleep, its SlopBar closed) is missing from it.
+const END_READ_SECONDS: i64 = 12 * 3600;
+
+/// Never ran out: in every one of its busiest recent weeks (`busiest`, model caps included) the
 /// account stayed under its limits, whichever computers its use came from, and there are enough
-/// weeks to go on (`assess`'s high confidence: the latest `RECENT` completed weeks, watched for most
-/// of their hours). Computers on such an account share it as planned (`AccountUsage::room_to_share`),
-/// and only such accounts are paired by the plan advisor. `h` must be the history SlopBar polled
+/// weeks to go on: `assess`'s high confidence (the latest `RECENT` completed weeks, watched for most
+/// of their hours), and at least `RECENT` of the latest `POOL_WEEKS` weeks read within
+/// `END_READ_SECONDS` of their reset, so a week whose end went unread cannot pass for a light one.
+/// Only such accounts are paired by the plan advisor. `h` must be the history SlopBar polled
 /// itself, without weeks from this PC's Codex rollouts.
 pub(crate) fn room(h: &AccountHistory, busiest: &[(String, f64)], now: DateTime<Utc>) -> bool {
-    assess(h, now).confidence == Confidence::High && !busiest.is_empty() && busiest.iter().all(|(_, p)| *p < LIMIT_PERCENT)
+    let since = now - chrono::Duration::weeks(POOL_WEEKS as i64);
+    let ends_read = h.windows.iter()
+        .filter(|r| r.kind == "weekly" && !r.local && r.resets_at <= now && r.resets_at > since && r.counts()
+            && (r.resets_at - r.last_obs).num_seconds() <= END_READ_SECONDS)
+        .count();
+    assess(h, now).confidence == Confidence::High && ends_read >= RECENT
+        && !busiest.is_empty() && busiest.iter().all(|(_, p)| *p < LIMIT_PERCENT)
 }
 
-/// Sets each account's `room_to_share` from this computer's usage history (`room`).
+/// Sets each account's `room_to_share`: it never ran out (`room`), and its busiest recent weeks,
+/// or the week in progress at its pace once `PACE_DAYS` have passed, leave the 20% spare every
+/// share keeps (`POOL_BUFFER`) in every weekly limit. The computers on such an account share it
+/// within its limits; an account that came close to a limit is no planned share, however many
+/// weeks it never quite ran out.
 pub fn attach_room(snapshot: &mut Snapshot, history: &History, now: DateTime<Utc>) {
     for acc in snapshot.accounts.iter_mut() {
-        acc.room_to_share = history.accounts.get(&history_key(acc.provider, &acc.id))
-            .is_some_and(|h| room(h, &busiest(h, pro_200(acc), now), now));
+        acc.room_to_share = history.accounts.get(&history_key(acc.provider, &acc.id)).is_some_and(|h| {
+            let basis = ShareBasis::of(acc, h, now);
+            basis.room && basis.load().iter().all(|(_, p)| p * (1.0 + POOL_BUFFER) <= 100.0 + 1e-9)
+        });
     }
 }
 
@@ -1783,6 +1800,11 @@ mod tests {
         let (h, now) = weeks(&[20.0; 6], 30);
         assert!(!room(&h, &busiest(&h, false, now), now));
         assert!(!room(&AccountHistory::default(), &[], now));
+        // Weeks whose last reading came two days before their reset may hide use after it.
+        let (mut h, now) = weeks(&[20.0; 5], 100);
+        assert!(room(&h, &busiest(&h, false, now), now));
+        for r in h.windows.iter_mut().skip(2) { r.last_obs = r.resets_at - days(2); }
+        assert!(!room(&h, &busiest(&h, false, now), now), "two of five ends read");
     }
 
     #[test]
@@ -1821,13 +1843,25 @@ mod tests {
 
     #[test]
     fn every_account_says_whether_it_has_room_to_share() {
-        let (h, now) = weeks(&[30.0; 4], 100);
         let mut history = History::default();
-        history.accounts.insert(history_key(Provider::Claude, "a1"), h);
-        let unseen = AccountUsage { id: "a2".into(), ..reading("weekly", 10.0, now + days(3)) };
-        let mut snapshot = Snapshot { accounts: vec![reading("weekly", 10.0, now + days(3)), unseen], updated_at: Some(now) };
+        for (id, peak) in [("a1", 30.0), ("near", 90.0)] {
+            history.accounts.insert(history_key(Provider::Claude, id), weeks(&[peak; 4], 100).0);
+        }
+        let now = weeks(&[30.0; 4], 100).1;
+        let read = |id: &str, used: f64, resets_in: Duration| AccountUsage { id: id.into(), fetched_at: Some(now), ..reading("weekly", used, now + resets_in) };
+        let mut snapshot = Snapshot { accounts: vec![
+            read("a1", 10.0, days(3)),
+            // Never ran out, but 90% leaves less than the 20% spare a share keeps.
+            read("near", 10.0, days(3)),
+            // No history here.
+            read("a2", 10.0, days(3)),
+        ], updated_at: Some(now) };
         attach_room(&mut snapshot, &history, now);
-        assert_eq!(snapshot.accounts.iter().map(|a| a.room_to_share).collect::<Vec<_>>(), [true, false]);
+        assert_eq!(snapshot.accounts.iter().map(|a| (a.id.as_str(), a.room_to_share)).collect::<Vec<_>>(), [("a1", true), ("near", false), ("a2", false)]);
+        // Four days in at 50%, its pace (87.5%) leaves no spare this week either.
+        let mut busy = Snapshot { accounts: vec![read("a1", 50.0, days(3))], updated_at: Some(now) };
+        attach_room(&mut busy, &history, now);
+        assert!(!busy.accounts[0].room_to_share);
     }
 
     #[test]
