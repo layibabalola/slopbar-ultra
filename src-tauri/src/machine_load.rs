@@ -534,7 +534,10 @@ pub fn advise(own: &Load, here: &str, peers: &Peers, accounts: &[AccountUsage], 
             let live = c.load.map(|l| shares(l, &|l| &l.live));
             let measured = c.load.is_some_and(|l| l.measured);
             let needs_own = measured && busiest.as_ref().is_some_and(|b| !fits_one(b));
-            if measured && !needs_own { members.push((i, busiest.clone().unwrap_or_default())); }
+            // Use on a plan of unknown size is missing from its numbers, so they may read low: such a
+            // computer is listed, never grouped.
+            let uncounted = c.load.is_some_and(|l| l.uncounted);
+            if measured && !needs_own && !uncounted { members.push((i, busiest.clone().unwrap_or_default())); }
             let most = |v: &Vec<f64>| round2(v.iter().copied().fold(0.0, f64::max) * 100.0);
             computers.push(Computer {
                 machine: c.machine.clone(),
@@ -544,7 +547,7 @@ pub fn advise(own: &Load, here: &str, peers: &Peers, accounts: &[AccountUsage], 
                 weeks: c.load.map_or(0, |l| l.weeks),
                 measured,
                 needs_own,
-                uncounted: c.load.is_some_and(|l| l.uncounted),
+                uncounted,
                 seen_at: c.seen_at,
             });
         }
@@ -865,6 +868,13 @@ mod tests {
         assert_eq!(computers, [("DESK-1".to_string(), Some(40.0), true, false), ("LAPTOP-2".to_string(), Some(30.0), true, false), ("OLD-PC".to_string(), None, false, false)],
             "an older SlopBar's computer is listed, its use unknown, never zero");
         assert_eq!(groups, [(names(&["DESK-1", "LAPTOP-2"]), 70.0)]);
+        // Use on a plan of unknown size is missing from a computer's numbers: listed, never grouped.
+        let mut partial = loaded(&[("weekly", 0.3)], true);
+        partial.providers.get_mut("claude").unwrap().uncounted = true;
+        let mut with_partial = Peers::default();
+        with_partial.note(&place(), &[peer("b", "LAPTOP-2", now - hours(1), Some(partial), &["x"])], "DESK-1", now);
+        let (computers, groups) = shown(&own, &with_partial, &accounts, now);
+        assert_eq!((computers.len(), groups.len()), (2, 0));
         // LAPTOP-2 quits: its empty record carries no load, and its last one stands.
         peers.note(&place(), &[peer("b", "LAPTOP-2", now, None, &[])], "DESK-1", now);
         assert_eq!(shown(&own, &peers, &accounts, now).0[1], ("LAPTOP-2".to_string(), Some(30.0), true, false));
