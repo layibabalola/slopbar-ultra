@@ -14,13 +14,23 @@
   reference, never the capture: it looks right even when nothing reaches the screen, which is
   exactly the bug the screen capture looks for (a flyout that is shown but never composited).
 
+  The screen is also captured 50 ms after the flyout appears, and that early capture must show
+  the flyout as the later one does. A flyout must be drawn when it appears, not a moment later:
+  the first open after a start once showed an empty panel, then a grey and an almost black one,
+  and was drawn only 0.3 to 0.5 s after the click, which the later capture alone usually missed.
+  -AfterRestart <seconds> tests exactly that open: it restarts SlopBar through its agent door
+  (slopbar-mcp restart_app), then clicks that many seconds after the new SlopBar started.
+
   FAIL means: the flyout did not appear within -TimeoutMs (2 s), or the screen matches the
   flyout's own pixels on less than 90% of its client area, or other windows covered more than 2%
   of it (WindowFromPoint over a grid of its client area), or the capture matches what is behind it
-  by more than 50%, or it has fewer than 20 distinct colours. The colour checks alone once passed
-  a capture that showed other windows where the flyout should have been. The PNGs (the capture,
-  what was behind, and the flyout's own rendering) are written to -OutDir (%TEMP% by default),
-  never into the repository.
+  by more than 50%, or it has fewer than 20 distinct colours, or the early capture matches the
+  later one on less than 30% of the flyout (drawn at once, it matches on 60% or more mid-way
+  through its entrance animation; appearing undrawn, on 0 to 4%) or shows exactly what is behind
+  it on more than half (a transparent, undrawn flyout). The colour checks alone once
+  passed a capture that showed other windows where the flyout should have been. The PNGs (the
+  capture, the early one, what was behind, and the flyout's own rendering) are written to -OutDir
+  (%TEMP% by default), never into the repository.
 
   Run it in an unlocked, interactive desktop session. It refuses to run when there is no
   foreground window (a locked screen, a disconnected remote session): nothing composites then,
@@ -33,11 +43,15 @@
 
 .EXAMPLE
   1..5 | % { powershell -ExecutionPolicy Bypass -File scripts/test-flyout-click.ps1 }
+
+.EXAMPLE
+  5, 30, 60 | % { powershell -ExecutionPolicy Bypass -File scripts/test-flyout-click.ps1 -AfterRestart $_ }
 #>
 param(
   [int]$WaitMs = 400,       # how long the flyout gets to draw before the capture
   [int]$TimeoutMs = 2000,   # how long it may take to become visible
-  [string]$OutDir = $env:TEMP
+  [string]$OutDir = $env:TEMP,
+  [int]$AfterRestart = -1   # restart SlopBar first and click this many seconds after it started
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
@@ -126,6 +140,36 @@ if ($widget -eq [IntPtr]::Zero) {
 }
 [uint32]$appPid = 0; [void]$T::GetWindowThreadProcessId($widget, [ref]$appPid)
 
+if ($AfterRestart -ge 0) {
+  # restart_app through the agent door, as agents ask for it: SlopBar exits as from its menu and
+  # starts again.
+  $mcp = Join-Path $env:LOCALAPPDATA 'SlopBar\slopbar-mcp.exe'
+  if (-not (Test-Path $mcp)) { Write-Host "CANNOT RUN: no $mcp to restart SlopBar through."; exit 2 }
+  $info = New-Object Diagnostics.ProcessStartInfo $mcp
+  $info.UseShellExecute = $false; $info.CreateNoWindow = $true
+  $info.RedirectStandardInput = $true; $info.RedirectStandardOutput = $true
+  $door = [Diagnostics.Process]::Start($info)
+  $door.StandardInput.WriteLine('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test-flyout-click","version":"1"}}}')
+  $door.StandardInput.WriteLine('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"restart_app","arguments":{}}}')
+  $door.StandardInput.Close(); [void]$door.StandardOutput.ReadToEnd(); [void]$door.WaitForExit(30000)
+  # The new SlopBar's widget, then the wait from when it started.
+  $restart = [Diagnostics.Stopwatch]::StartNew()
+  [uint32]$newPid = $appPid
+  while ($newPid -eq $appPid -and $restart.Elapsed.TotalSeconds -lt 60) {
+    Start-Sleep -Milliseconds 100
+    $widget = $T::FindWindow($WidgetClass, [NullString]::Value)
+    [uint32]$found = 0
+    if ($widget -ne [IntPtr]::Zero) { [void]$T::GetWindowThreadProcessId($widget, [ref]$found) }
+    if ($found -ne 0) { $newPid = $found }
+  }
+  if ($newPid -eq $appPid) { Write-Host 'CANNOT RUN: SlopBar did not start again within 60 s of restart_app.'; exit 2 }
+  $appPid = $newPid
+  $started = (Get-Process -Id $appPid).StartTime
+  $left = ($started.AddSeconds($AfterRestart) - (Get-Date)).TotalMilliseconds
+  if ($left -gt 0) { Start-Sleep -Milliseconds ([int]$left) }
+  Write-Host ("restarted:       clicked {0:N1} s after SlopBar started" -f ((Get-Date) - $started).TotalSeconds)
+}
+
 function Click-Widget {
   $lp = [IntPtr]((10 -shl 16) -bor 10)
   [void]$T::PostMessage($widget, $WM_LBUTTONDOWN, [IntPtr]1, $lp)
@@ -167,7 +211,13 @@ if ($flyout -eq [IntPtr]::Zero) {
 }
 
 $fronted = $T::Front($flyout)
-Start-Sleep -Milliseconds $WaitMs
+# What the screen shows a few frames after the flyout appeared: it must already be drawn.
+$untilEarly = 50 - ($sw.ElapsedMilliseconds - $visibleMs)
+if ($untilEarly -gt 0) { Start-Sleep -Milliseconds $untilEarly }
+$earlyMs = $sw.ElapsedMilliseconds - $visibleMs
+$er = New-Object FlyoutTest+RECT; [void]$T::GetWindowRect($flyout, [ref]$er)
+$early = Capture $er
+Start-Sleep -Milliseconds ([Math]::Max(0, $WaitMs - $earlyMs))
 $r = New-Object FlyoutTest+RECT; [void]$T::GetWindowRect($flyout, [ref]$r)
 [void]$T::SetWindowPos($flyout, $HWND_TOPMOST, 0, 0, 0, 0, $SWP_NOSIZE_NOMOVE_NOACTIVATE)
 Start-Sleep -Milliseconds 150
@@ -213,6 +263,26 @@ if ($own) {
   }
 }
 $drawn = if ($m) { $agree / $m } else { 0 }
+# How much of the client area the early capture showed as the later one does. Only when the
+# flyout kept its size: one that grew as it opened (an account added while it was closed) shows
+# its earlier layout first, which is not a flyout appearing undrawn.
+# Also how much of it was exactly what is behind the flyout: a transparent, undrawn flyout over a
+# window of similar colours can come close to the later pixels, never to the very same as behind.
+$drawnEarly = $null; $behindEarly = $null
+if (($er.R - $er.L) -eq ($r.R - $r.L) -and ($er.B - $er.T) -eq ($r.B - $r.T)) {
+  $agreeE = 0; $sameE = 0; $mE = 0
+  for ($y = $cy; $y -lt [Math]::Min($cy + $cr.B, $shot.Height); $y += 6) {
+    for ($x = $cx; $x -lt [Math]::Min($cx + $cr.R, $shot.Width); $x += 6) {
+      $a = $early.GetPixel($x, $y); $b = $shot.GetPixel($x, $y); $mE++
+      if ([Math]::Abs($a.R - $b.R) + [Math]::Abs($a.G - $b.G) + [Math]::Abs($a.B - $b.B) -le 48) { $agreeE++ }
+      if ($a.ToArgb() -eq $behind.GetPixel($x, $y).ToArgb()) { $sameE++ }
+    }
+  }
+  $drawnEarly = if ($mE) { $agreeE / $mE } else { 0 }
+  $behindEarly = if ($mE) { $sameE / $mE } else { 1 }
+}
+$earlyPath = Join-Path $OutDir "slopbar-flyout-$stamp-early.png"
+$early.Save($earlyPath, [Drawing.Imaging.ImageFormat]::Png); $early.Dispose()
 $shot.Save($shotPath, [Drawing.Imaging.ImageFormat]::Png); $behind.Save($behindPath, [Drawing.Imaging.ImageFormat]::Png)
 $ownPath = Join-Path $OutDir "slopbar-flyout-$stamp-own.png"
 if ($own) { $own.Save($ownPath, [Drawing.Imaging.ImageFormat]::Png); $own.Dispose() }
@@ -224,14 +294,20 @@ elseif ($drawn -lt 0.9) { $reasons += ("the screen shows the flyout's own pixels
 if ($onTop -lt 0.98) { $reasons += ('other windows covered {0:P0} of the flyout when it was captured' -f (1 - $onTop)) }
 if ($match -gt 0.5) { $reasons += 'the capture matches what is behind the flyout by more than 50%' }
 if ($colors.Count -lt 20) { $reasons += 'the capture has fewer than 20 distinct colours' }
+if ($null -ne $drawnEarly -and ($drawnEarly -lt 0.3 -or $behindEarly -gt 0.5)) {
+  $reasons += ("the flyout appeared undrawn: {0} ms after it appeared, the screen showed its later pixels on only {1:P0} of it, and what is behind it on {2:P0}" -f $earlyMs, $drawnEarly, $behindEarly)
+}
 Write-Host ("visible after:   {0} ms" -f $visibleMs)
 Write-Host ("flyout:          {0}x{1} at {2},{3}; fronted: {4}" -f ($r.R - $r.L), ($r.B - $r.T), $r.L, $r.T, $fronted)
+if ($null -ne $drawnEarly) { Write-Host ("drawn at once:   {0:P0} of its area {1} ms after it appeared ({2:P0} as behind it)" -f $drawnEarly, $earlyMs, $behindEarly) }
+else { Write-Host ("drawn at once:   not checked: it changed size as it opened ({0}x{1} at first)" -f ($er.R - $er.L), ($er.B - $er.T)) }
 Write-Host ("own pixels:      {0:P0} of its area" -f $drawn)
 Write-Host ("on top:          {0:P0} of its area" -f $onTop)
 Write-Host ("distinct colours: {0}" -f $colors.Count)
 Write-Host ("match behind:    {0:P0}" -f $match)
 if (-not $closed) { Write-Host 'warning:         the flyout was still visible after the closing click, so the behind capture includes it' }
 Write-Host "shot:            $shotPath"
+Write-Host "early:           $earlyPath"
 Write-Host "behind:          $behindPath"
 if ($own) { Write-Host "own:             $ownPath" }
 if ($reasons) { Write-Host ('FAIL: ' + ($reasons -join '; ')); exit 1 }
