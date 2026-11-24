@@ -26,16 +26,16 @@ const MIN_DAYS: u8 = 3;
 const LIMIT_PERCENT: f64 = 99.5;
 const UNUSED_PERCENT: f64 = 5.0;
 const UNDERUSED_PERCENT: f64 = 25.0;
-const WEEK_SECONDS: i64 = 7 * 86400;
+pub(crate) const WEEK_SECONDS: i64 = 7 * 86400;
 /// Two readings of one window can report a reset a little apart.
-const SAME_WINDOW_SECONDS: i64 = 3600;
+pub(crate) const SAME_WINDOW_SECONDS: i64 = 3600;
 const MAX_FILE: u64 = 4 << 20;
 /// An unused window's reset sits this close to a full week ahead.
-const IDLE_SLACK_SECONDS: i64 = 15 * 60;
+pub(crate) const IDLE_SLACK_SECONDS: i64 = 15 * 60;
 const FORGET_DAYS: i64 = 14;
 
 /// Weekly windows the history records. Session windows say nothing about a plan's value.
-const KINDS: [&str; 3] = ["weekly", "weekly_opus", "weekly_sonnet"];
+pub(crate) const KINDS: [&str; 3] = ["weekly", "weekly_opus", "weekly_sonnet"];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -652,6 +652,9 @@ pub struct Report {
     pub advice: Vec<crate::advisor::ProviderAdvice>,
     /// What the plans have cost month by month (`ledger`), when the app has a ledger.
     pub spend: Option<crate::ledger::Summary>,
+    /// Which of the user's computers could share one plan (`machine_load`), set by the app while
+    /// in-use status is shared; empty otherwise.
+    pub machines: Vec<crate::machine_load::MachineAdvice>,
 }
 
 /// A Codex plan with no use in the live week and none on this PC for this long reads as unused
@@ -772,7 +775,7 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
         }
     }).collect();
     let advice = crate::advisor::advise(&accounts, &providers);
-    Report { accounts, providers, generated_at: now, advice, spend: None }
+    Report { accounts, providers, generated_at: now, advice, spend: None, machines: vec![] }
 }
 
 fn sum_extra(accounts: &[Entry], provider: Provider, f: impl Fn(&crate::model::ExtraUsage) -> Option<f64>) -> Option<f64> {
@@ -947,12 +950,12 @@ const PACE_DAYS: i64 = 3;
 
 /// A Codex Pro 200 plan, whose weeks before its allowance cut (`PRO_200_LAST_DAY`) were measured
 /// against the previous, larger allowance.
-fn pro_200(acc: &AccountUsage) -> bool {
+pub(crate) fn pro_200(acc: &AccountUsage) -> bool {
     acc.provider == Provider::Codex && acc.plan.as_deref() == Some("pro")
 }
 
 /// The first moment of Pro 200's new allowance: the day after `PRO_200_LAST_DAY`, UTC.
-fn pro_200_cut() -> DateTime<Utc> {
+pub(crate) fn pro_200_cut() -> DateTime<Utc> {
     let (y, m, d) = PRO_200_LAST_DAY;
     NaiveDate::from_ymd_opt(y, m, d).and_then(|d| d.succ_opt()).and_then(|d| d.and_hms_opt(0, 0, 0))
         .map_or(DateTime::<Utc>::MIN_UTC, |t| Utc.from_utc_datetime(&t))
@@ -1022,13 +1025,18 @@ fn live_weeks(acc: &AccountUsage, now: DateTime<Utc>) -> Vec<(String, f64)> {
     let read_at = acc.fetched_at.unwrap_or(now).min(now);
     acc.windows.iter()
         .filter(|w| KINDS.contains(&w.kind.as_str()) && w.window_seconds.is_none_or(|s| s == WEEK_SECONDS))
-        .filter_map(|w| {
-            let resets = w.resets_at.filter(|r| *r > now)?;
-            let elapsed = WEEK_SECONDS - (resets - read_at).num_seconds();
-            let pace = (elapsed >= PACE_DAYS * 86400 && elapsed <= WEEK_SECONDS).then(|| w.used_percent * WEEK_SECONDS as f64 / elapsed as f64);
-            Some((w.kind.clone(), pace.map_or(w.used_percent, |p| p.max(w.used_percent))))
-        })
+        .filter_map(|w| Some((w.kind.clone(), live_week(w.used_percent, w.resets_at?, read_at, now)?)))
         .collect()
+}
+
+/// One weekly window still running at `now`, read at `read_at` with `used` percent gone: that use,
+/// or its pace (use over the share of the week gone by the reading) once `PACE_DAYS` have passed
+/// when that is higher. None for a window that has reset.
+pub(crate) fn live_week(used: f64, resets_at: DateTime<Utc>, read_at: DateTime<Utc>, now: DateTime<Utc>) -> Option<f64> {
+    if resets_at <= now { return None; }
+    let elapsed = WEEK_SECONDS - (resets_at - read_at.min(now)).num_seconds();
+    let pace = (PACE_DAYS * 86400..=WEEK_SECONDS).contains(&elapsed).then(|| used * WEEK_SECONDS as f64 / elapsed as f64);
+    Some(pace.map_or(used, |p| p.max(used)))
 }
 
 /// What sharing this account rests on, for the plan advisor (`advisor`): its busiest recent weeks,
