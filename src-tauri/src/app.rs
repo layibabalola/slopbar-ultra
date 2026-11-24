@@ -3872,7 +3872,12 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
     let decisions = {
         let last = state.last_switch.lock().unwrap().clone();
         let leased = state.leases.lock().unwrap().accounts();
-        balancer::decide_avoiding(&list, &settings, &last, &leased)
+        // Decided with what the last refresh knew of the other computers (`carry_over`): the fetch
+        // alone does not know where else an account is in use, and an account in use there is never
+        // a target.
+        let mut known = list.clone();
+        carry_over(&mut known, &previous);
+        balancer::decide_avoiding(&known, &settings, &last, &leased)
     };
     let decisions = graceful_decisions(app, &list, &settings, decisions);
     for (provider, id) in decisions {
@@ -4036,8 +4041,14 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
 }
 
 /// Gives freshly fetched accounts what the last refresh worked out from sharing and forecasts,
-/// so the early redraw does not blank them for a moment.
+/// so the early redraw does not blank them for a moment and the automatic switch knows where else
+/// each is in use.
 fn carry_over(list: &mut [crate::model::AccountUsage], previous: &[crate::model::AccountUsage]) {
+    carry_over_as(list, previous, presence::identity().map_or("", |(_, name)| name.as_str()));
+}
+
+/// `carry_over` on the machine named `me`.
+fn carry_over_as(list: &mut [crate::model::AccountUsage], previous: &[crate::model::AccountUsage], me: &str) {
     for a in list.iter_mut() {
         if let Some(p) = previous.iter().find(|p| p.provider == a.provider && p.id == a.id) {
             a.remote = p.remote.clone();
@@ -4048,7 +4059,7 @@ fn carry_over(list: &mut [crate::model::AccountUsage], previous: &[crate::model:
         }
     }
     // A switch may have changed which account is in use here since the last refresh.
-    presence::overlap(list, presence::identity().map_or("", |(_, name)| name.as_str()));
+    presence::overlap(list, me);
 }
 
 /// Other machines' readings of these accounts, from the rosters last read (no I/O): shown where
@@ -5939,5 +5950,39 @@ mod window_tests {
             assert!(args.split(' ').any(|a| a == flag), "{flag} in {args}");
         }
         assert!(windows().iter().all(|w| w.get("dataDirectory").is_none()), "one WebView2 data folder for all");
+    }
+}
+
+#[cfg(test)]
+mod balance_tests {
+    use super::*;
+    use crate::model::{AccountUsage, RemoteSeat};
+
+    fn account(id: &str, active: bool, percent: f64) -> AccountUsage {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "provider": "claude", "email": format!("{id}@example.invalid"), "alias": null, "plan": null, "org": null,
+            "active": active, "sources": [], "credits": null, "resets": [], "error": null, "stale": false,
+            "fetched_at": chrono::Utc::now(), "monitor_connected": true,
+            "windows": [{ "kind": "session", "window_seconds": null, "used_percent": percent, "resets_at": null }],
+        })).unwrap()
+    }
+
+    /// The refresh's automatic switch decides on the fetched accounts with what the last refresh
+    /// knew of the other computers (`carry_over`, as `refresh_locked` does: roster.rs's
+    /// `the_app_works_shared_readings_out_wherever_it_publishes` pins that). The fetch alone knows
+    /// nothing of where else an account is in use, so on it one in use on another computer would
+    /// pass for the best target.
+    #[test]
+    fn the_automatic_switch_knows_where_else_an_account_is_in_use() {
+        let mut settings = Settings::default();
+        settings.balancer.claude.auto = true;
+        let fetched = vec![account("current", true, 95.0), account("theirs", false, 5.0), account("free", false, 30.0)];
+        let mut previous = fetched.clone();
+        previous[1].remote = vec![RemoteSeat { machine: "LAPTOP-2".into(), where_: vec!["Windows".into()], seen_at: chrono::Utc::now(), live: true }];
+        assert_eq!(balancer::decide_avoiding(&fetched, &settings, &HashMap::new(), &[]), [(Provider::Claude, "theirs".to_string())],
+            "the bare fetch picks the emptiest, though LAPTOP-2 uses it");
+        let mut known = fetched.clone();
+        carry_over_as(&mut known, &previous, "DESK-1");
+        assert_eq!(balancer::decide_avoiding(&known, &settings, &HashMap::new(), &[]), [(Provider::Claude, "free".to_string())]);
     }
 }
