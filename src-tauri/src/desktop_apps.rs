@@ -42,6 +42,9 @@ pub enum Signed {
 pub struct Apps {
     pub claude: Option<Signed>,
     pub codex: Option<Signed>,
+    /// The Codex app is installed while `CODEX_HOME` points the CLI SlopBar reads elsewhere: the
+    /// app keeps its own sign-in in `~/.codex`, which SlopBar does not see (`unseen`).
+    pub codex_elsewhere: bool,
 }
 
 impl Apps {
@@ -125,7 +128,23 @@ pub fn read() -> Apps {
     }
     // With CODEX_HOME set, the CLI SlopBar sees may not use the home the app does.
     let shares = std::env::var_os("CODEX_HOME").is_none_or(|h| h.is_empty());
-    Apps { claude: read_claude(), codex: (shares && codex_installed()).then_some(Signed::SharesCli) }
+    let codex = codex_installed();
+    Apps { claude: read_claude(), codex: (shares && codex).then_some(Signed::SharesCli), codex_elsewhere: !shares && codex }
+}
+
+/// The providers whose desktop app here is signed in to an account SlopBar does not have, as
+/// `apply` left `list`: Claude Desktop's account is no slot's (no account is marked `desktop`),
+/// or the Codex app keeps a sign-in SlopBar does not see (`Apps::codex_elsewhere`). Whatever the
+/// CLI here is signed in to, if anything. Use there cannot be counted (`machine_load`).
+pub fn unseen(list: &[AccountUsage], apps: &Apps) -> Vec<Provider> {
+    let mut out = vec![];
+    if matches!(apps.claude, Some(Signed::ClaudeAccount(_))) && !list.iter().any(|a| a.provider == Provider::Claude && a.desktop) {
+        out.push(Provider::Claude);
+    }
+    if apps.codex_elsewhere {
+        out.push(Provider::Codex);
+    }
+    out
 }
 
 /// The CLI on Windows itself (not WSL): the source the Codex app shares.
@@ -260,7 +279,7 @@ mod tests {
     #[test]
     fn same_account_marks_desktop_without_drift() {
         let mut list = vec![account(Provider::Claude, "u1:o1", "a@example.invalid", &["Windows"]), account(Provider::Claude, "u2:o2", "b@example.invalid", &[])];
-        apply(&mut list, &Apps { claude: Some(Signed::ClaudeAccount("u1".into())), codex: None });
+        apply(&mut list, &Apps { claude: Some(Signed::ClaudeAccount("u1".into())), codex: None, codex_elsewhere: false });
         assert!(list[0].desktop && list[0].seats.is_none());
         assert!(!list[1].desktop);
     }
@@ -268,7 +287,7 @@ mod tests {
     #[test]
     fn different_accounts_flag_drift_on_both() {
         let mut list = vec![account(Provider::Claude, "u1:o1", "a@example.invalid", &["Windows"]), account(Provider::Claude, "u2:o2", "b@example.invalid", &[])];
-        apply(&mut list, &Apps { claude: Some(Signed::ClaudeAccount("u2".into())), codex: None });
+        apply(&mut list, &Apps { claude: Some(Signed::ClaudeAccount("u2".into())), codex: None, codex_elsewhere: false });
         assert!(list[1].desktop && !list[0].desktop);
         let d = list[0].seats.clone().unwrap();
         assert_eq!((d.cli.as_deref(), d.desktop.as_deref()), (Some("a@example.invalid"), Some("b@example.invalid")));
@@ -278,22 +297,41 @@ mod tests {
     #[test]
     fn unknown_desktop_account_flags_the_cli_account() {
         let mut list = vec![account(Provider::Claude, "u1:o1", "a@example.invalid", &["Windows"])];
-        apply(&mut list, &Apps { claude: Some(Signed::ClaudeAccount("zz".into())), codex: None });
+        apply(&mut list, &Apps { claude: Some(Signed::ClaudeAccount("zz".into())), codex: None, codex_elsewhere: false });
         assert_eq!(list[0].seats.as_ref().unwrap().desktop, None);
     }
 
     #[test]
     fn codex_app_follows_the_windows_cli() {
         let mut list = vec![account(Provider::Codex, "c1", "a@example.invalid", &["Windows"]), account(Provider::Codex, "c2", "b@example.invalid", &["WSL: Ubuntu"])];
-        apply(&mut list, &Apps { claude: None, codex: Some(Signed::SharesCli) });
+        apply(&mut list, &Apps { claude: None, codex: Some(Signed::SharesCli), codex_elsewhere: false });
         assert!(list[0].desktop && !list[1].desktop);
         assert!(list.iter().all(|a| a.seats.is_none()));
+    }
+
+    /// A desktop app on an account SlopBar does not have is told whatever the CLI here: a
+    /// computer with no CLI sign-in on Windows (WSL only, or the desktop app only) too.
+    #[test]
+    fn a_desktop_app_on_an_account_slopbar_does_not_have_is_told_whatever_the_cli() {
+        let claude = |uuid: &str| Apps { claude: Some(Signed::ClaudeAccount(uuid.into())), codex: None, codex_elsewhere: false };
+        for sources in [&["Windows"][..], &["WSL: Ubuntu"], &[]] {
+            let mut list = vec![account(Provider::Claude, "u1:o1", "a@example.invalid", sources)];
+            apply(&mut list, &claude("zz"));
+            assert_eq!(unseen(&list, &claude("zz")), [Provider::Claude], "{sources:?}");
+            apply(&mut list, &claude("u1"));
+            assert!(unseen(&list, &claude("u1")).is_empty(), "{sources:?}");
+        }
+        assert_eq!(unseen(&[], &claude("zz")), [Provider::Claude], "no account here at all");
+        // The Codex app on its own home while CODEX_HOME points the CLI elsewhere.
+        let elsewhere = Apps { codex_elsewhere: true, ..Default::default() };
+        assert_eq!(unseen(&[account(Provider::Codex, "c1", "a@example.invalid", &["Windows"])], &elsewhere), [Provider::Codex]);
+        assert!(unseen(&[], &Apps::default()).is_empty(), "no desktop app");
     }
 
     #[test]
     fn a_wsl_organization_does_not_hide_the_windows_one() {
         let mut list = vec![account(Provider::Claude, "u1:o1", "a@example.invalid", &["WSL: Ubuntu"]), account(Provider::Claude, "u1:o2", "a@example.invalid", &["Windows"])];
-        apply(&mut list, &Apps { claude: Some(Signed::ClaudeAccount("u1".into())), codex: None });
+        apply(&mut list, &Apps { claude: Some(Signed::ClaudeAccount("u1".into())), codex: None, codex_elsewhere: false });
         assert!(list[1].desktop && !list[0].desktop);
         assert!(list.iter().all(|a| a.seats.is_none()));
     }
@@ -301,7 +339,7 @@ mod tests {
     #[test]
     fn prefers_the_cli_organization_of_a_shared_account() {
         let mut list = vec![account(Provider::Claude, "u1:o1", "a@example.invalid", &[]), account(Provider::Claude, "u1:o2", "a@example.invalid", &["Windows"])];
-        apply(&mut list, &Apps { claude: Some(Signed::ClaudeAccount("u1".into())), codex: None });
+        apply(&mut list, &Apps { claude: Some(Signed::ClaudeAccount("u1".into())), codex: None, codex_elsewhere: false });
         assert!(list[1].desktop && !list[0].desktop && list[1].seats.is_none());
     }
 }

@@ -398,6 +398,9 @@ input[type="range"]:active::-webkit-slider-thumb { background: radial-gradient(c
 .chip.where { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chip.outside { background: transparent; border-color: var(--warn); color: var(--warn); }
 .chip.overlap { background: transparent; border-color: var(--warn); color: var(--warn); font-weight: 600; }
+/* One shared within its limits (`room_to_share`, a planned share) is no warning: outlined like the
+   amber one, in the secondary text color, as the flyout's `.share`. */
+.chip.share { background: transparent; border-color: var(--strong-stroke); color: var(--dim); }
 .overlap-icon { font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets"; font-size: 0.9em; vertical-align: -1px; }
 .chip.unexpected { background: transparent; border-color: var(--bad); color: var(--bad); }
 .web-use { display: inline-flex; align-items: center; gap: 4px; align-self: flex-start; cursor: pointer; }

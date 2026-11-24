@@ -200,6 +200,24 @@ test("an overlap marks this PC by its place, never by a name a clone may share",
     "not in use here: a machine named like this one is another machine");
 });
 
+test("an account shared within its limits is a planned share, said plainly", () => {
+  const conflict = overlapText(used({ active: true, overlap: ["DESK-1", "LAPTOP-2"] }));
+  assert.equal(conflict.shared, false);
+  assert.equal(conflict.lines[1], "Limits drain about 2× as fast, and this account has no room to share: it came within 20% of a weekly limit in recent weeks or at this week's pace, or SlopBar has not watched it long enough. Switch one machine to another account.");
+  const o = overlapText(used({ active: true, overlap: ["DESK-1", "LAPTOP-2", "TOWER-3"], room_to_share: true }));
+  assert.equal(o.shared, true);
+  assert.equal(o.chip, "Shared by 3 computers");
+  assert.deepEqual(o.lines, ["Shared by 3 computers: DESK-1 (this PC), LAPTOP-2, TOWER-3",
+    "Its busiest recent weeks and this week so far left 20% to spare under its weekly limits, so these computers' use adds up within them; the 5-hour limit is shared too."]);
+  // The flyout's tooltip says the same.
+  const tip = accountTipLines(used({ id: "fixture-3", provider: "codex", email: "x@example.invalid", active: true, sources: ["Windows"],
+    overlap: ["DESK-1", "LAPTOP-2"], room_to_share: true, windows: [], resets: [], monitor_connected: true }), { now });
+  assert.ok(tip.flat().includes("Shared by 2 computers: DESK-1 (this PC), LAPTOP-2"), JSON.stringify(tip));
+  assert.ok(!tip.flat().some((l) => l.includes("drain")), JSON.stringify(tip));
+  // Room with no overlap says nothing.
+  assert.deepEqual(overlapText(used({ active: true, room_to_share: true })), { chip: "", lines: [], shared: false });
+});
+
 test("another record under this machine's name is not listed twice", () => {
   const twin = { machine: "desk-1", where: ["WSL: Ubuntu"], seen_at: iso(now), live: true };
   const p = placesText(used({ active: true, sources: ["Windows"], remote: [twin, laptop] }));

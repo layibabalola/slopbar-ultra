@@ -26,16 +26,16 @@ const MIN_DAYS: u8 = 3;
 const LIMIT_PERCENT: f64 = 99.5;
 const UNUSED_PERCENT: f64 = 5.0;
 const UNDERUSED_PERCENT: f64 = 25.0;
-const WEEK_SECONDS: i64 = 7 * 86400;
+pub(crate) const WEEK_SECONDS: i64 = 7 * 86400;
 /// Two readings of one window can report a reset a little apart.
-const SAME_WINDOW_SECONDS: i64 = 3600;
+pub(crate) const SAME_WINDOW_SECONDS: i64 = 3600;
 const MAX_FILE: u64 = 4 << 20;
 /// An unused window's reset sits this close to a full week ahead.
-const IDLE_SLACK_SECONDS: i64 = 15 * 60;
+pub(crate) const IDLE_SLACK_SECONDS: i64 = 15 * 60;
 const FORGET_DAYS: i64 = 14;
 
 /// Weekly windows the history records. Session windows say nothing about a plan's value.
-const KINDS: [&str; 3] = ["weekly", "weekly_opus", "weekly_sonnet"];
+pub(crate) const KINDS: [&str; 3] = ["weekly", "weekly_opus", "weekly_sonnet"];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -60,6 +60,13 @@ pub struct AccountHistory {
     /// clock hour (the latest), for the sparklines in the flyout and Settings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trail: Vec<TrailPoint>,
+    /// The plan last seen on the account (`plan_label`), and when it changed to it: weeks before
+    /// that are shares of another tier's allowance. None while it has not changed since SlopBar
+    /// first noted the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_since: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -133,6 +140,11 @@ fn save_to(path: &std::path::Path, history: &History) -> Result<(), String> {
 pub fn observe(h: &mut AccountHistory, acc: &AccountUsage, now: DateTime<Utc>) {
     if acc.stale || acc.error.is_some() { return; }
     h.first_seen.get_or_insert(now);
+    // Only plans of known size: a login read without its tier says "Max", which is no change of plan.
+    if let Some(label) = plan_label(acc).filter(|_| plan_weight(acc).is_some()) {
+        if h.plan.as_ref().is_some_and(|p| *p != label) { h.plan_since = Some(now); }
+        h.plan = Some(label);
+    }
     if let Some(balance) = acc.credits.as_deref().and_then(parse_balance) { note_credits(h, balance, now); }
     note_trail(h, acc, now);
     for w in &acc.windows {
@@ -244,6 +256,13 @@ fn history_key(provider: Provider, id: &str) -> String {
     format!("{}:{id}", provider.name())
 }
 
+/// Whether a window was used on the account's present plan: it reset after the plan last changed
+/// (`AccountHistory::plan_since`). A week before the change was a share of another allowance, so
+/// the verdict and pool sizing leave it out, as `room` does.
+fn on_this_plan(h: &AccountHistory, r: &WindowRecord) -> bool {
+    h.plan_since.is_none_or(|t| r.resets_at > t)
+}
+
 /// Settings keys per account, as aliases use (`providers::alias_key`).
 pub(crate) fn pref_key(provider: Provider, id: &str) -> String {
     crate::providers::alias_key(provider, id)
@@ -298,7 +317,7 @@ pub struct Assessment {
 
 pub fn assess(h: &AccountHistory, now: DateTime<Utc>) -> Assessment {
     let recent = |kind: &str| -> Vec<&WindowRecord> {
-        let mut done: Vec<&WindowRecord> = h.windows.iter().filter(|r| r.kind == kind && r.resets_at <= now && r.counts()).collect();
+        let mut done: Vec<&WindowRecord> = h.windows.iter().filter(|r| r.kind == kind && r.resets_at <= now && r.counts() && on_this_plan(h, r)).collect();
         done.sort_by_key(|r| std::cmp::Reverse(r.resets_at));
         done.truncate(RECENT);
         done
@@ -604,6 +623,13 @@ pub struct Entry {
     /// The week SlopBar started watching the account.
     #[serde(skip)]
     pool_since: Option<NaiveDate>,
+    /// The week the plan last changed (`AccountHistory::plan_since`): its weeks before it are left out
+    /// of `pool_weeks`, being shares of another allowance.
+    #[serde(skip)]
+    pool_changed: Option<NaiveDate>,
+    /// What sharing this plan rests on (`advisor`).
+    #[serde(skip)]
+    pub(crate) share: ShareBasis,
 }
 
 impl Entry {
@@ -649,6 +675,9 @@ pub struct Report {
     pub advice: Vec<crate::advisor::ProviderAdvice>,
     /// What the plans have cost month by month (`ledger`), when the app has a ledger.
     pub spend: Option<crate::ledger::Summary>,
+    /// Which of the user's computers could share one plan (`machine_load`), set by the app while
+    /// in-use status is shared; empty otherwise.
+    pub machines: Vec<crate::machine_load::MachineAdvice>,
 }
 
 /// A Codex plan with no use in the live week and none on this PC for this long reads as unused
@@ -684,6 +713,8 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
     let accounts: Vec<Entry> = snapshot.accounts.iter().map(|acc| {
         let prefs = settings.subscriptions.get(&pref_key(acc.provider, &acc.id)).cloned().unwrap_or_default();
         let h = history.accounts.get(&history_key(acc.provider, &acc.id)).unwrap_or(&empty);
+        // Before this PC's Codex rollouts fill gaps: a share rests on weeks SlopBar watched.
+        let share = ShareBasis::of(acc, h, now);
         let kind = plan_kind(acc.plan.as_deref());
         let paid = kind == PlanKind::Personal;
         let monthly_cost = prefs.monthly_cost.or_else(|| list_price(acc).filter(|_| paid));
@@ -710,6 +741,7 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
         // Only from when SlopBar watched it: before then, rollout weeks exist only for the accounts
         // used on this PC, and leaving the rest out would make the fleet look less busy.
         let pool_since = h.first_seen.map(|t| monday(t.date_naive()));
+        let pool_changed = h.plan_since.map(|t| monday(t.date_naive()));
         let credits = (acc.provider == Provider::Codex).then(|| credit_info(acc.credits.as_deref(), h.credits.as_ref())).flatten();
         Entry {
             renewal_warning: if paid { renewal_warning(renewal.as_ref(), ends_at, &assessment, now) } else { None },
@@ -744,6 +776,8 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
             pool_weeks,
             pool_local,
             pool_since,
+            pool_changed,
+            share,
         }
     }).collect();
     let providers: Vec<ProviderSummary> = Provider::ALL.into_iter().filter(|p| accounts.iter().any(|a| a.provider == *p)).map(|provider| {
@@ -766,7 +800,7 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
         }
     }).collect();
     let advice = crate::advisor::advise(&accounts, &providers);
-    Report { accounts, providers, generated_at: now, advice, spend: None }
+    Report { accounts, providers, generated_at: now, advice, spend: None, machines: vec![] }
 }
 
 fn sum_extra(accounts: &[Entry], provider: Provider, f: impl Fn(&crate::model::ExtraUsage) -> Option<f64>) -> Option<f64> {
@@ -811,16 +845,29 @@ pub fn reference_plan(provider: Provider) -> &'static str {
 /// usage, so Pro = 1/20 and Max 5x = 1/4 of Max 20x); otherwise the list price ratio (ChatGPT
 /// Plus = 0.1, Pro 100 = 0.5 and Pro 500 = 2.5 of Pro 200).
 pub fn plan_weight(acc: &AccountUsage) -> Option<f64> {
-    Some(match (acc.provider, plan_label(acc)?.as_str()) {
-        (Provider::Claude, "Pro") => 0.05,
-        (Provider::Claude, "Max 5x") => 0.25,
-        (Provider::Claude, "Max 20x") => 1.0,
-        (Provider::Codex, "Plus") => 0.1,
-        (Provider::Codex, "Pro 100") => 0.5,
-        (Provider::Codex, "Pro 200") => 1.0,
-        (Provider::Codex, "Pro 500") => 2.5,
-        _ => return None,
-    })
+    tier_weight(acc.provider, &plan_label(acc)?)
+}
+
+/// Every tier with a known weight (`plan_weight`): its provider, its name as `plan_label` gives it,
+/// and its weight. Each provider's weights differ, so a weight names its tier (`tier_of`).
+const TIER_WEIGHTS: [(Provider, &str, f64); 7] = [
+    (Provider::Claude, "Pro", 0.05),
+    (Provider::Claude, "Max 5x", 0.25),
+    (Provider::Claude, "Max 20x", 1.0),
+    (Provider::Codex, "Plus", 0.1),
+    (Provider::Codex, "Pro 100", 0.5),
+    (Provider::Codex, "Pro 200", 1.0),
+    (Provider::Codex, "Pro 500", 2.5),
+];
+
+/// The weight of the provider's tier named `label` (`plan_label`), when it is known.
+pub(crate) fn tier_weight(provider: Provider, label: &str) -> Option<f64> {
+    TIER_WEIGHTS.iter().find(|(p, l, _)| *p == provider && *l == label).map(|(_, _, w)| *w)
+}
+
+/// The provider's tier of this weight (`tier_weight`).
+pub(crate) fn tier_of(provider: Provider, weight: f64) -> Option<&'static str> {
+    TIER_WEIGHTS.iter().find(|(p, _, w)| *p == provider && (w - weight).abs() < 1e-9).map(|(_, l, _)| *l)
 }
 
 /// Pool sizing looks at this many of the latest weeks, needs `POOL_MIN_WEEKS` of them, takes the
@@ -842,7 +889,7 @@ fn monday(d: NaiveDate) -> NaiveDate {
 fn week_peaks(h: &AccountHistory, now: DateTime<Utc>) -> (BTreeMap<NaiveDate, f64>, BTreeSet<NaiveDate>) {
     let mut out = BTreeMap::new();
     let mut local = BTreeSet::new();
-    for r in h.windows.iter().filter(|r| r.kind == "weekly" && r.resets_at <= now && r.counts()) {
+    for r in h.windows.iter().filter(|r| r.kind == "weekly" && r.resets_at <= now && r.counts() && on_this_plan(h, r)) {
         let week = monday((r.resets_at - chrono::Duration::seconds(1)).date_naive());
         let peak = out.entry(week).or_insert(0.0);
         *peak = f64::max(*peak, r.peak);
@@ -901,7 +948,13 @@ fn pool(provider: Provider, paid: &[&Entry], now: DateTime<Utc>) -> Pool {
             let (e, w) = weighted[i];
             match e.pool_weeks.get(week) {
                 Some(p) => p / 100.0 * w,
-                None => { filled = true; medians[i].unwrap_or(0.0) / 100.0 * w }
+                None => {
+                    filled = true;
+                    // A week before the plan changed was a share of another allowance and is left out:
+                    // counted as the whole plan, so no cut rests on the gap (its median would read the
+                    // weeks on the new plan only, or nothing yet).
+                    if e.pool_changed.is_some_and(|c| *week < c) { w } else { medians[i].unwrap_or(0.0) / 100.0 * w }
+                }
             }
         }).sum();
         estimated += filled as u8;
@@ -930,6 +983,154 @@ fn percentile(values: &[f64], p: f64) -> f64 {
     v.sort_by(f64::total_cmp);
     let rank = ((p * v.len() as f64).ceil() as usize).clamp(1, v.len().max(1));
     v.get(rank - 1).copied().unwrap_or(0.0)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Room to share
+
+/// The week in progress counts toward a share at its pace only once this many days of it have
+/// passed: read sooner, a busy morning's pace reads as a week that runs out.
+const PACE_DAYS: i64 = 3;
+
+/// A Codex Pro 200 plan, whose weeks before its allowance cut (`PRO_200_LAST_DAY`) were measured
+/// against the previous, larger allowance.
+pub(crate) fn pro_200(acc: &AccountUsage) -> bool {
+    acc.provider == Provider::Codex && acc.plan.as_deref() == Some("pro")
+}
+
+/// The first moment of Pro 200's new allowance: the day after `PRO_200_LAST_DAY`, UTC.
+pub(crate) fn pro_200_cut() -> DateTime<Utc> {
+    let (y, m, d) = PRO_200_LAST_DAY;
+    NaiveDate::from_ymd_opt(y, m, d).and_then(|d| d.succ_opt()).and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map_or(DateTime::<Utc>::MIN_UTC, |t| Utc.from_utc_datetime(&t))
+}
+
+/// An account's busiest recent week for each weekly window kind it has ("weekly" first, then
+/// Claude's model caps), in percent of its plan's allowance: the latest `POOL_WEEKS` completed
+/// weeks this computer watched closely enough to count, one per UTC week as pool sizing reads them
+/// (`week_peaks`). Weeks read from this PC's Codex rollouts are left out, as they miss use anywhere
+/// else. A Codex Pro 200 week that began before the allowance cut counts against the new, smaller
+/// allowance (`PRO_200_NEW_ALLOWANCE`), so a week that fit the old one is not taken for room it no
+/// longer has.
+pub(crate) fn busiest(h: &AccountHistory, pro_200: bool, now: DateTime<Utc>) -> Vec<(String, f64)> {
+    let cut = pro_200_cut();
+    KINDS.iter().filter_map(|kind| {
+        let mut weeks: BTreeMap<NaiveDate, f64> = BTreeMap::new();
+        for r in h.windows.iter().filter(|r| r.kind == *kind && !r.local && r.resets_at <= now && r.counts()) {
+            let began = r.resets_at - chrono::Duration::seconds(WEEK_SECONDS);
+            let peak = if pro_200 && began < cut { r.peak / PRO_200_NEW_ALLOWANCE } else { r.peak };
+            let week = weeks.entry(monday((r.resets_at - chrono::Duration::seconds(1)).date_naive())).or_insert(0.0);
+            *week = week.max(peak);
+        }
+        weeks.values().rev().take(POOL_WEEKS).copied().reduce(f64::max).map(|p| (kind.to_string(), p))
+    }).collect()
+}
+
+/// A week's peak is the week's own only when this computer read it this close to its reset: use
+/// after the last reading (this PC asleep, its SlopBar closed) is missing from it.
+pub(crate) const END_READ_SECONDS: i64 = 12 * 3600;
+
+/// Never ran out: in every one of its busiest recent weeks (`busiest`, model caps included) the
+/// account stayed under its limits, whichever computers its use came from, and there are enough
+/// weeks to go on: `assess`'s high confidence (the latest `RECENT` completed weeks, watched for most
+/// of their hours), and at least `RECENT` distinct weeks among the latest `POOL_WEEKS` whose end was
+/// read within `END_READ_SECONDS` of their reset (idle stretches end when use begins, so they are
+/// no evidence), so a week whose end went unread cannot pass for a light one. Any reading at a limit
+/// in those weeks, however briefly watched, ends it, and so does a change of plan within them (their
+/// shares were of another allowance). Only such accounts are paired by the plan advisor. `h` must
+/// be the history SlopBar polled itself, without weeks from this PC's Codex rollouts.
+pub(crate) fn room(h: &AccountHistory, busiest: &[(String, f64)], now: DateTime<Utc>) -> bool {
+    let since = now - chrono::Duration::weeks(POOL_WEEKS as i64);
+    let ends_read: BTreeSet<NaiveDate> = h.windows.iter()
+        .filter(|r| r.kind == "weekly" && !r.local && !r.idle && r.resets_at <= now && r.resets_at > since && r.counts()
+            && (r.resets_at - r.last_obs).num_seconds() <= END_READ_SECONDS)
+        .map(|r| monday((r.resets_at - chrono::Duration::seconds(1)).date_naive()))
+        .collect();
+    let limited = h.windows.iter().any(|r| KINDS.contains(&r.kind.as_str()) && r.resets_at > since && r.hit_limit());
+    assess(h, now).confidence == Confidence::High && ends_read.len() >= RECENT && !limited
+        && h.plan_since.is_none_or(|t| t <= since)
+        && !busiest.is_empty() && busiest.iter().all(|(_, p)| *p < LIMIT_PERCENT)
+}
+
+/// Sets each account's `room_to_share`: it never ran out (`room`: no reading at a limit, no change
+/// of plan, enough weeks whose end was read, all in the latest 8 weeks), and its busiest recent
+/// weeks, or the week in progress at its use so far or its pace once `PACE_DAYS` have passed, leave
+/// the 20% spare every share keeps (`POOL_BUFFER`) in every weekly limit. The computers on such an
+/// account share it within its limits; one that came close to a limit is no planned share. The
+/// run-out forecast (`runs_out_at`) is left out: it follows the last hours' pace, so a burst would
+/// make a share a conflict for an hour, and the week's own pace already counts from day 3.
+pub fn attach_room(snapshot: &mut Snapshot, history: &History, now: DateTime<Utc>) {
+    for acc in snapshot.accounts.iter_mut() {
+        acc.room_to_share = history.accounts.get(&history_key(acc.provider, &acc.id)).is_some_and(|h| {
+            let basis = ShareBasis::of(acc, h, now);
+            basis.room && basis.load().iter().all(|(_, p)| p * (1.0 + POOL_BUFFER) <= 100.0 + 1e-9)
+        });
+    }
+}
+
+/// The week in progress for each weekly window kind, in percent: its use so far, or its pace (use
+/// over the share of the week gone) once `PACE_DAYS` have passed when that is higher. A stale or
+/// failed reading keeps its last windows, read when they were (`fetched_at`): they are the least
+/// this week has used, and a share must not look roomier for a reading that failed.
+fn live_weeks(acc: &AccountUsage, now: DateTime<Utc>) -> Vec<(String, f64)> {
+    let read_at = acc.fetched_at.unwrap_or(now).min(now);
+    acc.windows.iter()
+        .filter(|w| KINDS.contains(&w.kind.as_str()) && w.window_seconds.is_none_or(|s| s == WEEK_SECONDS))
+        .filter_map(|w| Some((w.kind.clone(), live_week(w.used_percent, w.resets_at?, read_at, now)?)))
+        .collect()
+}
+
+/// One weekly window still running at `now`, read at `read_at` with `used` percent gone: that use,
+/// or its pace (use over the share of the week gone by the reading) once `PACE_DAYS` have passed
+/// when that is higher. None for a window that has reset.
+pub(crate) fn live_week(used: f64, resets_at: DateTime<Utc>, read_at: DateTime<Utc>, now: DateTime<Utc>) -> Option<f64> {
+    if resets_at <= now { return None; }
+    let elapsed = WEEK_SECONDS - (resets_at - read_at.min(now)).num_seconds();
+    let pace = (PACE_DAYS * 86400..=WEEK_SECONDS).contains(&elapsed).then(|| used * WEEK_SECONDS as f64 / elapsed as f64);
+    Some(pace.map_or(used, |p| p.max(used)))
+}
+
+/// What sharing this account rests on, for the plan advisor (`advisor`): its busiest recent weeks,
+/// the week in progress, and whether it may be shared at all. Not part of the report.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ShareBasis {
+    /// `busiest`, per weekly window kind.
+    pub busiest: Vec<(String, f64)>,
+    /// `live_weeks`, per weekly window kind.
+    pub live: Vec<(String, f64)>,
+    /// `room`.
+    pub room: bool,
+    /// The reading is fresh: neither stale nor failed.
+    pub fresh: bool,
+    /// Use came from where none of the user's computers had it signed in (`used_outside`,
+    /// `unexpected`): moving the computers on it would not move that use.
+    pub outside: bool,
+}
+
+impl ShareBasis {
+    fn of(acc: &AccountUsage, observed: &AccountHistory, now: DateTime<Utc>) -> ShareBasis {
+        let busiest = busiest(observed, pro_200(acc), now);
+        ShareBasis {
+            room: room(observed, &busiest, now),
+            busiest,
+            live: live_weeks(acc, now),
+            fresh: !acc.stale && acc.error.is_none(),
+            outside: acc.used_outside || acc.unexpected.is_some(),
+        }
+    }
+
+    /// The share of the plan to plan for, per weekly window kind: the busiest recent week, or the
+    /// week in progress when that is already higher.
+    pub(crate) fn load(&self) -> Vec<(String, f64)> {
+        let mut out = self.busiest.clone();
+        for (kind, p) in &self.live {
+            match out.iter_mut().find(|(k, _)| k == kind) {
+                Some((_, q)) => *q = q.max(*p),
+                None => out.push((kind.clone(), *p)),
+            }
+        }
+        out
+    }
 }
 
 /// A month in weeks and days, for spreading a monthly price over use.
@@ -1040,7 +1241,7 @@ mod tests {
             plan: Some("pro".into()), org: None, active: false, sources: vec![],
             windows: vec![UsageWindow { kind: kind.into(), window_seconds: None, used_percent: percent, resets_at: Some(resets_at) }],
             credits: None, resets: vec![], error: None, monitor_error: None, stale: false, fetched_at: None,
-            monitor_connected: true, monitor_ends_at: None, monitor_renewal: None, billing: BillingHints::default(), remote: vec![], overlap: vec![], shared: None, covered_by: None, used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None,
+            monitor_connected: true, monitor_ends_at: None, monitor_renewal: None, billing: BillingHints::default(), remote: vec![], overlap: vec![], shared: None, covered_by: None, used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None, room_to_share: false,
         }
     }
 
@@ -1552,6 +1753,18 @@ mod tests {
     }
 
     #[test]
+    fn weeks_before_a_change_of_plan_count_as_the_whole_plan_in_the_pool() {
+        let (snapshot, mut history, now) = fleet(&[("a", "20x", &[50.0, 60.0, 40.0, 70.0]), ("b", "5x", &[20.0; 4])]);
+        // b changed plan three days ago: its three earlier weeks were shares of another allowance.
+        history.accounts.get_mut("Claude:b").unwrap().plan_since = Some(now - days(3));
+        let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
+        // Those weeks count as b's whole plan (0.25), not as its one week on the new plan (0.05):
+        // 0.5 + 0.25, 0.6 + 0.25, 0.4 + 0.25, then 0.7 + 0.05; the busiest is 0.85.
+        assert!((p.demand_p90.unwrap() - 0.85).abs() < 1e-9, "{p:?}");
+        assert_eq!((p.weeks_estimated, p.confidence), (3, Confidence::Low));
+    }
+
+    #[test]
     fn the_pool_says_not_enough_history_below_two_weeks() {
         let (snapshot, history, now) = fleet(&[("a", "20x", &[90.0]), ("b", "20x", &[90.0])]);
         let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
@@ -1633,6 +1846,146 @@ mod tests {
         assert_eq!(percentile(&[3.0, 1.0, 2.0], 0.9), 3.0);
         let ten: Vec<f64> = (1..=10).map(f64::from).collect();
         assert_eq!(percentile(&ten, 0.9), 9.0);
+    }
+
+    fn weekly(p: f64) -> Vec<(String, f64)> { vec![("weekly".to_string(), p)] }
+
+    #[test]
+    fn the_busiest_weeks_are_the_latest_eight_of_each_kind() {
+        // Ten weeks, oldest first: the full week and the one after it fall out behind eight later ones.
+        let (mut h, now) = weeks(&[100.0, 90.0, 20.0, 30.0, 40.0, 35.0, 25.0, 15.0, 5.0, 12.0], 100);
+        assert_eq!(busiest(&h, false, now), weekly(40.0));
+        assert!(room(&h, &busiest(&h, false, now), now), "never at a limit in the latest eight, and watched closely");
+        // A model cap at its limit in one of those weeks leaves no room, though the week overall did not run out.
+        week(&mut h, "weekly_opus", now - Duration::hours(1) - days(14), 99.6, 100);
+        let b = busiest(&h, false, now);
+        assert_eq!(b, [("weekly".to_string(), 40.0), ("weekly_opus".to_string(), 99.6)]);
+        assert!(!room(&h, &b, now));
+        // A week at the limit within the latest eight leaves no room, even behind four quiet weeks.
+        let (h, now) = weeks(&[30.0, 100.0, 30.0, 30.0, 30.0, 30.0], 100);
+        assert_eq!(assess(&h, now).limit_weeks, 0, "the verdict's four weeks are quiet");
+        assert!(!room(&h, &busiest(&h, false, now), now));
+        // Too few weeks, or weeks glimpsed for a day or so each, are not enough to judge.
+        let (h, now) = weeks(&[20.0; 3], 100);
+        assert!(!room(&h, &busiest(&h, false, now), now));
+        let (h, now) = weeks(&[20.0; 6], 30);
+        assert!(!room(&h, &busiest(&h, false, now), now));
+        assert!(!room(&AccountHistory::default(), &[], now));
+        // Weeks whose last reading came two days before their reset may hide use after it.
+        let (mut h, now) = weeks(&[20.0; 5], 100);
+        assert!(room(&h, &busiest(&h, false, now), now));
+        for r in h.windows.iter_mut().skip(2) { r.last_obs = r.resets_at - days(2); }
+        assert!(!room(&h, &busiest(&h, false, now), now), "two of five ends read");
+        // Idle stretches end when use begins, so their end is always "read": they are no evidence.
+        let (mut h, now) = weeks(&[20.0; 5], 100);
+        for r in h.windows.iter_mut().skip(2) { r.last_obs = r.resets_at - days(2); }
+        for i in 0..3 {
+            let end = now - Duration::hours(1) - days(7 * i) - days(3);
+            h.windows.push(WindowRecord { kind: "weekly".into(), resets_at: end, peak: 0.0, first_obs: end - days(3), last_obs: end,
+                hours: 72, days: 3, idle: true, local: false });
+        }
+        assert!(!room(&h, &busiest(&h, false, now), now), "idle stretches do not stand in for unread week ends");
+        // A reading at a limit ends room, however briefly the week was watched.
+        let (mut h, now) = weeks(&[20.0; 5], 100);
+        let end = now - Duration::hours(1) - days(21);
+        h.windows.push(WindowRecord { kind: "weekly_sonnet".into(), resets_at: end, peak: 100.0, first_obs: end - Duration::hours(2), last_obs: end - Duration::hours(1),
+            hours: 2, days: 1, idle: false, local: false });
+        assert!(!room(&h, &busiest(&h, false, now), now), "a glimpse at a limit is proof enough");
+    }
+
+    #[test]
+    fn a_change_of_plan_leaves_no_room_until_its_weeks_are_on_the_new_plan() {
+        let (mut h, now) = weeks(&[20.0; 5], 100);
+        // A history from before SlopBar noted plans.
+        h.plan = None;
+        // Noted on Max 20x, then read on Max 5x: its weeks were shares of the bigger allowance.
+        let read = |tier: &str| AccountUsage { billing: BillingHints { tier: Some(format!("default_claude_max_{tier}")), ..Default::default() },
+            plan: Some("max".into()), fetched_at: Some(now), ..reading("weekly", 10.0, now + days(3)) };
+        observe(&mut h, &read("20x"), now - days(60));
+        assert_eq!((h.plan.as_deref(), h.plan_since), (Some("Max 20x"), None), "the first plan noted is no change");
+        assert!(room(&h, &busiest(&h, false, now), now));
+        observe(&mut h, &read("5x"), now - days(2));
+        assert_eq!((h.plan.as_deref(), h.plan_since), (Some("Max 5x"), Some(now - days(2))));
+        assert!(!room(&h, &busiest(&h, false, now), now));
+        // The verdict leaves out the weeks before the change too: none are left to judge by.
+        assert_eq!(assess(&h, now).verdict, Verdict::InsufficientData);
+        // A login read without its tier says "Max": no change of plan.
+        let untiered = AccountUsage { plan: Some("max".into()), fetched_at: Some(now), ..reading("weekly", 10.0, now + days(3)) };
+        observe(&mut h, &untiered, now - days(1));
+        assert_eq!((h.plan.as_deref(), h.plan_since), (Some("Max 5x"), Some(now - days(2))));
+        // Eight weeks on, the change is behind every week that counts, and room is judged again.
+        let later = now + days(57);
+        let mut fresh = h.clone();
+        let mut end = now + days(1);
+        for _ in 0..8 { week(&mut fresh, "weekly", end, 20.0, 100); end += days(7); }
+        assert!(room(&fresh, &busiest(&fresh, false, later), later), "{:?}", fresh.plan_since);
+    }
+
+    #[test]
+    fn pro_200_weeks_begun_before_the_allowance_cut_count_against_the_new_allowance() {
+        // Weeks ending 2026-09-07 to 2026-10-26 began before the cut: 45% of the old allowance is 90% of the new.
+        let (h, now) = weeks(&[45.0; 8], 100);
+        assert_eq!(busiest(&h, true, now), weekly(90.0));
+        assert_eq!(busiest(&h, false, now), weekly(45.0));
+        // Weeks begun after it count as read.
+        let mut later = AccountHistory::default();
+        for i in 0..4 { week(&mut later, "weekly", at("2026-11-10T00:00:00Z") + days(7 * i), 45.0, 100); }
+        assert_eq!(busiest(&later, true, at("2026-12-02T00:00:00Z")), weekly(45.0));
+        // A week that straddles the cut counts against the new allowance whole.
+        let mut straddle = AccountHistory::default();
+        week(&mut straddle, "weekly", at("2026-11-02T00:00:00Z"), 30.0, 100);
+        assert_eq!(busiest(&straddle, true, at("2026-11-03T00:00:00Z")), weekly(60.0));
+    }
+
+    #[test]
+    fn the_week_in_progress_counts_at_its_pace_after_three_days() {
+        let now = at("2026-11-20T00:00:00Z");
+        // Two days in, 40% so far is a burst, not a pace.
+        let acc = AccountUsage { fetched_at: Some(now), ..reading("weekly", 40.0, now + days(5)) };
+        assert_eq!(live_weeks(&acc, now), weekly(40.0));
+        // Four days in, 40% is a pace of 70%.
+        let acc = AccountUsage { fetched_at: Some(now), ..reading("weekly", 40.0, now + days(3)) };
+        assert_eq!(live_weeks(&acc, now), weekly(70.0));
+        // A stale reading keeps its last windows: the least this week has used, never nothing.
+        let stale = live_weeks(&AccountUsage { stale: true, ..acc.clone() }, now);
+        assert_eq!(ShareBasis { busiest: weekly(50.0), live: stale, ..Default::default() }.load(), weekly(70.0));
+        assert_eq!(ShareBasis { busiest: weekly(50.0), live: live_weeks(&acc, now), ..Default::default() }.load(), weekly(70.0));
+        assert_eq!(ShareBasis { busiest: weekly(50.0), live: vec![], ..Default::default() }.load(), weekly(50.0));
+        // A window whose reset has passed belongs to the next reading.
+        let passed = AccountUsage { fetched_at: Some(now), ..reading("weekly", 40.0, now - Duration::minutes(1)) };
+        assert!(live_weeks(&passed, now).is_empty());
+    }
+
+    #[test]
+    fn every_account_says_whether_it_has_room_to_share() {
+        let mut history = History::default();
+        for (id, peak) in [("a1", 30.0), ("near", 90.0)] {
+            history.accounts.insert(history_key(Provider::Claude, id), weeks(&[peak; 4], 100).0);
+        }
+        let now = weeks(&[30.0; 4], 100).1;
+        let read = |id: &str, used: f64, resets_in: Duration| AccountUsage { id: id.into(), fetched_at: Some(now), ..reading("weekly", used, now + resets_in) };
+        let mut snapshot = Snapshot { accounts: vec![
+            read("a1", 10.0, days(3)),
+            // Never ran out, but 90% leaves less than the 20% spare a share keeps.
+            read("near", 10.0, days(3)),
+            // No history here.
+            read("a2", 10.0, days(3)),
+        ], updated_at: Some(now) };
+        attach_room(&mut snapshot, &history, now);
+        assert_eq!(snapshot.accounts.iter().map(|a| (a.id.as_str(), a.room_to_share)).collect::<Vec<_>>(), [("a1", true), ("near", false), ("a2", false)]);
+        // Four days in at 50%, its pace (87.5%) leaves no spare this week either.
+        let mut busy = Snapshot { accounts: vec![read("a1", 50.0, days(3))], updated_at: Some(now) };
+        attach_room(&mut busy, &history, now);
+        assert!(!busy.accounts[0].room_to_share);
+        // A run-out forecast follows the last hours' pace: alone it does not end room (the week's use
+        // and its pace do, above).
+        let mut burst = Snapshot { accounts: vec![AccountUsage { runs_out_at: Some(now + days(1)), ..read("a1", 10.0, days(3)) }], updated_at: Some(now) };
+        attach_room(&mut burst, &history, now);
+        assert!(burst.accounts[0].room_to_share);
+        // A failed reading is judged on its last windows, not as a week with nothing used.
+        let mut failed = Snapshot { accounts: vec![AccountUsage { stale: true, error: Some("http_429".into()), ..read("a1", 50.0, days(3)) }], updated_at: Some(now) };
+        attach_room(&mut failed, &history, now);
+        assert!(!failed.accounts[0].room_to_share);
     }
 
     #[test]

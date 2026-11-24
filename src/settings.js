@@ -2,6 +2,7 @@ import { MARK } from "./marks.js";
 import { observeFrontend } from "./diagnostics.js";
 import { sparkline } from "./sparkline.js";
 import { money, pct, amount, renewalText, adviceText, creditsLine, extraUsageLine, cliSignInText } from "./accounttext.js";
+import { adviceCard, machinesCard } from "./advicetext.js";
 import { t, translateDom, setLanguage, setSystemLocale, setThisMachine, setSharing, LANGUAGES, resetText, groupResets, errorText, accountErrorText, duration, shortDate, shortDay, dayTime, windowLabel, windowResetText, visibleResetWindows, placesText, overlapText, seatsText, shownReading, currentWindows } from "./i18n.js";
 
 const { invoke } = window.__TAURI__.core;
@@ -141,18 +142,20 @@ function accountRow(p, a) {
     </div>`;
 }
 
-/** Sign-in health: the provider rejected the monitoring sign-in, or the CLI's own saved login. */
-/** Amber when the account is in use on several machines at once; the tooltip names them and says why it matters. */
+/** Amber when the CLI and the desktop app here are on different accounts. */
 function seatsChip(a) {
   const s = seatsText(a);
   return s.chip ? `<em class="chip overlap seats" title="${esc(s.line)}"><span class="overlap-icon" aria-hidden="true"></span> ${esc(s.chip)}</em>` : "";
 }
 
+/** Amber when the account is in use on several machines at once, a plain chip for a planned share
+ * (`room_to_share`); the tooltip names them and says why it matters. */
 function overlapChip(a) {
   const o = overlapText(a);
-  return o.chip ? `<em class="chip overlap" title="${esc(o.lines.join("\n"))}"><span class="overlap-icon" aria-hidden="true">\uE772</span> ${esc(o.chip)}</em>` : "";
+  return o.chip ? `<em class="chip ${o.shared ? "share" : "overlap"}" title="${esc(o.lines.join("\n"))}"><span class="overlap-icon" aria-hidden="true">\uE772</span> ${esc(o.chip)}</em>` : "";
 }
 
+/** Sign-in health: the provider rejected the monitoring sign-in, or the CLI's own saved login. */
 function signInChips(p, a) {
   // Ended on the provider's fixed limit (`monitor_renewal`) reads as such, not as a rejection.
   const ended = a.monitor_renewal === "ended";
@@ -508,39 +511,8 @@ function poolText(s) {
 
 const PROVIDER_NAMES = Object.fromEntries(PROVIDERS);
 
-// The plan change advisor: concrete moves per provider, with what they save and what is left.
-function adviceMove(m) {
-  const who = m.alias || m.email || t("unknownAccount");
-  const what = m.action === "cancel" ? t("advCancel", { plan: m.from }) : t("advDowngrade", { from: m.from, to: m.to });
-  const why = [t(`subVerdict_${m.verdict}`), m.peak_percent != null ? t("advPeak", { p: pct(m.peak_percent) }) : "",
-    m.basis === "local_codex" ? t("advLocal") : "", m.before ? t("advBefore", { d: shortDate(m.before) }) : ""].filter(Boolean).join(" · ");
-  return `
-    <div class="advice-move">
-      <div class="who"><div class="name">${esc(who)}</div><small>${esc(what)} · <b>${esc(t("perMonth", { v: money(m.monthly_saving) }))}</b></small><small>${esc(why)}</small></div>
-      <button class="btn use" data-billing="${m.provider}">${t("subManage")} <svg viewBox="0 0 16 16"><path d="M6 3h7v7M13 3 5 11"/></svg></button>
-    </div>`;
-}
-
-function adviceCard() {
-  const list = (report.advice ?? []).filter((a) => settings.providers[a.provider]);
-  if (!list.length) return "";
-  return `
-    <div class="provider advisor">
-      <div class="provider-head"><h3>${t("advTitle")}</h3></div>
-      ${list.map((a) => {
-        const name = PROVIDER_NAMES[a.provider] ?? a.provider;
-        const lines = [];
-        if (a.evidence === "clear_only") lines.push(t("advThin", { n: a.weeks_used, needed: a.weeks_needed }));
-        const head = a.moves.length ? t("advSave", { provider: name, v: money(a.monthly_saving), n: a.moves.length }) : t("advNone", { provider: name });
-        if (a.spare_after != null) lines.push(t("advAfter", { held: amount(a.capacity_after), unit: a.unit, spare: a.spare_after_percent != null ? pct(a.spare_after_percent) : "—" }));
-        if (a.kept_for_capacity) lines.push(t("advKept", { n: a.kept_for_capacity }));
-        return `
-          <p class="hint sub-pool"><b>${esc(head)}</b>${lines.length ? ` · ${esc(lines.join(" · "))}` : ""}</p>
-          ${a.moves.length ? `<div class="group">${a.moves.map(adviceMove).join("")}</div>` : ""}`;
-      }).join("")}
-      <p class="hint">${t("advHint")}</p>
-    </div>`;
-}
+// What the advisor's and the computers' cards need besides the report (`advicetext.js`).
+const advised = () => ({ on: (p) => !!settings.providers[p], names: PROVIDER_NAMES, snapshot });
 
 // The spend ledger: what the plans cost, year to date and over the last twelve months.
 function spendCard() {
@@ -565,7 +537,7 @@ function spendCard() {
 
 function renderSubscriptions() {
   if (!report || !settings) return;
-  patch($("subscriptions"), adviceCard() + PROVIDERS.filter(([p]) => settings.providers[p]).map(([p, name]) => {
+  patch($("subscriptions"), adviceCard(report, advised()) + machinesCard(report, advised()) + PROVIDERS.filter(([p]) => settings.providers[p]).map(([p, name]) => {
     const list = report.accounts.filter((e) => e.provider === p);
     const totals = report.providers.find((s) => s.provider === p);
     const summary = providerSummary(p, totals);
@@ -928,9 +900,11 @@ async function renderRoster() {
   const placed = Boolean(settings.presence_folder || settings.presence_remote);
   $("account-roster").checked = settings.account_roster;
   $("account-roster").disabled = !placed && !settings.account_roster;
-  // Usage readings ride the account list: offered, and shown on, only while it is on.
-  $("share-readings").checked = settings.account_roster && settings.share_readings !== false;
-  $("share-readings").disabled = !settings.account_roster;
+  // This computer's weekly use rides its in-use status file, and usage readings the account list:
+  // the switch is offered, and shown on, whenever either is shared.
+  const shares = placed || settings.account_roster;
+  $("share-readings").checked = shares && settings.share_readings !== false;
+  $("share-readings").disabled = !shares;
   const r = await invoke("get_roster").catch(() => null);
   $("roster-passphrase-state").textContent = r?.passphrase_saved ? t("rosterPassphraseSaved") : t("rosterPassphraseNone");
   $("roster-passphrase-clear").disabled = !r?.passphrase_saved;

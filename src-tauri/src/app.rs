@@ -1,4 +1,4 @@
-use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, desktop, desktop_apps, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, migrate, model, monitoring, notify, pairing, panel, phone, pins, plan_alerts, presence, providers, rclone, refresh_wait, relay, reset_credits, roster, settings, sharing, sharing_setup, signin, sources, subscriptions, unexpected, updates, usage_index, wind_down};
+use crate::{accounts, active_log, auto_monitor, backup, balancer, bulk, burn, calendar, codex_local, csv_export, desktop, desktop_apps, diagnostics, digest, dock, door, headroom, health, inspect, leases, ledger, machine_load, migrate, model, monitoring, notify, pairing, panel, phone, pins, plan_alerts, presence, providers, rclone, refresh_wait, relay, reset_credits, roster, settings, sharing, sharing_setup, signin, sources, subscriptions, unexpected, updates, usage_index, wind_down};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -62,9 +62,18 @@ pub struct AppState {
     presence_tracks: Mutex<presence::Tracks>,
     /// The other machines' last records, for a read that misses one (see `presence::Recall`).
     presence_recall: Mutex<presence::Recall>,
+    /// A read of the other computers' records has succeeded since SlopBar started, and the refreshes
+    /// that switched nothing automatically while none had (see `blind_refresh`).
+    presence_seen: std::sync::atomic::AtomicBool,
+    blind_refreshes: std::sync::atomic::AtomicU32,
     /// The records the last read had the bytes of, which stand in for downloading them again while
     /// they are listed unchanged (see `presence::Kept`).
     presence_kept: presence::Kept,
+    /// The account weekly windows this computer had in use and the days it refreshed, for its own
+    /// use whatever the account (see `machine_load`).
+    machine_ledger: Mutex<machine_load::Ledger>,
+    /// The other computers' last loads, from their presence records (see `machine_load::Peers`).
+    machine_peers: Mutex<machine_load::Peers>,
     /// Where in-use status is shared: what settings saves left for the next refresh to withdraw,
     /// and the account roster's sync, its keys and last write, which share one lock (see `sharing`).
     sharing: std::sync::Arc<sharing::Sharing>,
@@ -397,7 +406,37 @@ fn subscription_report(state: &AppState) -> subscriptions::Report {
     let now = chrono::Utc::now();
     let mut report = subscriptions::report(&snapshot, &state.usage_history.lock().unwrap(), &settings, local.as_deref(), now);
     report.spend = Some(ledger::summary(&state.ledger.lock().unwrap(), &settings.spend, now));
+    report.machines = machine_advice(state, &snapshot, &settings, now);
     report
+}
+
+/// Which of the user's computers could share one plan (see `machine_load`): only while in-use
+/// status is shared, which carries the other computers' use.
+fn machine_advice(state: &AppState, snapshot: &Snapshot, settings: &settings::Settings, now: chrono::DateTime<chrono::Utc>) -> Vec<machine_load::MachineAdvice> {
+    if settings.presence_folder.is_none() && settings.presence_remote.is_none() {
+        return vec![];
+    }
+    let own = machine_load::summary(&state.machine_ledger.lock().unwrap(), &settings.providers, now);
+    let me = presence::identity().map_or_else(presence::machine_name, |(_, name)| name.clone());
+    // The computers last read where sharing is now: a new place that has not been read (or cannot
+    // be) shows none of the old place's.
+    let peers = state.machine_peers.lock().unwrap();
+    let none = machine_load::Peers::default();
+    let peers = if peers.at(&sharing::Place::of(settings)) { &*peers } else { &none };
+    machine_load::advise(&own, &me, peers, &snapshot.accounts, settings, now)
+}
+
+/// Notes accounts in use here at `at` for this computer's own use (`machine_load::mark`): one
+/// switched to or from, leased or released, is charged though the next refresh finds it no
+/// longer in use. Saved at once when a mark moved, so a restart before that refresh (an update's)
+/// keeps it; under the ledger's lock, so no older copy is written over it.
+fn mark_in_use(state: &AppState, accounts: &[(Provider, String)], at: chrono::DateTime<chrono::Utc>) {
+    let saved = {
+        let mut ledger = state.machine_ledger.lock().unwrap();
+        if !machine_load::mark(&mut ledger, accounts, at) { return; }
+        machine_load::save(&ledger)
+    };
+    if saved.is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::MachineLoadSave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
 }
 
 /// Charges renewals that have passed and this month's extra usage to the spend ledger.
@@ -657,7 +696,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         R::GetPlanAdvice => {
             let report = subscription_report(&app.state::<AppState>());
             let credits = reset_credits::advise(&app.state::<AppState>().snapshot.lock().unwrap().accounts, chrono::Utc::now());
-            Ok(serde_json::json!({ "providers": report.advice, "reset_credits": credits, "generated_at": report.generated_at }))
+            Ok(serde_json::json!({ "providers": report.advice, "reset_credits": credits, "machines": report.machines, "generated_at": report.generated_at }))
         }
         R::GetBurnAlerts => {
             let state = app.state::<AppState>();
@@ -763,6 +802,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         }
         R::ReleaseLease { lease_id } => {
             let released = app.state::<AppState>().leases.lock().unwrap().release(&lease_id).ok_or("no_such_lease")?;
+            mark_in_use(&app.state::<AppState>(), &[(released.provider, released.id.clone())], chrono::Utc::now());
             leases_changed(&app).await;
             Ok(serde_json::json!({ "released": true, "lease": value(released)? }))
         }
@@ -1033,9 +1073,10 @@ fn account_label(app: &AppHandle, provider: Provider, id: &str) -> Option<String
 
 async fn switch_to(app: &AppHandle, provider: Provider, id: String, auto: bool) -> Result<(), String> {
     let found = app.state::<AppState>().sources.lock().unwrap().clone();
-    let from = {
+    let (from, left) = {
         let snapshot = app.state::<AppState>().snapshot.lock().unwrap().clone();
-        snapshot.accounts.iter().find(|a| a.provider == provider && a.active).map(|a| a.id.clone())
+        let left: Vec<(Provider, String)> = snapshot.accounts.iter().filter(|a| a.provider == provider && a.active).map(|a| (provider, a.id.clone())).collect();
+        (left.first().map(|(_, id)| id.clone()), left)
     };
     let target = id.clone();
     let started = Instant::now();
@@ -1046,6 +1087,8 @@ async fn switch_to(app: &AppHandle, provider: Provider, id: String, auto: bool) 
         action: if auto { diagnostics::Action::SwitchAuto } else { diagnostics::Action::SwitchManual },
         code: diagnostics::Code::from_error(result.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) });
     result?;
+    // Both were in use here now: the accounts left and the one taken, whatever the next refresh finds.
+    mark_in_use(&app.state::<AppState>(), &[left, vec![(provider, id.clone())]].concat(), chrono::Utc::now());
     // The account left behind gets its project profile back at once, not at the next refresh.
     sync_pins(app, None).await;
     let event = Switched {
@@ -3022,7 +3065,17 @@ async fn leases_changed(app: &AppHandle) {
 
 /// Ends expired leases and those whose process exited.
 async fn prune_leases(app: &AppHandle) {
-    let ended = app.state::<AppState>().leases.lock().unwrap().prune(chrono::Utc::now(), leases::process_alive);
+    let state = app.state::<AppState>();
+    let (ended, gone) = {
+        let mut held = state.leases.lock().unwrap();
+        let before = held.accounts();
+        let ended = held.prune(chrono::Utc::now(), leases::process_alive);
+        let after = held.accounts();
+        (ended, before.into_iter().filter(|a| !after.contains(a)).collect::<Vec<_>>())
+    };
+    // Leased until now, then ended: charged to this computer (`mark_in_use`). Those still leased
+    // are in use at every refresh; a call that ended none writes nothing.
+    if !gone.is_empty() { mark_in_use(&state, &gone, chrono::Utc::now()); }
     if ended { leases_changed(app).await; }
 }
 
@@ -3056,6 +3109,7 @@ async fn lease_account(app: &AppHandle, provider: Provider, purpose: &str, minut
         }
     };
     let lease = state.leases.lock().unwrap().take(provider, &id, purpose, minutes, pid, chrono::Utc::now())?;
+    mark_in_use(&state, &[(provider, id.clone())], lease.created_at);
     leases_changed(app).await;
     let profile = accounts::profiles_root().map(|r| r.join(accounts::profile_name(provider, &id)));
     let ready = state.profile_states.lock().unwrap().get(&(provider, id.clone())) == Some(&accounts::ProfileState::Ready);
@@ -3804,6 +3858,16 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
             *state.roster_seen.lock().unwrap() = roster::Seen::default();
         }
     }
+    // In use here until now: the accounts the last refresh found in use (one left since, by a switch
+    // in the CLI itself, is charged all the same) and those leased, before leases that ended go
+    // (`machine_load::mark`).
+    // Saved with the rest of the ledger at this refresh's end.
+    {
+        let mut was: Vec<(Provider, String)> = state.snapshot.lock().unwrap().accounts.iter()
+            .filter(|a| a.active || a.desktop).map(|a| (a.provider, a.id.clone())).collect();
+        was.extend(state.leases.lock().unwrap().accounts());
+        machine_load::mark(&mut state.machine_ledger.lock().unwrap(), &was, chrono::Utc::now());
+    }
     // Ended leases free their accounts (and profiles) before this refresh decides anything.
     state.leases.lock().unwrap().prune(chrono::Utc::now(), leases::process_alive);
     let started = Instant::now();
@@ -3852,10 +3916,20 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
     // What the last refresh worked out, for the early redraw: before a switch below publishes this
     // refresh's bare numbers.
     let previous = state.snapshot.lock().unwrap().accounts.clone();
-    let decisions = {
+    // With sharing on, automatic switching waits until a read of the other computers has succeeded
+    // since the start (the last refresh's knowledge of them is then real), rather than move onto an
+    // account in use there; at most `BLIND_REFRESHES` refreshes, so failing reads cannot stop it.
+    let blind = presence::store(&settings).is_some() && blind_refresh(
+        state.presence_seen.load(std::sync::atomic::Ordering::Relaxed), &state.blind_refreshes);
+    let decisions = if blind { vec![] } else {
         let last = state.last_switch.lock().unwrap().clone();
         let leased = state.leases.lock().unwrap().accounts();
-        balancer::decide_avoiding(&list, &settings, &last, &leased)
+        // Decided with what the last refresh knew of the other computers (`carry_over`): the fetch
+        // alone does not know where else an account is in use, and an account in use there is never
+        // a target.
+        let mut known = list.clone();
+        carry_over(&mut known, &previous);
+        balancer::decide_avoiding(&known, &settings, &last, &leased)
     };
     let decisions = graceful_decisions(app, &list, &settings, decisions);
     for (provider, id) in decisions {
@@ -3886,6 +3960,8 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
     // Beside the CLI: which account each desktop app here is signed in to.
     let apps = tauri::async_runtime::spawn_blocking(crate::desktop_apps::read).await.unwrap_or_default();
     crate::desktop_apps::apply(&mut list, &apps);
+    // A desktop app here on an account SlopBar does not have, whatever the CLI here (`machine_load`).
+    let desktop_unseen = crate::desktop_apps::unseen(&list, &apps);
 
     // The widget redraws now: what sharing and forecasts add is carried over from the last
     // refresh until they are worked out below.
@@ -3914,6 +3990,8 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
         let mine = list.clone();
         let (place, h) = (sharing::Place::of(&settings), app.clone());
         let read_from = place.clone();
+        // This computer's use as of the last refresh, while readings are shared (`machine_load`).
+        let load = machine_load::published(&state.machine_ledger.lock().unwrap(), &settings, now);
         let exchanged = tauri::async_runtime::spawn_blocking(move || {
             let Some((id, name)) = presence::identity() else { return Some((vec![], health::SharingResult::failed(now))) };
             // A save that moved sharing since this refresh read the settings: nothing is written to
@@ -3921,7 +3999,7 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
             if !sharing::still(&place, &sharing::Place::of(&h.state::<AppState>().settings.lock().unwrap())) {
                 return None;
             }
-            let wrote = store.write(&presence::own(id, name, interval, &mine, now));
+            let wrote = store.write(&presence::own(id, name, interval, &mine, now).with_load(load));
             // Over rclone, neither this machine's own record nor one listed unchanged since the last
             // read is downloaded (`PresenceStore::others`).
             let listed = store.others(id, &h.state::<AppState>().presence_kept);
@@ -3935,7 +4013,10 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
             // missed, while that record is live (`presence::Recall`).
             let found = presence::peers(files.iter().cloned(), own, now);
             let every = presence::peers(state.presence_recall.lock().unwrap().fill(&read_from, result.read.then_some(files.as_slice()), own, now), own, now);
+            // Each other computer's last load stands while its record does (`machine_load::Peers`).
+            state.machine_peers.lock().unwrap().note(&read_from, &every, result.read, now);
             shared = Some(result);
+            if result.read { state.presence_seen.store(true, std::sync::atomic::Ordering::Relaxed); }
             covered = result.wrote || found.iter().any(|p| p.live);
             presence::apply(&mut list, &found, &every, me, now);
         }
@@ -3975,7 +4056,18 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
         let now = chrono::Utc::now();
         recent.record(&snapshot.accounts, now);
         headroom::attach_forecasts(&mut snapshot, &settings, &recent, now);
+        // Whether several computers on an account share it within its limits (`overlap`'s tone).
+        subscriptions::attach_room(&mut snapshot, &history, now);
     }
+    // This computer's use whatever the account: the windows it had in use (`machine_load`).
+    // Saved under the ledger's lock, as `mark_in_use` saves: no older copy is written over a newer.
+    let wanted = profile_accounts(&state);
+    let saved = {
+        let mut ledger = state.machine_ledger.lock().unwrap();
+        machine_load::observe(&mut ledger, &snapshot, &wanted, &desktop_unseen, &settings.providers, chrono::Utc::now());
+        machine_load::save(&ledger)
+    };
+    if saved.is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::MachineLoadSave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
     if subscriptions::save(&history).is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::HistorySave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
     state.diagnostics.record(None, None, diagnostics::Event::PollFinished { elapsed_ms: diagnostics::millis(started), accounts: snapshot.accounts.len(),
         native_sources: found.iter().filter(|s| s.distro.is_none()).count(), wsl_sources: found.iter().filter(|s| s.distro.is_some()).count() });
@@ -4004,19 +4096,36 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
     snapshot
 }
 
+/// Refreshes that switch nothing automatically while no read of the other computers has succeeded.
+const BLIND_REFRESHES: u32 = 3;
+
+/// Whether this refresh's automatic switching waits: no read of the other computers has succeeded
+/// since the start (`seen`), and fewer than `BLIND_REFRESHES` refreshes have waited (`waited`, counted
+/// here).
+fn blind_refresh(seen: bool, waited: &std::sync::atomic::AtomicU32) -> bool {
+    !seen && waited.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < BLIND_REFRESHES
+}
+
 /// Gives freshly fetched accounts what the last refresh worked out from sharing and forecasts,
-/// so the early redraw does not blank them for a moment.
+/// so the early redraw does not blank them for a moment and the automatic switch knows where else
+/// each is in use.
 fn carry_over(list: &mut [crate::model::AccountUsage], previous: &[crate::model::AccountUsage]) {
+    carry_over_as(list, previous, presence::identity().map_or("", |(_, name)| name.as_str()));
+}
+
+/// `carry_over` on the machine named `me`.
+fn carry_over_as(list: &mut [crate::model::AccountUsage], previous: &[crate::model::AccountUsage], me: &str) {
     for a in list.iter_mut() {
         if let Some(p) = previous.iter().find(|p| p.provider == a.provider && p.id == a.id) {
             a.remote = p.remote.clone();
             a.used_outside = p.used_outside;
             a.runs_out_at = p.runs_out_at;
+            a.room_to_share = p.room_to_share;
             a.unexpected = p.unexpected.clone();
         }
     }
     // A switch may have changed which account is in use here since the last refresh.
-    presence::overlap(list, presence::identity().map_or("", |(_, name)| name.as_str()));
+    presence::overlap(list, me);
 }
 
 /// Other machines' readings of these accounts, from the rosters last read (no I/O): shown where
@@ -5621,7 +5730,11 @@ pub fn run() {
         sources: Mutex::default(),
         presence_tracks: Mutex::default(),
         presence_recall: Mutex::default(),
+        presence_seen: std::sync::atomic::AtomicBool::new(false),
+        blind_refreshes: std::sync::atomic::AtomicU32::new(0),
         presence_kept: presence::Kept::default(),
+        machine_ledger: Mutex::new(machine_load::load()),
+        machine_peers: Mutex::default(),
         // What saves left for the next refresh to withdraw, kept between runs (see `sharing`).
         sharing: std::sync::Arc::new(sharing::Sharing::kept_in(settings::app_dir().expect("config directory").join(sharing::DUE_FILE))),
         roster_seen: Mutex::default(),
@@ -5905,5 +6018,49 @@ mod window_tests {
             assert!(args.split(' ').any(|a| a == flag), "{flag} in {args}");
         }
         assert!(windows().iter().all(|w| w.get("dataDirectory").is_none()), "one WebView2 data folder for all");
+    }
+}
+
+#[cfg(test)]
+mod balance_tests {
+    use super::*;
+    use crate::model::{AccountUsage, RemoteSeat};
+
+    #[test]
+    fn switching_waits_for_a_read_of_the_other_computers_but_not_for_ever() {
+        let waited = std::sync::atomic::AtomicU32::new(0);
+        // A read has succeeded: never waits, and counts nothing.
+        assert!(!blind_refresh(true, &waited));
+        assert_eq!(waited.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // None yet: the first three refreshes wait, the fourth switches as the reads keep failing.
+        assert_eq!((0..4).map(|_| blind_refresh(false, &waited)).collect::<Vec<_>>(), [true, true, true, false]);
+    }
+
+    fn account(id: &str, active: bool, percent: f64) -> AccountUsage {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "provider": "claude", "email": format!("{id}@example.invalid"), "alias": null, "plan": null, "org": null,
+            "active": active, "sources": [], "credits": null, "resets": [], "error": null, "stale": false,
+            "fetched_at": chrono::Utc::now(), "monitor_connected": true,
+            "windows": [{ "kind": "session", "window_seconds": null, "used_percent": percent, "resets_at": null }],
+        })).unwrap()
+    }
+
+    /// The refresh's automatic switch decides on the fetched accounts with what the last refresh
+    /// knew of the other computers (`carry_over`, as `refresh_locked` does: roster.rs's
+    /// `the_app_works_shared_readings_out_wherever_it_publishes` pins that). The fetch alone knows
+    /// nothing of where else an account is in use, so on it one in use on another computer would
+    /// pass for the best target.
+    #[test]
+    fn the_automatic_switch_knows_where_else_an_account_is_in_use() {
+        let mut settings = Settings::default();
+        settings.balancer.claude.auto = true;
+        let fetched = vec![account("current", true, 95.0), account("theirs", false, 5.0), account("free", false, 30.0)];
+        let mut previous = fetched.clone();
+        previous[1].remote = vec![RemoteSeat { machine: "LAPTOP-2".into(), where_: vec!["Windows".into()], seen_at: chrono::Utc::now(), live: true }];
+        assert_eq!(balancer::decide_avoiding(&fetched, &settings, &HashMap::new(), &[]), [(Provider::Claude, "theirs".to_string())],
+            "the bare fetch picks the emptiest, though LAPTOP-2 uses it");
+        let mut known = fetched.clone();
+        carry_over_as(&mut known, &previous, "DESK-1");
+        assert_eq!(balancer::decide_avoiding(&known, &settings, &HashMap::new(), &[]), [(Provider::Claude, "free".to_string())]);
     }
 }

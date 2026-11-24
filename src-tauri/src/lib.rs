@@ -28,6 +28,7 @@ mod active_log;
 mod usage_index;
 mod csv_export;
 mod presence;
+mod machine_load;
 mod rclone;
 mod sharing_setup;
 mod roster;

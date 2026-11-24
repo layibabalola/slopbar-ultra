@@ -65,7 +65,8 @@ pub struct Notifications {
     /// expire unused (see `reset_credits`).
     pub reset_credits: bool,
     /// An account in use on more than one of the user's machines at once (see
-    /// `presence::overlap`), once per overlap. Needs in-use sharing.
+    /// `presence::overlap`), once per overlap; never one shared within its limits
+    /// (`AccountUsage::room_to_share`). Needs in-use sharing.
     pub multi_machine: bool,
     /// A sharing setup (here, or one this computer finishes for another) waiting for the user to
     /// allow access in Dropbox; clicking it opens Dropbox's page (see `sharing_setup`).
@@ -194,9 +195,12 @@ pub struct Settings {
     /// user's other machines through the in-use sharing location, encrypted with a roster
     /// passphrase set on each machine (see `roster`), so a new machine knows every account.
     pub account_roster: bool,
-    /// With the roster on, it also carries each account's latest usage reading taken here (its
-    /// windows and when), so a machine whose own monitoring sign-in ended shows this one's
-    /// (`roster::Reading`). Others' readings are shown either way.
+    /// Wherever in-use status is shared, this computer's weekly use, as a share of a plan, goes into
+    /// its in-use status file (`presence::Presence::load`, see `machine_load`), so the user's
+    /// computers can tell which of them could share one plan. With the roster on, the roster also
+    /// carries each account's latest usage reading taken here (its windows and when), so a machine
+    /// whose own monitoring sign-in ended shows this one's (`roster::Reading`). Others' readings and
+    /// use are shown either way.
     pub share_readings: bool,
     /// Use (and switch_account) also moves this machine's desktop app onto the account: guided for
     /// Claude Desktop (it has no supported way to be signed in from outside), and a reminder to

@@ -304,8 +304,9 @@ fn start(files: &impl Withdraw, kind: Kind, place: &Place, index: usize, done: &
 impl<S: Forget> Sharing<S> {
     /// A settings save, called holding `settings_lock` (no I/O but this machine's own disk): notes
     /// what the next refresh withdraws, and keeps it in the file. Whether a refresh is due: the
-    /// providers polled, where in-use status is shared, whether the roster is on, or whether it
-    /// carries readings, changed (readings turned off go from the roster at that refresh).
+    /// providers polled, where in-use status is shared, whether the roster is on, or, while sharing
+    /// is on, whether readings are shared changed (readings turned off go from the in-use status file
+    /// and the roster at that refresh).
     pub fn saved(&self, before: &Settings, after: &Settings) -> bool {
         let (from, to) = (Place::of(before), Place::of(after));
         {
@@ -317,8 +318,10 @@ impl<S: Forget> Sharing<S> {
                 self.keep(&due);
             }
         }
+        // Readings shared or not: the in-use status file carries this computer's weekly use, and the
+        // roster each account's reading, so the refresh rewrites them wherever sharing is on.
         before.providers.claude != after.providers.claude || before.providers.codex != after.providers.codex || from != to
-            || to.roster && before.share_readings != after.share_readings
+            || to.shares() && before.share_readings != after.share_readings
     }
 
     /// Whether a save left anything for `catch_up`, or a withdrawal that ran late has ended since
@@ -819,10 +822,12 @@ mod tests {
         let mut claude = at("A", true);
         claude.providers.claude = !claude.providers.claude;
         assert!(sharing.saved(&at("A", true), &claude));
-        // Readings turned off go from this machine's roster at once: the refresh rewrites it.
+        // Readings turned off go from this machine's roster and in-use status at once: the refresh
+        // rewrites them.
         let quiet = Settings { share_readings: false, ..at("A", true) };
         assert!(sharing.saved(&at("A", true), &quiet) && sharing.saved(&quiet, &at("A", true)), "readings shared or not");
-        assert!(!sharing.saved(&at("A", false), &Settings { share_readings: false, ..at("A", false) }), "with no roster to carry them");
+        assert!(sharing.saved(&at("A", false), &Settings { share_readings: false, ..at("A", false) }), "the in-use status carries this computer's weekly use");
+        assert!(!sharing.saved(&Settings::default(), &Settings { share_readings: false, ..Settings::default() }), "with nowhere to share");
         assert!(!sharing.is_due(), "and nothing to withdraw or forget");
 
         assert!(sharing.saved(&Settings::default(), &at("A", false)), "sharing turned on");

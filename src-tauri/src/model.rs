@@ -71,8 +71,9 @@ pub struct AccountUsage {
     pub remote: Vec<RemoteSeat>,
     /// Every machine the account is in use on right now (this one first, then live other
     /// machines by name), when that is more than one; empty otherwise (see `presence::overlap`).
-    /// Two machines on one account drain its limits twice as fast, and the provider may sign
-    /// one of them out.
+    /// Their use adds up, so two machines on one account drain its limits twice as fast: with
+    /// `room_to_share` that is a planned share within its limits, without it a conflict that
+    /// Health, a notification and recommend_account flag.
     #[serde(default)]
     pub overlap: Vec<String>,
     /// Another of the user's computers' reading of this account, newer than this computer's own,
@@ -132,6 +133,13 @@ pub struct AccountUsage {
     /// Set on the CLI's account and the desktop app's account when they differ on this machine.
     #[serde(default)]
     pub seats: Option<SeatDrift>,
+    /// Its busiest recent weeks, and the week in progress so far, left the 20% spare every share
+    /// keeps under every weekly limit, model caps included, over enough weeks to judge
+    /// (`subscriptions::attach_room`, from this computer's usage history): use from several
+    /// computers adds up within its limits, so `overlap` on it is a planned share rather than a
+    /// conflict. Set by the app after each refresh.
+    #[serde(default)]
+    pub room_to_share: bool,
 }
 
 /// Why a sign-in needs a new one: a connected account's monitoring sign-in

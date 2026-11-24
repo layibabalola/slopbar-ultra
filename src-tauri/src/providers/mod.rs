@@ -156,7 +156,7 @@ pub async fn fetch_all(
                 billing: slot.billing(),
                 remote: vec![], overlap: vec![], shared: None, covered_by: None,
                 used_outside: false,
-                runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None,
+                runs_out_at: None, unexpected: None, cli_rejected: false, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None, room_to_share: false,
                 // When the saved CLI sign-in ends, and whether it needs a new one while the
                 // account is not in use (the CLI manages the one in use).
                 cli_ends_at: slot.ends_at(),
