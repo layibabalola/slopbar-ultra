@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 
 // i18n.js sets the page language on load.
 globalThis.document ??= { documentElement: {} };
-const { t, setLanguage, setThisMachine, setSharing, windowResetText, placesText, compactPlaces, overlapText, shownReading, duration, currentWindows, coveredMonitoring, resetSince, resetText, groupResets } = await import("../src/i18n.js");
+const { t, setLanguage, shortDate, shortDay, setThisMachine, setSharing, windowResetText, placesText, compactPlaces, overlapText, shownReading, duration, currentWindows, coveredMonitoring, resetSince, resetText, groupResets } = await import("../src/i18n.js");
 const { accountTip, accountTipLines, adviceText, cliSignInText } = await import("../src/accounttext.js");
 const { sparkline, sparklineText } = await import("../src/sparkline.js");
 setLanguage("en");
@@ -96,7 +96,8 @@ const account = {
 const sub = {
   provider: "claude", id: "fixture-1", plan_kind: "personal", monthly_cost: 200, cost_entered: false,
   renewal: { at: iso(now + 5 * 24 * HOUR), source: "provider" }, ends_at: null, cancel_after: null,
-  assessment: { verdict: "unused", renew_wasteful: true }, idle_now: false, delinquent: false,
+  assessment: { verdict: "unused", renew_wasteful: true }, idle_now: false, delinquent: false, plan_weight: 1,
+  advised: { action: "cancel", from: "Max 20x", to: null, monthly_saving: 200, verdict: "unused" }, kept: null,
   this_week: { used_percent: 77, pace_percent: 140, resets_at: weekly.resets_at, runs_out_at: null },
   credits: null, extra_usage: null,
 };
@@ -383,6 +384,61 @@ test("a Fable reset says it gives back only what Fable used, and resets list usa
     assert.ok(text.startsWith(t("resetFable")) && text.includes(t("resetFableHint")) && t("resetFable") !== "resetFable", `${lang}: ${text}`);
   }
   setLanguage("en");
+});
+
+// ---------------------------------------------------------------------------------------------
+// The plan's advice line follows the plan Advisor (`advised`, `kept`), never one plan's verdict.
+
+const plan = (extra = {}) => ({ ...sub, assessment: { verdict: "unused", renew_wasteful: false }, advised: null, kept: null, ...extra });
+const unneeded = (d) => [t("subAdviceUnused", { d }), t("subAdviceUnusedNoDate")];
+
+test("a plan the Advisor keeps is never called unneeded, and its line says why", () => {
+  const d = shortDate(sub.renewal.at);
+  for (const [kept, key] of [["busiest_weeks", "subAdviceKept"], ["this_week", "subAdviceKeptNow"], ["last_plan", "subAdviceKeptLast"], ["carries", "subAdviceKeptCarries"], ["smallest", "subAdviceKeptSmallest"]]) {
+    for (const verdict of ["unused", "underused"]) {
+      const line = adviceText(plan({ kept, assessment: { verdict, renew_wasteful: false } }));
+      assert.equal(line, t(key), `${kept} ${verdict}`);
+      assert.ok(!unneeded(d).includes(line) && !/cancel/i.test(line), line);
+    }
+  }
+  assert.equal(adviceText(plan({ kept: "busiest_weeks" })), "The Advisor keeps this plan to cover your busiest weeks.");
+  // A report from before the Advisor's word reached each plan (no advised, no kept) says nothing unneeded either.
+  const old = { ...sub, assessment: { verdict: "unused", renew_wasteful: true } };
+  delete old.advised; delete old.kept;
+  assert.ok(!unneeded(d).includes(adviceText(old)), adviceText(old));
+});
+
+test("the Advisor's move is the advice: cancel, use another plan instead, or a smaller tier", () => {
+  const d = shortDate(sub.renewal.at);
+  assert.equal(adviceText(plan({ advised: { action: "cancel" } })), t("subAdviceUnused", { d }));
+  const share = plan({ assessment: { verdict: "healthy", renew_wasteful: true }, advised: { action: "share", share: { id: "h", email: "host@example.invalid", alias: "Home" } } });
+  assert.equal(adviceText(share), `Use Home instead, then cancel this plan before ${d} to avoid the next charge.`);
+  const down = plan({ assessment: { verdict: "underused", renew_wasteful: true }, advised: { action: "downgrade", to: "Max 5x" } });
+  assert.equal(adviceText(down), `Max 5x would cover this plan's use: change to it before ${d}.`);
+  // Without a renewal date the move still stands, worded without one.
+  assert.equal(adviceText({ ...down, renewal: null }), "Max 5x would cover this plan's use: change to it before the next billing date.");
+  assert.equal(adviceText({ ...share, renewal: null }), "Use Home instead, then cancel this plan before the next billing date.");
+  assert.equal(adviceText(plan({ advised: { action: "cancel" }, renewal: null })), t("subAdviceUnusedNoDate"));
+  // An entered billing day is a calendar day.
+  const entered = { ...down, renewal: { at: "2026-12-05T00:00:00Z", source: "entered" } };
+  assert.equal(adviceText(entered), `Max 5x would cover this plan's use: change to it before ${shortDay(entered.renewal.at)}.`);
+  // A move this build does not know, or a downgrade without its tier, is never read as a cancel.
+  for (const advised of [{ action: "merge" }, { action: "downgrade", to: null }, {}]) {
+    const line = adviceText(plan({ advised }));
+    assert.ok(!unneeded(d).includes(line) && line === t("subAdviceUnderusedMaybe"), `${JSON.stringify(advised)}: ${line}`);
+  }
+});
+
+test("an idle plan with no move and no reason to keep it says what the Advisor lacks, never unneeded", () => {
+  // Thin history: no downgrade yet.
+  assert.equal(adviceText(plan({ assessment: { verdict: "underused", renew_wasteful: false } })), t("subAdviceUnderusedMaybe"));
+  // A plan of unknown size or price the Advisor cannot weigh.
+  assert.equal(adviceText(plan({ plan_weight: null })), t("subAdviceUnsized"));
+  assert.equal(adviceText(plan({ monthly_cost: null })), t("subAdviceUnsized"));
+  // Ended, lapsing, busy and organization plans read as before.
+  assert.equal(adviceText(plan({ ends_at: "2026-12-10T00:00:00Z", advised: { action: "cancel" } })), t("subAdviceEnding", { d: shortDate("2026-12-10T00:00:00Z") }));
+  assert.equal(adviceText(plan({ assessment: { verdict: "exhausted_weekly" } })), "This plan is fully used, so the Advisor keeps it.");
+  assert.equal(adviceText(plan({ plan_kind: "organization", advised: { action: "cancel" } })), "");
 });
 
 console.log(`${passed} account tooltip and sparkline checks passed`);

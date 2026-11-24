@@ -21,6 +21,7 @@ pub struct Digest {
     pub monthly_total: f64,
     /// Paid plans whose cost is unknown, left out of `monthly_total`.
     pub unpriced: usize,
+    /// What the plan Advisor's moves save a month, across providers (never a plan it keeps).
     pub possible_savings: f64,
     pub renewing: Vec<Renewing>,
     /// Accounts that reached their weekly limit in the past seven days, by alias or email.

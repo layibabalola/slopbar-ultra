@@ -1,8 +1,9 @@
-//! Which plan notifications are due: renewals of plans that look unneeded, any paid plan renewing
-//! within a day, the account in use running out of its week before it resets, and Codex Pro 200
-//! accounts whose use would not fit the plan's smaller allowance after the cut. Each is shown
-//! once (per account and renewal date, or per weekly window), remembered across restarts in a small
-//! file. What the notification says is up to the frontend, which owns the translations.
+//! Which plan notifications are due: renewals of plans the plan Advisor cancels, shares or
+//! downgrades (never one it keeps, however idle) and of plans the user is letting lapse, any paid
+//! plan renewing within a day, the account in use running out of its week before it resets, and
+//! Codex Pro 200 accounts whose use would not fit the plan's smaller allowance after the cut. Each
+//! is shown once (per account and renewal date, or per weekly window), remembered across restarts
+//! in a small file. What the notification says is up to the frontend, which owns the translations.
 
 use std::collections::HashMap;
 
@@ -31,8 +32,11 @@ pub struct Sent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
-    /// A plan that looks unused or underused renews within three days.
+    /// A plan the Advisor advises changing (`Alert::advised`) renews within three days.
     RenewalWasteful,
+    /// A plan the user is letting lapse renews within three days, and it is the charge they meant
+    /// to stop: in case it was not cancelled at the provider yet.
+    RenewalLapsing,
     /// A paid plan renews within a day.
     RenewalSoon,
     /// The account in use reaches its weekly limit within a few hours, before the reset.
@@ -61,6 +65,9 @@ pub struct Alert {
     pub source: Option<DateSource>,
     pub verdict: Option<Verdict>,
     pub monthly_cost: Option<f64>,
+    /// A wasteful renewal: the Advisor's move for the plan, which the notification words.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advised: Option<crate::advisor::Move>,
     /// When the weekly window that runs out resets.
     pub resets_at: Option<DateTime<Utc>>,
     /// Every account the notification is about, by alias or email, when there are several.
@@ -113,11 +120,19 @@ pub fn due(report: &Report, snapshot: &Snapshot, prefs: &Notifications, sent: &m
                     if within_day { mark(format!("soon:{account}"), sent); }
                     Kind::RenewalWasteful
                 }
+                // Once per renewal: a plan warned about as wasteful that the user then marks as
+                // lapsing was already told to cancel before this renewal.
+                RenewalWarning::Lapsing if !sent.sent.contains_key(&format!("lapsing:{account}")) && !sent.sent.contains_key(&format!("wasteful:{account}")) => {
+                    mark(format!("lapsing:{account}"), sent);
+                    if within_day { mark(format!("soon:{account}"), sent); }
+                    Kind::RenewalLapsing
+                }
                 _ if within_day && mark(format!("soon:{account}"), sent) => Kind::RenewalSoon,
                 _ => continue,
             };
+            let advised = if kind == Kind::RenewalWasteful { e.advised.clone() } else { None };
             out.push(Alert { kind, provider: e.provider, id: e.id.clone(), email: e.email.clone(), alias: e.alias.clone(),
-                at: renewal.at, source: Some(renewal.source), verdict: Some(e.assessment.verdict), monthly_cost: e.monthly_cost, resets_at: None, accounts: vec![], percent: None, used: None, limit: None });
+                at: renewal.at, source: Some(renewal.source), verdict: Some(e.assessment.verdict), monthly_cost: e.monthly_cost, advised, resets_at: None, accounts: vec![], percent: None, used: None, limit: None });
         }
         let cut: Vec<&crate::subscriptions::Entry> = report.accounts.iter()
             .filter(|e| e.allowance_change.as_ref().is_some_and(|c| c.would_hit_limit) && e.ends_at.is_none()).collect();
@@ -125,7 +140,7 @@ pub fn due(report: &Report, snapshot: &Snapshot, prefs: &Notifications, sent: &m
             if mark(format!("pro_allowance_cut:{}", change.last_day), sent) {
                 let at = change.last_day.and_hms_opt(23, 59, 59).map(|d| d.and_utc()).unwrap_or(now);
                 out.push(Alert { kind: Kind::ProAllowanceCut, provider: first.provider, id: first.id.clone(), email: first.email.clone(), alias: first.alias.clone(),
-                    at, source: None, verdict: None, monthly_cost: None, resets_at: None,
+                    at, source: None, verdict: None, monthly_cost: None, advised: None, resets_at: None,
                     accounts: cut.iter().map(|e| e.alias.clone().or_else(|| e.email.clone()).unwrap_or_else(|| e.id.clone())).collect(), percent: None, used: None, limit: None });
             }
         }
@@ -141,7 +156,7 @@ pub fn due(report: &Report, snapshot: &Snapshot, prefs: &Notifications, sent: &m
             if !mark(key(percent), sent) { continue; }
             for t in EXTRA_USAGE_THRESHOLDS.iter().filter(|t| **t < percent) { mark(key(*t), sent); }
             out.push(Alert { kind: Kind::ExtraUsage, provider: e.provider, id: e.id.clone(), email: e.email.clone(), alias: e.alias.clone(),
-                at: now, source: None, verdict: None, monthly_cost: None, resets_at: None, accounts: vec![],
+                at: now, source: None, verdict: None, monthly_cost: None, advised: None, resets_at: None, accounts: vec![],
                 percent: Some(percent), used: x.used, limit: x.monthly_limit });
         }
     }
@@ -152,7 +167,7 @@ pub fn due(report: &Report, snapshot: &Snapshot, prefs: &Notifications, sent: &m
             // Once per weekly window: its reset, to the hour, absorbs jitter between readings.
             if !mark(format!("runs_out:{}:{}:{}", a.provider.name(), a.id, resets_at.timestamp() / 3600), sent) { continue; }
             out.push(Alert { kind: Kind::RunsOut, provider: a.provider, id: a.id.clone(), email: a.email.clone(), alias: a.alias.clone(),
-                at, source: None, verdict: None, monthly_cost: None, resets_at: Some(resets_at), accounts: vec![], percent: None, used: None, limit: None });
+                at, source: None, verdict: None, monthly_cost: None, advised: None, resets_at: Some(resets_at), accounts: vec![], percent: None, used: None, limit: None });
         }
     }
     out
@@ -234,6 +249,19 @@ pub(crate) mod tests {
         for s in w.settings.subscriptions.values_mut() { s.next_billing = Some("2026-11-24".parse().unwrap()); }
         w.snapshot.accounts[2].billing.cancels_at = Some(at("2026-11-24T00:00:00Z"));
         assert_eq!(run(&w, &mut sent, now), [(Kind::RenewalWasteful, "idle".to_string())]);
+    }
+
+    #[test]
+    fn a_plan_being_let_lapse_is_reminded_of_once_before_the_charge_it_was_meant_to_stop() {
+        let now = at("2026-10-21T09:00:00Z");
+        let mut w = world(now);
+        w.settings.subscriptions.get_mut("codex:busy").unwrap().cancel_after = Some("2026-10-24".parse().unwrap());
+        let mut sent = Sent::default();
+        // With the busy plan going, the idle one is the provider's last: the Advisor keeps it, so
+        // only the lapsing plan is warned about, and never as wasteful.
+        assert_eq!(run(&w, &mut sent, now), [(Kind::RenewalLapsing, "busy".to_string())]);
+        assert!(run(&w, &mut sent, now + Duration::hours(1)).is_empty(), "once");
+        assert!(sent.sent.keys().any(|k| k == "lapsing:Codex:busy:2026-10-24"), "{:?}", sent.sent.keys().collect::<Vec<_>>());
     }
 
     #[test]

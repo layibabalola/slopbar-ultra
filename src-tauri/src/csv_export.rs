@@ -71,9 +71,14 @@ pub fn breakdown_csv(rows: &[DailyRow]) -> String {
 pub fn subscriptions_csv(report: &Report) -> String {
     csv(&["provider", "account_id", "email", "alias", "plan", "in_use", "verdict", "confidence", "basis", "weeks_counted", "average_peak_percent",
         "median_peak_percent", "limit_weeks", "renewal_looks_unneeded", "this_week_percent", "pace_percent", "runs_out_at", "next_renewal",
-        "renewal_source", "renewal_warning", "monthly_cost", "cost_entered", "cancel_after", "ends_at", "plan_weight", "days_tracked", "extra_usage_enabled", "extra_usage_used", "extra_usage_limit"],
+        "renewal_source", "renewal_warning", "monthly_cost", "cost_entered", "cancel_after", "ends_at", "plan_weight", "days_tracked", "extra_usage_enabled", "extra_usage_used", "extra_usage_limit",
+        // The plan Advisor's word on the plan, which renewal_looks_unneeded follows: its move (with
+        // the tier or the plan to use instead, and what it saves a month), or why it keeps it.
+        "advisor_move", "advisor_move_to", "advisor_monthly_saving", "advisor_keeps"],
         report.accounts.iter().map(|e| {
             let a = &e.assessment;
+            let m = e.advised.as_ref();
+            let to = m.and_then(|m| m.to.clone().or_else(|| m.share.as_ref().map(|s| s.alias.clone().or_else(|| s.email.clone()).unwrap_or_else(|| s.id.clone()))));
             vec![text(e.provider.name()), text(&e.id), opt(e.email.as_deref()), opt(e.alias.as_deref()), opt(e.plan.as_deref()), e.active.to_string(),
                 name(a.verdict), name(a.confidence), name(a.basis), a.weeks_counted.to_string(), num(a.average_peak), num(a.median_peak),
                 a.limit_weeks.to_string(), a.renew_wasteful.to_string(), num(e.this_week.as_ref().map(|w| w.used_percent)),
@@ -81,7 +86,8 @@ pub fn subscriptions_csv(report: &Report) -> String {
                 time(e.renewal.as_ref().map(|r| r.at)), e.renewal.as_ref().map(|r| name(r.source)).unwrap_or_default(),
                 e.renewal_warning.map(name).unwrap_or_default(), num(e.monthly_cost), e.cost_entered.to_string(),
                 e.cancel_after.map(|d| d.to_string()).unwrap_or_default(), time(e.ends_at), num(e.plan_weight), e.days_tracked.to_string(),
-                e.extra_usage.as_ref().and_then(|x| x.enabled).map(|b| b.to_string()).unwrap_or_default(), num(e.extra_usage.as_ref().and_then(|x| x.used)), num(e.extra_usage.as_ref().and_then(|x| x.monthly_limit))]
+                e.extra_usage.as_ref().and_then(|x| x.enabled).map(|b| b.to_string()).unwrap_or_default(), num(e.extra_usage.as_ref().and_then(|x| x.used)), num(e.extra_usage.as_ref().and_then(|x| x.monthly_limit)),
+                m.map(|m| name(m.action)).unwrap_or_default(), opt(to.as_deref()), num(m.map(|m| m.monthly_saving)), e.kept.map(name).unwrap_or_default()]
         }))
 }
 
@@ -136,6 +142,22 @@ mod tests {
         assert_eq!(text("=HYPERLINK(\"x\")"), "\"'=HYPERLINK(\"\"x\"\")\"");
         assert_eq!(text("@sum"), "'@sum");
         assert_eq!(text("line\nbreak"), "linebreak");
+    }
+
+    #[test]
+    fn the_subscriptions_csv_says_what_the_advisor_does_with_each_plan() {
+        // Three Codex plans renewing on the 24th: one unused (cancelled by the Advisor), one busy,
+        // one already cancelled.
+        let now = at("2026-10-21T09:00:00Z");
+        let w = crate::plan_alerts::tests::world(now);
+        let s = subscriptions_csv(&crate::subscriptions::report(&w.snapshot, &w.history, &w.settings, None, now));
+        let lines: Vec<&str> = s.trim_start_matches('\u{feff}').split("\r\n").collect();
+        assert!(lines[0].ends_with(",extra_usage_limit,advisor_move,advisor_move_to,advisor_monthly_saving,advisor_keeps"), "{}", lines[0]);
+        let column = |line: &str, name: &str| line.split(',').nth(lines[0].split(',').position(|h| h == name).unwrap()).unwrap().to_string();
+        let idle = lines.iter().find(|l| l.contains("idle@")).unwrap();
+        assert_eq!((column(idle, "renewal_looks_unneeded"), column(idle, "advisor_move"), column(idle, "advisor_monthly_saving")), ("true".into(), "cancel".into(), "200".into()));
+        let busy = lines.iter().find(|l| l.contains("busy@")).unwrap();
+        assert_eq!((column(busy, "renewal_looks_unneeded"), column(busy, "advisor_move"), column(busy, "advisor_keeps")), ("false".into(), String::new(), String::new()));
     }
 
     #[test]
