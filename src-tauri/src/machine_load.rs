@@ -35,8 +35,9 @@ use crate::subscriptions::{self, END_READ_SECONDS, IDLE_SLACK_SECONDS, KINDS, PO
 
 /// 2: windows keep a reading per day. A ledger of another version starts over.
 pub(crate) const VERSION: u8 = 2;
-/// The `load.v` this SlopBar writes and reads; a load of any other is dropped.
-const LOAD_VERSION: u32 = 1;
+/// The `load.v` this SlopBar writes and reads; a load of any other is dropped. 2: the busiest 7 days
+/// are spans of daily readings, and measured and uncounted ask more (a load of 1 meant less by them).
+const LOAD_VERSION: u32 = 2;
 const FILE: &str = "machine-load.json";
 /// The ledger file is read up to this size; `save` keeps it within.
 const MAX_FILE: u64 = 256 * 1024;
@@ -88,8 +89,12 @@ pub struct Ledger {
     /// The UTC days some use here could not be counted (`observe`), by provider.
     pub gaps: BTreeMap<String, BTreeSet<NaiveDate>>,
     /// The accounts in use on the UTC day being watched and whether each had a reading that day:
-    /// one in use whose readings fail all day leaves that day a gap.
+    /// one in use whose readings fail all day leaves that day pending (`Pending`).
     pub today: Option<Watch>,
+    /// Days an account in use had no fresh reading, until a later one of the window it had running
+    /// shows that day's use (readings add up within a window) or the window resets unread, which
+    /// leaves the day a gap. Uncounted meanwhile.
+    pub pending: Vec<Pending>,
     /// The latest reset of a window left out of the file to keep it within `MAX_FILE`: use until
     /// then may be missing.
     pub trimmed: Option<DateTime<Utc>>,
@@ -100,6 +105,15 @@ pub struct Watch {
     pub day: NaiveDate,
     /// By `account_key`: whether a fresh reading of it came that day.
     pub read: BTreeMap<String, bool>,
+}
+
+/// A day account `key` was in use without one fresh reading, waiting for a fresh reading of the
+/// window it had running then (the one resetting first, at `until`) on a later day before it resets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Pending {
+    pub key: String,
+    pub day: NaiveDate,
+    pub until: DateTime<Utc>,
 }
 
 /// One account weekly window this computer had in use. Short names keep a ledger of
@@ -133,6 +147,10 @@ pub struct Touched {
     /// counts, in use here or not since: the whole window is charged.
     #[serde(rename = "d", default)]
     pub daily: Vec<f64>,
+    /// When it ended before its reset: a later reset of its kind was read while it still had this
+    /// one ahead (a banked reset or reset credit used on it).
+    #[serde(rename = "e", default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
 }
 
 impl Touched {
@@ -144,9 +162,19 @@ impl Touched {
         self.began().date_naive()
     }
 
+    /// When it ended: at its reset, or earlier when cut short (`ended_at`).
+    fn end(&self) -> DateTime<Utc> {
+        self.ended_at.map_or(self.resets_at, |e| e.min(self.resets_at))
+    }
+
+    /// Still running at `now`.
+    fn running(&self, now: DateTime<Utc>) -> bool {
+        self.end() > now
+    }
+
     /// The UTC day of its last moment.
     fn last_day(&self) -> NaiveDate {
-        (self.resets_at - Duration::seconds(1)).date_naive()
+        (self.end() - Duration::seconds(1)).date_naive()
     }
 
     fn peak(&self) -> f64 {
@@ -181,9 +209,14 @@ fn account_key(provider: Provider, id: &str) -> String {
     format!("{}:{}", provider.key(), account_code(provider, id))
 }
 
-fn provider_of(key: &str) -> Option<Provider> {
-    let (p, _) = key.split_once(':')?;
-    Provider::ALL.into_iter().find(|x| x.key() == p)
+/// The provider and account code of an `account_key`.
+fn parse_key(key: &str) -> Option<(Provider, &str)> {
+    let (p, code) = key.split_once(':')?;
+    Some((Provider::ALL.into_iter().find(|x| x.key() == p)?, code))
+}
+
+fn day_start(day: NaiveDate) -> DateTime<Utc> {
+    day.and_time(chrono::NaiveTime::MIN).and_utc()
 }
 
 pub fn load() -> Ledger {
@@ -262,13 +295,44 @@ fn gap(ledger: &mut Ledger, provider: Provider, day: NaiveDate) {
     ledger.gaps.entry(provider.key().to_string()).or_default().insert(day);
 }
 
-/// Ends the day watched for readings that failed all day, once `today` is another: each account in
-/// use then without one fresh reading leaves that day a gap of its provider.
+/// Ends the day watched for readings that failed all day, once `today` is another. Each account in
+/// use then without one fresh reading leaves that day pending on the window it had running (the
+/// one resetting first): a later fresh reading of it holds that day's use. With no window known
+/// running that day, the day is a gap of its provider at once.
 fn close_watch(ledger: &mut Ledger, today: NaiveDate) {
     let Some(watch) = ledger.today.take_if(|w| w.day != today) else { return };
+    let (start, end) = (day_start(watch.day), day_start(watch.day) + Duration::days(1));
     for key in watch.read.iter().filter(|(_, read)| !**read).map(|(k, _)| k) {
-        if let Some(provider) = provider_of(key) { gap(ledger, provider, watch.day); }
+        let Some((provider, code)) = parse_key(key) else { continue };
+        let until = ledger.windows.iter()
+            .filter(|t| t.provider == provider && t.account == code && t.ended_at.is_none() && t.began() < end && t.resets_at > start)
+            .map(|t| t.resets_at).min();
+        match until {
+            Some(until) => ledger.pending.push(Pending { key: key.clone(), day: watch.day, until }),
+            None => gap(ledger, provider, watch.day),
+        }
     }
+}
+
+/// A fresh reading of account `key` taken at `at` with these windows: the days pending on a window
+/// it shows, before its reset and on a later day, are resolved, since its use since adds up in it.
+fn resolve(ledger: &mut Ledger, key: &str, windows: &[crate::model::UsageWindow], at: DateTime<Utc>) {
+    ledger.pending.retain(|p| !(p.key == key && at.date_naive() > p.day && at < p.until
+        && windows.iter().any(|w| KINDS.contains(&w.kind.as_str()) && w.resets_at.is_some_and(|r| (r - p.until).num_seconds().abs() < SAME_WINDOW_SECONDS))));
+}
+
+/// Days still pending once their window has reset unread stay gaps.
+fn expire_pending(ledger: &mut Ledger, now: DateTime<Utc>) {
+    let (expired, waiting): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut ledger.pending).into_iter().partition(|p| p.until <= now);
+    ledger.pending = waiting;
+    for p in expired {
+        if let Some((provider, _)) = parse_key(&p.key) { gap(ledger, provider, p.day); }
+    }
+}
+
+/// A weekly limit as the ledger counts them: a weekly kind a week long.
+fn weekly(w: &crate::model::UsageWindow) -> bool {
+    KINDS.contains(&w.kind.as_str()) && w.window_seconds.is_none_or(|s| s == WEEK_SECONDS)
 }
 
 /// Folds one refresh into the ledger. The day counts as refreshed for every provider on. Each
@@ -279,42 +343,54 @@ fn close_watch(ledger: &mut Ledger, today: NaiveDate) {
 /// of the account, a stale one included (an earlier reading of the same window, counted on the day
 /// it was taken), and another computer's newer one shown here (`AccountUsage::shared`), which only
 /// raises a window already touched. Not touched: a window not used yet (0% with its reset a full
-/// week ahead, no fixed reset yet), and one resetting further ahead than `AHEAD_SECONDS`.
+/// week ahead, no fixed reset yet), and one resetting further ahead than `AHEAD_SECONDS`. A window
+/// whose account shows a later reset of its kind while it still had its own ahead ended then
+/// (`Touched::ended_at`).
 ///
-/// Use that cannot be counted leaves the day a gap of the provider (`ProviderLoad::uncounted`): the
-/// desktop app here signed in to an account SlopBar does not have, an account in use with limits of
-/// another length than a week, or one in use whose readings fail all day.
-pub fn observe(ledger: &mut Ledger, snapshot: &Snapshot, wanted: &[(Provider, String)], providers: &Providers, now: DateTime<Utc>) {
+/// Use that cannot be counted leaves the day a gap of the provider (`ProviderLoad::uncounted`): a
+/// desktop app here signed in to an account SlopBar does not have (`unseen`, from
+/// `desktop_apps::unseen`, whatever the CLI here), an account in use with limits of another length
+/// than a week, or one whose fresh reading has no weekly limit at all. An account in use whose
+/// readings fail all day leaves the day pending (`close_watch`) until a later fresh reading of its
+/// window resolves it.
+pub fn observe(ledger: &mut Ledger, snapshot: &Snapshot, wanted: &[(Provider, String)], unseen: &[Provider], providers: &Providers, now: DateTime<Utc>) {
     ledger.version = VERSION;
     let today = now.date_naive();
     close_watch(ledger, today);
     for p in Provider::ALL.into_iter().filter(|p| enabled(providers, *p)) {
         ledger.days.entry(p.key().to_string()).or_default().insert(today);
+        if unseen.contains(&p) { gap(ledger, p, today); }
     }
     for acc in snapshot.accounts.iter().filter(|a| enabled(providers, a.provider)) {
         let key = account_key(acc.provider, &acc.id);
         let in_use = acc.active || acc.desktop || wanted.iter().any(|(p, id)| *p == acc.provider && *id == acc.id);
-        // `desktop_apps` names no account for the desktop app here when SlopBar does not have it.
-        let mut uncounted = acc.seats.as_ref().is_some_and(|s| s.desktop.is_none());
+        let fresh = !acc.stale && acc.error.is_none();
+        let own = acc.fetched_at.unwrap_or(now).min(now);
         if in_use {
             mark_key(ledger, &key, now);
             let watch = ledger.today.get_or_insert_with(|| Watch { day: today, read: BTreeMap::new() });
-            *watch.read.entry(key.clone()).or_insert(false) |= !acc.stale && acc.error.is_none();
-            uncounted |= acc.windows.iter().any(|w| w.kind == "window" || KINDS.contains(&w.kind.as_str()) && w.window_seconds.is_some_and(|s| s != WEEK_SECONDS));
+            *watch.read.entry(key.clone()).or_insert(false) |= fresh;
+            let other_length = acc.windows.iter().any(|w| w.kind == "window" || KINDS.contains(&w.kind.as_str()) && !weekly(w));
+            if other_length || fresh && !acc.windows.iter().any(weekly) { gap(ledger, acc.provider, today); }
         }
-        if uncounted { gap(ledger, acc.provider, today); }
+        if fresh { resolve(ledger, &key, &acc.windows, own); }
         let last_used = ledger.used.get(&key).copied();
         let account = account_code(acc.provider, &acc.id);
         let weight = subscriptions::plan_weight(acc);
         let pro_200 = subscriptions::pro_200(acc);
-        let own = acc.fetched_at.unwrap_or(now).min(now);
         let readings = acc.windows.iter().map(|w| (w, own, false))
             .chain(acc.shared.iter().flat_map(|s| s.windows.iter().map(move |w| (w, s.taken_at.min(now), true))));
         for (w, read_at, shared) in readings {
-            if !KINDS.contains(&w.kind.as_str()) || w.window_seconds.is_some_and(|s| s != WEEK_SECONDS) || !w.used_percent.is_finite() { continue; }
+            if !weekly(w) || !w.used_percent.is_finite() { continue; }
             let Some(resets_at) = w.resets_at.filter(|r| *r > now && (*r - now).num_seconds() <= AHEAD_SECONDS) else { continue };
             let used = w.used_percent.max(0.0);
             if used <= 0.0 && (resets_at - now).num_seconds() > WEEK_SECONDS - IDLE_SLACK_SECONDS { continue; }
+            if !shared {
+                for t in ledger.windows.iter_mut().filter(|t| t.provider == acc.provider && t.account == account && t.kind == w.kind
+                    && t.ended_at.is_none() && t.resets_at > now && (resets_at - t.resets_at).num_seconds() >= SAME_WINDOW_SECONDS) {
+                    t.ended_at = Some(whole_second(read_at).max(t.read_at));
+                }
+            }
             let began = resets_at - Duration::seconds(WEEK_SECONDS);
             let same = ledger.windows.iter_mut().find(|t| t.provider == acc.provider && t.account == account && t.kind == w.kind
                 && (t.resets_at - resets_at).num_seconds().abs() < SAME_WINDOW_SECONDS);
@@ -322,7 +398,7 @@ pub fn observe(ledger: &mut Ledger, snapshot: &Snapshot, wanted: &[(Provider, St
                 Some(t) => t.read(used, read_at, weight, pro_200),
                 None if !shared && (in_use || last_used.is_some_and(|u| began <= u && u < resets_at)) => {
                     let mut t = Touched { provider: acc.provider, account: account.clone(), kind: w.kind.clone(), resets_at: whole_second(resets_at),
-                        read_at: whole_second(read_at), weight, pro_200, daily: vec![] };
+                        read_at: whole_second(read_at), weight, pro_200, daily: vec![], ended_at: None };
                     t.read(used, read_at, weight, pro_200);
                     ledger.windows.push(t);
                 }
@@ -330,6 +406,7 @@ pub fn observe(ledger: &mut Ledger, snapshot: &Snapshot, wanted: &[(Provider, St
             }
         }
     }
+    expire_pending(ledger, now);
     prune(ledger, now);
 }
 
@@ -345,7 +422,7 @@ fn lookback(now: DateTime<Utc>) -> NaiveDate {
 fn prune(ledger: &mut Ledger, now: DateTime<Utc>) {
     let since = now - Duration::weeks(KEEP_WEEKS);
     let ahead = now + Duration::seconds(AHEAD_SECONDS);
-    ledger.windows.retain(|t| t.resets_at > since && t.resets_at <= ahead);
+    ledger.windows.retain(|t| t.end() > since && t.resets_at <= ahead);
     if ledger.windows.len() > MAX_WINDOWS {
         let first = lookback(now);
         ledger.windows.sort_by_key(|t| t.resets_at);
@@ -391,7 +468,8 @@ pub struct ProviderLoad {
     pub weeks: u8,
     pub measured: bool,
     /// Some use in the lookback is not in the numbers: on a plan of unknown weight (a free plan, an
-    /// unknown tier), or on a day with a gap (`observe`), or left out of the file (`stored`).
+    /// unknown tier), on a day with a gap or still pending (`observe`), or left out of the file
+    /// (`stored`).
     pub uncounted: bool,
 }
 
@@ -477,7 +555,8 @@ fn provider_load(ledger: &Ledger, provider: Provider, now: DateTime<Utc>) -> Pro
     let today = now.date_naive();
     let first = lookback(now);
     let mine: Vec<&Touched> = ledger.windows.iter().filter(|t| t.provider == provider && t.last_day() >= first).collect();
-    let gaps = ledger.gaps.get(provider.key()).is_some_and(|g| g.range(first..).next().is_some());
+    let gaps = ledger.gaps.get(provider.key()).is_some_and(|g| g.range(first..).next().is_some())
+        || ledger.pending.iter().any(|p| p.day >= first && parse_key(&p.key).is_some_and(|(q, _)| q == provider));
     let trimmed = ledger.trimmed.is_some_and(|t| t.date_naive() >= first);
     let mut out = ProviderLoad { uncounted: gaps || trimmed || mine.iter().any(|t| t.weight.is_none()), ..Default::default() };
     for kind in KINDS {
@@ -486,8 +565,8 @@ fn provider_load(ledger: &Ledger, provider: Provider, now: DateTime<Utc>) -> Pro
         let rise = |t: &Touched, end: f64, end_day: NaiveDate| in_plans(t, (end - t.by(end_day - Duration::days(SPAN_DAYS))).max(0.0));
         let span = |end_day: NaiveDate| of_kind.iter().map(|t| rise(t, t.by(end_day), end_day)).sum::<f64>();
         let live = of_kind.iter().map(|t| {
-            let end = subscriptions::live_week(t.peak(), t.resets_at, t.read_at, now).unwrap_or_else(|| t.by(today));
-            rise(t, end, today)
+            let end = if t.running(now) { subscriptions::live_week(t.peak(), t.resets_at, t.read_at, now) } else { None };
+            rise(t, end.unwrap_or_else(|| t.by(today)), today)
         }).sum::<f64>();
         let busiest = (1..LOOK_WEEKS * 7).map(|back| span(today - Duration::days(back))).fold(live, f64::max);
         out.busiest.insert(kind.to_string(), plans(busiest));
@@ -514,7 +593,7 @@ fn evidence(days: Option<&BTreeSet<NaiveDate>>, windows: &[&Touched], now: DateT
         let end = start + Duration::days(7);
         let refreshed = days.map_or(0, |d| d.range(start..end).count()) >= MEASURED_DAYS;
         let ends_read = windows.iter().filter(|t| (start..end).contains(&t.last_day()))
-            .all(|t| (t.resets_at - t.read_at).num_seconds() <= END_READ_SECONDS);
+            .all(|t| (t.end() - t.read_at).num_seconds() <= END_READ_SECONDS);
         refreshed && ends_read
     }).collect();
     let weeks = measured.iter().filter(|m| **m).count() as u8;
@@ -616,9 +695,14 @@ pub struct MachineAdvice {
     pub unit: String,
     /// Measured weeks a computer needs (`WEEKS_NEEDED`).
     pub weeks_needed: u8,
+    /// The user holds paid plans of more than one tier of the provider: use on a smaller tier counts
+    /// in plans of the larger by `subscriptions::plan_weight`, which the providers' own figures do
+    /// not settle (Anthropic's weekly hours put a Max 5x nearer 0.6 of a Max 20x than 0.25), so
+    /// such a computer could read light. The computers are listed and no group is formed.
+    pub mixed: bool,
     /// This computer first, then the others by name.
     pub computers: Vec<Computer>,
-    /// Computers that could share one plan of `unit`, two or more each.
+    /// Computers that could share one plan of `unit`, two or more each; none while `mixed`.
     pub groups: Vec<MachineGroup>,
 }
 
@@ -710,6 +794,7 @@ fn round2(v: f64) -> f64 {
 /// whatever their dates: conservative) plus 20% fits one plan in every weekly limit. Every grouping
 /// is tried up to `SEARCH_MAX` computers, then the busiest first into the first group it fits; of
 /// equally few plans, the one keeping most computers that already share an account together.
+/// While the user holds paid plans of more than one tier (`mixed`), no group is formed.
 pub fn advise(own: &Load, here: &str, peers: &Peers, accounts: &[AccountUsage], settings: &Settings, now: DateTime<Utc>) -> Vec<MachineAdvice> {
     let here = clean_name(here);
     let mut named = vec![Named { machine: here.clone(), here: true, seen_at: now, loads: vec![Some(own)], seats: own_seats(accounts) }];
@@ -735,6 +820,7 @@ pub fn advise(own: &Load, here: &str, peers: &Peers, accounts: &[AccountUsage], 
         if !loads.iter().flatten().any(|l| l.busiest.values().any(|v| *v > 0.0)) { continue; }
         let seats: Vec<Vec<&String>> = named.iter().map(|n| n.seats.iter().filter(|(p, _)| *p == provider).map(|(_, h)| h).collect()).collect();
         let (unit, weight) = unit(provider, accounts, settings, now);
+        let mixed = mixed(provider, accounts);
         // Each computer's use per kind, in plans of `unit`.
         let shares = |of: &BTreeMap<String, f64>| -> Vec<f64> { KINDS.iter().map(|k| of.get(*k).copied().unwrap_or(0.0) / weight).collect() };
         let fits_one = |loads: &[f64]| loads.iter().all(|v| v * (1.0 + POOL_BUFFER) <= 1.0 + 1e-9);
@@ -745,9 +831,10 @@ pub fn advise(own: &Load, here: &str, peers: &Peers, accounts: &[AccountUsage], 
             let live = load.as_ref().map(|l| shares(&l.live));
             let measured = load.as_ref().is_some_and(|l| l.measured);
             let needs_own = measured && busiest.as_ref().is_some_and(|b| !fits_one(b));
-            // Use missing from its numbers may make them read low: listed, never grouped.
+            // Use missing from its numbers may make them read low: listed, never grouped. And no
+            // computer is grouped while plans of several tiers make its numbers uncertain.
             let uncounted = load.as_ref().is_some_and(|l| l.uncounted);
-            if measured && !needs_own && !uncounted { members.push((i, busiest.clone().unwrap_or_default())); }
+            if measured && !needs_own && !uncounted && !mixed { members.push((i, busiest.clone().unwrap_or_default())); }
             let most = |v: &Vec<f64>| round2(v.iter().copied().fold(0.0, f64::max) * 100.0);
             computers.push(Computer {
                 machine: n.machine.clone(),
@@ -770,9 +857,19 @@ pub fn advise(own: &Load, here: &str, peers: &Peers, accounts: &[AccountUsage], 
             MachineGroup { machines: g.iter().map(|&m| named[members[m].0].machine.clone()).collect(), combined_percent: round2(combined * 100.0) }
         }).collect();
         groups.sort_by_key(|g| computers.iter().position(|c| g.machines.first() == Some(&c.machine)));
-        out.push(MachineAdvice { provider, unit, weeks_needed: WEEKS_NEEDED, computers, groups });
+        out.push(MachineAdvice { provider, unit, weeks_needed: WEEKS_NEEDED, mixed, computers, groups });
     }
     out
+}
+
+/// Whether the user holds the provider's paid plans (`subscriptions::PlanKind::Personal`) of more
+/// than one tier (`subscriptions::plan_label`): their sizes, compared by `plan_weight`, are an
+/// assumption the providers' own figures do not settle (`MachineAdvice::mixed`).
+fn mixed(provider: Provider, accounts: &[AccountUsage]) -> bool {
+    let tiers: BTreeSet<String> = accounts.iter()
+        .filter(|a| a.provider == provider && subscriptions::plan_kind(a.plan.as_deref()) == subscriptions::PlanKind::Personal)
+        .filter_map(subscriptions::plan_label).collect();
+    tiers.len() > 1
 }
 
 /// Whether `members` added up, plus `POOL_BUFFER`, fit one plan in every weekly limit.
@@ -877,7 +974,7 @@ mod tests {
     }
 
     fn refresh(ledger: &mut Ledger, accounts: Vec<AccountUsage>, now: DateTime<Utc>) {
-        observe(ledger, &Snapshot { accounts, updated_at: Some(now) }, &[], &Providers::default(), now);
+        observe(ledger, &Snapshot { accounts, updated_at: Some(now) }, &[], &[], &Providers::default(), now);
     }
 
     fn load_of(ledger: &Ledger, provider: Provider, now: DateTime<Utc>) -> ProviderLoad {
@@ -1021,7 +1118,7 @@ mod tests {
         assert!(l.windows.is_empty(), "a reset more than a week and an hour ahead");
         // A window recorded under a clock that was wrong goes once it reads as that far ahead.
         l.windows.push(Touched { provider: Provider::Claude, account: account_code(Provider::Claude, "x"), kind: "weekly".into(),
-            resets_at: now + days(20), read_at: now, weight: Some(1.0), pro_200: false, daily: vec![30.0] });
+            resets_at: now + days(20), read_at: now, weight: Some(1.0), pro_200: false, daily: vec![30.0], ended_at: None });
         refresh(&mut l, vec![], now);
         assert!(l.windows.is_empty());
         // Another computer's reading of y, which was never in use here, touches nothing; of x, in
@@ -1060,7 +1157,7 @@ mod tests {
             for h in [1, 9, 17] { refresh(&mut l, vec![], at("2026-11-02T00:00:00Z") + days(d) + hours(h)); }
         }
         let codex_off = Providers { claude: true, codex: false };
-        observe(&mut l, &Snapshot::default(), &[], &codex_off, at("2026-11-23T08:00:00Z"));
+        observe(&mut l, &Snapshot::default(), &[], &[], &codex_off, at("2026-11-23T08:00:00Z"));
         assert_eq!((l.days["claude"].len(), l.days["codex"].len()), (22, 21));
         let load = summary(&l, &codex_off, at("2026-11-23T08:00:00Z"));
         assert_eq!(load.providers.keys().collect::<Vec<_>>(), ["claude"], "only providers on are published");
@@ -1093,38 +1190,110 @@ mod tests {
         let (x, end) = (max20("x"), at("2026-11-26T00:00:00Z"));
         let now = at("2026-11-23T10:00:00Z");
         let uncounted = |l: &Ledger, when: DateTime<Utc>| load_of(l, Provider::Claude, when).uncounted;
-        // The desktop app here signed in to an account SlopBar does not have.
+        // A desktop app here signed in to an account SlopBar does not have (`desktop_apps::unseen`),
+        // whatever the CLI here: none at all on this one.
         let mut l = Ledger::default();
-        let drift = crate::model::SeatDrift { app: "Claude Desktop".into(), cli: Some("x".into()), desktop: None };
-        refresh(&mut l, vec![AccountUsage { seats: Some(drift), ..read(&x, 10.0, end, true, now) }], now);
-        assert!(uncounted(&l, now));
+        observe(&mut l, &Snapshot::default(), &[], &[Provider::Claude], &Providers::default(), now);
+        assert!(uncounted(&l, now) && !load_of(&l, Provider::Codex, now).uncounted);
         // An account in use with limits of another length.
         let mut l = Ledger::default();
         let mut odd = read(&account(Provider::Codex, "c", "pro", None), 10.0, end, true, now);
         odd.windows.push(UsageWindow { kind: "window".into(), window_seconds: Some(3 * 86400), used_percent: 40.0, resets_at: Some(end) });
         refresh(&mut l, vec![odd], now);
         assert!(load_of(&l, Provider::Codex, now).uncounted);
-        // An account in use whose readings fail all day: known once the day is over.
+        // An account in use whose fresh reading has no weekly limit: none at all, or the 5-hour one only.
+        for windows in [vec![], vec![UsageWindow { kind: "session".into(), window_seconds: Some(18000), used_percent: 30.0, resets_at: Some(now + hours(3)) }]] {
+            let mut l = Ledger::default();
+            refresh(&mut l, vec![AccountUsage { windows: windows.clone(), ..read(&x, 0.0, end, true, now) }], now);
+            assert!(uncounted(&l, now), "{windows:?}");
+        }
+        // Not so a week not begun (Claude reports its weekly limit with no reset), nor an account not in use.
         let mut l = Ledger::default();
-        let failing = AccountUsage { stale: true, error: Some("http_500".into()), ..read(&x, 10.0, end, true, now - days(1)) };
-        refresh(&mut l, vec![failing.clone()], now);
-        refresh(&mut l, vec![failing.clone()], now + hours(6));
-        assert!(!uncounted(&l, now + hours(6)), "the day is not over");
-        refresh(&mut l, vec![read(&x, 12.0, end, true, now + days(1))], now + days(1));
-        assert!(uncounted(&l, now + days(1)));
-        assert_eq!(l.gaps["claude"].iter().collect::<Vec<_>>(), [&now.date_naive()]);
-        // One good reading that day is enough.
-        let mut l = Ledger::default();
-        refresh(&mut l, vec![failing.clone()], now);
-        refresh(&mut l, vec![read(&x, 11.0, end, true, now + hours(1))], now + hours(1));
-        refresh(&mut l, vec![read(&x, 12.0, end, true, now + days(1))], now + days(1));
-        assert!(!uncounted(&l, now + days(1)));
+        let idle = AccountUsage { windows: vec![UsageWindow { kind: "weekly".into(), window_seconds: None, used_percent: 0.0, resets_at: None }], ..read(&x, 0.0, end, true, now) };
+        refresh(&mut l, vec![idle, AccountUsage { windows: vec![], ..read(&max20("y"), 0.0, end, false, now) }], now);
+        assert!(!uncounted(&l, now));
         // A gap counts while a span of the lookback reaches it.
         let mut l = Ledger::default();
         gap(&mut l, Provider::Claude, now.date_naive() - days(62));
         assert!(uncounted(&l, now));
         l.gaps.insert("claude".into(), BTreeSet::from([now.date_naive() - days(63)]));
         assert!(!uncounted(&l, now));
+    }
+
+    #[test]
+    fn a_day_whose_readings_failed_is_resolved_by_a_later_reading_of_its_window() {
+        let (x, end) = (max20("x"), at("2026-11-26T00:00:00Z"));
+        let now = at("2026-11-23T10:00:00Z");
+        let uncounted = |l: &Ledger, when: DateTime<Utc>| load_of(l, Provider::Claude, when).uncounted;
+        // x is in use and every reading of it fails on 2026-11-23 (its last one, from the day before,
+        // is of the window resetting on the 26th).
+        let failing = AccountUsage { stale: true, error: Some("http_500".into()), ..read(&x, 10.0, end, true, now - days(1)) };
+        let mut l = Ledger::default();
+        refresh(&mut l, vec![failing.clone()], now);
+        refresh(&mut l, vec![failing.clone()], now + hours(6));
+        assert!(!uncounted(&l, now + hours(6)), "the day is not over");
+        // Next day, still failing: that day is pending on the window, and uncounted meanwhile.
+        refresh(&mut l, vec![failing.clone()], now + days(1));
+        assert_eq!(l.pending, [Pending { key: account_key(Provider::Claude, "x"), day: now.date_naive(), until: end }]);
+        assert!(uncounted(&l, now + days(1)));
+        // A fresh reading of that window before it resets holds those days' use: resolved, both.
+        let mut resolved = l.clone();
+        refresh(&mut resolved, vec![read(&x, 30.0, end, true, now + days(2))], now + days(2));
+        assert!(resolved.pending.is_empty() && resolved.gaps.is_empty() && !uncounted(&resolved, now + days(2)));
+        // Never read again before it reset: those days stay gaps.
+        refresh(&mut l, vec![read(&x, 5.0, end + days(7), true, end + hours(10))], end + hours(10));
+        assert!(l.pending.is_empty());
+        assert_eq!(l.gaps["claude"].iter().copied().collect::<Vec<_>>(), [now.date_naive(), now.date_naive() + days(1)]);
+        assert!(uncounted(&l, end + hours(10)));
+        // One good reading on the day is enough; with no window known running, the day is a gap at once.
+        let mut l = Ledger::default();
+        refresh(&mut l, vec![failing.clone()], now);
+        refresh(&mut l, vec![read(&x, 11.0, end, true, now + hours(1))], now + hours(1));
+        refresh(&mut l, vec![read(&x, 12.0, end, true, now + days(1))], now + days(1));
+        assert!(!uncounted(&l, now + days(1)));
+        let mut l = Ledger::default();
+        refresh(&mut l, vec![AccountUsage { windows: vec![], ..failing.clone() }], now);
+        refresh(&mut l, vec![read(&x, 12.0, end, true, now + days(1))], now + days(1));
+        assert!(l.pending.is_empty() && l.gaps["claude"].contains(&now.date_naive()));
+    }
+
+    #[test]
+    fn a_window_cut_short_by_a_reset_ends_when_the_next_one_is_read() {
+        let x = max20("x");
+        let now = at("2026-11-24T10:00:00Z");
+        let mut l = Ledger::default();
+        refresh(&mut l, vec![read(&x, 30.0, at("2026-11-27T00:00:00Z"), true, now - hours(1))], now - hours(1));
+        // A reset credit used on it: the provider now shows a new week.
+        refresh(&mut l, vec![read(&x, 5.0, now + days(7), true, now)], now);
+        let old = &l.windows[0];
+        assert_eq!((old.ended_at, old.end(), old.running(now)), (Some(now), now, false));
+        assert_eq!(weekly(&load_of(&l, Provider::Claude, now)), (Some(0.35), Some(0.35)), "both weeks' use, the first at what it reached");
+        // Its end was read: the week it ended in can be measured.
+        for d in [1, 2] { refresh(&mut l, vec![read(&x, 6.0, now + days(7), true, now + days(d))], now + days(d)); }
+        let mine: Vec<&Touched> = l.windows.iter().collect();
+        assert_eq!(evidence(l.days.get("claude"), &mine, at("2026-12-02T12:00:00Z")), (1, false));
+        // Another computer's reading of a later week cuts nothing.
+        let mut l = Ledger::default();
+        refresh(&mut l, vec![read(&x, 30.0, at("2026-11-27T00:00:00Z"), true, now - hours(1))], now - hours(1));
+        let theirs = AccountUsage { shared: Some(crate::model::SharedReading { machine: "LAPTOP-2".into(), taken_at: now, windows: vec![weekly_window(&x, 5.0, now + days(7))] }),
+            stale: true, ..read(&x, 30.0, at("2026-11-27T00:00:00Z"), true, now - hours(1)) };
+        refresh(&mut l, vec![theirs], now);
+        assert!(l.windows.iter().all(|t| t.ended_at.is_none()));
+    }
+
+    #[test]
+    fn plans_of_several_tiers_form_no_group() {
+        let now = at("2026-11-23T10:00:00Z");
+        let peers = fleet(&[("A", &[("weekly", 0.2)], true, &[])], now);
+        let own = loaded(&[("weekly", 0.2)], true);
+        let advise_with = |accounts: &[AccountUsage]| advise(&own, "DESK-1", &peers, accounts, &Settings::default(), now).remove(0);
+        let one = advise_with(&[max20("x"), max20("z"), account(Provider::Claude, "f", "free", None)]);
+        assert_eq!((one.mixed, one.groups.len()), (false, 1), "one tier, a free plan beside it");
+        let two = advise_with(&[max20("x"), max5("y")]);
+        assert_eq!((two.mixed, two.groups.len(), two.computers.len(), two.unit.as_str()), (true, 0, 2, "Max 20x"));
+        assert!(two.computers.iter().all(|c| c.measured && !c.needs_own), "listed as they are");
+        let json = serde_json::to_value(&two).unwrap();
+        assert_eq!(json["mixed"], true);
     }
 
     #[test]
@@ -1140,7 +1309,7 @@ mod tests {
         let on = Settings { share_readings: true, ..Settings::default() };
         let load = published(&l, &on, now).unwrap();
         let json = serde_json::to_value(&load).unwrap();
-        assert_eq!(json["v"], 1);
+        assert_eq!(json["v"], 2);
         assert_eq!(json["providers"]["claude"]["busiest"], serde_json::json!({ "weekly": 0.59 }), "42% five days in is on pace for 58.8%, rounded up");
         let text = json.to_string();
         assert!(!text.contains(&crate::presence::hash(Provider::Claude, "x")) && !text.contains(&account_code(Provider::Claude, "x")), "{text}");
@@ -1156,19 +1325,21 @@ mod tests {
     #[test]
     fn a_load_is_read_leniently_and_never_sinks_its_record() {
         let deep = format!("{}1{}", "[".repeat(300), "]".repeat(300));
-        for bad in [r#""junk""#.to_string(), "null".into(), "[1,2]".into(), r#"{"v":2,"at":"2026-11-23T10:00:00Z","providers":{}}"#.into(),
-            r#"{"v":1,"providers":{}}"#.into(), r#"{"v":"1","at":"2026-11-23T10:00:00Z"}"#.into(),
+        for bad in [r#""junk""#.to_string(), "null".into(), "[1,2]".into(), r#"{"v":3,"at":"2026-11-23T10:00:00Z","providers":{}}"#.into(),
+            // A load of version 1 meant less by its busiest, measured and uncounted: dropped, not misread.
+            r#"{"v":1,"at":"2026-11-23T10:00:00Z","providers":{"claude":{"busiest":{"weekly":0.1},"weeks":8,"measured":true,"uncounted":false}}}"#.into(),
+            r#"{"v":2,"providers":{}}"#.into(), r#"{"v":"2","at":"2026-11-23T10:00:00Z"}"#.into(),
             // Read as raw JSON first: a number out of range and nesting too deep drop the load alone.
-            r#"{"v":1,"at":"2026-11-23T10:00:00Z","providers":{"claude":{"busiest":{"weekly":1e400}}}}"#.into(),
-            format!(r#"{{"v":1,"at":"2026-11-23T10:00:00Z","providers":{{"claude":{{"busiest":{{"weekly":0.1}},"x":{deep}}}}}}}"#)] {
+            r#"{"v":2,"at":"2026-11-23T10:00:00Z","providers":{"claude":{"busiest":{"weekly":1e400}}}}"#.into(),
+            format!(r#"{{"v":2,"at":"2026-11-23T10:00:00Z","providers":{{"claude":{{"busiest":{{"weekly":0.1}},"x":{deep}}}}}}}"#)] {
             let p: crate::presence::Presence = serde_json::from_str(&record_with(&bad)).unwrap_or_else(|e| panic!("{e}: {bad}"));
             assert_eq!((p.seats.len(), p.load.is_none()), (1, true), "{bad}");
         }
         // A key twice within it: the last one, as JSON readers take it.
-        let twice = r#"{"v":1,"at":"2026-11-23T10:00:00Z","providers":{"claude":{"busiest":{"weekly":0.1,"weekly":0.2},"uncounted":false}}}"#;
+        let twice = r#"{"v":2,"at":"2026-11-23T10:00:00Z","providers":{"claude":{"busiest":{"weekly":0.1,"weekly":0.2},"uncounted":false}}}"#;
         let p: crate::presence::Presence = serde_json::from_str(&record_with(twice)).unwrap();
         assert_eq!(p.load.unwrap().providers["claude"].busiest["weekly"], 0.2);
-        let odd = serde_json::json!({ "v": 1, "at": "2026-11-23T10:00:00Z", "future": true, "providers": {
+        let odd = serde_json::json!({ "v": 2, "at": "2026-11-23T10:00:00Z", "future": true, "providers": {
             "claude": { "busiest": { "weekly": 0.123, "weekly_haiku": "x" }, "live": { "weekly": 1000 }, "weeks": 300, "measured": true, "uncounted": false },
             "codex": { "busiest": { "weekly": -3 }, "uncounted": false }, "gemini": { "busiest": { "weekly": 0.5 } } } });
         let load = Load::from_value(&odd).unwrap();
@@ -1180,10 +1351,10 @@ mod tests {
         // object: that provider is unknown. Without `uncounted`, some use is taken as uncounted.
         for entry in [serde_json::json!({ "busiest": { "weekly": "0.1" }, "uncounted": false }), serde_json::json!({ "uncounted": false }),
             serde_json::json!({ "busiest": {}, "live": 3, "uncounted": false })] {
-            let load = Load::from_value(&serde_json::json!({ "v": 1, "at": "2026-11-23T10:00:00Z", "providers": { "claude": entry } })).unwrap();
+            let load = Load::from_value(&serde_json::json!({ "v": 2, "at": "2026-11-23T10:00:00Z", "providers": { "claude": entry } })).unwrap();
             assert!(load.providers.is_empty(), "{entry}");
         }
-        let silent = Load::from_value(&serde_json::json!({ "v": 1, "at": "2026-11-23T10:00:00Z", "providers": { "claude": { "busiest": { "weekly": 0.1 } } } })).unwrap();
+        let silent = Load::from_value(&serde_json::json!({ "v": 2, "at": "2026-11-23T10:00:00Z", "providers": { "claude": { "busiest": { "weekly": 0.1 } } } })).unwrap();
         assert!(silent.providers["claude"].uncounted && !silent.providers["claude"].measured);
         assert_eq!((plans(f64::NAN), plans(f64::INFINITY), plans(-0.0)), (100.0, 100.0, 0.0));
     }
@@ -1420,7 +1591,8 @@ mod tests {
         for i in 0..count {
             let resets_at = now + days(6) - Duration::minutes(i as i64 * step);
             full.windows.push(Touched { provider: Provider::Claude, account: account_code(Provider::Claude, &format!("account-{i}")), kind: "weekly_sonnet".into(),
-                resets_at, read_at: resets_at - Duration::minutes(7), weight: Some(0.25), pro_200: true, daily: vec![33.33, 44.44, 55.55, 66.66, 77.77, 88.88, 99.99, 100.0, 100.0] });
+                resets_at, read_at: resets_at - Duration::minutes(7), weight: Some(0.25), pro_200: true, daily: vec![33.33, 44.44, 55.55, 66.66, 77.77, 88.88, 99.99, 100.0, 100.0],
+                ended_at: Some(resets_at - Duration::minutes(3)) });
         }
         for p in Provider::ALL {
             full.days.insert(p.key().into(), (0..KEEP_WEEKS * 7 + 3).map(|d| now.date_naive() - days(d)).collect());
@@ -1468,7 +1640,7 @@ mod tests {
         // 400 windows within the lookback, and 20 from before it.
         for i in 0..420 {
             let resets_at = if i < 400 { now + days(3) - Duration::minutes(i as i64 * 20) } else { now - days(70) - hours(i as i64 - 400) };
-            l.windows.push(Touched { provider: Provider::Claude, account: format!("{i:016x}"), kind: "weekly".into(), resets_at, read_at: now, weight: Some(1.0), pro_200: false, daily: vec![1.0] });
+            l.windows.push(Touched { provider: Provider::Claude, account: format!("{i:016x}"), kind: "weekly".into(), resets_at, read_at: now, weight: Some(1.0), pro_200: false, daily: vec![1.0], ended_at: None });
         }
         prune(&mut l, now);
         assert_eq!(l.windows.len(), 400, "the 20 before the lookback go, the rest stay beyond MAX_WINDOWS");
@@ -1497,12 +1669,20 @@ mod tests {
             "{}", lost("ReleaseLease in app.rs", "the mark of a released lease", TEST));
         let prune = function(&app, "app.rs", "async fn prune_leases(", TEST);
         before(prune, "prune_leases in app.rs", "mark_in_use(&state, &leased, chrono::Utc::now());", ".prune(chrono::Utc::now(), leases::process_alive)");
+        // Every mark is saved at once, under the ledger's lock, and a failed save is recorded.
+        let mark = function(&app, "app.rs", "fn mark_in_use(", TEST);
+        let failed = "if saved.is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::MachineLoadSave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }";
+        assert!(has(mark, "let saved = { let mut ledger = state.machine_ledger.lock().unwrap(); machine_load::mark(&mut ledger, accounts, at); machine_load::save(&ledger) };")
+            && has(mark, failed), "{}", lost("mark_in_use in app.rs", "the save of each mark", TEST));
         let refresh = function(&app, "app.rs", "async fn refresh_locked(", TEST);
-        before(refresh, "refresh_locked in app.rs", "mark_in_use(&state, &was, chrono::Utc::now());", "state.leases.lock().unwrap().prune(chrono::Utc::now(), leases::process_alive);");
+        before(refresh, "refresh_locked in app.rs", "machine_load::mark(&mut state.machine_ledger.lock().unwrap(), &was, chrono::Utc::now());",
+            "state.leases.lock().unwrap().prune(chrono::Utc::now(), leases::process_alive);");
+        // What the desktop apps here are signed in to, then the ledger after the bookkeeping.
+        before(refresh, "refresh_locked in app.rs", "crate::desktop_apps::apply(&mut list, &apps); let desktop_unseen = crate::desktop_apps::unseen(&list, &apps);",
+            "subscriptions::attach_room(&mut snapshot, &history, now);");
         before(refresh, "refresh_locked in app.rs", "subscriptions::attach_room(&mut snapshot, &history, now);",
-            "machine_load::observe(&mut ledger, &snapshot, &wanted, &settings.providers, chrono::Utc::now());");
-        assert!(has(refresh, "if machine_load::save(&machine_ledger).is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::MachineLoadSave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }"),
-            "{}", lost("refresh_locked in app.rs", "the ledger's save failure", TEST));
+            "let saved = { let mut ledger = state.machine_ledger.lock().unwrap(); machine_load::observe(&mut ledger, &snapshot, &wanted, &desktop_unseen, &settings.providers, chrono::Utc::now()); machine_load::save(&ledger) };");
+        assert!(has(refresh, failed), "{}", lost("refresh_locked in app.rs", "the ledger's save failure", TEST));
         assert!(has(refresh, "state.machine_peers.lock().unwrap().note(&read_from, &every, result.read, now);"), "{}", lost("refresh_locked in app.rs", "Peers::note", TEST));
         let advice = function(&app, "app.rs", "fn machine_advice(", TEST);
         assert!(has(advice, "let peers = if peers.at(&sharing::Place::of(settings)) { &*peers } else { &none };"), "{}", lost("machine_advice in app.rs", "Peers::at", TEST));
@@ -1519,7 +1699,7 @@ mod tests {
         assert!(l.windows.is_empty(), "a week not begun and a session window");
         // Pinned to a project here, or leased here: in use.
         let mut l = Ledger::default();
-        observe(&mut l, &Snapshot { accounts: vec![read(&x, 5.0, now + days(4), false, now)], updated_at: None }, &[(Provider::Claude, "x".into())], &Providers::default(), now);
+        observe(&mut l, &Snapshot { accounts: vec![read(&x, 5.0, now + days(4), false, now)], updated_at: None }, &[(Provider::Claude, "x".into())], &[], &Providers::default(), now);
         assert_eq!(l.windows.len(), 1);
     }
 }

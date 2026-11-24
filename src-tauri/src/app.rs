@@ -424,9 +424,15 @@ fn machine_advice(state: &AppState, snapshot: &Snapshot, settings: &settings::Se
 
 /// Notes accounts in use here at `at` for this computer's own use (`machine_load::mark`): one
 /// switched to or from, leased or released, is charged though the next refresh finds it no
-/// longer in use.
+/// longer in use. Saved at once, so a restart before that refresh (an update's) keeps it; under the
+/// ledger's lock, so no older copy is written over it.
 fn mark_in_use(state: &AppState, accounts: &[(Provider, String)], at: chrono::DateTime<chrono::Utc>) {
-    machine_load::mark(&mut state.machine_ledger.lock().unwrap(), accounts, at);
+    let saved = {
+        let mut ledger = state.machine_ledger.lock().unwrap();
+        machine_load::mark(&mut ledger, accounts, at);
+        machine_load::save(&ledger)
+    };
+    if saved.is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::MachineLoadSave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
 }
 
 /// Charges renewals that have passed and this month's extra usage to the spend ledger.
@@ -3845,11 +3851,12 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
     // In use here until now: the accounts the last refresh found in use (one left since, by a switch
     // in the CLI itself, is charged all the same) and those leased, before leases that ended go
     // (`machine_load::mark`).
+    // Saved with the rest of the ledger at this refresh's end.
     {
         let mut was: Vec<(Provider, String)> = state.snapshot.lock().unwrap().accounts.iter()
             .filter(|a| a.active || a.desktop).map(|a| (a.provider, a.id.clone())).collect();
         was.extend(state.leases.lock().unwrap().accounts());
-        mark_in_use(&state, &was, chrono::Utc::now());
+        machine_load::mark(&mut state.machine_ledger.lock().unwrap(), &was, chrono::Utc::now());
     }
     // Ended leases free their accounts (and profiles) before this refresh decides anything.
     state.leases.lock().unwrap().prune(chrono::Utc::now(), leases::process_alive);
@@ -3938,6 +3945,8 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
     // Beside the CLI: which account each desktop app here is signed in to.
     let apps = tauri::async_runtime::spawn_blocking(crate::desktop_apps::read).await.unwrap_or_default();
     crate::desktop_apps::apply(&mut list, &apps);
+    // A desktop app here on an account SlopBar does not have, whatever the CLI here (`machine_load`).
+    let desktop_unseen = crate::desktop_apps::unseen(&list, &apps);
 
     // The widget redraws now: what sharing and forecasts add is carried over from the last
     // refresh until they are worked out below.
@@ -4035,13 +4044,14 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
         subscriptions::attach_room(&mut snapshot, &history, now);
     }
     // This computer's use whatever the account: the windows it had in use (`machine_load`).
+    // Saved under the ledger's lock, as `mark_in_use` saves: no older copy is written over a newer.
     let wanted = profile_accounts(&state);
-    let machine_ledger = {
+    let saved = {
         let mut ledger = state.machine_ledger.lock().unwrap();
-        machine_load::observe(&mut ledger, &snapshot, &wanted, &settings.providers, chrono::Utc::now());
-        ledger.clone()
+        machine_load::observe(&mut ledger, &snapshot, &wanted, &desktop_unseen, &settings.providers, chrono::Utc::now());
+        machine_load::save(&ledger)
     };
-    if machine_load::save(&machine_ledger).is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::MachineLoadSave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
+    if saved.is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::MachineLoadSave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
     if subscriptions::save(&history).is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::HistorySave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
     state.diagnostics.record(None, None, diagnostics::Event::PollFinished { elapsed_ms: diagnostics::millis(started), accounts: snapshot.accounts.len(),
         native_sources: found.iter().filter(|s| s.distro.is_none()).count(), wsl_sources: found.iter().filter(|s| s.distro.is_some()).count() });
