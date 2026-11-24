@@ -30,7 +30,7 @@
   FAIL means: the flyout did not appear within -TimeoutMs (2 s), or the screen matches the
   flyout's own pixels on less than 90% of its client area, or other windows covered more than 2%
   of it (WindowFromPoint over a grid of its client area), or the capture matches what is behind it
-  by more than 50%, or it has fewer than 20 distinct colours, or the early capture matches the
+  by more than 50%, or it has fewer than 10 distinct colours, or the early capture matches the
   later one on less than 30% of the flyout (drawn at once, it matches on 60% or more mid-way
   through its entrance animation; appearing undrawn, on 0 to 4%) or shows exactly what is behind
   it on more than half (a transparent, undrawn flyout). The colour checks alone once
@@ -319,7 +319,9 @@ if (-not $own) { $reasons += "the flyout's own rendering could not be read (Prin
 elseif ($drawn -lt 0.9) { $reasons += ("the screen shows the flyout's own pixels on only {0:P0} of it" -f $drawn) }
 if ($onTop -lt 0.98) { $reasons += ('other windows covered {0:P0} of the flyout when it was captured' -f (1 - $onTop)) }
 if ($match -gt 0.5) { $reasons += 'the capture matches what is behind the flyout by more than 50%' }
-if ($colors.Count -lt 20) { $reasons += 'the capture has fewer than 20 distinct colours' }
+# Measured: the almost black frame of an undrawn first open showed 8; the flyout shows 15 while
+# it looks for accounts just after a start (a right picture, which 20 failed) and 50-70 with them.
+if ($colors.Count -lt 10) { $reasons += 'the capture has fewer than 10 distinct colours' }
 $grew = ($er.R - $er.L) -ne ($mr.R - $mr.L) -or ($er.B - $er.T) -ne ($mr.B - $mr.T)
 if ($AfterRestart -ge 0 -and $grew) {
   $reasons += ("the first open after a start changed size as it opened ({0}x{1}, then {2}x{3} 250 ms after it appeared): it appeared at an earlier height" -f ($er.R - $er.L), ($er.B - $er.T), ($mr.R - $mr.L), ($mr.B - $mr.T))
