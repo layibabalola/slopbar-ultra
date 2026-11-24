@@ -650,8 +650,8 @@ pub struct Entry {
 
 impl Entry {
     /// The next renewal is the charge the user meant to stop: they are letting the plan lapse with
-    /// a last paid day on or before it (`cancel_after`, which Settings sets to the renewal's day),
-    /// and the provider shows no end yet, so it may not have been cancelled there.
+    /// a last paid day on or before it (`cancel_after`, which Settings sets to the day before the
+    /// renewal), and the provider shows no end yet, so it may not have been cancelled there.
     pub fn lapsing_charge(&self) -> bool {
         self.ends_at.is_none() && self.cancel_after.zip(self.renewal.as_ref()).is_some_and(|(last, r)| r.at.date_naive() >= last)
     }
@@ -924,8 +924,8 @@ pub const POOL_BUFFER: f64 = 0.2;
 
 /// The spare kept over the busiest weeks: `POOL_BUFFER`, doubled while any of the provider's paid
 /// plans keeps running out (its use is cut short, so real demand is higher than measured). The
-/// pool's size and the Advisor's floor both use it, so "your usage fits in N plans" never reads as
-/// a plan to spare that the Advisor keeps.
+/// pool's size and the Advisor's floor both use it, so a plan the Advisor keeps for the busiest
+/// weeks never reads as one to spare in "your usage fits in N plans".
 pub fn pool_buffer(exhausted: usize) -> f64 {
     if exhausted > 0 { 2.0 * POOL_BUFFER } else { POOL_BUFFER }
 }
@@ -1913,7 +1913,8 @@ mod tests {
         let renews = at("2026-10-23T00:00:00Z");
         let now = at("2026-10-21T09:00:00Z");
         let (snapshot, history, mut settings) = claude_parts(&[("busy", "20x", 90.0), ("going", "20x", 60.0)], renews, now);
-        settings.subscriptions.get_mut("claude:going").unwrap().cancel_after = Some(renews.date_naive());
+        // As Settings writes it: the last paid day is the day before the renewal.
+        settings.subscriptions.get_mut("claude:going").unwrap().cancel_after = Some(renews.date_naive() - days(1));
         let r = report(&snapshot, &history, &settings, None, now);
         let going = r.accounts.iter().find(|e| e.id == "going").unwrap();
         // Busy or not, it is the user's own choice: never called wasteful, never counted as a saving.
@@ -1927,7 +1928,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pool_keeps_the_advisors_spare_so_it_never_shows_a_plan_to_spare_that_the_advisor_keeps() {
+    fn the_pool_keeps_the_advisors_spare_so_a_plan_kept_for_the_busiest_weeks_is_not_shown_as_spare() {
         let now = at("2026-10-21T09:00:00Z");
         // One plan runs out every week, one is busy, one idle: the busiest weeks are 1.65 plans.
         // Plus 20% would fit in 2 of the 3 held; while a plan runs out the Advisor keeps 40%

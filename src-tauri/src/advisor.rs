@@ -3,8 +3,9 @@
 //! computers share one plan, move underused ones (and unused ones that must stay) to a cheaper tier
 //! that still fits their busiest recent week, and never leave a provider with less than its pool's
 //! busiest weeks (90th percentile) plus 20%, or plus 40% while any of its plans keeps running out
-//! (so the next advice does not ask for the cut capacity back). Each move says what it saves a month; the provider
-//! says how much capacity would be left once every move is made, and which plans could take more.
+//! (so the next advice does not ask for the cut capacity back). Each move says what it saves a
+//! month; the provider says how much capacity would be left once every move is made, and which
+//! plans could take more.
 //!
 //! A share ("use X instead of Y, then cancel Y") rests on the accounts, never on which computers
 //! use them right now: those change with every switch, and the weeks an account used were made by
@@ -169,8 +170,9 @@ pub struct ProviderAdvice {
     /// Unused or underused plans kept because moving them would leave too little for the busiest
     /// weeks (this week's use so far, with too little history), or fit no smaller tier.
     pub kept_for_capacity: usize,
-    /// Every unused or underused plan kept all the same, with why: those, the provider's last plan,
-    /// a plan carrying a share, and one with no smaller tier to move to.
+    /// Every plan the advice weighed and kept though judged unused or underused, with why: those,
+    /// the provider's last plan, a plan carrying a share, and one with no smaller tier to move to.
+    /// With too little history only unused plans are weighed, so underused ones are not listed.
     pub kept: Vec<Kept>,
     /// Too little capacity, and the cheapest fix. Only when there are no moves: a provider is
     /// never told to cancel or downgrade and to add in the same advice.
@@ -334,7 +336,9 @@ fn advise_provider(summary: &ProviderSummary, accounts: &[Entry]) -> ProviderAdv
                 // or what is smaller would leave too little.
                 None if kept_above.is_some() => kept.push((c, kept_above.unwrap_or(short))),
                 None if smaller.is_empty() => kept.push((c, KeptBecause::Smallest)),
-                None if host.is_some() => kept.push((c, KeptBecause::Carries)),
+                // A share's plan no smaller tier can carry; one that could, but for the floor, is
+                // kept for the busiest weeks like any other.
+                None if host.is_some() && !smaller.iter().any(|(_, w, _)| *w + 1e-9 >= need) => kept.push((c, KeptBecause::Carries)),
                 None => kept.push((c, short)),
             }
         }
@@ -610,7 +614,7 @@ fn greedy(s: &Search) -> Vec<Vec<usize>> {
 fn shortage(provider: Provider, candidates: &[Candidate], capacity: f64, demand: Option<f64>, exhausted: usize) -> Option<Shortage> {
     let demand = demand?;
     let over = demand * (1.0 + POOL_BUFFER) - capacity;
-    let limited = demand * (1.0 + 2.0 * POOL_BUFFER) - capacity;
+    let limited = demand * (1.0 + pool_buffer(exhausted)) - capacity;
     let (cause, need) = if over > 1e-9 { (ShortageCause::OverCapacity, over) }
         else if exhausted > 0 && limited > 1e-9 { (ShortageCause::HittingLimits, limited) }
         else { return None };
@@ -841,6 +845,10 @@ mod tests {
         let now = at("2026-12-02T12:00:00Z");
         let codex = |id: &str, plan_type: &str, peak: f64| (plan("codex", id, plan_type, None, 1.0, now), history_of(&[peak; 4], now));
         assert_eq!(shares(&advice_for("codex", vec![codex("a", "pro", 30.0), codex("b", "pro", 20.0)], now)), [("b", "a", 200.0)]);
+        // An underused plan carrying a share stays the tier it is, and says so.
+        let a = advice_for("codex", vec![codex("a", "pro", 20.0), codex("b", "pro", 15.0)], now);
+        assert_eq!(shares(&a), [("b", "a", 200.0)]);
+        assert_eq!((a.kept.iter().map(|k| (k.id.as_str(), k.because)).collect::<Vec<_>>(), a.kept_for_capacity), (vec![("a", KeptBecause::Carries)], 0));
         // A Plus plan's size next to Pro is a price guess: no share across tiers.
         assert!(shares(&advice_for("codex", vec![codex("a", "pro", 30.0), codex("b", "plus", 20.0)], now)).is_empty());
         // Use from where none of the user's computers had it signed in would not move with them: that plan
@@ -1084,9 +1092,12 @@ mod tests {
         assert_eq!((m.id.as_str(), m.action, m.monthly_saving, m.basis), ("u1:acct-idle", Action::Cancel, 200.0, Basis::LocalCodex));
         // This week's use + 20% still fits what is left: 0.3 plans of 1.
         assert_eq!((a.floor, a.capacity_after, a.spare_after), (Some(0.36), 1.0, Some(0.7)));
-        // Alone, the idle plan is the provider's last: no advice to drop it.
+        // Alone, the idle plan is the provider's last: no advice to drop it, and with too little
+        // history no downgrade either; it is kept as the last.
         let r = report(&Snapshot { accounts: vec![idle], updated_at: Some(now) }, &History::default(), &Settings::default(), Some(&local), now);
         assert!(r.advice[0].moves.is_empty());
+        assert_eq!(r.advice[0].kept.iter().map(|k| k.because).collect::<Vec<_>>(), [KeptBecause::LastPlan]);
+        assert_eq!(r.accounts[0].kept, Some(KeptBecause::LastPlan));
         // Underused on thin evidence is never downgraded.
         let mut history = History::default();
         let mut thin = watched(10.0, now);

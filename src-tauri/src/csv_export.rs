@@ -78,7 +78,7 @@ pub fn subscriptions_csv(report: &Report) -> String {
         report.accounts.iter().map(|e| {
             let a = &e.assessment;
             let m = e.advised.as_ref();
-            let to = m.and_then(|m| m.to.clone().or_else(|| m.share.as_ref().and_then(|s| s.alias.clone().or_else(|| s.email.clone()))));
+            let to = m.and_then(|m| m.to.clone().or_else(|| m.share.as_ref().map(|s| s.alias.clone().or_else(|| s.email.clone()).unwrap_or_else(|| s.id.clone()))));
             vec![text(e.provider.name()), text(&e.id), opt(e.email.as_deref()), opt(e.alias.as_deref()), opt(e.plan.as_deref()), e.active.to_string(),
                 name(a.verdict), name(a.confidence), name(a.basis), a.weeks_counted.to_string(), num(a.average_peak), num(a.median_peak),
                 a.limit_weeks.to_string(), a.renew_wasteful.to_string(), num(e.this_week.as_ref().map(|w| w.used_percent)),

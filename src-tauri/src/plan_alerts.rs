@@ -1,10 +1,9 @@
 //! Which plan notifications are due: renewals of plans the plan Advisor cancels, shares or
 //! downgrades (never one it keeps, however idle) and of plans the user is letting lapse, any paid
 //! plan renewing within a day, the account in use running out of its week before it resets, and
-//! Codex Pro 200
-//! accounts whose use would not fit the plan's smaller allowance after the cut. Each is shown
-//! once (per account and renewal date, or per weekly window), remembered across restarts in a small
-//! file. What the notification says is up to the frontend, which owns the translations.
+//! Codex Pro 200 accounts whose use would not fit the plan's smaller allowance after the cut. Each
+//! is shown once (per account and renewal date, or per weekly window), remembered across restarts
+//! in a small file. What the notification says is up to the frontend, which owns the translations.
 
 use std::collections::HashMap;
 
@@ -121,7 +120,9 @@ pub fn due(report: &Report, snapshot: &Snapshot, prefs: &Notifications, sent: &m
                     if within_day { mark(format!("soon:{account}"), sent); }
                     Kind::RenewalWasteful
                 }
-                RenewalWarning::Lapsing if !sent.sent.contains_key(&format!("lapsing:{account}")) => {
+                // Once per renewal: a plan warned about as wasteful that the user then marks as
+                // lapsing was already told to cancel before this renewal.
+                RenewalWarning::Lapsing if !sent.sent.contains_key(&format!("lapsing:{account}")) && !sent.sent.contains_key(&format!("wasteful:{account}")) => {
                     mark(format!("lapsing:{account}"), sent);
                     if within_day { mark(format!("soon:{account}"), sent); }
                     Kind::RenewalLapsing
