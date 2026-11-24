@@ -19,7 +19,13 @@
   the first open after a start once showed an empty panel, then a grey and an almost black one,
   and was drawn only 0.3 to 0.5 s after the click, which the later capture alone usually missed.
   -AfterRestart <seconds> tests exactly that open: it restarts SlopBar through its agent door
-  (slopbar-mcp restart_app), then clicks that many seconds after the new SlopBar started.
+  (slopbar-mcp restart_app), then clicks that many seconds after the new SlopBar started. That
+  open must also keep its size for its first 250 ms: appearing at an earlier height and growing
+  as it laid itself out was the other half of the same bug. (Growing later is right: accounts that
+  arrive while it is open, as the first refresh after a start can. Elsewhere a size change as the
+  flyout opens can be right too, an account added while it was closed, and only the early check is
+  skipped.) The capture is taken while the flyout holds still. Windows on no monitor are not
+  counted: the app draws its closed flyout off-screen before its first open.
 
   FAIL means: the flyout did not appear within -TimeoutMs (2 s), or the screen matches the
   flyout's own pixels on less than 90% of its client area, or other windows covered more than 2%
@@ -83,6 +89,7 @@ public static class FlyoutTest {
   [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
   [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
+  [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
   // The share of a grid over the window's client area where it is the topmost window on screen
   // (the web view's child windows count as it). Another window in front lowers it.
   public static double OnTop(IntPtr h, int step) {
@@ -102,10 +109,12 @@ public static class FlyoutTest {
     uint p; uint fg = GetWindowThreadProcessId(GetForegroundWindow(), out p); uint me = GetCurrentThreadId();
     AttachThreadInput(me, fg, true); bool ok = SetForegroundWindow(h); AttachThreadInput(me, fg, false); return ok;
   }
+  // The app's visible windows on a monitor. One shown but on no monitor is being drawn off-screen
+  // (the closed flyout, before its first open), not on screen.
   public static List<IntPtr> Visible(uint pid, string skipClass) {
     var list = new List<IntPtr>();
     EnumWindows((h, l) => { uint p; GetWindowThreadProcessId(h, out p);
-      if (p == pid && IsWindowVisible(h)) { var sb = new StringBuilder(256); GetClassName(h, sb, 256);
+      if (p == pid && IsWindowVisible(h) && MonitorFromWindow(h, 0) != IntPtr.Zero) { var sb = new StringBuilder(256); GetClassName(h, sb, 256);
         if (sb.ToString() != skipClass) list.Add(h); } return true; }, IntPtr.Zero);
     return list;
   }
@@ -151,7 +160,9 @@ if ($AfterRestart -ge 0) {
   $door = [Diagnostics.Process]::Start($info)
   $door.StandardInput.WriteLine('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test-flyout-click","version":"1"}}}')
   $door.StandardInput.WriteLine('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"restart_app","arguments":{}}}')
-  $door.StandardInput.Close(); [void]$door.StandardOutput.ReadToEnd(); [void]$door.WaitForExit(30000)
+  $door.StandardInput.Close(); $answer = $door.StandardOutput.ReadToEndAsync()
+  if (-not $door.WaitForExit(30000)) { $door.Kill(); Write-Host 'CANNOT RUN: the agent door did not answer restart_app within 30 s.'; exit 2 }
+  [void]$answer.Wait(5000)
   # The new SlopBar's widget, then the wait from when it started.
   $restart = [Diagnostics.Stopwatch]::StartNew()
   [uint32]$newPid = $appPid
@@ -217,18 +228,33 @@ if ($untilEarly -gt 0) { Start-Sleep -Milliseconds $untilEarly }
 $earlyMs = $sw.ElapsedMilliseconds - $visibleMs
 $er = New-Object FlyoutTest+RECT; [void]$T::GetWindowRect($flyout, [ref]$er)
 $early = Capture $er
-Start-Sleep -Milliseconds ([Math]::Max(0, $WaitMs - $earlyMs))
-$r = New-Object FlyoutTest+RECT; [void]$T::GetWindowRect($flyout, [ref]$r)
-[void]$T::SetWindowPos($flyout, $HWND_TOPMOST, 0, 0, 0, 0, $SWP_NOSIZE_NOMOVE_NOACTIVATE)
-Start-Sleep -Milliseconds 150
-$onTop = $T::OnTop($flyout, 16)
-$shot = Capture $r
-$own = Own $flyout $r
-# The client area within the captured window rectangle (its invisible borders show what is behind).
-$cr = New-Object FlyoutTest+RECT; [void]$T::GetClientRect($flyout, [ref]$cr)
-$co = New-Object FlyoutTest+POINT; [void]$T::ClientToScreen($flyout, [ref]$co)
-$cx = $co.X - $r.L; $cy = $co.Y - $r.T
-[void]$T::SetWindowPos($flyout, $HWND_NOTOPMOST, 0, 0, 0, 0, $SWP_NOSIZE_NOMOVE_NOACTIVATE)
+# Its size a moment later: one that grows this soon laid itself out on screen as it opened.
+$untilSettled = 250 - ($sw.ElapsedMilliseconds - $visibleMs)
+if ($untilSettled -gt 0) { Start-Sleep -Milliseconds $untilSettled }
+$mr = New-Object FlyoutTest+RECT; [void]$T::GetWindowRect($flyout, [ref]$mr)
+Start-Sleep -Milliseconds ([Math]::Max(0, $WaitMs - ($sw.ElapsedMilliseconds - $visibleMs)))
+# Captured while it holds still: accounts that arrive as it opens make it grow, and a capture taken
+# across that compares the wrong pixels.
+for ($try = 1; $try -le 3; $try++) {
+  $r = New-Object FlyoutTest+RECT; [void]$T::GetWindowRect($flyout, [ref]$r)
+  [void]$T::SetWindowPos($flyout, $HWND_TOPMOST, 0, 0, 0, 0, $SWP_NOSIZE_NOMOVE_NOACTIVATE)
+  Start-Sleep -Milliseconds 150
+  $onTop = $T::OnTop($flyout, 16)
+  $shot = Capture $r
+  $shownAtShot = $T::IsWindowVisible($flyout)
+  $own = Own $flyout $r
+  # The client area within the captured window rectangle (its invisible borders show what is behind).
+  $cr = New-Object FlyoutTest+RECT; [void]$T::GetClientRect($flyout, [ref]$cr)
+  $co = New-Object FlyoutTest+POINT; [void]$T::ClientToScreen($flyout, [ref]$co)
+  $cx = $co.X - $r.L; $cy = $co.Y - $r.T
+  [void]$T::SetWindowPos($flyout, $HWND_NOTOPMOST, 0, 0, 0, 0, $SWP_NOSIZE_NOMOVE_NOACTIVATE)
+  $after = New-Object FlyoutTest+RECT; [void]$T::GetWindowRect($flyout, [ref]$after)
+  $still = $after.L -eq $r.L -and $after.T -eq $r.T -and $after.R -eq $r.R -and $after.B -eq $r.B -and $cx -ge 0 -and $cy -ge 0
+  if ($still -or $try -eq 3) { break }
+  $shot.Dispose(); if ($own) { $own.Dispose() }
+  Start-Sleep -Milliseconds 300
+}
+if (-not $still) { Write-Host 'CANNOT RUN: the flyout kept moving or changing size while it was captured.'; exit 2 }
 
 # A second click closes it, as for a user; then capture what was behind it.
 Start-Sleep -Milliseconds 300
@@ -294,11 +320,16 @@ elseif ($drawn -lt 0.9) { $reasons += ("the screen shows the flyout's own pixels
 if ($onTop -lt 0.98) { $reasons += ('other windows covered {0:P0} of the flyout when it was captured' -f (1 - $onTop)) }
 if ($match -gt 0.5) { $reasons += 'the capture matches what is behind the flyout by more than 50%' }
 if ($colors.Count -lt 20) { $reasons += 'the capture has fewer than 20 distinct colours' }
+$grew = ($er.R - $er.L) -ne ($mr.R - $mr.L) -or ($er.B - $er.T) -ne ($mr.B - $mr.T)
+if ($AfterRestart -ge 0 -and $grew) {
+  $reasons += ("the first open after a start changed size as it opened ({0}x{1}, then {2}x{3} 250 ms after it appeared): it appeared at an earlier height" -f ($er.R - $er.L), ($er.B - $er.T), ($mr.R - $mr.L), ($mr.B - $mr.T))
+}
 if ($null -ne $drawnEarly -and ($drawnEarly -lt 0.3 -or $behindEarly -gt 0.5)) {
   $reasons += ("the flyout appeared undrawn: {0} ms after it appeared, the screen showed its later pixels on only {1:P0} of it, and what is behind it on {2:P0}" -f $earlyMs, $drawnEarly, $behindEarly)
 }
 Write-Host ("visible after:   {0} ms" -f $visibleMs)
-Write-Host ("flyout:          {0}x{1} at {2},{3}; fronted: {4}" -f ($r.R - $r.L), ($r.B - $r.T), $r.L, $r.T, $fronted)
+$class = New-Object Text.StringBuilder 256; [void]$T::GetClassName($flyout, $class, 256)
+Write-Host ("flyout:          {0}x{1} at {2},{3}; fronted: {4}; class {5}; shown when captured: {6}" -f ($r.R - $r.L), ($r.B - $r.T), $r.L, $r.T, $fronted, $class, $shownAtShot)
 if ($null -ne $drawnEarly) { Write-Host ("drawn at once:   {0:P0} of its area {1} ms after it appeared ({2:P0} as behind it)" -f $drawnEarly, $earlyMs, $behindEarly) }
 else { Write-Host ("drawn at once:   not checked: it changed size as it opened ({0}x{1} at first)" -f ($er.R - $er.L), ($er.B - $er.T)) }
 Write-Host ("own pixels:      {0:P0} of its area" -f $drawn)
