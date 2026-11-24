@@ -386,7 +386,8 @@ fn advise_provider(summary: &ProviderSummary, accounts: &[Entry]) -> ProviderAdv
         capacity_after: round(capacity),
         demand_p90: pool.demand_p90,
         floor: floor.map(round),
-        monthly_saving: round(moves.iter().map(|m: &Move| m.monthly_saving).sum()),
+        // An empty sum is -0.0, which would read "-0.0" in the report and here: no moves save 0.
+        monthly_saving: round(moves.iter().map(|m: &Move| m.monthly_saving).sum::<f64>() + 0.0),
         spare_after: demand.map(|d| round(capacity - d)),
         spare_after_percent: demand.filter(|d| *d > 0.0).map(|d| round((capacity / d - 1.0) * 100.0)),
         moves,
@@ -1063,6 +1064,8 @@ mod tests {
         let now = at("2026-10-21T12:00:00Z");
         let a = &claude(&[("busy", "20x", 100.0), ("ok", "20x", 50.0)], now)[0];
         assert!(a.moves.is_empty() && a.monthly_saving == 0.0);
+        // Nothing to save reads 0, never -0.0 (an empty sum), here and as the report's could-save.
+        assert_eq!(serde_json::to_string(&a.monthly_saving).unwrap(), "0.0");
         let mut history = History::default();
         history.accounts.insert("Claude:gone".into(), watched(0.0, now));
         history.accounts.insert("Claude:busy".into(), watched(40.0, now));
