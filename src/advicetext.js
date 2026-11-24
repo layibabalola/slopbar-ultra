@@ -1,8 +1,8 @@
 // The plan advisor's card and the card of computers that could share one plan, as Settings >
 // Subscriptions shows them. Pure: the report, the snapshot and which providers are on come in, HTML
 // comes out, so `scripts/test-advice.mjs` can draw them from made-up accounts and computers.
-import { t, shortDate, placesText } from "./i18n.js";
-import { money, pct, amount } from "./accounttext.js";
+import { t, placesText } from "./i18n.js";
+import { money, pct, amount, renewalDay } from "./accounttext.js";
 
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`);
 const LINK = `<svg viewBox="0 0 16 16"><path d="M6 3h7v7M13 3 5 11"/></svg>`;
@@ -17,14 +17,17 @@ export function computersOn(snapshot, provider, id) {
   return machines.length ? machines : used.active || used.desktop ? [t("thisPcUnnamed")] : [];
 }
 
-/** One move of the advisor: what to do with which plan, what it saves, and why. */
-export function adviceMove(m, snapshot) {
+/**
+ * One move of the advisor: what to do with which plan, what it saves, and why. `source` is where
+ * the plan's renewal date comes from, so an entered billing day reads as the plan's own line says it.
+ */
+export function adviceMove(m, snapshot, source = null) {
   const host = m.share ? advisedAccount(m.share) : "";
   const what = m.action === "cancel" ? t("advCancel", { plan: m.from })
     : m.action === "share" ? t("advShare", { account: host, plan: m.from })
     : t("advDowngrade", { from: m.from, to: m.to });
   const why = [t(`subVerdict_${m.verdict}`), m.peak_percent != null ? t("advPeak", { p: pct(m.peak_percent) }) : "",
-    m.basis === "local_codex" ? t("advLocal") : "", m.before ? t("advBefore", { d: shortDate(m.before) }) : ""].filter(Boolean).join(" · ");
+    m.basis === "local_codex" ? t("advLocal") : "", m.before ? t("advBefore", { d: renewalDay({ at: m.before, source }) }) : ""].filter(Boolean).join(" · ");
   // A share: how full the plan kept gets, and which computers move to it.
   const moving = m.share ? computersOn(snapshot, m.provider, m.id) : [];
   const share = m.share ? [t("advShareFit", { p: pct(m.share.combined_percent), plan: m.share.plan }),
@@ -57,6 +60,7 @@ export function shortageText(a, name) {
 export function adviceCard(report, { on, names, snapshot }) {
   const list = (report?.advice ?? []).filter((a) => on(a.provider));
   if (!list.length) return "";
+  const renewalSource = (m) => report.accounts?.find((e) => e.provider === m.provider && e.id === m.id)?.renewal?.source ?? null;
   return `
     <div class="provider advisor">
       <div class="provider-head"><h3>${t("advTitle")}</h3></div>
@@ -70,12 +74,16 @@ export function adviceCard(report, { on, names, snapshot }) {
         // With too little history the advisor measures against this week's use so far.
         const now = a.evidence === "clear_only";
         if (a.spare_after != null) lines.push(t(now ? "advAfterNow" : "advAfter", { held: amount(a.capacity_after), unit: a.unit, spare: a.spare_after_percent != null ? pct(a.spare_after_percent) : "—" }));
+        // Idle plans kept all the same, as each plan's own line says why: those kept for the busiest
+        // weeks (or this week's use so far) are counted, and a provider's last plan, which advice
+        // never drops, said apart. A plan kept to carry a share shows in that share's move.
         if (a.kept_for_capacity) lines.push(t(now ? "advKeptNow" : "advKept", { n: a.kept_for_capacity }));
+        if (a.kept?.some((k) => k.because === "last_plan")) lines.push(t("advKeptLast"));
         const room = (a.room ?? []).map((r) => t("advRoomItem", { account: advisedAccount(r), p: pct(r.free_percent) }));
         return `
           <p class="hint sub-pool"><b>${esc(head)}</b>${lines.length ? ` · ${esc(lines.join(" · "))}` : ""}</p>
           ${room.length ? `<p class="hint sub-pool">${esc(t("advRoom", { list: room.join(", ") }))}</p>` : ""}
-          ${a.moves.length ? `<div class="group">${a.moves.map((m) => adviceMove(m, snapshot)).join("")}</div>` : ""}`;
+          ${a.moves.length ? `<div class="group">${a.moves.map((m) => adviceMove(m, snapshot, renewalSource(m))).join("")}</div>` : ""}`;
       }).join("")}
       <p class="hint">${t("advHint")}</p>
     </div>`;

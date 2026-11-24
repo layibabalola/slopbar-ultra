@@ -53,7 +53,7 @@ pub struct Notifications {
     /// A monitored account used where none of the user's computers is (see `unexpected`). It
     /// can only fire while in-use sharing is on, so "on" here means on whenever sharing is.
     pub unexpected_use: bool,
-    /// A plan that looks unneeded renews within three days; any paid plan within a day.
+    /// A plan the plan Advisor advises changing renews within three days; any paid plan within a day.
     pub renewals: bool,
     /// Monday mornings: last week's spend, savings, renewals and accounts that ran out.
     pub digest: bool,

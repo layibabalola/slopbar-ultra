@@ -21,13 +21,35 @@ export function renewalText(e) {
   return t(days === 0 ? "subRenewsToday" : days === 1 ? "subRenewsTomorrow" : "subRenews", { d: when, n: days, source });
 }
 
+const KEPT = { busiest_weeks: "subAdviceKept", this_week: "subAdviceKeptNow", last_plan: "subAdviceKeptLast", carries: "subAdviceKeptCarries", smallest: "subAdviceKeptSmallest" };
+
+/** A renewal's day as the plan's own line says it: an entered billing day is a calendar day. */
+export const renewalDay = (renewal) => (renewal ? (renewal.source === "entered" ? shortDay : shortDate)(renewal.at) : "");
+
+/**
+ * What to do about a plan, as the plan Advisor says it (`advised`, its move, and `kept`, why it
+ * keeps a plan that looks idle): a plan the Advisor does not cancel, share or downgrade is never
+ * called unneeded here, whatever its own verdict.
+ */
 export function adviceText(e) {
   const a = e.assessment;
   if (e.ends_at) return t("subAdviceEnding", { d: shortDate(e.ends_at) });
   if (e.cancel_after) return t("subLapsing", { d: shortDay(e.cancel_after) });
   if (e.plan_kind !== "personal") return "";
-  if (a.verdict === "unused") return t(e.renewal ? "subAdviceUnused" : "subAdviceUnusedNoDate", { d: e.renewal ? (e.renewal.source === "entered" ? shortDay : shortDate)(e.renewal.at) : "" });
-  if (a.verdict === "underused") return t(a.renew_wasteful ? "subAdviceUnderused" : "subAdviceUnderusedMaybe");
+  const m = e.advised;
+  // Worth doing before the next renewal.
+  const d = renewalDay(e.renewal);
+  if (m?.action === "cancel") return t(d ? "subAdviceUnused" : "subAdviceUnusedNoDate", { d });
+  if (m?.action === "share") {
+    const account = m.share?.alias || m.share?.email || t("unknownAccount");
+    return t(d ? "subAdviceShare" : "subAdviceShareNoDate", { account, d });
+  }
+  if (m?.action === "downgrade" && m.to) return t(d ? "subAdviceDowngrade" : "subAdviceDowngradeNoDate", { plan: m.to, d });
+  if (KEPT[e.kept]) return t(KEPT[e.kept]);
+  if (a.verdict === "unused" || a.verdict === "underused") {
+    // Of unknown size or price, a plan the Advisor cannot weigh; otherwise too little history yet.
+    return t(e.plan_weight == null || e.monthly_cost == null ? "subAdviceUnsized" : "subAdviceUnderusedMaybe");
+  }
   if (a.verdict === "exhausted_weekly") return t("subAdviceExhausted");
   return "";
 }

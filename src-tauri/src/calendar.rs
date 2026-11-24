@@ -1,12 +1,14 @@
 //! Plan renewals as an iCalendar file (RFC 5545) that Outlook or Google Calendar can subscribe to:
-//! one all-day event per paid plan's next renewal, with a reminder three days ahead for plans that
-//! look unused or underused. Written to a path the user chooses (Documents\SlopBar\renewals.ics by
-//! default) and rewritten after each refresh while turned on.
+//! one all-day event per paid plan's next renewal, with a reminder three days ahead for plans the
+//! plan Advisor cancels, shares or downgrades (never one it keeps, however idle) and for the charge
+//! a plan the user is letting lapse was meant to stop. Written to a path the user chooses
+//! (Documents\SlopBar\renewals.ics by default) and rewritten after each refresh while turned on.
 
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 
+use crate::advisor::{Action, KeptBecause};
 use crate::settings::Settings;
 use crate::subscriptions::{DateSource, PlanKind, Report, Verdict, WASTEFUL_DAYS};
 
@@ -42,7 +44,8 @@ pub struct Event {
     pub date: NaiveDate,
     pub summary: String,
     pub description: String,
-    /// Remind `WASTEFUL_DAYS` ahead: the plan looks unused or underused.
+    /// Remind `WASTEFUL_DAYS` ahead: the Advisor advises changing the plan before it renews, or the
+    /// user is letting it lapse and this is the charge they meant to stop.
     pub alarm: bool,
 }
 
@@ -59,7 +62,7 @@ pub fn events<Tz: TimeZone>(report: &Report, tz: &Tz) -> Vec<Event> {
             };
             let provider = provider_name(e.provider);
             let name = e.alias.clone().or_else(|| e.email.clone()).unwrap_or_else(|| e.id.clone());
-            let alarm = matches!(e.assessment.verdict, Verdict::Unused | Verdict::Underused);
+            let alarm = e.advised.is_some() || e.lapsing_charge();
             let mut description = vec![format!("{provider} {} plan", e.plan.as_deref().unwrap_or("paid"))];
             if let Some(cost) = e.monthly_cost { description.push(format!("${cost:.2}/month")); }
             match e.assessment.verdict {
@@ -69,7 +72,7 @@ pub fn events<Tz: TimeZone>(report: &Report, tz: &Tz) -> Vec<Event> {
                 _ => {}
             }
             if renewal.source == DateSource::Estimated { description.push("Date estimated from the plan's start.".into()); }
-            if alarm { description.push(format!("Not needed? Cancel it on the provider's billing page: {}", crate::subscriptions::billing_page(e.provider))); }
+            if let Some(advice) = advice_line(e) { description.push(advice); }
             Some(Event {
                 uid: format!("renewal-{}-{:016x}-{}@slopbar", e.provider.name().to_lowercase(), fnv(&e.id), date.format("%Y%m%d")),
                 date,
@@ -81,6 +84,32 @@ pub fn events<Tz: TimeZone>(report: &Report, tz: &Tz) -> Vec<Event> {
         .collect();
     out.sort_by(|a, b| (a.date, &a.summary, &a.uid).cmp(&(b.date, &b.summary, &b.uid)));
     out
+}
+
+/// What the plan Advisor says about the plan: its move, with the billing page where it is made, or
+/// why it keeps a plan that looks idle.
+fn advice_line(e: &crate::subscriptions::Entry) -> Option<String> {
+    let page = crate::subscriptions::billing_page(e.provider);
+    if let Some(m) = &e.advised {
+        return Some(match m.action {
+            Action::Cancel => format!("The Advisor advises cancelling it before this renewal: {page}"),
+            Action::Share => {
+                let host = m.share.as_ref().and_then(|s| s.alias.clone().or_else(|| s.email.clone())).unwrap_or_else(|| "another plan".into());
+                format!("The Advisor advises using {host} instead, then cancelling it before this renewal: {page}")
+            }
+            Action::Downgrade => format!("The Advisor advises moving it to {} before this renewal: {page}", m.to.as_deref().unwrap_or("a smaller plan")),
+        });
+    }
+    if e.lapsing_charge() {
+        return Some(format!("You're letting this plan lapse: if you haven't cancelled it yet, cancel it before this renewal: {page}"));
+    }
+    e.kept.map(|k| match k {
+        KeptBecause::BusiestWeeks => "The Advisor keeps it to cover your busiest weeks.".into(),
+        KeptBecause::ThisWeek => "The Advisor keeps it to cover this week's use so far.".into(),
+        KeptBecause::LastPlan => "The Advisor keeps it: advice always leaves a provider at least one plan.".into(),
+        KeptBecause::Carries => "The Advisor keeps it as it is: another plan's use moves onto it.".into(),
+        KeptBecause::Smallest => "The Advisor keeps it: there is no smaller, cheaper plan to move to.".into(),
+    })
 }
 
 fn provider_name(p: crate::accounts::Provider) -> &'static str {
@@ -215,6 +244,25 @@ mod tests {
         assert_eq!(names, [("Codex plan renews · busy@example.invalid", "2026-10-24".into(), false), ("Codex plan renews · idle@example.invalid", "2026-10-24".into(), true)],
             "the cancelled plan has no renewal");
         assert!(events[1].description.contains("Looks unused") && events[1].description.contains("https://"));
+        assert!(events[1].description.contains("The Advisor advises cancelling it before this renewal"));
+        // Once the busy plan runs out every week, the idle one is needed for the busiest weeks: the
+        // Advisor keeps it, on the smaller tier that still leaves enough.
+        let mut w = world(now);
+        w.history.accounts.insert("Codex:busy".into(), crate::plan_alerts::tests::watched(100.0, now));
+        let moved = super::events(&report(&w.snapshot, &w.history, &w.settings, None, now), &FixedOffset::west_opt(8 * 3600).unwrap());
+        let idle = moved.iter().find(|e| e.summary.contains("idle@")).unwrap();
+        assert!(idle.alarm && idle.description.contains("The Advisor advises moving it to Pro 100 before this renewal"), "{idle:?}");
+        // With the busy plan being let lapse, the idle one is the provider's last: the Advisor keeps
+        // it, so it gets no reminder and is not called unneeded, while the lapsing plan gets the
+        // reminder for the charge it was meant to stop.
+        let mut w = world(now);
+        w.settings.subscriptions.get_mut("codex:busy").unwrap().cancel_after = Some("2026-10-24".parse().unwrap());
+        let lapsing = super::events(&report(&w.snapshot, &w.history, &w.settings, None, now), &FixedOffset::west_opt(8 * 3600).unwrap());
+        let idle = lapsing.iter().find(|e| e.summary.contains("idle@")).unwrap();
+        assert!(!idle.alarm && idle.description.contains("Looks unused"), "{idle:?}");
+        assert!(idle.description.contains("The Advisor keeps it: advice always leaves a provider at least one plan.") && !idle.description.contains("ancel"), "{idle:?}");
+        let busy = lapsing.iter().find(|e| e.summary.contains("busy@")).unwrap();
+        assert!(busy.alarm && busy.description.contains("You're letting this plan lapse: if you haven't cancelled it yet"), "{busy:?}");
     }
 
     #[test]

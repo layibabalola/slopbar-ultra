@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 
 // i18n.js sets the page language on load.
 globalThis.document ??= { documentElement: {} };
-const { setLanguage, setThisMachine, setSharing } = await import("../src/i18n.js");
+const { setLanguage, setThisMachine, setSharing, shortDate, shortDay } = await import("../src/i18n.js");
 const { adviceCard, machinesCard, adviceMove, computersOn } = await import("../src/advicetext.js");
 setLanguage("en");
 setThisMachine("DESK-1");
@@ -84,6 +84,32 @@ test("the advisor card totals the moves, lists room for more use, and shows a sh
   // A provider turned off is left out, and an empty report draws nothing.
   assert.equal(adviceCard({ advice: [advice()] }, { on: () => false, names, snapshot: null }), "");
   assert.equal(adviceCard({}, { on, names, snapshot: null }), "");
+});
+
+test("the card says how many idle plans are kept for the busiest weeks, and a provider's last plan apart", () => {
+  const kept = (because) => ({ id: because, email: `${because}@example.invalid`, alias: null, plan: "Max 20x", because });
+  const card = (extra) => text(adviceCard({ advice: [advice(extra)] }, { on, names, snapshot: { accounts: [] } }));
+  const both = card({ kept_for_capacity: 2, kept: [kept("busiest_weeks"), kept("busiest_weeks"), kept("last_plan")] });
+  assert.ok(both.includes("2 kept to cover your busiest weeks") && both.includes("last plan kept: advice never drops a provider"), both);
+  // A plan kept to carry a share is said by that share's move, and one with nothing smaller to
+  // move to by its own line: neither is counted as kept for the busiest weeks.
+  const carries = card({ kept_for_capacity: 0, kept: [kept("carries"), kept("smallest")] });
+  assert.ok(!carries.includes("kept"), carries);
+  const thin = card({ evidence: "clear_only", kept_for_capacity: 1, kept: [kept("this_week")] });
+  assert.ok(thin.includes("1 kept to cover this week's use so far"), thin);
+  // Advice from before plans were named still shows its count.
+  assert.ok(card({ kept_for_capacity: 1 }).includes("1 kept to cover your busiest weeks"));
+});
+
+test("a move's date reads as the plan's own line says it: an entered billing day is a calendar day", () => {
+  // Midnight UTC is the day before west of UTC: an entered day must not slip a day.
+  const before = "2026-12-05T00:00:00Z";
+  const report = (source) => ({ advice: [advice({ moves: [move("idle", "cancel", { verdict: "unused", before })], monthly_saving: 200 })],
+    accounts: [{ provider: "claude", id: "idle", renewal: { at: before, source } }] });
+  const at = (source) => text(adviceCard(report(source), { on, names, snapshot: { accounts: [] } }));
+  assert.ok(at("entered").includes(`before ${shortDay(before)}`), at("entered"));
+  assert.ok(at("provider").includes(`before ${shortDate(before)}`), at("provider"));
+  assert.ok(text(adviceMove(move("idle", "cancel", { before }), { accounts: [] })).includes(`before ${shortDate(before)}`));
 });
 
 test("the computers card names each computer's busiest week and the groups that could share one plan", () => {
