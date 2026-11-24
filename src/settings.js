@@ -141,18 +141,20 @@ function accountRow(p, a) {
     </div>`;
 }
 
-/** Sign-in health: the provider rejected the monitoring sign-in, or the CLI's own saved login. */
-/** Amber when the account is in use on several machines at once; the tooltip names them and says why it matters. */
+/** Amber when the CLI and the desktop app here are on different accounts. */
 function seatsChip(a) {
   const s = seatsText(a);
   return s.chip ? `<em class="chip overlap seats" title="${esc(s.line)}"><span class="overlap-icon" aria-hidden="true"></span> ${esc(s.chip)}</em>` : "";
 }
 
+/** Amber when the account is in use on several machines at once, a plain chip for a planned share
+ * (`room_to_share`); the tooltip names them and says why it matters. */
 function overlapChip(a) {
   const o = overlapText(a);
-  return o.chip ? `<em class="chip overlap" title="${esc(o.lines.join("\n"))}"><span class="overlap-icon" aria-hidden="true">\uE772</span> ${esc(o.chip)}</em>` : "";
+  return o.chip ? `<em class="chip ${o.shared ? "share" : "overlap"}" title="${esc(o.lines.join("\n"))}"><span class="overlap-icon" aria-hidden="true">\uE772</span> ${esc(o.chip)}</em>` : "";
 }
 
+/** Sign-in health: the provider rejected the monitoring sign-in, or the CLI's own saved login. */
 function signInChips(p, a) {
   // Ended on the provider's fixed limit (`monitor_renewal`) reads as such, not as a rejection.
   const ended = a.monitor_renewal === "ended";

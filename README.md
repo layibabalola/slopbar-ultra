@@ -42,7 +42,7 @@ With in-use sharing on (Settings → Data → Other computers), wherever SlopBar
 
 ### One account on two computers
 
-With in-use sharing on (Settings → Data → Other computers), SlopBar flags an account that is in use on more than one of your computers at the same time: an amber "In use on 2 machines" line in the flyout and in Settings → Accounts, an amber badge on that provider's ring in the taskbar widget, a Health warning, and one notification per overlap (Settings → Notifications). Its limits drain that many times as fast, and the provider may sign sessions out. A computer counts only while it keeps writing its status, so one that was shut down drops out within about 15 minutes.
+With in-use sharing on (Settings → Data → Other computers), SlopBar flags an account that is in use on more than one of your computers at the same time: an amber "In use on 2 machines" line in the flyout and in Settings → Accounts, an amber badge on that provider's ring in the taskbar widget, a Health warning, and one notification per overlap (Settings → Notifications). Their use adds up, so its limits drain that many times as fast. An account that stayed under its weekly limits, model caps included, in each of its busiest recent weeks (the latest 8 completed weeks this computer watched, at least 4 of them watched long enough to judge) is shared within its limits: a planned share. It shows a plain "Shared by 2 computers" instead, with nothing amber, Health lists it as ok, no notification comes, and `recommend_account` does not move a computer using it off it (an account in use on other computers only is still left to them). A computer counts only while it keeps writing its status, so one that was shut down drops out within about 15 minutes.
 
 ### A new computer
 

@@ -383,8 +383,13 @@ pub struct Recommendation {
     pub summary: String,
     /// Every machine this provider's account in use here is in use on at once (this one first),
     /// when that is more than one: a conflict to resolve by switching one of them (see
-    /// `AccountUsage::overlap`). Empty otherwise.
+    /// `AccountUsage::overlap`), unless the account has room to share (`overlap_room`). Empty
+    /// otherwise.
     pub overlap: Vec<String>,
+    /// The account in use here has room to share (`AccountUsage::room_to_share`): its `overlap` is
+    /// a planned share, which the summary says, and it is ranked as usual.
+    #[serde(skip)]
+    pub overlap_room: bool,
 }
 
 /// An account as a summary names it, clipped: the summary reaches agents cut at `mcp::MAX_TEXT`,
@@ -428,13 +433,20 @@ fn reading_exclusion(acc: &AccountUsage, settings: &Settings, now: DateTime<Utc>
     None
 }
 
-/// In use elsewhere, or on a plan that lapsed or ends: whatever its readings say.
+/// In use elsewhere, or on a plan that lapsed or ends: whatever its readings say. An account this
+/// machine uses too (its CLI or desktop app) with room to share (`AccountUsage::room_to_share`) is
+/// a planned share, not kept from this machine; one in use on other machines only stays theirs.
 fn elsewhere_exclusion(acc: &AccountUsage, settings: &Settings, now: DateTime<Utc>) -> Option<String> {
-    if acc.overlap.len() > 1 {
-        return Some(format!("in use on {} machines at once ({}): its limits drain about {}x as fast and sessions may be signed out",
-            acc.overlap.len(), crate::mcp::listed(&acc.overlap), acc.overlap.len()));
+    let shared_here = acc.room_to_share && (acc.active || acc.desktop);
+    if acc.overlap.len() > 1 && !shared_here {
+        let (n, list) = (acc.overlap.len(), crate::mcp::listed(&acc.overlap));
+        return Some(if acc.room_to_share {
+            format!("in use on {n} other machines at once ({list}), shared within its limits")
+        } else {
+            format!("in use on {n} machines at once ({list}): its limits drain about {n}x as fast")
+        });
     }
-    if let Some(seat) = acc.remote.iter().find(|r| r.live) {
+    if let Some(seat) = acc.remote.iter().find(|r| r.live).filter(|_| !shared_here) {
         return Some(format!("in use on another machine ({})", seat.machine));
     }
     if crate::subscriptions::lapsed(settings, acc.provider, &acc.id, now) { return Some("its plan has lapsed".into()); }
@@ -513,18 +525,24 @@ pub fn recommend(accounts: &[AccountUsage], settings: &Settings, provider: Provi
         .then_with(|| if a.fits { a.use_before.unwrap_or(DateTime::<Utc>::MAX_UTC).cmp(&b.use_before.unwrap_or(DateTime::<Utc>::MAX_UTC)) } else { std::cmp::Ordering::Equal })
         .then_with(|| b.weekly_left_percent.unwrap_or(0.0).total_cmp(&a.weekly_left_percent.unwrap_or(0.0)))
         .then_with(|| b.active.cmp(&a.active)));
-    let overlap = accounts.iter().find(|a| a.provider == provider && a.active).map(|a| a.overlap.clone()).unwrap_or_default();
-    with_overlap(finish(provider, expected_percent, hours, ranking, excluded), overlap)
+    let (overlap, room) = accounts.iter().find(|a| a.provider == provider && a.active).map(|a| (a.overlap.clone(), a.room_to_share)).unwrap_or_default();
+    with_overlap(finish(provider, expected_percent, hours, ranking, excluded), overlap, room)
 }
 
 /// Says the account in use here is also in use elsewhere, ahead of what to do about it: the
 /// machines in a list of bounded length, so the advice after it reaches agents (`mcp::MAX_TEXT`).
-fn with_overlap(mut rec: Recommendation, overlap: Vec<String>) -> Recommendation {
+/// With room to share (`room`) that is a planned share, said in brief.
+fn with_overlap(mut rec: Recommendation, overlap: Vec<String>, room: bool) -> Recommendation {
     if overlap.len() > 1 {
-        rec.summary = format!("The account in use is in use on {} machines at once ({}), so its limits drain faster and sessions may be signed out. {}",
-            overlap.len(), crate::mcp::listed(&overlap), rec.summary);
+        let (n, list) = (overlap.len(), crate::mcp::listed(&overlap));
+        rec.summary = if room {
+            format!("The account in use is shared by {n} computers ({list}) within its limits. {}", rec.summary)
+        } else {
+            format!("The account in use is in use on {n} machines at once ({list}), so its limits drain about {n}x as fast. {}", rec.summary)
+        };
     }
     rec.overlap = overlap;
+    rec.overlap_room = room;
     rec
 }
 
@@ -534,7 +552,7 @@ pub fn without_leased(rec: Recommendation, leased: &[(String, String)]) -> Recom
     if leased.is_empty() {
         return rec;
     }
-    let Recommendation { provider, expected_percent, hours, ranking, mut excluded, overlap, .. } = rec;
+    let Recommendation { provider, expected_percent, hours, ranking, mut excluded, overlap, overlap_room, .. } = rec;
     let (taken, ranking): (Vec<_>, Vec<_>) = ranking.into_iter().partition(|c| leased.iter().any(|(id, _)| *id == c.id));
     for c in taken {
         let purpose = leased.iter().find(|(id, _)| *id == c.id).map_or("", |(_, p)| p.as_str());
@@ -545,7 +563,7 @@ pub fn without_leased(rec: Recommendation, leased: &[(String, String)]) -> Recom
     for e in excluded.iter_mut().filter(|e| leased.iter().any(|(id, _)| *id == e.id)) {
         e.shared = None;
     }
-    with_overlap(finish(provider, expected_percent, hours, ranking, excluded), overlap)
+    with_overlap(finish(provider, expected_percent, hours, ranking, excluded), overlap, overlap_room)
 }
 
 fn finish(provider: Provider, expected_percent: Option<f64>, hours: Option<f64>, ranking: Vec<Candidate>, excluded: Vec<Excluded>) -> Recommendation {
@@ -558,7 +576,7 @@ fn finish(provider: Provider, expected_percent: Option<f64>, hours: Option<f64>,
     Recommendation {
         provider, expected_percent, hours,
         recommended: best.map(|c| c.id.clone()), recommended_label: best.and_then(|c| c.label.clone()),
-        action, summary, ranking, excluded, overlap: vec![],
+        action, summary, ranking, excluded, overlap: vec![], overlap_room: false,
     }
 }
 
@@ -639,12 +657,62 @@ mod tests {
         let free = account("free", false, 30.0, 50);
         let rec = recommend(&[current, free], &settings, Provider::Claude, None, None, now);
         assert_eq!(rec.overlap, ["DESK-1", "LAPTOP-2"]);
-        assert!(rec.excluded[0].reason.starts_with("in use on 2 machines at once (DESK-1, LAPTOP-2)"), "{}", rec.excluded[0].reason);
+        assert_eq!(rec.excluded[0].reason, "in use on 2 machines at once (DESK-1, LAPTOP-2): its limits drain about 2x as fast");
         assert_eq!((rec.action, rec.recommended.as_deref()), (Action::Switch, Some("free")));
-        assert!(rec.summary.starts_with("The account in use is in use on 2 machines at once"), "{}", rec.summary);
+        assert!(rec.summary.starts_with("The account in use is in use on 2 machines at once (DESK-1, LAPTOP-2), so its limits drain about 2x as fast. Switch to free"), "{}", rec.summary);
         // Kept when leases are taken out.
         let rec = without_leased(rec, &[("nobody".into(), "x".into())]);
         assert_eq!(rec.overlap.len(), 2);
+        assert!(rec.summary.starts_with("The account in use is in use on 2 machines at once"), "{}", rec.summary);
+    }
+
+    #[test]
+    fn an_account_shared_within_its_limits_is_no_reason_to_move_this_machine_off_it() {
+        let now = at(NOW);
+        let settings = Settings::default();
+        let seat = |machine: &str| RemoteSeat { machine: machine.into(), where_: vec!["Windows".into()], seen_at: now, live: true };
+        // In use here and on LAPTOP-2, its week resetting first: kept, as with no other machine on it.
+        let mut current = account("current", true, 20.0, 40);
+        current.remote = vec![seat("LAPTOP-2")];
+        current.overlap = vec!["DESK-1".into(), "LAPTOP-2".into()];
+        current.room_to_share = true;
+        let free = account("free", false, 30.0, 50);
+        let rec = recommend(&[current.clone(), free.clone()], &settings, Provider::Claude, Some(10.0), None, now);
+        assert_eq!((rec.action, rec.recommended.as_deref()), (Action::Stay, Some("current")));
+        assert!(rec.excluded.is_empty(), "{:?}", rec.excluded);
+        assert_eq!(rec.overlap, ["DESK-1", "LAPTOP-2"]);
+        assert!(rec.overlap_room);
+        assert_eq!(rec.summary, "The account in use is shared by 2 computers (DESK-1, LAPTOP-2) within its limits. \
+            Keep using current@example.invalid: it fits the job and should be used first.");
+        let leased = without_leased(rec, &[("nobody".into(), "x".into())]);
+        assert!(leased.summary.starts_with("The account in use is shared by 2 computers (DESK-1, LAPTOP-2) within its limits. Keep using"), "{}", leased.summary);
+        // Ranked as usual: another account whose week resets sooner is still the better fit.
+        let sooner = account("sooner", false, 30.0, 10);
+        let rec = recommend(&[current.clone(), sooner.clone()], &settings, Provider::Claude, Some(10.0), None, now);
+        assert_eq!((rec.action, rec.recommended.as_deref(), rec.ranking.len()), (Action::Switch, Some("sooner"), 2));
+        // This machine's desktop app on it counts as using it here.
+        let mut desktop = current.clone();
+        desktop.active = false;
+        desktop.desktop = true;
+        let rec = recommend(&[desktop, account("cli", true, 20.0, 100)], &settings, Provider::Claude, Some(10.0), None, now);
+        assert_eq!(rec.recommended.as_deref(), Some("current"));
+        // On other machines only, it stays theirs, room or not: never a target here.
+        let mut theirs = current.clone();
+        theirs.active = false;
+        theirs.remote = vec![seat("LAPTOP-2"), seat("TOWER-3")];
+        theirs.overlap = vec!["LAPTOP-2".into(), "TOWER-3".into()];
+        let rec = recommend(&[theirs.clone(), free.clone()], &settings, Provider::Claude, Some(10.0), None, now);
+        assert_eq!(rec.recommended.as_deref(), Some("free"));
+        assert_eq!(rec.excluded[0].reason, "in use on 2 other machines at once (LAPTOP-2, TOWER-3), shared within its limits");
+        theirs.remote.truncate(1);
+        theirs.overlap.clear();
+        let rec = recommend(&[theirs, free.clone()], &settings, Provider::Claude, Some(10.0), None, now);
+        assert_eq!(rec.excluded[0].reason, "in use on another machine (LAPTOP-2)");
+        // Without room, the account in use here is excluded as before.
+        current.room_to_share = false;
+        let rec = recommend(&[current, free], &settings, Provider::Claude, Some(10.0), None, now);
+        assert_eq!((rec.action, rec.recommended.as_deref(), rec.overlap_room), (Action::Switch, Some("free"), false));
+        assert!(rec.excluded[0].reason.ends_with("its limits drain about 2x as fast"), "{}", rec.excluded[0].reason);
     }
 
     /// What recommend_account answers and lease_account's error quotes reaches an agent whole
@@ -671,11 +739,21 @@ mod tests {
         }
         // Short names fill the list's whole room; long ones are clipped.
         for len in [8, 60] {
+            let names: Vec<String> = (0..1000).map(|i| format!("{i:03}{}", "m".repeat(len))).collect();
             let mut current = long(account("current", true, 20.0, 100));
-            current.overlap = (0..1000).map(|i| format!("{i:03}{}", "m".repeat(len))).collect();
+            current.overlap = names.clone();
+            // The same account shared within its limits stays ranked, and one in use on other
+            // machines only says so in its reason.
+            let mut shared = current.clone();
+            shared.room_to_share = true;
+            let mut theirs = long(account("theirs", false, 10.0, 30));
+            theirs.overlap = names[1..].to_vec();
+            theirs.room_to_share = true;
             let switch = vec![current.clone(), long(account("free", false, 30.0, 50))];
             let none = vec![current, stale.clone(), failed.clone()];
-            for (accounts, action, advice) in [(switch, Action::Switch, "Switch only if the user allowed switching."), (none, Action::None, "ask the user.")] {
+            let kept = vec![shared, theirs, stale.clone()];
+            for (accounts, action, advice) in [(switch, Action::Switch, "Switch only if the user allowed switching."), (none, Action::None, "ask the user."),
+                (kept, Action::Stay, "should be used first.")] {
                 let rec = recommend(&accounts, &settings, Provider::Claude, Some(30.0), None, now);
                 assert_eq!(rec.action, action, "{}", rec.summary);
                 // As recommend_account answers (the note added) and as lease_account's error quotes it.
@@ -687,7 +765,8 @@ mod tests {
                 for text in texts {
                     assert!(text.chars().count() <= crate::mcp::MAX_TEXT, "{len}: {} characters: {text}", text.chars().count());
                 }
-                assert!(rec.excluded[0].reason.ends_with("sessions may be signed out"), "{}", rec.excluded[0].reason);
+                let reason = &rec.excluded[0].reason;
+                assert!(reason.ends_with("its limits drain about 1000x as fast") || reason.ends_with("shared within its limits"), "{reason}");
             }
         }
     }
