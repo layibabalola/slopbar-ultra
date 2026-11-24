@@ -740,13 +740,21 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
         },
     });
 
-    // One account on several computers at once (seen through sharing, live ones only).
+    // One account on several computers at once (seen through sharing, live ones only): a planned
+    // share when its busiest recent weeks and this one left the spare a share keeps
+    // (`AccountUsage::room_to_share`), a conflict otherwise.
     for a in inputs.accounts.iter().filter(|a| a.overlap.len() > 1) {
         let n = a.overlap.len();
-        checks.push(check(format!("overlap:{}:{}", a.provider.key(), a.id), Status::Warning,
-            format!("{}: in use on {n} computers at once", name(a)),
-            format!("In use on {} at the same time: its limits drain about {n}x as fast and the provider may sign sessions out. Switch one of them to another account (recommend_account names a free one).", crate::mcp::listed(&a.overlap)),
-            Some(Fix::OpenSettings { page: "accounts" })));
+        let (id, list) = (format!("overlap:{}:{}", a.provider.key(), a.id), crate::mcp::listed(&a.overlap));
+        checks.push(if a.room_to_share {
+            check(id, Status::Ok, format!("{}: shared by {n} computers", name(a)),
+                format!("In use on {list} at the same time. Its busiest recent weeks and this week so far left 20% to spare under its weekly limits, so these computers' use adds up within them; the 5-hour limit is shared too."),
+                None)
+        } else {
+            check(id, Status::Warning, format!("{}: in use on {n} computers at once", name(a)),
+                format!("In use on {list} at the same time: its limits drain about {n}x as fast. It has no room to share (it came within 20% of a weekly limit in recent weeks or at this week's pace, or SlopBar has not watched it long enough), so this is not a planned share. Switch one of those computers to another account (recommend_account names a free one)."),
+                Some(Fix::OpenSettings { page: "accounts" }))
+        });
     }
 
     // The CLI and the desktop app on this machine on different accounts (one check per app).
@@ -1181,6 +1189,8 @@ mod tests {
                 a.covered_by = Some("M".repeat(63));
                 a.overlap = names.clone();
                 a.cli_ends_at = Some(now() - Duration::days(2));
+                // A conflict on a and c, a planned share on b and d: both rows' wording.
+                a.room_to_share = matches!(a.id.as_str(), "b" | "d");
             }
             // a ended a little early, b was refused well before its end, c was never connected,
             // d is in use, its CLI sign-in ended and the desktop app is on another account.
@@ -1196,9 +1206,11 @@ mod tests {
             let a = find(&r, &format!("monitoring:{}:a", provider.key()));
             assert!(a.reason.contains("ended a little early") && a.reason.ends_with("needs no account use."), "{}", a.reason);
             let (overlap, drift) = (format!("overlap:{}:a", provider.key()), format!("desktop_drift:{}", provider.key()));
-            for id in ["wsl", RENEWAL_SUMMARY, CLI_RENEWAL_SUMMARY, overlap.as_str(), drift.as_str()] {
+            let shared = format!("overlap:{}:b", provider.key());
+            for id in ["wsl", RENEWAL_SUMMARY, CLI_RENEWAL_SUMMARY, overlap.as_str(), shared.as_str(), drift.as_str()] {
                 find(&r, id);
             }
+            assert_eq!((find(&r, &overlap).status, find(&r, &shared).status), (Status::Warning, Status::Ok));
             whole(&r);
             // WSL answering: what it read and what it left stopped, each list in its room.
             case.wsl.timed_out = false;
@@ -1570,11 +1582,31 @@ mod tests {
         assert!(case.run().checks.iter().all(|c| !c.id.starts_with("overlap:")));
         case.accounts[0].overlap = vec!["DESK-1".into(), "LAPTOP-2".into()];
         let r = case.run();
-        let c = r.checks.iter().find(|c| c.id.starts_with("overlap:")).unwrap();
-        assert_eq!(c.status, Status::Warning);
+        let c = find(&r, "overlap:claude:a");
+        assert_eq!((c.status, r.warnings), (Status::Warning, 1));
         assert!(c.title.ends_with("in use on 2 computers at once"), "{}", c.title);
-        assert!(c.reason.starts_with("In use on DESK-1, LAPTOP-2 at the same time"), "{}", c.reason);
+        assert!(c.reason.starts_with("In use on DESK-1, LAPTOP-2 at the same time: its limits drain about 2x as fast."), "{}", c.reason);
+        // Why it is no planned share, and nothing SlopBar has no ground for: no sign-out is promised.
+        assert!(c.reason.contains("It has no room to share (it came within 20% of a weekly limit in recent weeks or at this week's pace, or SlopBar has not watched it long enough), so this is not a planned share."), "{}", c.reason);
+        assert!(!c.reason.contains("sign"), "{}", c.reason);
         assert_eq!(c.fix, Some(Fix::OpenSettings { page: "accounts" }));
+    }
+
+    #[test]
+    fn an_account_shared_within_its_limits_is_a_planned_share() {
+        let mut case = Case::healthy();
+        case.accounts[0].overlap = vec!["DESK-1".into(), "LAPTOP-2".into(), "TOWER-3".into()];
+        case.accounts[0].room_to_share = true;
+        let r = case.run();
+        let c = find(&r, "overlap:claude:a");
+        assert_eq!((c.status, r.status, r.warnings), (Status::Ok, Status::Ok, 0), "no warning: {c:?}");
+        assert_eq!(c.title, "a@example.invalid: shared by 3 computers");
+        assert_eq!(c.reason, "In use on DESK-1, LAPTOP-2, TOWER-3 at the same time. Its busiest recent weeks and this week \
+            so far left 20% to spare under its weekly limits, so these computers' use adds up within them; the 5-hour limit is shared too.");
+        assert_eq!(c.fix, None);
+        // Room alone says nothing: only an account on several computers gets a row.
+        case.accounts[0].overlap.clear();
+        assert!(case.run().checks.iter().all(|c| !c.id.starts_with("overlap:")));
     }
 
     #[test]

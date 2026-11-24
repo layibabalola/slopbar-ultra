@@ -1,8 +1,9 @@
 //! Automatic account switching: when the signed-in account of a provider reaches the
 //! configured share of any usage window, move to the account `headroom::recommend` ranks first
 //! among those well below it: the one whose weekly reset or renewal comes soonest, so capacity
-//! that would be lost is used first. Accounts in use on another machine, on a plan that is
-//! ending or lapsed, or without a fresh reading are never targets.
+//! that would be lost is used first. Accounts in use on another machine, whether or not they are
+//! shared within their limits (`AccountUsage::room_to_share`; one this machine's desktop app shares
+//! included), on a plan that is ending or lapsed, or without a fresh reading are never targets.
 //!
 //! An account with its own percentage (`Settings::rotate_at`) is rotated off at that percentage
 //! even with automatic switching off, and is a target only well below it, so an account kept for
@@ -77,7 +78,7 @@ mod tests {
             active, sources: vec![], windows: percent.map(|used_percent| UsageWindow {
                 kind: "session".into(), window_seconds: None, used_percent, resets_at: None,
             }).into_iter().collect(), credits: None, resets: vec![], error: None, monitor_error: None, stale: false,
-            fetched_at: Some(chrono::Utc::now()), monitor_connected: true, monitor_ends_at: None, monitor_renewal: None, billing: Default::default(), remote: vec![], overlap: vec![], shared: None, covered_by: None, used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None,
+            fetched_at: Some(chrono::Utc::now()), monitor_connected: true, monitor_ends_at: None, monitor_renewal: None, billing: Default::default(), remote: vec![], overlap: vec![], shared: None, covered_by: None, used_outside: false, runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None, room_to_share: false,
         }
     }
 
@@ -195,5 +196,30 @@ mod tests {
         // The cooldown still holds.
         let last = HashMap::from([(Provider::Claude, Instant::now())]);
         assert!(decide(&all, &settings, &last).is_empty());
+    }
+
+    #[test]
+    fn an_account_shared_within_its_limits_is_never_a_target_and_its_threshold_still_rotates_off_it() {
+        let mut settings = Settings::default();
+        settings.balancer.claude.auto = true;
+        let laptop = RemoteSeat { machine: "LAPTOP-2".into(), where_: vec![], seen_at: chrono::Utc::now(), live: true };
+        let shared = |id: &str, active: bool, desktop: bool, percent: f64| {
+            let mut a = account(id, active, Some(percent));
+            a.desktop = desktop;
+            a.remote = vec![laptop.clone()];
+            a.overlap = if active || desktop { vec!["DESK-1".into(), "LAPTOP-2".into()] } else { vec![] };
+            a.room_to_share = true;
+            a
+        };
+        // The desktop app here and LAPTOP-2 share it within its limits: the CLI would add to that
+        // share, so it is no target however much room its reading shows. Nor is one LAPTOP-2 alone uses.
+        let current = account("active", true, Some(95.0));
+        for other in [shared("desktop", false, true, 5.0), shared("theirs", false, false, 5.0)] {
+            assert_eq!(decide(&[current.clone(), other.clone(), account("free", false, Some(30.0))], &settings, &HashMap::new()), [(Provider::Claude, "free".into())]);
+            assert!(decide(&[current.clone(), other], &settings, &HashMap::new()).is_empty());
+        }
+        // The CLI's own account shared within its limits still rotates off at its threshold.
+        let rotate = [shared("active", true, false, 95.0), account("free", false, Some(30.0))];
+        assert_eq!(decide(&rotate, &settings, &HashMap::new()), [(Provider::Claude, "free".into())]);
     }
 }

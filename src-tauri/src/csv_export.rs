@@ -152,7 +152,7 @@ mod tests {
             attribution: Attribution::Unattributed, repo: "my, repo".into(), model: "claude-opus-5-5".into(), tokens: Tokens { input: 1, cache_write: 2, cached: 3, output: 4, total: 10 } }];
         let b = breakdown_csv(&rows);
         assert!(b.contains("2026-10-20,Claude,,,unattributed,\"my, repo\",claude-opus-5-5,1,2,3,4,10\r\n"), "{b}");
-        let report = Report { accounts: vec![], providers: vec![], generated_at: at("2026-10-21T00:00:00Z"), advice: vec![], spend: None };
+        let report = Report { accounts: vec![], providers: vec![], generated_at: at("2026-10-21T00:00:00Z"), advice: vec![], spend: None, machines: vec![] };
         let s = subscriptions_csv(&report);
         let dir = crate::test_support::TempDir::new();
         let out = dir.0.join("nested").join("SlopBar Exports");

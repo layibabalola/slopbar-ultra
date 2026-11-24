@@ -24,6 +24,11 @@ jobs:
       # Every language has every English text, with the same {placeholders}.
       - name: Translations complete
         run: node scripts/check-i18n.cjs
+      # The flyout's account tooltip and Settings' advice cards, drawn from made-up accounts.
+      - name: UI text checks
+        run: |
+          node scripts/test-account-tip.mjs
+          node scripts/test-advice.mjs
       - name: Unit tests (desktop build)
         run: cargo test --locked --lib --manifest-path src-tauri/Cargo.toml
       # Releases turn on upstream-updates, which changes defaults such as auto_update: a test can

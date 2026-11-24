@@ -158,8 +158,9 @@ pub struct View {
     /// What each item's tooltip says below its headline (`account_detail`), one per item; empty
     /// for text items.
     pub details: Vec<String>,
-    /// Per item, whether its account is in use on several machines at once (`overlap`): an amber
-    /// badge on the ring. Missing entries are false.
+    /// Per item, whether its account is in use on several machines at once (`overlap`) without
+    /// room to share it (`room_to_share`): an amber badge on the ring. A planned share gets none;
+    /// the tooltip says it. Missing entries are false.
     pub overlap: Vec<bool>,
 }
 
@@ -234,9 +235,11 @@ pub fn account_detail(texts: &dyn Texts, a: &AccountUsage, now: chrono::DateTime
         who.push(texts.t("seatsDrift", &[("cli", d.cli.as_deref().unwrap_or("-")), ("desktop", d.desktop.as_deref().unwrap_or(&unknown))]));
     }
     if a.overlap.len() > 1 {
+        // A planned share (`room_to_share`) is said plainly; a conflict says why it matters.
+        let (on, why) = if a.room_to_share { ("overlapSharedOn", "overlapSharedWhy") } else { ("overlapOn", "overlapWhy") };
         let n = a.overlap.len().to_string();
-        who.push(texts.t("overlapOn", &[("n", &n), ("list", &f::overlap_list(lang, a, me.as_deref()))]));
-        who.push(texts.t("overlapWhy", &[("n", &n)]));
+        who.push(texts.t(on, &[("n", &n), ("list", &f::overlap_list(lang, a, me.as_deref()))]));
+        who.push(texts.t(why, &[("n", &n)]));
     }
     who.extend(a.remote.iter().filter(|r| !r.live).map(|r| texts.t("seenOn", &[("machine", &f::remote_text(lang, r)), ("t", &ago(r.seen_at))])));
     if a.used_outside { who.push(texts.t("usedOutside", &[])); }
@@ -352,7 +355,7 @@ pub fn view(snap: &Snapshot, toast: Option<&str>, health_problems: usize, texts:
             .map(|a| {
                 let percent = if a.stale || a.error.is_some() { None } else { peak(a) };
                 details.push(account_detail(texts, a, chrono::Utc::now()));
-                overlap.push(a.overlap.len() > 1);
+                overlap.push(a.overlap.len() > 1 && !a.room_to_share);
                 Item::Chip { provider: a.provider, percent, tip: chip_tip(texts, a.provider, percent) }
             })
             .collect()
@@ -816,7 +819,8 @@ mod tests {
         assert_eq!(v.overlap, [false, true]);
         assert!(!v.details[0].contains("machines"));
         assert!(v.details[1].contains("In use on 2 machines at once: this PC, LAPTOP-2"), "{}", v.details[1]);
-        assert!(v.details[1].contains("Limits drain about 2× as fast"), "{}", v.details[1]);
+        assert!(v.details[1].contains("Limits drain about 2× as fast, and this account has no room to share: it came within 20% of a weekly limit in recent weeks or at this week's pace, or SlopBar Ultra has not watched it long enough."), "{}", v.details[1]);
+        assert!(!v.details[1].contains("sign"), "no sign-out is promised: {}", v.details[1]);
         // On DESK-1 itself, the tooltip says which of the two this is.
         let here = view(&snap(vec![codex]), None, 0, &OnDesk1);
         assert!(here.details[0].contains("In use on 2 machines at once: DESK-1 (this PC), LAPTOP-2"), "{}", here.details[0]);
@@ -824,6 +828,19 @@ mod tests {
         let l = layout(&v, 48.0, &measure);
         let ((x, y), r) = overlap_badge(&l.items[1]);
         assert!(x > l.items[1].x + l.items[1].w / 2.0 && y > l.items[1].y + l.items[1].h / 2.0 && r > 0.0);
+    }
+
+    #[test]
+    fn an_account_shared_within_its_limits_gets_no_badge_and_is_said_plainly() {
+        let mut codex = account(Provider::Codex, "c1", true, &[10.0]);
+        codex.overlap = vec!["DESK-1".into(), "LAPTOP-2".into(), "TOWER-3".into(), "BOX-4".into()];
+        codex.room_to_share = true;
+        let v = view(&snap(vec![account(Provider::Claude, "a1", true, &[5.0]), codex]), None, 0, &OnDesk1);
+        assert_eq!(v.overlap, [false, false], "a planned share is no warning");
+        let tip = &v.details[1];
+        assert!(tip.contains("Shared by 4 computers: DESK-1 (this PC), LAPTOP-2, TOWER-3, BOX-4\n\
+            Its busiest recent weeks and this week so far left 20% to spare under its weekly limits, so these computers' use adds up within them; the 5-hour limit is shared too."), "{tip}");
+        assert!(!tip.contains("drain") && !tip.contains("at once"), "{tip}");
     }
 
     #[test]

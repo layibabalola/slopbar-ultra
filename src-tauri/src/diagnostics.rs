@@ -89,6 +89,8 @@ pub enum Action {
     TokenRead,
     Revoke,
     Export,
+    /// This computer's use ledger (`machine_load`) could not be saved.
+    MachineLoadSave,
 }
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -538,7 +540,7 @@ fn observation(event: &Event) -> Option<(Family, Event)> {
             action, elapsed_ms, ..
         } if matches!(
             action,
-            Action::TokenRead | Action::CacheSave | Action::HistorySave | Action::MonitorSave
+            Action::TokenRead | Action::CacheSave | Action::HistorySave | Action::MonitorSave | Action::MachineLoadSave
         ) =>
         {
             *elapsed_ms = 0;
@@ -1348,7 +1350,7 @@ mod tests {
                 windows: vec![crate::model::UsageWindow { kind: canary.into(), used_percent: 61.25, window_seconds: None, resets_at: None }] }),
             covered_by: Some(canary.into()),
             used_outside: true,
-            runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None,
+            runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None, room_to_share: false,
         };
         let snapshot = Snapshot {
             accounts: vec![a],

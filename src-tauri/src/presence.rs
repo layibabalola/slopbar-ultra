@@ -8,7 +8,12 @@
 //!   `<folder>/SlopBar/presence/<machine id>.json`; later, possibly a cloud API (`CloudApi`). The
 //!   record lists which accounts the machine has signed in. Accounts appear there only as a unsalted SHA-256 prefix of
 //!   `provider|slot id`, which every machine computes the same way; no emails, tokens or
-//!   organization names are written.
+//!   organization names are written. While readings are shared (`Settings::share_readings`) the
+//!   record also carries the computer's own weekly use (`load`, see `machine_load`): per provider,
+//!   totals in plans and the plan tiers they were on, never an account code or id. Readers take it
+//!   leniently: a `load` they
+//!   cannot read (another version, a malformed value, a number out of range, nesting too deep) is
+//!   dropped, never the record.
 //! - **Inference**, for monitored accounts nobody claims: usage that keeps rising while the
 //!   account is signed in nowhere SlopBar can see means it is used outside this PC (another
 //!   machine, the web or the desktop app).
@@ -33,8 +38,9 @@ const MIN_LIVE: i64 = 15 * 60;
 /// Machines that stopped writing are shown dimmed ("seen 3h ago") this long.
 const SHOW_FOR: i64 = 24 * 3600;
 /// Files older than this are ignored altogether.
-const IGNORE_AFTER: i64 = 7 * 24 * 3600;
-/// A clock this far ahead of ours is not trusted; the file's modification time is used instead.
+pub(crate) const IGNORE_AFTER: i64 = 7 * 24 * 3600;
+/// A clock this far ahead of ours is not trusted; the file's modification time is used instead,
+/// and the record's `load` is dropped.
 const SKEW: i64 = 5 * 60;
 /// Machine names longer than this are cut (they come from other machines).
 const NAME_MAX: usize = 63;
@@ -57,6 +63,26 @@ pub struct Presence {
     pub interval_s: u64,
     #[serde(default)]
     pub seats: Vec<Seat>,
+    /// The machine's own weekly use (`machine_load::Load`), while it shares readings. Read from
+    /// whatever JSON is there (`lenient_load`): one of another `load.v`, or malformed, is None and
+    /// the record stands, so `v` stays 1 and older SlopBars, which ignore it, read the rest.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_load")]
+    pub load: Option<crate::machine_load::Load>,
+}
+
+/// A record's `load`, taken as raw JSON (which checks its syntax only) and then read on its own: a
+/// number out of range or nesting too deep fails that second read, which drops the load and keeps
+/// the record.
+fn lenient_load<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<crate::machine_load::Load>, D::Error> {
+    let raw = <Box<serde_json::value::RawValue>>::deserialize(d)?;
+    Ok(serde_json::from_str::<serde_json::Value>(raw.get()).ok().and_then(|v| crate::machine_load::Load::from_value(&v)))
+}
+
+impl Presence {
+    /// This record with the machine's load (None: no load, as while readings are not shared).
+    pub fn with_load(self, load: Option<crate::machine_load::Load>) -> Presence {
+        Presence { load, ..self }
+    }
 }
 
 /// How another machine's account appears on every machine: the first 32 hex digits of
@@ -109,8 +135,12 @@ pub fn this_machine() -> Option<String> {
     clean_name(&name)
 }
 
+/// A machine name as shown: one line, without control characters or the invisible ones that would
+/// let "DESK-1" with a zero-width space pass for another computer than "DESK-1"
+/// (`roster::invisible`), trimmed and bounded.
 fn clean_name(name: &str) -> Option<String> {
-    let name: String = name.trim().chars().filter(|c| !c.is_control()).take(NAME_MAX).collect();
+    let visible: String = name.chars().filter(|c| !c.is_control() && !crate::roster::invisible(*c)).collect();
+    let name: String = visible.trim().chars().take(NAME_MAX).collect();
     (!name.is_empty()).then_some(name)
 }
 
@@ -151,8 +181,8 @@ pub trait PresenceStore: Send + Sync {
 #[derive(Debug, Default)]
 pub struct Kept(std::sync::Mutex<HashMap<String, (String, Vec<u8>)>>);
 
-/// A record is kept for the next read only up to this size, and at most this many records: one is a
-/// few hundred bytes (about 130 more per account), and whoever can write the folder could otherwise
+/// A record is kept for the next read only up to this size, and at most this many records: one is
+/// about 1-2 KB (some 130 bytes per account, and a few hundred for its load), and whoever can write the folder could otherwise
 /// have this computer hold `MAX_RECORD` bytes between refreshes for every file they put there. Any
 /// other record is downloaded at every read, as every record was.
 const KEEP_BYTES: usize = 16 * 1024;
@@ -359,16 +389,20 @@ pub fn own(machine_id: &str, machine: &str, interval_s: u64, accounts: &[Account
         })
         .collect();
     seats.sort_by(|a, b| (a.p.key(), &a.h).cmp(&(b.p.key(), &b.h)));
-    Presence { v: 1, machine_id: machine_id.into(), machine: machine.into(), written_at: now, interval_s, seats }
+    Presence { v: 1, machine_id: machine_id.into(), machine: machine.into(), written_at: now, interval_s, seats, load: None }
 }
 
 /// Another machine, as of its newest file.
 #[derive(Debug, Clone)]
 pub struct Peer {
+    pub machine_id: String,
     pub machine: String,
     pub seen_at: DateTime<Utc>,
     pub live: bool,
     pub seats: Vec<Seat>,
+    /// Its newest record's `load`, unless that record was written more than `SKEW` ahead of this
+    /// machine's clock. None says nothing about its use (`machine_load::Peers`).
+    pub load: Option<crate::machine_load::Load>,
 }
 
 /// Every other machine in `store` that wrote within the last week (the refresh lists the store
@@ -382,11 +416,22 @@ pub fn read(store: &dyn PresenceStore, own_id: &str, now: DateTime<Utc>) -> Vec<
 /// a dead machine "live" forever: the file's own modification time is trusted then, and never a
 /// moment after now.
 fn seen(presence: &Presence, modified: Option<DateTime<Utc>>, now: DateTime<Utc>) -> DateTime<Utc> {
-    if presence.written_at > now + Duration::seconds(SKEW) {
+    if ahead(presence, now) {
         modified.unwrap_or(now - Duration::seconds(IGNORE_AFTER + 1)).min(now)
     } else {
         presence.written_at.min(now)
     }
+}
+
+/// Written by a clock more than `SKEW` ahead of this machine's.
+fn ahead(presence: &Presence, now: DateTime<Utc>) -> bool {
+    presence.written_at > now + Duration::seconds(SKEW)
+}
+
+/// The record's `load`, unless its clock runs ahead: a load is dated by that clock, so one from the
+/// future could stand for this week long after the machine stopped writing.
+fn trusted_load(presence: &Presence, now: DateTime<Utc>) -> Option<crate::machine_load::Load> {
+    if ahead(presence, now) { None } else { presence.load.clone() }
 }
 
 /// How long after writing a record its machine counts as live.
@@ -423,9 +468,11 @@ pub fn peers(files: impl IntoIterator<Item = (Presence, Option<DateTime<Utc>>)>,
                 return None;
             }
             Some(Peer {
+                load: trusted_load(&p, now),
                 machine: clean_name(&p.machine).unwrap_or_else(|| "?".into()),
                 seen_at: seen,
                 live: age <= live_for(&p),
+                machine_id: p.machine_id,
                 seats: p.seats,
             })
         })
@@ -467,7 +514,9 @@ impl Recall {
         for (presence, modified) in read.iter().filter(|(p, _)| of_peer(p, own_id)) {
             let at = seen(presence, *modified, now);
             if brought.get(presence.machine_id.as_str()).is_none_or(|kept| at > kept.written_at) {
-                brought.insert(&presence.machine_id, Presence { written_at: at, ..presence.clone() });
+                // Its time replaced, a record from a clock running ahead no longer looks it: its load
+                // goes now, as `peers` would drop it.
+                brought.insert(&presence.machine_id, Presence { written_at: at, load: trusted_load(presence, now), ..presence.clone() });
             }
         }
         let missed: Vec<(Presence, Option<DateTime<Utc>>)> = self.records.iter()
@@ -644,12 +693,12 @@ mod tests {
             billing: Default::default(),
             remote: vec![], overlap: vec![], shared: None, covered_by: None,
             used_outside: false,
-            runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None,
+            runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None, room_to_share: false,
         }
     }
 
     fn file(id: &str, machine: &str, written: DateTime<Utc>, seats: Vec<Seat>) -> Presence {
-        Presence { v: 1, machine_id: id.into(), machine: machine.into(), written_at: written, interval_s: 300, seats }
+        Presence { v: 1, machine_id: id.into(), machine: machine.into(), written_at: written, interval_s: 300, seats, load: None }
     }
 
     fn seat(id: &str) -> Seat {

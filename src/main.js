@@ -130,23 +130,24 @@ function loadCreditAdvice() {
   }, () => {});
 }
 
-/** The full card's amber line when the account is in use on several machines at once. */
+/** The full card's line when the account is in use on several machines at once: amber, or plain
+ * for a planned share (`room_to_share`), which is no warning. */
 function overlapLine(a) {
   const o = overlapText(a);
   if (!o.chip) return "";
-  return `<div class="overlap" role="note" title="${esc(o.lines.join("\n"))}"><span class="overlap-icon" aria-hidden="true">\uE772</span><span>${esc(o.lines[0])}</span></div>`;
+  return `<div class="${o.shared ? "share" : "overlap"}" role="note" title="${esc(o.lines.join("\n"))}"><span class="overlap-icon" aria-hidden="true">\uE772</span><span>${esc(o.lines[0])}</span></div>`;
 }
 
-/** The compact row's amber mark for the same; its tooltip (the row's) says it in full. */
 // The CLI and the desktop app here on different accounts, on the full card.
 function seatsLine(a) {
   const s = seatsText(a);
   return s.line ? `<div class="overlap seats" role="note" title="${esc(s.line)}"><span class="overlap-icon" aria-hidden="true"></span><span>${esc(s.line)}</span></div>` : "";
 }
 
+/** The compact row's mark for the same, amber or plain as that line; its tooltip (the row's) says it in full. */
 function overlapBadge(a) {
   const o = overlapText(a);
-  return o.chip ? `<span class="overlap-badge" role="img" aria-label="${esc(o.lines.join(" "))}" title="${esc(o.lines.join("\n"))}"><span class="overlap-icon" aria-hidden="true">\uE772</span>${(a.overlap ?? []).length}</span>` : "";
+  return o.chip ? `<span class="${o.shared ? "share-badge" : "overlap-badge"}" role="img" aria-label="${esc(o.lines.join(" "))}" title="${esc(o.lines.join("\n"))}"><span class="overlap-icon" aria-hidden="true">\uE772</span>${(a.overlap ?? []).length}</span>` : "";
 }
 
 function resetLines(a) {

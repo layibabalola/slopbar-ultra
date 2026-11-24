@@ -1891,13 +1891,19 @@ mod tests {
     /// Where app.rs publishes a snapshot before this refresh's roster sync (the automatic switch's
     /// notice, the early redraw), what other machines' readings show is worked out from the rosters
     /// last read; after the sync, from what it read; and a new passphrase brings a refresh that works
-    /// it out from the rosters that passphrase opens.
+    /// it out from the rosters that passphrase opens. The automatic switch itself decides with what
+    /// the last refresh knew of the other computers (`carry_over`), never on the bare fetch, which
+    /// knows nothing of where else an account is in use (app.rs's
+    /// `balance_tests::the_automatic_switch_knows_where_else_an_account_is_in_use`).
     #[test]
     fn the_app_works_shared_readings_out_wherever_it_publishes() {
         use crate::source_guard::{function, has, tokens, update};
         const HERE: &str = "roster::tests::the_app_works_shared_readings_out_wherever_it_publishes (src-tauri/src/roster.rs)";
         let app = tokens(include_str!("app.rs"));
         let locked = function(&app, "app.rs", "async fn refresh_locked(", HERE);
+        assert!(has(locked, "let mut known = list.clone(); carry_over(&mut known, &previous); balancer::decide_avoiding(&known, &settings, &last, &leased)"),
+            "the automatic switch decides with what the last refresh knew of the other computers. {}", update(HERE));
+        assert!(!has(locked, "decide_avoiding(&list"), "never on the bare fetch. {}", update(HERE));
         assert!(has(locked, "let mut accounts = list.clone(); carry_over(&mut accounts, &previous); apply_shared(&state, &settings, &mut accounts);             *state.snapshot.lock().unwrap() = Snapshot { accounts, updated_at: Some(chrono::Utc::now()) };"), "the automatic switch's publish. {}", update(HERE));
         assert!(has(locked, "let mut early = list.clone(); carry_over(&mut early, &previous); apply_shared(&state, &settings, &mut early);"),
             "the early redraw. {}", update(HERE));

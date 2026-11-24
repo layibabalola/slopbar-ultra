@@ -54,7 +54,7 @@ pub struct State {
     pub reset_groups: HashMap<String, HashMap<String, u32>>,
     /// The unexpected-use decision (`alert_at`) last acted on.
     pub unexpected: HashMap<String, DateTime<Utc>>,
-    /// Accounts in use on several machines at once, keyed `provider:id`.
+    /// Accounts in use on several machines at once without room to share them, keyed `provider:id`.
     pub overlaps: HashMap<String, OverlapSeen>,
 }
 
@@ -262,9 +262,11 @@ pub fn check_usage(state: &mut State, snap: &Snapshot, prefs: &Notifications, la
 /// Accounts that became in use on more than one machine at once (`AccountUsage::overlap`): one
 /// notification per overlap, once it has lasted `OVERLAP_SETTLE_MS` without a break. The same
 /// overlap is not said again while it lasts, nor when it comes back within `OVERLAP_FORGET_MS`,
-/// nor when a machine drops out of it; another machine joining is news. `state` is updated
-/// whatever the settings say. Only snapshots with freshly read presence belong here. `me` is this
-/// machine's name, marked in the list of machines.
+/// nor when a machine drops out of it; another machine joining is news. An account shared within
+/// its limits (`AccountUsage::room_to_share`) is a planned share, never news: its overlap counts
+/// as a break, so one that loses its room later must settle then and is said once. `state` is
+/// updated whatever the settings say. Only snapshots with freshly read presence belong here. `me`
+/// is this machine's name, marked in the list of machines.
 pub fn check_overlap(state: &mut State, snap: &Snapshot, prefs: &Notifications, lang: &str, me: Option<&str>, now: DateTime<Utc>) -> Vec<Notice> {
     let mut out = Vec::new();
     // Forgotten first, by when each was last seen (a night asleep makes the next one new).
@@ -272,7 +274,7 @@ pub fn check_overlap(state: &mut State, snap: &Snapshot, prefs: &Notifications, 
     for a in &snap.accounts {
         let pstr = provider_str(a.provider);
         let key = format!("{pstr}:{}", a.id);
-        if a.overlap.len() < 2 {
+        if a.overlap.len() < 2 || a.room_to_share {
             // A break before it was said: it must settle again from scratch.
             if state.overlaps.get(&key).is_some_and(|s| !s.notified) {
                 state.overlaps.remove(&key);
@@ -808,7 +810,8 @@ mod tests {
         let out = check_overlap(&mut s, &both, &prefs, "en", Some("DESK-1"), mins(5));
         assert_eq!(titles(&out), ["Claude account in use on 2 machines"]);
         let Notice::Plain { body, page, .. } = &out[0] else { panic!() };
-        assert!(body.starts_with("me@example.invalid is in use on DESK-1 (this PC), LAPTOP-2 at once"), "{body}");
+        assert_eq!(body, "me@example.invalid is in use on DESK-1 (this PC), LAPTOP-2 at once. Limits drain about 2× as fast, \
+            and it has no room to share: it came within 20% of a weekly limit in recent weeks or at this week's pace, or SlopBar Ultra has not watched it long enough.");
         assert_eq!(*page, Some("accounts"));
         // Not in use here: a peer that shares this machine's name (a cloned machine) is not this PC.
         let mut elsewhere = a.clone();
@@ -851,6 +854,40 @@ mod tests {
         check_overlap(&mut s, &both, &off, "en", None, mins(0));
         assert!(check_overlap(&mut s, &both, &off, "en", None, mins(5)).is_empty());
         assert!(s.overlaps["claude:a1"].notified);
+    }
+
+    #[test]
+    fn a_share_within_its_limits_is_never_said_until_its_room_is_gone() {
+        let prefs = Notifications::default();
+        let mins = |m: i64| at(NOW) + chrono::Duration::minutes(m);
+        let mut a = account(10.0, RESET);
+        a.overlap = vec!["DESK-1".into(), "LAPTOP-2".into(), "TOWER-3".into()];
+        a.room_to_share = true;
+        let shared = snap(vec![a.clone()]);
+        a.room_to_share = false;
+        let tight = snap(vec![a]);
+
+        // A planned share: never said, however long it lasts, and nothing waits to be said.
+        let mut s = State::default();
+        for m in [0, 5, 60, 600] {
+            assert!(check_overlap(&mut s, &shared, &prefs, "en", None, mins(m)).is_empty(), "{m}");
+        }
+        assert!(s.overlaps.is_empty());
+        // Its room gone (a week that reached a limit): a conflict from then, said once it settles.
+        assert!(check_overlap(&mut s, &tight, &prefs, "en", None, mins(601)).is_empty());
+        assert_eq!(titles(&check_overlap(&mut s, &tight, &prefs, "en", None, mins(606))), ["Claude account in use on 3 machines"]);
+        assert!(check_overlap(&mut s, &tight, &prefs, "en", None, mins(610)).is_empty());
+        // Room back and gone again soon after: the same conflict, not said twice.
+        assert!(check_overlap(&mut s, &shared, &prefs, "en", None, mins(615)).is_empty());
+        assert!(check_overlap(&mut s, &tight, &prefs, "en", None, mins(620)).is_empty());
+        assert!(check_overlap(&mut s, &tight, &prefs, "en", None, mins(630)).is_empty());
+
+        // Room that comes back before a conflict settled breaks it off: the clock starts again.
+        let mut s = State::default();
+        check_overlap(&mut s, &tight, &prefs, "en", None, mins(0));
+        check_overlap(&mut s, &shared, &prefs, "en", None, mins(2));
+        assert!(check_overlap(&mut s, &tight, &prefs, "en", None, mins(4)).is_empty());
+        assert_eq!(check_overlap(&mut s, &tight, &prefs, "en", None, mins(8)).len(), 1);
     }
 
     #[test]
