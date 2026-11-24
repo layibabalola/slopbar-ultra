@@ -96,10 +96,10 @@ test("the computers card names each computer's busiest week and the groups that 
   assert.equal(card[1], "Claude: each computer's busiest week, in % of one Max 20x");
   assert.equal(card[2], "DESK-1 (this PC), LAPTOP-2 could share one Max 20x: 55% together at their busiest");
   assert.deepEqual(card.slice(3, 11), [
-    "DESK-1 (this PC)", "busiest week 25% · this week 10%",
-    "LAPTOP-2", "busiest week 30% · this week 10%",
-    "TOWER-3", "busiest week 95% · this week 10% · needs its own Max 20x",
-    "NEW-4", "this week 5% · 1 of 4 weeks measured · use on plans of unknown size not counted",
+    "DESK-1 (this PC)", "busiest week 25% · last 8 days 10%",
+    "LAPTOP-2", "busiest week 30% · last 8 days 10%",
+    "TOWER-3", "busiest week 95% · last 8 days 10% · needs its own Max 20x",
+    "NEW-4", "last 8 days 5% · 1 of 4 weeks measured · some use not counted (a plan of unknown size, an account SlopBar does not have, or readings that failed all day)",
   ]);
   // Before two computers are measured it says when groups will show; after, that none fit.
   const waiting = { machines: [{ ...report.machines[0], groups: [], computers: [computer("DESK-1", { here: true, measured: false, weeks: 2 })] }] };
