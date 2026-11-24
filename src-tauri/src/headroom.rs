@@ -388,7 +388,6 @@ pub struct Recommendation {
     pub overlap: Vec<String>,
     /// The account in use here has room to share (`AccountUsage::room_to_share`): its `overlap` is
     /// a planned share, which the summary says, and it is ranked as usual.
-    #[serde(skip)]
     pub overlap_room: bool,
 }
 
@@ -433,20 +432,22 @@ fn reading_exclusion(acc: &AccountUsage, settings: &Settings, now: DateTime<Utc>
     None
 }
 
-/// In use elsewhere, or on a plan that lapsed or ends: whatever its readings say. An account this
-/// machine uses too (its CLI or desktop app) with room to share (`AccountUsage::room_to_share`) is
-/// a planned share, not kept from this machine; one in use on other machines only stays theirs.
+/// In use elsewhere, or on a plan that lapsed or ends: whatever its readings say. The account the
+/// CLI here is already on, shared with room (`AccountUsage::room_to_share`), is a planned share and
+/// stays ranked. Any other account in use elsewhere stays theirs, room or not, one this machine's
+/// desktop app shares included: moving the CLI onto it adds use its share was not judged with, and
+/// `fits` counts neither the other machines' use nor the spare a share keeps.
 fn elsewhere_exclusion(acc: &AccountUsage, settings: &Settings, now: DateTime<Utc>) -> Option<String> {
-    let shared_here = acc.room_to_share && (acc.active || acc.desktop);
-    if acc.overlap.len() > 1 && !shared_here {
+    let kept = acc.room_to_share && acc.active;
+    if acc.overlap.len() > 1 && !kept {
         let (n, list) = (acc.overlap.len(), crate::mcp::listed(&acc.overlap));
-        return Some(if acc.room_to_share {
-            format!("in use on {n} other machines at once ({list}), shared within its limits")
-        } else {
-            format!("in use on {n} machines at once ({list}): its limits drain about {n}x as fast")
+        return Some(match (acc.room_to_share, acc.desktop) {
+            (false, _) => format!("in use on {n} machines at once ({list}): its limits drain about {n}x as fast"),
+            (true, true) => format!("in use on {n} machines at once ({list}), shared within its limits; the CLI here would add to that share"),
+            (true, false) => format!("in use on {n} other machines at once ({list}), shared within its limits"),
         });
     }
-    if let Some(seat) = acc.remote.iter().find(|r| r.live).filter(|_| !shared_here) {
+    if let Some(seat) = acc.remote.iter().find(|r| r.live).filter(|_| !kept) {
         return Some(format!("in use on another machine ({})", seat.machine));
     }
     if crate::subscriptions::lapsed(settings, acc.provider, &acc.id, now) { return Some("its plan has lapsed".into()); }
@@ -684,18 +685,24 @@ mod tests {
         assert!(rec.overlap_room);
         assert_eq!(rec.summary, "The account in use is shared by 2 computers (DESK-1, LAPTOP-2) within its limits. \
             Keep using current@example.invalid: it fits the job and should be used first.");
+        // An agent reads the share in the reply's fields as well as in its summary.
+        let reply = serde_json::to_value(&rec).unwrap();
+        assert_eq!((reply["overlap"].clone(), reply["overlap_room"].clone()), (serde_json::json!(["DESK-1", "LAPTOP-2"]), serde_json::json!(true)));
         let leased = without_leased(rec, &[("nobody".into(), "x".into())]);
-        assert!(leased.summary.starts_with("The account in use is shared by 2 computers (DESK-1, LAPTOP-2) within its limits. Keep using"), "{}", leased.summary);
+        assert!(leased.overlap_room && leased.summary.starts_with("The account in use is shared by 2 computers (DESK-1, LAPTOP-2) within its limits. Keep using"), "{}", leased.summary);
         // Ranked as usual: another account whose week resets sooner is still the better fit.
         let sooner = account("sooner", false, 30.0, 10);
         let rec = recommend(&[current.clone(), sooner.clone()], &settings, Provider::Claude, Some(10.0), None, now);
         assert_eq!((rec.action, rec.recommended.as_deref(), rec.ranking.len()), (Action::Switch, Some("sooner"), 2));
-        // This machine's desktop app on it counts as using it here.
+        // Only the CLI already on it keeps it: one this machine's desktop app shares is no target for
+        // the CLI, which would add its use to the share (`fits` counts neither the others' use nor
+        // the spare a share keeps), however early its week resets.
         let mut desktop = current.clone();
         desktop.active = false;
         desktop.desktop = true;
         let rec = recommend(&[desktop, account("cli", true, 20.0, 100)], &settings, Provider::Claude, Some(10.0), None, now);
-        assert_eq!(rec.recommended.as_deref(), Some("current"));
+        assert_eq!((rec.action, rec.recommended.as_deref(), rec.overlap_room), (Action::Stay, Some("cli"), false));
+        assert_eq!(rec.excluded[0].reason, "in use on 2 machines at once (DESK-1, LAPTOP-2), shared within its limits; the CLI here would add to that share");
         // On other machines only, it stays theirs, room or not: never a target here.
         let mut theirs = current.clone();
         theirs.active = false;
@@ -749,9 +756,13 @@ mod tests {
             let mut theirs = long(account("theirs", false, 10.0, 30));
             theirs.overlap = names[1..].to_vec();
             theirs.room_to_share = true;
+            let mut desk = long(account("desk", false, 10.0, 30));
+            desk.desktop = true;
+            desk.overlap = names.clone();
+            desk.room_to_share = true;
             let switch = vec![current.clone(), long(account("free", false, 30.0, 50))];
             let none = vec![current, stale.clone(), failed.clone()];
-            let kept = vec![shared, theirs, stale.clone()];
+            let kept = vec![shared, theirs, desk, stale.clone()];
             for (accounts, action, advice) in [(switch, Action::Switch, "Switch only if the user allowed switching."), (none, Action::None, "ask the user."),
                 (kept, Action::Stay, "should be used first.")] {
                 let rec = recommend(&accounts, &settings, Provider::Claude, Some(30.0), None, now);

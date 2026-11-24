@@ -203,12 +203,12 @@ test("an overlap marks this PC by its place, never by a name a clone may share",
 test("an account shared within its limits is a planned share, said plainly", () => {
   const conflict = overlapText(used({ active: true, overlap: ["DESK-1", "LAPTOP-2"] }));
   assert.equal(conflict.shared, false);
-  assert.equal(conflict.lines[1], "Limits drain about 2× as fast, and SlopBar has not seen this account stay under its weekly limits in recent weeks. Switch one machine to another account.");
+  assert.equal(conflict.lines[1], "Limits drain about 2× as fast, and SlopBar has not seen this account keep 20% to spare under its weekly limits over enough recent weeks. Switch one machine to another account.");
   const o = overlapText(used({ active: true, overlap: ["DESK-1", "LAPTOP-2", "TOWER-3"], room_to_share: true }));
   assert.equal(o.shared, true);
   assert.equal(o.chip, "Shared by 3 computers");
   assert.deepEqual(o.lines, ["Shared by 3 computers: DESK-1 (this PC), LAPTOP-2, TOWER-3",
-    "Its busiest recent weeks stayed under its weekly limits, so these computers' use adds up within them; the 5-hour limit is shared too."]);
+    "Its busiest recent weeks and this week so far left 20% to spare under its weekly limits, so these computers' use adds up within them; the 5-hour limit is shared too."]);
   // The flyout's tooltip says the same.
   const tip = accountTipLines(used({ id: "fixture-3", provider: "codex", email: "x@example.invalid", active: true, sources: ["Windows"],
     overlap: ["DESK-1", "LAPTOP-2"], room_to_share: true, windows: [], resets: [], monitor_connected: true }), { now });

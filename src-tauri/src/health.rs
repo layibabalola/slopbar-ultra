@@ -741,18 +741,18 @@ pub fn checks(inputs: &Inputs, now: DateTime<Utc>) -> Report {
     });
 
     // One account on several computers at once (seen through sharing, live ones only): a planned
-    // share when its busiest recent weeks left room for them all (`AccountUsage::room_to_share`),
-    // a conflict otherwise.
+    // share when its busiest recent weeks and this one left the spare a share keeps
+    // (`AccountUsage::room_to_share`), a conflict otherwise.
     for a in inputs.accounts.iter().filter(|a| a.overlap.len() > 1) {
         let n = a.overlap.len();
         let (id, list) = (format!("overlap:{}:{}", a.provider.key(), a.id), crate::mcp::listed(&a.overlap));
         checks.push(if a.room_to_share {
             check(id, Status::Ok, format!("{}: shared by {n} computers", name(a)),
-                format!("In use on {list} at the same time. In its busiest recent weeks it stayed under its weekly limits, so these computers' use adds up within them; the 5-hour limit is shared too."),
+                format!("In use on {list} at the same time. Its busiest recent weeks and this week so far left 20% to spare under its weekly limits, so these computers' use adds up within them; the 5-hour limit is shared too."),
                 None)
         } else {
             check(id, Status::Warning, format!("{}: in use on {n} computers at once", name(a)),
-                format!("In use on {list} at the same time: its limits drain about {n}x as fast. SlopBar has not seen it stay under its weekly limits in recent weeks, so this is not a planned share. Switch one of those computers to another account (recommend_account names a free one)."),
+                format!("In use on {list} at the same time: its limits drain about {n}x as fast. SlopBar has not seen it keep 20% to spare under its weekly limits over enough recent weeks, so this is not a planned share. Switch one of those computers to another account (recommend_account names a free one)."),
                 Some(Fix::OpenSettings { page: "accounts" }))
         });
     }
@@ -1587,7 +1587,7 @@ mod tests {
         assert!(c.title.ends_with("in use on 2 computers at once"), "{}", c.title);
         assert!(c.reason.starts_with("In use on DESK-1, LAPTOP-2 at the same time: its limits drain about 2x as fast."), "{}", c.reason);
         // Why it is no planned share, and nothing SlopBar has no ground for: no sign-out is promised.
-        assert!(c.reason.contains("SlopBar has not seen it stay under its weekly limits in recent weeks"), "{}", c.reason);
+        assert!(c.reason.contains("SlopBar has not seen it keep 20% to spare under its weekly limits over enough recent weeks, so this is not a planned share."), "{}", c.reason);
         assert!(!c.reason.contains("sign"), "{}", c.reason);
         assert_eq!(c.fix, Some(Fix::OpenSettings { page: "accounts" }));
     }
@@ -1601,8 +1601,8 @@ mod tests {
         let c = find(&r, "overlap:claude:a");
         assert_eq!((c.status, r.status, r.warnings), (Status::Ok, Status::Ok, 0), "no warning: {c:?}");
         assert_eq!(c.title, "a@example.invalid: shared by 3 computers");
-        assert_eq!(c.reason, "In use on DESK-1, LAPTOP-2, TOWER-3 at the same time. In its busiest recent weeks it stayed \
-            under its weekly limits, so these computers' use adds up within them; the 5-hour limit is shared too.");
+        assert_eq!(c.reason, "In use on DESK-1, LAPTOP-2, TOWER-3 at the same time. Its busiest recent weeks and this week \
+            so far left 20% to spare under its weekly limits, so these computers' use adds up within them; the 5-hour limit is shared too.");
         assert_eq!(c.fix, None);
         // Room alone says nothing: only an account on several computers gets a row.
         case.accounts[0].overlap.clear();

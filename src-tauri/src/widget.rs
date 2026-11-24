@@ -819,7 +819,7 @@ mod tests {
         assert_eq!(v.overlap, [false, true]);
         assert!(!v.details[0].contains("machines"));
         assert!(v.details[1].contains("In use on 2 machines at once: this PC, LAPTOP-2"), "{}", v.details[1]);
-        assert!(v.details[1].contains("Limits drain about 2× as fast, and SlopBar has not seen this account stay under its weekly limits in recent weeks."), "{}", v.details[1]);
+        assert!(v.details[1].contains("Limits drain about 2× as fast, and SlopBar has not seen this account keep 20% to spare under its weekly limits over enough recent weeks."), "{}", v.details[1]);
         assert!(!v.details[1].contains("sign"), "no sign-out is promised: {}", v.details[1]);
         // On DESK-1 itself, the tooltip says which of the two this is.
         let here = view(&snap(vec![codex]), None, 0, &OnDesk1);
@@ -839,7 +839,7 @@ mod tests {
         assert_eq!(v.overlap, [false, false], "a planned share is no warning");
         let tip = &v.details[1];
         assert!(tip.contains("Shared by 4 computers: DESK-1 (this PC), LAPTOP-2, TOWER-3, BOX-4\n\
-            Its busiest recent weeks stayed under its weekly limits, so these computers' use adds up within them; the 5-hour limit is shared too."), "{tip}");
+            Its busiest recent weeks and this week so far left 20% to spare under its weekly limits, so these computers' use adds up within them; the 5-hour limit is shared too."), "{tip}");
         assert!(!tip.contains("drain") && !tip.contains("at once"), "{tip}");
     }
 
