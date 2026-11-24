@@ -3975,6 +3975,8 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
         let now = chrono::Utc::now();
         recent.record(&snapshot.accounts, now);
         headroom::attach_forecasts(&mut snapshot, &settings, &recent, now);
+        // Whether several computers on an account share it within its limits (`overlap`'s tone).
+        subscriptions::attach_room(&mut snapshot, &history, now);
     }
     if subscriptions::save(&history).is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::HistorySave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
     state.diagnostics.record(None, None, diagnostics::Event::PollFinished { elapsed_ms: diagnostics::millis(started), accounts: snapshot.accounts.len(),
@@ -4012,6 +4014,7 @@ fn carry_over(list: &mut [crate::model::AccountUsage], previous: &[crate::model:
             a.remote = p.remote.clone();
             a.used_outside = p.used_outside;
             a.runs_out_at = p.runs_out_at;
+            a.room_to_share = p.room_to_share;
             a.unexpected = p.unexpected.clone();
         }
     }

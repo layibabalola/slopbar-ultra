@@ -132,6 +132,12 @@ pub struct AccountUsage {
     /// Set on the CLI's account and the desktop app's account when they differ on this machine.
     #[serde(default)]
     pub seats: Option<SeatDrift>,
+    /// In each of its busiest recent weeks this account stayed under every weekly limit, model caps
+    /// included, over enough weeks to judge (`subscriptions::room`, from this computer's usage
+    /// history): use from several computers adds up within its limits, so `overlap` on it is a
+    /// planned share rather than a conflict. Set by the app after each refresh.
+    #[serde(default)]
+    pub room_to_share: bool,
 }
 
 /// Why a sign-in needs a new one: a connected account's monitoring sign-in

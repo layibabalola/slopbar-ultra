@@ -644,7 +644,7 @@ mod tests {
             billing: Default::default(),
             remote: vec![], overlap: vec![], shared: None, covered_by: None,
             used_outside: false,
-            runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None,
+            runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None, room_to_share: false,
         }
     }
 

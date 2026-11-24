@@ -1348,7 +1348,7 @@ mod tests {
                 windows: vec![crate::model::UsageWindow { kind: canary.into(), used_percent: 61.25, window_seconds: None, resets_at: None }] }),
             covered_by: Some(canary.into()),
             used_outside: true,
-            runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None,
+            runs_out_at: None, unexpected: None, cli_rejected: false, cli_ends_at: None, cli_renewal: None, extra_usage: None, leased: None, desktop: false, seats: None, resets_withheld: false, resets_read_at: None, room_to_share: false,
         };
         let snapshot = Snapshot {
             accounts: vec![a],
