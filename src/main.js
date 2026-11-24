@@ -34,12 +34,20 @@ const COMPACT_OFFER_ABOVE = 8;
 // in a queue that runs as it opens. Handled one by one, a night's usage updates were hundreds of
 // renders and app calls before the flyout answered (it opened frozen for seconds). While closed,
 // the flyout only notes what it missed, then catches up once as it opens.
+//
+// Not before it first opens: until it has been on screen its webview is never suspended, so it
+// handles events as they come. The hidden flyout then holds the accounts and the height they
+// need when it first opens. Deferred too, its first open after a start began from "Looking for
+// accounts…": it showed at that height, then laid every account out and grew while on screen,
+// and was drawn only about half a second after the click.
 let panelOpen = false;
+/** The flyout has been opened since this page loaded (its webview may be suspended when closed). */
+let opened = false;
 let missedUsage = false;
 let missedSettings = false;
 /** True (and noted) when the flyout is closed, so an event's work waits for it to open. */
 function deferWhileClosed() {
-  if (IS_DOCK || panelOpen) return false;
+  if (IS_DOCK || panelOpen || !opened) return false;
   missedUsage = true;
   return true;
 }
@@ -80,8 +88,9 @@ let toastTimer;
 
 /** Briefly replaces the widget's content with a notice (e.g. an automatic account switch). */
 function showToast(text) {
-  // A closed flyout shows no notice: one replayed as it opens would be hours old.
-  if (deferWhileClosed()) return;
+  // A closed flyout shows no notice: one replayed as it opens would be hours old. (Not even
+  // before its first open, when it handles events as they come: see deferWhileClosed.)
+  if (!IS_DOCK && !panelOpen) return;
   toast = text;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { toast = null; render(lastSnap); }, 4000);
@@ -353,12 +362,31 @@ $accounts.addEventListener("click", async (e) => {
   }
 });
 
+/** The flyout's height with every account showing, its parts added up: right whatever height
+ * the window has now. (Its scrollHeight was not. A hidden flyout's page can keep an earlier,
+ * smaller window's size, and there it counted the accounts twice: 1090 px for 606.) */
+function flyoutHeight() {
+  const box = getComputedStyle($details);
+  let height = parseFloat(box.paddingTop) + parseFloat(box.paddingBottom) + parseFloat(box.borderTopWidth) + parseFloat(box.borderBottomWidth);
+  for (const part of $details.children) {
+    const style = getComputedStyle(part);
+    if (style.display === "none") continue;
+    // Margins add up: the flyout lays its parts out as a flex column, where they never collapse.
+    height += (part === $accounts ? part.scrollHeight : part.offsetHeight) + parseFloat(style.marginTop) + parseFloat(style.marginBottom);
+  }
+  return Math.ceil(height);
+}
+
 /** Sizes the window to its content: the widget's width, or the flyout's height. */
 function layout() {
   if (IS_DOCK) invoke("set_dock_width", { width: Math.ceil($widget.offsetWidth) });
+  // Not before the settings have come: they choose the accounts' layout (rows or cards). Laid
+  // out as cards meanwhile, 15 accounts asked for 2911 px and the hidden flyout grew to the
+  // screen's height until the next report.
+  else if (!current) return;
   // The account list scrolls once the flyout reaches the screen's height (the app caps the
   // window there), so ask for the height it would need unclipped.
-  else invoke("set_panel_height", { height: Math.ceil($details.scrollHeight - $accounts.clientHeight + $accounts.scrollHeight) });
+  else invoke("set_panel_height", { height: flyoutHeight() });
 }
 
 // Monitoring sign-ins that ended, were refused or end within 3 days (`monitor_renewal`, from
@@ -457,7 +485,14 @@ invoke("get_usage").then(render);
 if (!IS_DOCK) {
   listen("panel-visible", ({ payload }) => {
     panelOpen = payload;
-    if (payload) catchUp();
+    if (payload) { opened = true; catchUp(); }
+  });
+  // Before its first open the app draws the closed flyout off-screen, and waits for this frame,
+  // so that open shows a drawn flyout (panel.rs, `warm`). Drawn as it rests: its entrance, still
+  // running just after the page loads, is finished first (it replays as the flyout opens).
+  listen("panel-warm", ({ payload: ask }) => {
+    for (const a of $details.getAnimations()) a.finish();
+    requestAnimationFrame(() => requestAnimationFrame(() => invoke("panel_drawn", { ask })));
   });
 }
 setInterval(() => { if (IS_DOCK || panelOpen) invoke("get_usage").then(render); }, 60_000);
@@ -472,8 +507,11 @@ async function checkHealth() {
   if (report?.problems) { $health.title = t("healthIssues", { n: report.problems }); $health.setAttribute("aria-label", $health.title); }
   // Accounts other computers' rosters name that are not signed in here (Settings > Accounts signs them in).
   const waiting = report?.checks?.find((c) => c.id === "roster_waiting")?.count ?? 0;
+  const before = $rosterWaiting.hidden;
   $rosterWaiting.hidden = !waiting;
   $rosterWaiting.textContent = waiting ? t("rosterWaiting", { n: waiting }) : "";
+  // The line takes a row of the flyout: its height changes with it.
+  if ($rosterWaiting.hidden !== before) layout();
 }
 $health.addEventListener("click", () => invoke("open_settings", { page: "health" }));
 $rosterWaiting.addEventListener("click", () => invoke("open_settings", { page: "accounts" }));
@@ -481,7 +519,9 @@ listen("usage-updated", (e) => {
   if (deferWhileClosed()) return;
   render(e.payload);
   loadTrails();
-  loadSubs();
+  // Subscriptions only feed the compact rows' tooltips: a flyout not opened yet loads them as it
+  // opens (catchUp), not at every refresh.
+  if (opened) loadSubs(); else missedUsage = true;
   checkHealth();
 });
 listen("monitoring-login", () => { if (!deferWhileClosed()) checkHealth(); });

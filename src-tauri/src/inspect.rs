@@ -9,6 +9,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
+use crate::dock::Rect;
 use crate::door::SETTINGS_PAGES as PAGES;
 /// Longest text returned; the pages are far shorter.
 const MAX_TEXT: usize = 20_000;
@@ -122,13 +123,18 @@ async fn look(window: &tauri::WebviewWindow, target: Target, page: Option<String
         // Then a moment to paint (longer for windows that do not mark their loads).
         tokio::time::sleep(Duration::from_millis(if target == Target::Settings { 300 } else { 800 })).await;
     }
-    let was_visible = unsafe { wm::IsWindowVisible(hwnd as windows_sys::Win32::Foundation::HWND) } != 0;
-    let mut restore = None;
+    // Checked where it is shown, on the main thread, so nothing else shows it in between (the
+    // flyout draws itself off-screen the same way before its first open: `panel::warm`).
+    let restore = on_main(&window, {
+        let controller = controller.clone();
+        move || unsafe {
+            let controller = controller;
+            let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+            (wm::IsWindowVisible(hwnd) == 0).then(|| show_off_screen(hwnd, &controller.0))
+        }
+    }).await?;
+    let was_visible = restore.is_none();
     if !was_visible {
-        restore = Some(on_main(&window, {
-            let controller = controller.clone();
-            move || unsafe { let controller = controller; show_off_screen(hwnd as windows_sys::Win32::Foundation::HWND, &controller.0) }
-        }).await?);
         // A webview that was hidden needs a moment to lay out and paint again.
         tokio::time::sleep(Duration::from_millis(600)).await;
     }
@@ -172,47 +178,115 @@ pub async fn inspect(_: &AppHandle, _: Target, _: Option<String>, _: bool) -> Re
 /// just carry it there.
 #[cfg(windows)]
 #[derive(Clone)]
-struct SendController(webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller);
+pub(crate) struct SendController(pub(crate) webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller);
 #[cfg(windows)]
 unsafe impl Send for SendController {}
 #[cfg(windows)]
 unsafe impl Sync for SendController {}
 
+/// Where a window shown off-screen was, and the extended-style bits `show_off_screen` changed,
+/// for `hide_again`.
 #[cfg(windows)]
-struct Saved { x: i32, y: i32, ex_style: isize }
+pub(crate) struct Saved { x: i32, y: i32, added: isize, removed: isize }
 
 /// Runs `f` on the main thread, where the window and its webview live.
 #[cfg(windows)]
-async fn on_main<T: Send + 'static>(window: &tauri::WebviewWindow, f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+pub(crate) async fn on_main<T: Send + 'static>(window: &tauri::WebviewWindow, f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     window.run_on_main_thread(move || { let _ = tx.send(f()); }).map_err(|e| e.to_string())?;
     rx.await.map_err(|_| "main thread unavailable".to_string())
 }
 
+/// Where a window (`window`, on monitor `on`) can be shown unseen: just outside that monitor, on
+/// the first side (left, right, below) where it covers no monitor and is nearer to `on` than to
+/// any other. A window on no monitor takes the nearest one's DPI, so it is drawn at the scale it
+/// has where it opens; left of every monitor, it took the leftmost one's, which differs on a
+/// laptop beside an external screen. Not above: a window that grows there (the flyout's height
+/// can change while it is drawn) grows down into the monitor. None when no side qualifies.
+pub(crate) fn off_screen_spot(window: Rect, on: Rect, monitors: &[Rect]) -> Option<(i32, i32)> {
+    const GAP: i32 = 100;
+    let (w, h) = (window.right - window.left, window.bottom - window.top);
+    let at = |x: i32, y: i32| Rect { left: x, top: y, right: x + w, bottom: y + h };
+    let overlaps = |a: Rect, b: &Rect| a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+    // As Windows picks the monitor of a window on none: the nearest.
+    let gap = |a: Rect, m: &Rect| {
+        let dx = i64::from((m.left - a.right).max(a.left - m.right).max(0));
+        let dy = i64::from((m.top - a.bottom).max(a.top - m.bottom).max(0));
+        dx * dx + dy * dy
+    };
+    [(on.left - w - GAP, window.top), (on.right + GAP, window.top), (window.left, on.bottom + GAP)]
+        .into_iter()
+        .find(|&(x, y)| {
+            let spot = at(x, y);
+            !monitors.iter().any(|m| overlaps(spot, m)) && monitors.iter().min_by_key(|m| gap(spot, m)) == Some(&on)
+        })
+}
+
+/// Every monitor's rectangle, and the one `hwnd` is on (or nearest to).
 #[cfg(windows)]
-unsafe fn show_off_screen(hwnd: windows_sys::Win32::Foundation::HWND, controller: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller) -> Saved {
+unsafe fn monitors_of(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<(Rect, Vec<Rect>)> {
+    use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    unsafe extern "system" fn add(_: HMONITOR, _: HDC, rect: *mut RECT, list: LPARAM) -> BOOL {
+        let (r, list) = (&*rect, &mut *(list as *mut Vec<Rect>));
+        list.push(Rect { left: r.left, top: r.top, right: r.right, bottom: r.bottom });
+        1
+    }
+    let mut all: Vec<Rect> = Vec::new();
+    EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null(), Some(add), &mut all as *mut Vec<Rect> as LPARAM);
+    let mut info: MONITORINFO = std::mem::zeroed();
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info) == 0 {
+        return None;
+    }
+    let m = info.rcMonitor;
+    Some((Rect { left: m.left, top: m.top, right: m.right, bottom: m.bottom }, all))
+}
+
+/// Whether `hwnd` is shown but on no monitor: drawn off-screen right now (`show_off_screen`).
+#[cfg(windows)]
+pub(crate) fn off_screen(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
+    use windows_sys::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONULL};
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+    unsafe { IsWindowVisible(hwnd) != 0 && MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL).is_null() }
+}
+
+/// Shows a hidden window off-screen beside its monitor (`off_screen_spot`), without activating it
+/// or giving it a taskbar button, and tells its webview it is on screen, so it lays out and draws.
+/// `hide_again` undoes it.
+#[cfg(windows)]
+pub(crate) unsafe fn show_off_screen(hwnd: windows_sys::Win32::Foundation::HWND, controller: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller) -> Saved {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::UI::WindowsAndMessaging as wm;
     let mut rect: RECT = std::mem::zeroed();
     wm::GetWindowRect(hwnd, &mut rect);
     let ex_style = wm::GetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE);
-    // A tool window gets no taskbar button, so the taskbar does not flicker either.
-    wm::SetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE, (ex_style | wm::WS_EX_TOOLWINDOW as isize | wm::WS_EX_NOACTIVATE as isize) & !(wm::WS_EX_APPWINDOW as isize));
-    // Left of every monitor.
-    let left = wm::GetSystemMetrics(wm::SM_XVIRTUALSCREEN) - (rect.right - rect.left) - 100;
-    wm::SetWindowPos(hwnd, std::ptr::null_mut(), left, rect.top, 0, 0, wm::SWP_NOSIZE | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE);
+    // A tool window gets no taskbar button, so the taskbar does not flicker either. Only the bits
+    // changed here are put back, so a style the app sets meanwhile is kept.
+    let wanted = wm::WS_EX_TOOLWINDOW as isize | wm::WS_EX_NOACTIVATE as isize;
+    let (added, removed) = (wanted & !ex_style, wm::WS_EX_APPWINDOW as isize & ex_style);
+    wm::SetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE, (ex_style | added) & !removed);
+    let window = Rect { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+    let width = rect.right - rect.left;
+    let (left, top) = monitors_of(hwnd)
+        .and_then(|(on, all)| off_screen_spot(window, on, &all))
+        // Left of every monitor, far enough that the window stays off them should taking another
+        // monitor's DPI there make it up to three times as wide.
+        .unwrap_or((wm::GetSystemMetrics(wm::SM_XVIRTUALSCREEN) - 3 * width - 100, rect.top));
+    wm::SetWindowPos(hwnd, std::ptr::null_mut(), left, top, 0, 0, wm::SWP_NOSIZE | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE);
     wm::ShowWindow(hwnd, wm::SW_SHOWNOACTIVATE);
     let _ = controller.SetIsVisible(true);
-    Saved { x: rect.left, y: rect.top, ex_style }
+    Saved { x: rect.left, y: rect.top, added, removed }
 }
 
 #[cfg(windows)]
-unsafe fn hide_again(hwnd: windows_sys::Win32::Foundation::HWND, controller: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller, saved: Saved) {
+pub(crate) unsafe fn hide_again(hwnd: windows_sys::Win32::Foundation::HWND, controller: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller, saved: Saved) {
     use windows_sys::Win32::UI::WindowsAndMessaging as wm;
     let _ = controller.SetIsVisible(false);
     wm::ShowWindow(hwnd, wm::SW_HIDE);
     wm::SetWindowPos(hwnd, std::ptr::null_mut(), saved.x, saved.y, 0, 0, wm::SWP_NOSIZE | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE);
-    wm::SetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE, saved.ex_style);
+    let ex_style = wm::GetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE);
+    wm::SetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE, (ex_style & !saved.added) | saved.removed);
 }
 
 /// Runs a script in the page and returns its result as JSON text.
@@ -284,6 +358,44 @@ pub fn prune(dir: &std::path::Path) {
 mod tests {
     use super::*;
     use crate::test_support::TempDir;
+
+    const fn r(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
+        Rect { left, top, right, bottom }
+    }
+
+    #[test]
+    fn a_window_is_shown_unseen_beside_its_own_monitor() {
+        // A flyout above the taskbar of a 2560x1440 monitor (ULTRA-MAGNUS's layout: two side by side).
+        let flyout = r(2000, 500, 2592, 1420);
+        let (left, right) = (r(0, 0, 2731, 1440), r(2731, 0, 5291, 1440));
+        // On the left one: left of it, where nothing is.
+        assert_eq!(off_screen_spot(flyout, left, &[left, right]), Some((-692, 500)));
+        // On the right one: not left of it (that is the other monitor, on screen), but right of it.
+        let there = r(4000, 500, 4592, 1420);
+        assert_eq!(off_screen_spot(there, right, &[left, right]), Some((5391, 500)));
+        // A middle monitor with screens on both sides: below it.
+        let middle = r(2731, 0, 5291, 1440);
+        let third = r(5291, 0, 7851, 1440);
+        assert_eq!(off_screen_spot(there, middle, &[left, middle, third]), Some((4000, 1540)));
+        // Screens left, right and below, nothing above: never above (a window growing there grows
+        // into the monitor), so nowhere.
+        let top_row = r(2731, 0, 5291, 1440);
+        let sides = [r(0, 0, 2731, 1440), top_row, r(5291, 0, 8022, 1440), r(2731, 1440, 5291, 2880)];
+        assert_eq!(off_screen_spot(there, top_row, &sides), None);
+        // One monitor: left of it.
+        assert_eq!(off_screen_spot(flyout, left, &[left]), Some((-692, 500)));
+    }
+
+    #[test]
+    fn an_unseen_spot_is_nearer_its_own_monitor_than_any_other() {
+        // Left of the laptop is free, but an external screen sits just below that spot (60 px from
+        // it, the laptop 100 px), so a window there would take the external screen's DPI.
+        let laptop = r(0, 0, 1920, 1080);
+        let external = r(-2600, 1100, 0, 2540);
+        let flyout = r(1300, 400, 1870, 1040);
+        let spot = off_screen_spot(flyout, laptop, &[laptop, external]).expect("a side qualifies");
+        assert_eq!(spot, (1920 + 100, 400), "right of the laptop, not left of it nor below it");
+    }
 
     #[test]
     fn only_the_newest_captures_are_kept_and_other_files_are_left_alone() {
