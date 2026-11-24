@@ -414,7 +414,19 @@ fn machine_advice(state: &AppState, snapshot: &Snapshot, settings: &settings::Se
     }
     let own = machine_load::summary(&state.machine_ledger.lock().unwrap(), &settings.providers, now);
     let me = presence::identity().map_or_else(presence::machine_name, |(_, name)| name.clone());
-    machine_load::advise(&own, &me, &state.machine_peers.lock().unwrap(), &snapshot.accounts, settings, now)
+    // The computers last read where sharing is now: a new place that has not been read (or cannot
+    // be) shows none of the old place's.
+    let peers = state.machine_peers.lock().unwrap();
+    let none = machine_load::Peers::default();
+    let peers = if peers.at(&sharing::Place::of(settings)) { &*peers } else { &none };
+    machine_load::advise(&own, &me, peers, &snapshot.accounts, settings, now)
+}
+
+/// Notes accounts in use here at `at` for this computer's own use (`machine_load::mark`): one
+/// switched to or from, leased or released, is charged though the next refresh finds it no
+/// longer in use.
+fn mark_in_use(state: &AppState, accounts: &[(Provider, String)], at: chrono::DateTime<chrono::Utc>) {
+    machine_load::mark(&mut state.machine_ledger.lock().unwrap(), accounts, at);
 }
 
 /// Charges renewals that have passed and this month's extra usage to the spend ledger.
@@ -780,6 +792,7 @@ async fn door_call(app: AppHandle, request: door::Request) -> Result<serde_json:
         }
         R::ReleaseLease { lease_id } => {
             let released = app.state::<AppState>().leases.lock().unwrap().release(&lease_id).ok_or("no_such_lease")?;
+            mark_in_use(&app.state::<AppState>(), &[(released.provider, released.id.clone())], chrono::Utc::now());
             leases_changed(&app).await;
             Ok(serde_json::json!({ "released": true, "lease": value(released)? }))
         }
@@ -1050,9 +1063,10 @@ fn account_label(app: &AppHandle, provider: Provider, id: &str) -> Option<String
 
 async fn switch_to(app: &AppHandle, provider: Provider, id: String, auto: bool) -> Result<(), String> {
     let found = app.state::<AppState>().sources.lock().unwrap().clone();
-    let from = {
+    let (from, left) = {
         let snapshot = app.state::<AppState>().snapshot.lock().unwrap().clone();
-        snapshot.accounts.iter().find(|a| a.provider == provider && a.active).map(|a| a.id.clone())
+        let left: Vec<(Provider, String)> = snapshot.accounts.iter().filter(|a| a.provider == provider && a.active).map(|a| (provider, a.id.clone())).collect();
+        (left.first().map(|(_, id)| id.clone()), left)
     };
     let target = id.clone();
     let started = Instant::now();
@@ -1063,6 +1077,8 @@ async fn switch_to(app: &AppHandle, provider: Provider, id: String, auto: bool) 
         action: if auto { diagnostics::Action::SwitchAuto } else { diagnostics::Action::SwitchManual },
         code: diagnostics::Code::from_error(result.as_ref().err().map(String::as_str)), elapsed_ms: diagnostics::millis(started) });
     result?;
+    // Both were in use here now: the accounts left and the one taken, whatever the next refresh finds.
+    mark_in_use(&app.state::<AppState>(), &[left, vec![(provider, id.clone())]].concat(), chrono::Utc::now());
     // The account left behind gets its project profile back at once, not at the next refresh.
     sync_pins(app, None).await;
     let event = Switched {
@@ -3039,7 +3055,11 @@ async fn leases_changed(app: &AppHandle) {
 
 /// Ends expired leases and those whose process exited.
 async fn prune_leases(app: &AppHandle) {
-    let ended = app.state::<AppState>().leases.lock().unwrap().prune(chrono::Utc::now(), leases::process_alive);
+    let state = app.state::<AppState>();
+    // Leased until now, whichever end: charged to this computer (`mark_in_use`).
+    let leased = state.leases.lock().unwrap().accounts();
+    mark_in_use(&state, &leased, chrono::Utc::now());
+    let ended = state.leases.lock().unwrap().prune(chrono::Utc::now(), leases::process_alive);
     if ended { leases_changed(app).await; }
 }
 
@@ -3073,6 +3093,7 @@ async fn lease_account(app: &AppHandle, provider: Provider, purpose: &str, minut
         }
     };
     let lease = state.leases.lock().unwrap().take(provider, &id, purpose, minutes, pid, chrono::Utc::now())?;
+    mark_in_use(&state, &[(provider, id.clone())], lease.created_at);
     leases_changed(app).await;
     let profile = accounts::profiles_root().map(|r| r.join(accounts::profile_name(provider, &id)));
     let ready = state.profile_states.lock().unwrap().get(&(provider, id.clone())) == Some(&accounts::ProfileState::Ready);
@@ -3821,6 +3842,15 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
             *state.roster_seen.lock().unwrap() = roster::Seen::default();
         }
     }
+    // In use here until now: the accounts the last refresh found in use (one left since, by a switch
+    // in the CLI itself, is charged all the same) and those leased, before leases that ended go
+    // (`machine_load::mark`).
+    {
+        let mut was: Vec<(Provider, String)> = state.snapshot.lock().unwrap().accounts.iter()
+            .filter(|a| a.active || a.desktop).map(|a| (a.provider, a.id.clone())).collect();
+        was.extend(state.leases.lock().unwrap().accounts());
+        mark_in_use(&state, &was, chrono::Utc::now());
+    }
     // Ended leases free their accounts (and profiles) before this refresh decides anything.
     state.leases.lock().unwrap().prune(chrono::Utc::now(), leases::process_alive);
     let started = Instant::now();
@@ -3955,7 +3985,7 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
             let found = presence::peers(files.iter().cloned(), own, now);
             let every = presence::peers(state.presence_recall.lock().unwrap().fill(&read_from, result.read.then_some(files.as_slice()), own, now), own, now);
             // Each other computer's last load stands while its record does (`machine_load::Peers`).
-            state.machine_peers.lock().unwrap().note(&read_from, &every, me, now);
+            state.machine_peers.lock().unwrap().note(&read_from, &every, result.read, now);
             shared = Some(result);
             covered = result.wrote || found.iter().any(|p| p.live);
             presence::apply(&mut list, &found, &every, me, now);
@@ -4006,7 +4036,7 @@ async fn refresh_locked(app: &AppHandle) -> Snapshot {
         machine_load::observe(&mut ledger, &snapshot, &wanted, &settings.providers, chrono::Utc::now());
         ledger.clone()
     };
-    let _ = machine_load::save(&machine_ledger);
+    if machine_load::save(&machine_ledger).is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::MachineLoadSave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
     if subscriptions::save(&history).is_err() { state.diagnostics.record(None, None, diagnostics::Event::Action { action: diagnostics::Action::HistorySave, code: diagnostics::Code::Storage, elapsed_ms: 0 }); }
     state.diagnostics.record(None, None, diagnostics::Event::PollFinished { elapsed_ms: diagnostics::millis(started), accounts: snapshot.accounts.len(),
         native_sources: found.iter().filter(|s| s.distro.is_none()).count(), wsl_sources: found.iter().filter(|s| s.distro.is_some()).count() });

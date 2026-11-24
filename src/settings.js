@@ -900,9 +900,11 @@ async function renderRoster() {
   const placed = Boolean(settings.presence_folder || settings.presence_remote);
   $("account-roster").checked = settings.account_roster;
   $("account-roster").disabled = !placed && !settings.account_roster;
-  // Usage readings ride the account list: offered, and shown on, only while it is on.
-  $("share-readings").checked = settings.account_roster && settings.share_readings !== false;
-  $("share-readings").disabled = !settings.account_roster;
+  // This computer's weekly use rides its in-use status file, and usage readings the account list:
+  // the switch is offered, and shown on, whenever either is shared.
+  const shares = placed || settings.account_roster;
+  $("share-readings").checked = shares && settings.share_readings !== false;
+  $("share-readings").disabled = !shares;
   const r = await invoke("get_roster").catch(() => null);
   $("roster-passphrase-state").textContent = r?.passphrase_saved ? t("rosterPassphraseSaved") : t("rosterPassphraseNone");
   $("roster-passphrase-clear").disabled = !r?.passphrase_saved;

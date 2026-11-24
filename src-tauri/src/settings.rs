@@ -195,9 +195,12 @@ pub struct Settings {
     /// user's other machines through the in-use sharing location, encrypted with a roster
     /// passphrase set on each machine (see `roster`), so a new machine knows every account.
     pub account_roster: bool,
-    /// With the roster on, it also carries each account's latest usage reading taken here (its
-    /// windows and when), so a machine whose own monitoring sign-in ended shows this one's
-    /// (`roster::Reading`). Others' readings are shown either way.
+    /// Wherever in-use status is shared, this computer's weekly use, as a share of a plan, goes into
+    /// its in-use status file (`presence::Presence::load`, see `machine_load`), so the user's
+    /// computers can tell which of them could share one plan. With the roster on, the roster also
+    /// carries each account's latest usage reading taken here (its windows and when), so a machine
+    /// whose own monitoring sign-in ended shows this one's (`roster::Reading`). Others' readings and
+    /// use are shown either way.
     pub share_readings: bool,
     /// Use (and switch_account) also moves this machine's desktop app onto the account: guided for
     /// Claude Desktop (it has no supported way to be signed in from outside), and a reminder to

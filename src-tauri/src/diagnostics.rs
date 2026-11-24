@@ -89,6 +89,8 @@ pub enum Action {
     TokenRead,
     Revoke,
     Export,
+    /// This computer's use ledger (`machine_load`) could not be saved.
+    MachineLoadSave,
 }
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -538,7 +540,7 @@ fn observation(event: &Event) -> Option<(Family, Event)> {
             action, elapsed_ms, ..
         } if matches!(
             action,
-            Action::TokenRead | Action::CacheSave | Action::HistorySave | Action::MonitorSave
+            Action::TokenRead | Action::CacheSave | Action::HistorySave | Action::MonitorSave | Action::MachineLoadSave
         ) =>
         {
             *elapsed_ms = 0;
