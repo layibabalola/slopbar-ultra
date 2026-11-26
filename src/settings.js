@@ -985,6 +985,8 @@ async function render() {
   $("compact-flyout").checked = settings.compact_flyout;
   $("compact-flyout-hint").textContent = snapshot.accounts.length > COMPACT_SUGGEST_ABOVE && !settings.compact_flyout
     ? t("compactFlyoutSuggested", { n: snapshot.accounts.length }) : t("compactFlyoutHint");
+  $("account-order").innerHTML = ["alphabetical", "weekly_reset"].map((v) => `<option value="${v}">${t(`accountOrder_${v}`)}</option>`).join("");
+  $("account-order").value = settings.account_order ?? "alphabetical";
   document.querySelectorAll("input.switch").forEach((el) => el.setAttribute("role", "switch"));
   renderGuide();
   renderCalendar();
@@ -1043,6 +1045,7 @@ $("wsl-rescan").addEventListener("click", async () => {
   finally { button.disabled = false; $("wsl-rescan-hint").textContent = t("wslRescanHint"); }
 });
 $("compact-flyout").addEventListener("change", (e) => update({ compact_flyout: e.target.checked, compact_suggested: true }));
+$("account-order").addEventListener("change", (e) => update({ account_order: e.target.value }));
 
 // ---------------------------------------------------------------------------------------------
 // The first-run guide (Accounts): shown while no account is found or none is monitored, until

@@ -4,6 +4,7 @@ import { observeFrontend } from "./diagnostics.js";
 import { creditAdviceText } from "./alerts.js";
 import { sparkline } from "./sparkline.js";
 import { accountTip, cliSignInText } from "./accounttext.js";
+import { orderAccounts } from "./accountorder.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -29,6 +30,11 @@ let trails = {};
 let subs = {};
 /** The compact layout is offered above this many accounts. */
 const COMPACT_OFFER_ABOVE = 8;
+/** When the account rows last moved on screen (`patch`): ordered by weekly reset, a reset passing
+ * while the flyout is open moves an account down. A click within MOVED_CLICK_MS of that does
+ * nothing, since it was aimed at the row that was there before: Use would switch the account below. */
+let rowsMovedAt = -Infinity;
+const MOVED_CLICK_MS = 1000;
 
 // The closed flyout's webview is suspended (panel.rs), and the events sent to it meanwhile wait
 // in a queue that runs as it opens. Handled one by one, a night's usage updates were hundreds of
@@ -126,6 +132,9 @@ const PROVIDER_NAME = { claude: "Claude", codex: "Codex" };
 
 const accountName = (a) => a.alias || a.email || t("unknownAccount");
 
+/** One provider's accounts in the order chosen in Settings > General (`orderAccounts`). */
+const providerAccounts = (snap, provider) => orderAccounts(snap.accounts.filter((a) => a.provider === provider), current?.account_order);
+
 /** Usage-limit resets the account holds, one line each; green when usable now. */
 let creditAdvice = {};
 /** Spend-or-switch advice for Codex accounts at their limit with a reset credit; re-renders when it changes. */
@@ -179,7 +188,8 @@ function bars(a) {
     </div>`).join("");
 }
 
-/** One section per provider; each account shows its usage, the signed-in one marked "in use". */
+/** One section per provider, its accounts in the order chosen (`providerAccounts`); each account
+ * shows its usage, the signed-in one marked "in use". */
 function renderDetails(snap) {
   const notice = document.getElementById("panel-notice");
   notice.textContent = toast ?? "";
@@ -195,7 +205,7 @@ function renderDetails(snap) {
   if ($accounts.dataset.layout !== layout) { $accounts.replaceChildren(); $accounts.dataset.layout = layout; }
   if (layout === "compact") { renderCompactList(snap); return; }
   const groups = ["claude", "codex"]
-    .map((p) => [p, snap.accounts.filter((a) => a.provider === p)])
+    .map((p) => [p, providerAccounts(snap, p)])
     .filter(([, list]) => list.length);
   patch($accounts, groups.map(([provider, list]) => `
     <section>
@@ -247,7 +257,7 @@ function renderDetails(snap) {
  * under the name, the machines it is in use on. The row's tooltip says everything the full card
  * would (accountTip), and screen readers get the same text as the row's description. */
 function renderCompactList(snap) {
-  const list = ["claude", "codex"].flatMap((p) => snap.accounts.filter((a) => a.provider === p));
+  const list = ["claude", "codex"].flatMap((p) => providerAccounts(snap, p));
   patch($accounts, `<div class="compact-list" role="list" aria-label="${esc(t("title"))}">${list.map((a, i) => {
     const key = `${a.provider}:${a.id}`;
     // Another computer's newer reading while this one has none fresh, marked as such: its number
@@ -308,7 +318,11 @@ function patch(container, html) {
   const keys = (root) => [...root.querySelectorAll("[data-key]")].map((el) => el.dataset.key).join("|");
   const sameRows = container.querySelector("[data-key]") && keys(container) === keys(next);
   if (!sameRows) {
-    if (container.innerHTML !== next.innerHTML) container.replaceChildren(...next.childNodes);
+    if (container.innerHTML !== next.innerHTML) {
+      // Rows on screen move: other rows now sit under the pointer (see rowsMovedAt).
+      if (container.querySelector("[data-key]")) rowsMovedAt = performance.now();
+      container.replaceChildren(...next.childNodes);
+    }
     return;
   }
   const fresh = new Map([...next.querySelectorAll("[data-key]")].map((el) => [el.dataset.key, el]));
@@ -319,6 +333,8 @@ function patch(container, html) {
 }
 
 $accounts.addEventListener("click", async (e) => {
+  // The rows just moved: this click was aimed at another account's row (see rowsMovedAt).
+  if (performance.now() - rowsMovedAt < MOVED_CLICK_MS) return;
   const monitor = e.target.closest("button.monitor");
   if (monitor) {
     monitor.disabled = true;
