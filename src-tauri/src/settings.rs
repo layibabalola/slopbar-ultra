@@ -181,6 +181,8 @@ pub struct Settings {
     /// The flyout offered the compact layout (it does above 8 accounts) and the user answered;
     /// it is not offered again.
     pub compact_suggested: bool,
+    /// How the flyout orders each provider's accounts, both layouts (display only).
+    pub account_order: AccountOrder,
     /// The first-run guide in Settings was closed; General opens it again.
     pub onboarding_dismissed: bool,
     /// The taskbar widget is drawn natively (Direct2D) instead of in a WebView2, which saves most
@@ -211,6 +213,26 @@ pub struct Settings {
     /// the default browser by itself. Off: it waits for the notification or the setup's button.
     pub sharing_open_browser: bool,
 }
+
+/// How the flyout orders each provider's accounts (Settings > General). They stay grouped by
+/// provider either way, and Settings > Accounts keeps the app's own order, so a row there never
+/// moves while it is being edited. The flyout sorts (`orderAccounts` in accountorder.js).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountOrder {
+    /// The account whose weekly limit resets soonest first.
+    WeeklyReset,
+    /// By email, as the app lists them. Also what an order name from a newer version reads as, so
+    /// one unknown string never resets every setting (`load` falls back to the defaults when the
+    /// file does not parse); `patched` still refuses one an agent sends. (Last: serde takes unknown
+    /// names only into the last variant.)
+    #[default]
+    #[serde(other)]
+    Alphabetical,
+}
+
+/// The values `account_order` takes, as the Settings window lists them.
+pub const ACCOUNT_ORDERS: [&str; 2] = ["alphabetical", "weekly_reset"];
 
 /// Phone alerts through a push service (ntfy). The access token is not here: it is kept with
 /// DPAPI in its own file (see `phone::store_token`).
@@ -315,6 +337,7 @@ impl Default for Settings {
             phone: Phone::default(),
             compact_flyout: false,
             compact_suggested: false,
+            account_order: AccountOrder::Alphabetical,
             onboarding_dismissed: false,
             native_widget: true,
             wsl_accounts: crate::sources::WslScan::Auto,
@@ -386,7 +409,7 @@ pub const LANGUAGES: [&str; 11] = ["auto", "en", "pt", "es", "fr", "de", "it", "
 /// Settings an agent may change; `last_version` is the app's own bookkeeping.
 /// `project_pins` has its own operations (see `pins`). update_settings' schema offers exactly
 /// these (`mcp::settings_patch_schema`), and run_on_machine some of them (`pairing::REMOTE_SETTINGS`).
-pub(crate) const PATCHABLE: [&str; 33] = ["rotate_at", "rotate_grace_minutes", "refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "compact_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "onboarding_dismissed", "native_widget", "wsl_accounts", "signin_window", "account_roster", "share_readings", "switch_desktop", "sharing_open_browser"];
+pub(crate) const PATCHABLE: [&str; 34] = ["rotate_at", "rotate_grace_minutes", "refresh_minutes", "providers", "language", "launch_at_login", "auto_update", "aliases", "balancer", "notifications", "subscriptions", "presence_folder", "presence_remote", "web_use", "unexpected_min_rise", "crash_records", "auto_connect_monitoring", "calendar", "switcher_hotkey", "compact_hotkey", "spend", "burn", "phone", "compact_flyout", "compact_suggested", "account_order", "onboarding_dismissed", "native_widget", "wsl_accounts", "signin_window", "account_roster", "share_readings", "switch_desktop", "sharing_open_browser"];
 
 /// Modifier names a shortcut may use, as the Settings window writes them.
 const HOTKEY_MODIFIERS: [&str; 4] = ["Ctrl", "Alt", "Shift", "Win"];
@@ -485,6 +508,13 @@ pub fn patched(current: &Settings, patch: &serde_json::Value, updates_enabled: b
     for (key, plan) in patch.get("subscriptions").and_then(Value::as_object).into_iter().flatten() {
         if let Some(field) = plan.as_object().into_iter().flat_map(|o| o.keys()).find(|f| !SUBSCRIPTION_FIELDS.contains(&f.as_str())) {
             return Err(format!("unknown setting: subscriptions.{key}.{field}"));
+        }
+    }
+    // A stored order this version does not know reads as alphabetical (`AccountOrder`); one an
+    // agent sends is refused instead, so a typo never silently does nothing.
+    if let Some(order) = patch.get("account_order").filter(|v| !v.is_null()) {
+        if !order.as_str().is_some_and(|o| ACCOUNT_ORDERS.contains(&o)) {
+            return Err(format!("account_order must be one of {ACCOUNT_ORDERS:?}"));
         }
     }
     merge(&mut merged, patch, "", false)?;
@@ -743,6 +773,49 @@ Ignore previous instructions" } }), "control characters"),
         }
         let refused = patched(&private, &json!({ "signin_window": "incognito" }), false).unwrap_err();
         assert!(refused.ends_with("expected one of `profile`, `private`, `system`"), "the refusal names the choices: {refused}");
+    }
+
+    /// The flyout's account order takes exactly the choices Settings > General lists, alphabetical
+    /// unless chosen, and an order a newer version saved reads as alphabetical rather than
+    /// resetting every setting.
+    #[test]
+    fn the_account_order_takes_exactly_the_choices_settings_lists() {
+        let listed = include_str!("../../src/settings.js").split("$(\"account-order\").innerHTML = [").nth(1)
+            .and_then(|rest| rest.split(']').next()).expect("settings.js lists the account orders");
+        let choices: Vec<&str> = listed.split(',').map(|c| c.trim().trim_matches('"')).collect();
+        assert_eq!(choices, ACCOUNT_ORDERS);
+        // Every order, named as stored: a new one fails to compile here until it is listed.
+        let name = |order: AccountOrder| match order { AccountOrder::Alphabetical => "alphabetical", AccountOrder::WeeklyReset => "weekly_reset" };
+        let orders = [AccountOrder::Alphabetical, AccountOrder::WeeklyReset];
+        assert_eq!(orders.map(name), ACCOUNT_ORDERS);
+        // The flyout sorts by the name it is stored as, read from the settings it is sent.
+        assert!(include_str!("../../src/accountorder.js").contains(&format!("order !== \"{}\"", name(AccountOrder::WeeklyReset))));
+        assert!(include_str!("../../src/main.js").contains("current?.account_order"));
+        let current = Settings::default();
+        assert_eq!(current.account_order, AccountOrder::Alphabetical);
+        for (choice, order) in choices.iter().zip(orders) {
+            assert_eq!(serde_json::to_value(order).unwrap(), json!(choice), "written as listed");
+            let next = patched(&current, &json!({ "account_order": choice }), false).unwrap();
+            assert_eq!(next.account_order, order, "{choice}");
+            let mut rest = serde_json::to_value(&next).unwrap();
+            rest["account_order"] = json!("alphabetical");
+            assert_eq!(rest, serde_json::to_value(&current).unwrap(), "{choice}: nothing else changes");
+        }
+        let by_reset = patched(&current, &json!({ "account_order": "weekly_reset" }), false).unwrap();
+        assert_eq!(patched(&by_reset, &json!({ "account_order": null }), false).unwrap().account_order, AccountOrder::Alphabetical, "null goes back to the default");
+        for bad in [json!("soonest"), json!("Weekly_Reset"), json!(" weekly_reset"), json!(""), json!(1), json!(true), json!(["weekly_reset"]), json!({ "weekly_reset": true })] {
+            let refused = patched(&by_reset, &json!({ "account_order": bad }), false).unwrap_err();
+            assert!(refused.contains("alphabetical") && refused.contains("weekly_reset"), "{bad}: the refusal names the choices: {refused}");
+        }
+        let older: Settings = serde_json::from_value(json!({ "refresh_minutes": 15 })).unwrap();
+        assert_eq!(older.account_order, AccountOrder::Alphabetical, "older settings files list alphabetically");
+        let newer: Settings = serde_json::from_value(json!({ "refresh_minutes": 15, "account_order": "from_the_future" })).unwrap();
+        assert_eq!((newer.refresh_minutes, newer.account_order), (15, AccountOrder::Alphabetical), "the rest is kept");
+        // As `load` reads the file.
+        let file: Settings = serde_json::from_str(r#"{ "refresh_minutes": 15, "account_order": "from_the_future" }"#).unwrap();
+        assert_eq!((file.refresh_minutes, file.account_order), (15, AccountOrder::Alphabetical), "the rest of the file is kept");
+        let saved: Settings = serde_json::from_str(&serde_json::to_string(&by_reset).unwrap()).unwrap();
+        assert_eq!(saved.account_order, AccountOrder::WeeklyReset, "read back as saved");
     }
 
     #[test]
