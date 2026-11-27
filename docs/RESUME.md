@@ -87,3 +87,7 @@ machine".
 - Release channel and each machine's build: `pwsh scripts/fleet-slopbar.ps1` (on `ultra`), and the
   release runs: `gh run list -R layibabalola/slopbar-ultra --workflow ultra-release.yml`.
 - Leftover worktrees from finished sessions.
+- Follow-ups that sessions noticed but did not do ("Follow-ups noticed, not done" in the decisions
+  log). The newest backlog triage there says which were dropped and which are parked, each with the
+  event that revives it. Take up a parked one when its event comes, triage only follow-ups logged
+  after that triage, and never pick up a dropped one again.
