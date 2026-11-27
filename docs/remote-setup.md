@@ -99,10 +99,14 @@ The agent should:
 
 1. Call `get_machine_readiness` with `ssh_host: "newpc"`. `problems` names anything in the way:
    `no_desktop_session` (nobody is signed in at its desktop), `app_not_running`, `desktop_locked`,
-   `desktop_not_shown` (a closed Remote Desktop or another user switched in), `no_browser`. Two
-   codes never stop sign-ins but say SSH starts Windows PowerShell there: `ssh_shell_windows_powershell`
-   (its SSH shell is set to it: run the OpenSSH block above there) and `no_pwsh_over_ssh`
-   (PowerShell 7 did not start there, so SlopBar used it: install PowerShell 7 there).
+   `desktop_not_shown` (a closed Remote Desktop or another user switched in), `no_browser` (no Edge
+   or Chrome for the sign-in pages: install one). When its `signin_window` is `system` (set it with
+   `run_on_machine` → `update_settings`), that computer's own sign-ins open in its default browser, so
+   `no_browser` stops nothing there: it only notes that completing other computers' sign-ins on it
+   (`sign_in_all` with `everywhere`) still needs Edge or Chrome. Two codes never stop sign-ins but
+   say SSH starts Windows PowerShell there: `ssh_shell_windows_powershell` (its SSH shell is set to
+   it: run the OpenSSH block above there) and `no_pwsh_over_ssh` (PowerShell 7 did not start there,
+   so SlopBar used it: install PowerShell 7 there).
 2. If the new computer has no sharing location yet (readiness lists `no_sharing_location` or
    `rclone_remote_missing`), ask you to sit at its screen, then call `setup_sharing` with
    `ssh_host: "newpc"` and `confirm: true`. SlopBar there gets rclone (a fixed, checksum-verified

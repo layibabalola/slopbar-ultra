@@ -4707,8 +4707,11 @@ async fn readiness(app: &AppHandle) -> serde_json::Value {
     let roster = roster_status(app, false).await;
     let desktop = desktop::of_process();
     let browser = tauri::async_runtime::spawn_blocking(|| signin::find_browser().map(|(k, _)| pairing::browser_name(k))).await.ok().flatten();
-    let (ready, mut problems, mut next) = pairing::assess(true, desktop, browser.is_some(), &roster);
     let state = app.state::<AppState>();
+    // Read once, before it decides what a missing browser means (the system window opens this
+    // computer's own sign-ins in the default browser), and told as read.
+    let signin_window = state.settings.lock().unwrap().signin_window;
+    let (ready, mut problems, mut next) = pairing::assess(true, desktop, browser.is_some(), signin_window == signin::Window::System, &roster);
     // A remote named in settings shares nothing unless rclone here has it.
     let remote = state.settings.lock().unwrap().presence_remote.clone();
     if let Some(name) = remote {
@@ -4723,7 +4726,6 @@ async fn readiness(app: &AppHandle) -> serde_json::Value {
     let ssh_shell = tauri::async_runtime::spawn_blocking(pairing::ssh_shell).await.ok().flatten();
     pairing::note_ssh_shell(ssh_shell, &mut problems, &mut next);
     let snapshot = state.snapshot.lock().unwrap().clone();
-    let signin_window = state.settings.lock().unwrap().signin_window;
     let mut summary = roster.clone();
     let waiting = summary.get_mut("waiting").map(serde_json::Value::take).unwrap_or_default();
     summary["waiting"] = waiting.as_array().map_or(0, Vec::len).into();
@@ -5145,10 +5147,10 @@ mod sign_in_tests {
     /// sign-in's (`start`, with the email's `opens`, never a window of its own), and another
     /// computer's (`relayed_turn`, with the email's window and profile). The closed sets: app.rs
     /// reads the setting only for a sign-in of its own (`Opens::own`), at an email's turn, and for
-    /// readiness's report of it; and makes a window of its own only for Add account and for a
-    /// monitoring sign-in given none (outside a run). Each failure is a sign-in that could open its
-    /// page where its run does not watch for it, or in the everyday
-    /// browser.
+    /// readiness (what a missing browser means there, and its report of it); and makes a window of
+    /// its own only for Add account and for a monitoring sign-in given none (outside a run). Each
+    /// failure is a sign-in that could open its page where its run does not watch for it, or in the
+    /// everyday browser.
     #[test]
     fn a_run_reads_the_sign_in_window_once_per_email() {
         use crate::source_guard::{args, calls, count, find, function, has, places, tokens, words};
@@ -5166,8 +5168,16 @@ mod sign_in_tests {
         assert_eq!(reads, 3, "app.rs reads the sign-in window only in Opens::own, at an email's turn in run_sign_ins, and for readiness: \
             a sign-in reads it once, as it starts, and never again");
         // Nor through a destructured or matched Settings: the name stands alone only in those three
-        // reads and readiness's report (`let signin_window = …` and its `"signin_window": signin_window`).
-        assert_eq!(words(&code, "signin_window"), 5, "app.rs names the setting only where it reads it (see above)");
+        // reads, readiness's use of it (`signin_window == signin::Window::System`, which decides what
+        // a missing browser means) and its report (`let signin_window = …` and its
+        // `"signin_window": signin_window`).
+        assert_eq!(words(&code, "signin_window"), 6, "app.rs names the setting only where it reads it (see above)");
+        // Readiness reads it before it assesses with it: a missing browser stops sign-ins unless this
+        // computer's own open in the default browser (`pairing::assess`), and only the system window does.
+        let readiness = function(&code, "app.rs", "async fn readiness(", T);
+        let assessed = "pairing::assess(true, desktop, browser.is_some(), signin_window == signin::Window::System, &roster)";
+        assert!(matches!((find(readiness, report), find(readiness, assessed)), (Some(read), Some(assess)) if read < assess),
+            "readiness assesses with the sign-in window it read, which says whether this computer's own sign-ins need Edge or Chrome\n{readiness}");
         // A window of its own only outside a run: Add account's, and a monitoring sign-in's given none.
         assert_eq!(places(&code, "Opens::own(").len(), 2, "Opens::own is called only by Add account and by a monitoring sign-in given no window");
         let add = function(&code, "app.rs", "async fn start_add_account(", T);
