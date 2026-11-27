@@ -1004,15 +1004,16 @@ pub struct Pool {
     /// fewer than `POOL_MIN_WEEKS` weeks: not enough history. The Advisor's floor rests on it, so no
     /// cancel, share or downgrade leaves less than those weeks need.
     pub demand_p90: Option<f64>,
-    /// The same weeks as read, without that conversion: equal to `demand_p90` but for Pro 200 weeks
-    /// before the cut. Advice to add or upgrade (the Advisor's shortage) rests on it alone: the new
-    /// allowance is a third-party estimate (`PRO_200_NEW_ALLOWANCE`) and weeks since the cut are
-    /// measured, so the estimate may keep a plan but never asks for one (the one-way rule).
+    /// The same percentile with every week as read, without that conversion: equal to `demand_p90`
+    /// unless a Pro 200 week before the cut is among them. Advice to add or upgrade (the Advisor's
+    /// shortage) rests on it alone: the new allowance is a third-party estimate
+    /// (`PRO_200_NEW_ALLOWANCE`) and weeks since the cut are measured, so the estimate may keep a
+    /// plan but never asks for one (the one-way rule).
     pub measured_demand_p90: Option<f64>,
     /// This week's use so far across the plans, in plan-weeks.
     pub live_demand: Option<f64>,
     /// Plans that cover `demand_p90` with `buffer_percent` to spare, as the floor does; beyond the
-    /// plans that renew, only as many as `measured_demand_p90` needs (`pool_sizing`).
+    /// whole plans that renew, only as many as `measured_demand_p90` needs (`pool_sizing`).
     pub plans_needed: Option<u32>,
     /// The spare `plans_needed` keeps, in percent: 20, or 40 while any paid plan keeps running out,
     /// as the Advisor's floor (`pool_buffer`); 20 again while the plans hold less than even that,
@@ -2092,6 +2093,8 @@ mod tests {
         // 0.5 + 0.25, 0.6 + 0.25, 0.4 + 0.25, then 0.7 + 0.05; the busiest is 0.85.
         assert!((p.demand_p90.unwrap() - 0.85).abs() < 1e-9, "{p:?}");
         assert_eq!((p.weeks_estimated, p.confidence), (3, Confidence::Low));
+        // With no Pro 200 week before its cut, the weeks as read are the same, those filled in too.
+        assert_eq!(p.measured_demand_p90, p.demand_p90);
     }
 
     #[test]
@@ -2132,7 +2135,7 @@ mod tests {
         history.accounts.get_mut("Claude:b").unwrap().windows.retain(|r| r.resets_at != second);
         let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
         assert_eq!((p.weeks_used, p.weeks_estimated, p.confidence), (4, 1, Confidence::Low));
-        assert!((p.demand_p90.unwrap() - 1.5).abs() < 1e-9);
+        assert!((p.demand_p90.unwrap() - 1.5).abs() < 1e-9 && p.measured_demand_p90 == p.demand_p90, "{p:?}");
         // With c missing too, fewer than half the plans were watched: the week does not count.
         history.accounts.get_mut("Claude:c").unwrap().windows.retain(|r| r.resets_at != second);
         let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
@@ -2401,6 +2404,21 @@ mod tests {
         // read: nothing to spare, not the 2 plans missing that the estimate would read.
         assert_eq!((p.plans_needed, p.buffer_percent, p.spare_percent), (Some(3), 20.0, Some(50.0)), "{p:?}");
         assert_eq!((a.spare_after, a.spare_after_percent), (Some(0.0), Some(0.0)));
+        agrees_with_the_advisor(&r);
+    }
+
+    #[test]
+    fn the_estimate_sizes_the_pool_to_the_whole_plans_that_renew_at_most() {
+        let now = at("2026-11-26T12:00:00Z");
+        // A Pro 200 that read 45% before the cut (90% of the new allowance) and 30% since, beside a Pro
+        // 100 at 20%: 1.0 plans as counted, 0.55 as read, and 1.5 that renew. Plus 20%, as counted the
+        // busiest weeks would need 2 plans, as read 1. The estimate may need the one whole plan among
+        // those that renew, never a second: 2 would read as a shortage the Advisor does not advise.
+        let r = fleet_report(vec![codex_plan("busy", "pro", &across_the_cut([45.0, 30.0, 30.0, 30.0]), now),
+            codex_plan("lite", "prolite", &across_the_cut([20.0; 4]), now)], now);
+        let (a, p) = (&r.advice[0], &r.providers[0].pool);
+        assert!((p.demand_p90.unwrap() - 1.0).abs() < 1e-9 && (p.measured_demand_p90.unwrap() - 0.55).abs() < 1e-9, "{p:?}");
+        assert_eq!((a.capacity_now, a.shortage.is_none(), p.plans_needed), (1.5, true, Some(1)), "{p:?}");
         agrees_with_the_advisor(&r);
     }
 

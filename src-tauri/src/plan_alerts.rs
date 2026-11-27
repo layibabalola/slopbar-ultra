@@ -178,7 +178,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::model::{AccountUsage, BillingHints, UsageWindow};
     use crate::settings::{Settings, Subscription};
-    use crate::subscriptions::{report, AccountHistory, History, WindowRecord};
+    use crate::subscriptions::{report, AccountHistory, History, WindowRecord, PRO_200_NEW_ALLOWANCE};
     use crate::test_support::TempDir;
 
     pub(crate) fn at(s: &str) -> DateTime<Utc> { DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc) }
@@ -205,14 +205,17 @@ pub(crate) mod tests {
 
     pub(crate) struct World { pub snapshot: Snapshot, pub history: History, pub settings: Settings }
 
-    /// Three paid Codex plans renewing on the 24th: one unused, one busy, one already cancelled. Their
-    /// weeks began before Pro 200's allowance cut, so busy's 40% counts as 80% of the new allowance
-    /// (`subscriptions::week_peaks`): the busiest weeks still leave the unused plan to cancel.
+    /// Three paid Codex plans renewing on the 24th: one unused, one busy, one already cancelled. Busy
+    /// reads 30% a week, and a week of it begun before Pro 200's allowance cut counts as 60% of the
+    /// new allowance (`subscriptions::week_peaks`): all four at the October dates, the oldest at
+    /// 2026-11-21. Plus 20%, that busiest week needs 0.72 of a plan: the unused plan is cancelled with
+    /// over a quarter of a plan to spare, and once it is the provider's last it stays whole (Pro 100
+    /// holds 0.5).
     pub(crate) fn world(now: DateTime<Utc>) -> World {
         let mut settings = Settings::default();
         let mut history = History::default();
         let mut accounts = vec![];
-        for (id, peak) in [("idle", 0.0), ("busy", 40.0), ("gone", 0.0)] {
+        for (id, peak) in [("idle", 0.0), ("busy", 60.0 * PRO_200_NEW_ALLOWANCE), ("gone", 0.0)] {
             accounts.push(account(id, 1.0, now + Duration::days(5)));
             history.accounts.insert(format!("Codex:{id}"), watched(peak, now));
             settings.subscriptions.insert(format!("codex:{id}"), Subscription { next_billing: Some("2026-10-24".parse().unwrap()), ..Default::default() });

@@ -170,8 +170,8 @@ pub struct ProviderAdvice {
     /// while any plan keeps running out; this week's use instead when the pool has too little
     /// history).
     pub demand_p90: Option<f64>,
-    /// The same week as measured, without that conversion: the only demand `shortage` rests on
-    /// (`subscriptions::Pool::measured_demand_p90`).
+    /// The same percentile with every week as read, without that conversion: the only demand
+    /// `shortage` rests on (`subscriptions::Pool::measured_demand_p90`).
     pub measured_demand_p90: Option<f64>,
     pub floor: Option<f64>,
     pub moves: Vec<Move>,
