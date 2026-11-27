@@ -226,7 +226,7 @@ pub fn export(report: &Report, settings: &Settings, now: DateTime<Utc>) -> Resul
 mod tests {
     use super::*;
     use crate::plan_alerts::tests::{at, world};
-    use crate::subscriptions::report;
+    use crate::subscriptions::{report, PRO_200_NEW_ALLOWANCE};
     use crate::test_support::TempDir;
     use chrono::{Duration, FixedOffset};
 
@@ -245,10 +245,11 @@ mod tests {
             "the cancelled plan has no renewal");
         assert!(events[1].description.contains("Looks unused") && events[1].description.contains("https://"));
         assert!(events[1].description.contains("The Advisor advises cancelling it before this renewal"));
-        // Once the busy plan runs out every week, the idle one is needed for the busiest weeks: the
-        // Advisor keeps it, on the smaller tier that still leaves enough.
+        // Once the busy plan's weeks fill a whole plan of the new allowance (they began before Pro 200's
+        // allowance cut, so half the old allowance is all of the new), the idle one is needed for the
+        // busiest weeks: the Advisor keeps it, on the smaller tier that still leaves enough.
         let mut w = world(now);
-        w.history.accounts.insert("Codex:busy".into(), crate::plan_alerts::tests::watched(100.0, now));
+        w.history.accounts.insert("Codex:busy".into(), crate::plan_alerts::tests::watched(100.0 * PRO_200_NEW_ALLOWANCE, now));
         let moved = super::events(&report(&w.snapshot, &w.history, &w.settings, None, now), &FixedOffset::west_opt(8 * 3600).unwrap());
         let idle = moved.iter().find(|e| e.summary.contains("idle@")).unwrap();
         assert!(idle.alarm && idle.description.contains("The Advisor advises moving it to Pro 100 before this renewal"), "{idle:?}");
