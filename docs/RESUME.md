@@ -47,7 +47,13 @@ machine".
 
 - Feature work goes on a branch cut from `origin/claude/subscription-value`, merged back with a normal
   merge, and pushed.
-- Then merge into `ultra` in `C:\code\slopbar-worktrees\ultra`. On conflict, keep ultra's
+- Then merge into `ultra` in `C:\code\slopbar-worktrees\ultra`. First bring that worktree up to date:
+  `git fetch origin --prune`, then `git merge --ff-only origin/ultra`. Never `git pull` there, even
+  when a push is rejected and git suggests it. Whatever the fast-forward says, run the spotting test
+  in memory `project-ultra-history-purged`. If it finds the old history, merge and push nothing until
+  the clone is realigned as that entry says. If it finds none and the fast-forward failed, another
+  machine pushed first: `git merge origin/ultra`. Do the same before committing `docs/ROADMAP.md` on
+  `ultra`. When merging the integration branch conflicts, keep ultra's
   `tauri.conf.json` `plugins.updater` block and re-brand visible strings. Push `ultra`, and that is
   the last step. When the push changes what ships, the release workflow publishes the next
   `0.1.0-ultra.<n>` by itself, and every machine installs it at its next update check
