@@ -258,7 +258,8 @@ fn history_key(provider: Provider, id: &str) -> String {
 
 /// Whether a window was used on the account's present plan: it reset after the plan last changed
 /// (`AccountHistory::plan_since`). A week before the change was a share of another allowance, so
-/// the verdict and pool sizing leave it out, as `room` does.
+/// the verdict and pool sizing leave it out, as `room` does. (Pro 200's allowance cut is no change
+/// of plan: the weeks before it stay, and pool sizing counts them against the new allowance.)
 fn on_this_plan(h: &AccountHistory, r: &WindowRecord) -> bool {
     h.plan_since.is_none_or(|t| r.resets_at > t)
 }
@@ -318,6 +319,10 @@ pub struct Assessment {
     pub basis: Basis,
 }
 
+/// One plan's verdict from its latest completed weeks, each at face value: a Codex Pro 200 week
+/// begun before its allowance cut is read against the allowance it had then, unlike pool sizing and
+/// shares (`week_peaks`, `busiest`), which count it against the new one. A verdict describes use;
+/// what to change is the Advisor's.
 pub fn assess(h: &AccountHistory, now: DateTime<Utc>) -> Assessment {
     let recent = |kind: &str| -> Vec<&WindowRecord> {
         let mut done: Vec<&WindowRecord> = h.windows.iter().filter(|r| r.kind == kind && r.resets_at <= now && r.counts() && on_this_plan(h, r)).collect();
@@ -630,9 +635,14 @@ pub struct Entry {
     pub credits: Option<CreditInfo>,
     /// Claude only: extra usage beyond the plan this month, when the provider reported it.
     pub extra_usage: Option<crate::model::ExtraUsage>,
-    /// Inputs for the provider's pool sizing; not part of the report.
+    /// Inputs for the provider's pool sizing; not part of the report. Each counted week's peak as
+    /// `week_peaks` counts it for this plan: a Codex Pro 200 week begun before its allowance cut
+    /// against the new allowance.
     #[serde(skip)]
     pool_weeks: BTreeMap<NaiveDate, f64>,
+    /// The same weeks as read, without that conversion.
+    #[serde(skip)]
+    pool_measured: BTreeMap<NaiveDate, f64>,
     /// Weeks of `pool_weeks` read from this PC's Codex rollouts.
     #[serde(skip)]
     pool_local: BTreeSet<NaiveDate>,
@@ -657,10 +667,17 @@ impl Entry {
     }
 
     /// The busiest recent week in percent of this plan's allowance: the latest `RECENT` weeks that
-    /// count, and the week in progress.
+    /// count, and the week in progress. A Codex Pro 200 week begun before its allowance cut counts
+    /// against the new allowance (`week_peaks`), so a downgrade never rests on room it no longer has.
     pub(crate) fn recent_peak(&self) -> Option<f64> {
         let live = self.this_week.as_ref().filter(|_| !self.stale).map(|w| w.used_percent);
         self.pool_weeks.values().rev().take(RECENT).copied().chain(live).reduce(f64::max)
+    }
+
+    /// Renews as it is: neither ending at the provider nor being let lapse. The Advisor's capacity
+    /// counts only these plans (`advisor`), and so does how far an estimate may size the pool (`pool`).
+    pub(crate) fn renews(&self) -> bool {
+        self.ends_at.is_none() && self.cancel_after.is_none()
     }
 }
 
@@ -760,7 +777,9 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
         let renewal = if paid { next_renewal(acc, &prefs, now) } else { None };
         let ends_at = if paid { ends_at(acc, now) } else { None };
         let cost_per_use = monthly_cost.map(|c| cost_per_use(c, &assessment, activity.as_ref()));
-        let (pool_weeks, pool_local) = week_peaks(h, now);
+        let (pool_weeks, pool_local) = week_peaks(h, pro_200(acc), now);
+        // The same weeks as read, for what only measured weeks may ask for (`Pool::measured_demand_p90`).
+        let (pool_measured, _) = week_peaks(h, false, now);
         // Only from when SlopBar watched it: before then, rollout weeks exist only for the accounts
         // used on this PC, and leaving the rest out would make the fleet look less busy.
         let pool_since = h.first_seen.map(|t| monday(t.date_naive()));
@@ -800,6 +819,7 @@ pub fn report(snapshot: &Snapshot, history: &History, settings: &Settings, local
             credits,
             extra_usage: acc.extra_usage.clone().filter(|_| acc.provider == Provider::Claude),
             pool_weeks,
+            pool_measured,
             pool_local,
             pool_since,
             pool_changed,
@@ -846,10 +866,11 @@ fn follow_advice(accounts: &mut [Entry], providers: &mut [ProviderSummary], advi
     for p in providers.iter_mut() {
         let a = advice.iter().find(|a| a.provider == p.provider);
         p.possible_savings = a.map_or(0.0, |a| a.monthly_saving);
-        // While even 20% over the busiest weeks is more than the plans hold, the Advisor's shortage
-        // asks for that first: the pool says the same, not the 40% its floor keeps for cuts.
+        // While even 20% over the busiest weeks as measured is more than the plans hold, the
+        // Advisor's shortage asks for that first: the pool says the same, not the 40% its floor keeps
+        // for cuts.
         if a.and_then(|a| a.shortage.as_ref()).is_some_and(|s| s.cause == crate::advisor::ShortageCause::OverCapacity) {
-            (p.pool.plans_needed, p.pool.spare_percent, p.pool.buffer_percent) = sizing(p.pool.demand_p90, POOL_BUFFER);
+            (p.pool.plans_needed, p.pool.spare_percent, p.pool.buffer_percent) = sizing(p.pool.measured_demand_p90, POOL_BUFFER);
         }
     }
 }
@@ -945,14 +966,19 @@ fn monday(d: NaiveDate) -> NaiveDate {
 
 /// Each completed weekly window watched closely enough to count, by the Monday of the UTC week
 /// it reset in: accounts reset on different days, but each has one window ending per week. When
-/// an idle stretch and a real window end in the same week, the higher peak.
-fn week_peaks(h: &AccountHistory, now: DateTime<Utc>) -> (BTreeMap<NaiveDate, f64>, BTreeSet<NaiveDate>) {
+/// an idle stretch and a real window end in the same week, the higher peak. With `pro_200`, a week
+/// that began before Pro 200's allowance cut counts against the new, smaller allowance
+/// (`PRO_200_NEW_ALLOWANCE`), exactly as `busiest` counts it; without, every week as read.
+fn week_peaks(h: &AccountHistory, pro_200: bool, now: DateTime<Utc>) -> (BTreeMap<NaiveDate, f64>, BTreeSet<NaiveDate>) {
+    let cut = pro_200_cut();
     let mut out = BTreeMap::new();
     let mut local = BTreeSet::new();
     for r in h.windows.iter().filter(|r| r.kind == "weekly" && r.resets_at <= now && r.counts() && on_this_plan(h, r)) {
+        let began = r.resets_at - chrono::Duration::seconds(WEEK_SECONDS);
+        let counted = if pro_200 && began < cut { r.peak / PRO_200_NEW_ALLOWANCE } else { r.peak };
         let week = monday((r.resets_at - chrono::Duration::seconds(1)).date_naive());
         let peak = out.entry(week).or_insert(0.0);
-        *peak = f64::max(*peak, r.peak);
+        *peak = f64::max(*peak, counted);
         if r.local { local.insert(week); }
     }
     (out, local)
@@ -973,17 +999,28 @@ pub struct Pool {
     /// Of those, weeks where an account not watched was filled in from its own typical week.
     pub weeks_estimated: u8,
     /// The busiest weeks' total use (90th percentile), in plan-weeks, or this week's so far when
-    /// that is already higher. None with fewer than `POOL_MIN_WEEKS` weeks: not enough history.
+    /// that is already higher, each week as `week_peaks` counts it: a Codex Pro 200 week begun
+    /// before its allowance cut against the new allowance, about double what it read. None with
+    /// fewer than `POOL_MIN_WEEKS` weeks: not enough history. The Advisor's floor rests on it, so no
+    /// cancel, share or downgrade leaves less than those weeks need.
     pub demand_p90: Option<f64>,
+    /// The same percentile with every week as read, without that conversion: equal to `demand_p90`
+    /// unless a Pro 200 week before the cut is among them. Advice to add or upgrade (the Advisor's
+    /// shortage) rests on it alone: the new allowance is a third-party estimate
+    /// (`PRO_200_NEW_ALLOWANCE`) and weeks since the cut are measured, so the estimate may keep a
+    /// plan but never asks for one (the one-way rule).
+    pub measured_demand_p90: Option<f64>,
     /// This week's use so far across the plans, in plan-weeks.
     pub live_demand: Option<f64>,
-    /// Plans that cover `demand_p90` with `buffer_percent` to spare.
+    /// Plans that cover `demand_p90` with `buffer_percent` to spare, as the floor does; beyond the
+    /// whole plans that renew, only as many as `measured_demand_p90` needs (`pool_sizing`).
     pub plans_needed: Option<u32>,
     /// The spare `plans_needed` keeps, in percent: 20, or 40 while any paid plan keeps running out,
     /// as the Advisor's floor (`pool_buffer`); 20 again while the plans hold less than even that,
     /// as the Advisor's shortage asks for first (`follow_advice`).
     pub buffer_percent: f64,
-    /// How far `plans_needed` exceeds `demand_p90`, in percent.
+    /// How far `plans_needed` exceeds the busiest weeks, in percent: `demand_p90`, used up to
+    /// `plans_needed` at most, or `measured_demand_p90` when that is higher (`one_way`).
     pub spare_percent: Option<f64>,
     pub confidence: Confidence,
     /// `LocalCodex` when a counted week includes one read from this PC's Codex rollouts.
@@ -993,13 +1030,18 @@ pub struct Pool {
 /// Sums each recent week's peak across the paid plans, weighted by `plan_weight`, and sizes the
 /// pool from its 90th percentile. A week counts when accounts holding at least half the plans
 /// (of those SlopBar knew by then) were watched in it; an account missing from a counted week is
-/// filled in with the median of its own counted weeks, and the confidence says so.
+/// filled in with the median of its own counted weeks, and the confidence says so. Every week is
+/// summed twice, from the same weeks and fill-ins: as `week_peaks` counts it for each plan
+/// (`demand_p90`), and as read (`measured_demand_p90`).
 fn pool(provider: Provider, paid: &[&Entry], buffer: f64, now: DateTime<Utc>) -> Pool {
     let weighted: Vec<(&Entry, f64)> = paid.iter().filter_map(|e| Some((*e, e.plan_weight?))).collect();
     let plans_held = weighted.iter().map(|(_, w)| w).sum::<f64>();
-    let medians: Vec<Option<f64>> = weighted.iter().map(|(e, _)| median(&e.pool_weeks.values().copied().collect::<Vec<_>>())).collect();
+    let renewing = weighted.iter().filter(|(e, _)| e.renews()).map(|(_, w)| w).sum::<f64>();
+    let median_of = |weeks: &BTreeMap<NaiveDate, f64>| median(&weeks.values().copied().collect::<Vec<_>>());
+    let medians: Vec<(Option<f64>, Option<f64>)> = weighted.iter().map(|(e, _)| (median_of(&e.pool_weeks), median_of(&e.pool_measured))).collect();
     let all: BTreeSet<NaiveDate> = weighted.iter().flat_map(|(e, _)| e.pool_weeks.keys().copied()).collect();
-    let mut demands = Vec::new();
+    // Each counted week's total: as counted, and as read.
+    let mut demands: Vec<(f64, f64)> = Vec::new();
     let mut estimated = 0u8;
     let mut local = false;
     for week in all.iter().rev().take(POOL_WEEKS) {
@@ -1008,19 +1050,22 @@ fn pool(provider: Provider, paid: &[&Entry], buffer: f64, now: DateTime<Utc>) ->
         let watched: f64 = known.iter().filter(|&&i| weighted[i].0.pool_weeks.contains_key(week)).map(|&i| weighted[i].1).sum();
         if held <= 0.0 || watched < held * POOL_COVERAGE { continue; }
         let mut filled = false;
-        let demand: f64 = known.iter().map(|&i| {
+        let demand = known.iter().map(|&i| {
             let (e, w) = weighted[i];
-            match e.pool_weeks.get(week) {
-                Some(p) => p / 100.0 * w,
-                None => {
+            match (e.pool_weeks.get(week), e.pool_measured.get(week)) {
+                (Some(p), Some(m)) => (p / 100.0 * w, m / 100.0 * w),
+                _ => {
                     filled = true;
                     // A week before the plan changed was a share of another allowance and is left out:
                     // counted as the whole plan, so no cut rests on the gap (its median would read the
                     // weeks on the new plan only, or nothing yet).
-                    if e.pool_changed.is_some_and(|c| *week < c) { w } else { medians[i].unwrap_or(0.0) / 100.0 * w }
+                    if e.pool_changed.is_some_and(|c| *week < c) { (w, w) } else {
+                        let (p, m) = medians[i];
+                        (p.unwrap_or(0.0) / 100.0 * w, m.unwrap_or(0.0) / 100.0 * w)
+                    }
                 }
             }
-        }).sum();
+        }).fold((0.0, 0.0), |(d, m), (x, y)| (d + x, m + y));
         estimated += filled as u8;
         local |= known.iter().any(|&i| weighted[i].0.pool_local.contains(week));
         demands.push(demand);
@@ -1029,14 +1074,15 @@ fn pool(provider: Provider, paid: &[&Entry], buffer: f64, now: DateTime<Utc>) ->
     let live: Vec<f64> = weighted.iter().filter(|(e, _)| !e.stale)
         .filter_map(|(e, w)| e.this_week.as_ref().filter(|t| t.resets_at.map_or(true, |r| r > now)).map(|t| t.used_percent / 100.0 * w)).collect();
     let live_demand = (!live.is_empty()).then(|| live.iter().sum::<f64>());
-    let demand_p90 = (weeks_used >= POOL_MIN_WEEKS).then(|| {
-        let p = percentile(&demands, POOL_PERCENTILE);
+    let p90 = |pick: fn(&(f64, f64)) -> f64| (weeks_used >= POOL_MIN_WEEKS).then(|| {
+        let p = percentile(&demands.iter().map(pick).collect::<Vec<_>>(), POOL_PERCENTILE);
         live_demand.map_or(p, |l| p.max(l))
     });
-    let (plans_needed, spare_percent, buffer_percent) = sizing(demand_p90, buffer);
+    let (demand_p90, measured_demand_p90) = (p90(|d| d.0), p90(|d| d.1));
+    let (plans_needed, spare_percent, buffer_percent) = pool_sizing(demand_p90, measured_demand_p90, renewing, buffer);
     let confidence = if weeks_used >= RECENT as u8 && estimated == 0 { Confidence::High } else { Confidence::Low };
     Pool { unit: reference_plan(provider), plans_held, unweighted: paid.len() - weighted.len(), weeks_used,
-        weeks_needed: POOL_MIN_WEEKS, weeks_estimated: estimated, demand_p90, live_demand, plans_needed, buffer_percent, spare_percent, confidence,
+        weeks_needed: POOL_MIN_WEEKS, weeks_estimated: estimated, demand_p90, measured_demand_p90, live_demand, plans_needed, buffer_percent, spare_percent, confidence,
         basis: if local { Basis::LocalCodex } else { Basis::Observed } }
 }
 
@@ -1046,6 +1092,29 @@ fn sizing(demand: Option<f64>, buffer: f64) -> (Option<u32>, Option<f64>, f64) {
     let needed = demand.map(|d| ((d * (1.0 + buffer) - 1e-9).ceil() as u32).max(1));
     let spare = demand.zip(needed).filter(|(d, _)| *d > 0.0).map(|(d, n)| (n as f64 / d - 1.0) * 100.0);
     (needed, spare, (buffer * 100.0).round())
+}
+
+/// The pool's size, by the one-way rule (`Pool::measured_demand_p90`): the plans that cover
+/// `demand` (the busiest weeks as counted) with `buffer` to spare, as the Advisor's floor keeps
+/// them, so a plan kept for those weeks never reads as one to spare; but the estimate alone never
+/// needs more than the whole plans that renew (`renewing`), so beyond them only as many as
+/// `measured` needs. The spare is over the demand those plans are set against (`one_way`).
+fn pool_sizing(demand: Option<f64>, measured: Option<f64>, renewing: f64, buffer: f64) -> (Option<u32>, Option<f64>, f64) {
+    let (needed, _, buffer_percent) = sizing(demand, buffer);
+    let (least, _, _) = sizing(measured, buffer);
+    let whole = (renewing + 1e-9).floor() as u32;
+    let needed = needed.zip(least).map(|(n, l)| n.min(l.max(whole)));
+    let over = demand.zip(measured).zip(needed).map(|((d, m), n)| one_way(m, d, n as f64));
+    let spare = over.zip(needed).filter(|(d, _)| *d > 0.0).map(|(d, n)| (n as f64 / d - 1.0) * 100.0);
+    (needed, spare, buffer_percent)
+}
+
+/// The busiest weeks to set against `room` (plans, in the reference tier) by the one-way rule
+/// (`Pool::measured_demand_p90`): as `counted` (Codex Pro 200's weeks before its allowance cut against
+/// the new allowance) as far as `room` goes, which may use up the spare but never shows a shortfall
+/// of its own; past `room`, only as far as `measured`, the weeks as read.
+pub(crate) fn one_way(measured: f64, counted: f64, room: f64) -> f64 {
+    measured.max(counted.min(room))
 }
 
 /// Nearest-rank percentile: with fewer than ten weeks the 90th is the busiest week.
@@ -1081,8 +1150,8 @@ pub(crate) fn pro_200_cut() -> DateTime<Utc> {
 /// weeks this computer watched closely enough to count, one per UTC week as pool sizing reads them
 /// (`week_peaks`). Weeks read from this PC's Codex rollouts are left out, as they miss use anywhere
 /// else. A Codex Pro 200 week that began before the allowance cut counts against the new, smaller
-/// allowance (`PRO_200_NEW_ALLOWANCE`), so a week that fit the old one is not taken for room it no
-/// longer has.
+/// allowance (`PRO_200_NEW_ALLOWANCE`), as pool sizing counts it too, so a week that fit the old one
+/// is not taken for room it no longer has.
 pub(crate) fn busiest(h: &AccountHistory, pro_200: bool, now: DateTime<Utc>) -> Vec<(String, f64)> {
     let cut = pro_200_cut();
     KINDS.iter().filter_map(|kind| {
@@ -2024,6 +2093,8 @@ mod tests {
         // 0.5 + 0.25, 0.6 + 0.25, 0.4 + 0.25, then 0.7 + 0.05; the busiest is 0.85.
         assert!((p.demand_p90.unwrap() - 0.85).abs() < 1e-9, "{p:?}");
         assert_eq!((p.weeks_estimated, p.confidence), (3, Confidence::Low));
+        // With no Pro 200 week before its cut, the weeks as read are the same, those filled in too.
+        assert_eq!(p.measured_demand_p90, p.demand_p90);
     }
 
     #[test]
@@ -2064,7 +2135,7 @@ mod tests {
         history.accounts.get_mut("Claude:b").unwrap().windows.retain(|r| r.resets_at != second);
         let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
         assert_eq!((p.weeks_used, p.weeks_estimated, p.confidence), (4, 1, Confidence::Low));
-        assert!((p.demand_p90.unwrap() - 1.5).abs() < 1e-9);
+        assert!((p.demand_p90.unwrap() - 1.5).abs() < 1e-9 && p.measured_demand_p90 == p.demand_p90, "{p:?}");
         // With c missing too, fewer than half the plans were watched: the week does not count.
         history.accounts.get_mut("Claude:c").unwrap().windows.retain(|r| r.resets_at != second);
         let p = &report(&snapshot, &history, &Settings::default(), None, now).providers[0].pool;
@@ -2197,6 +2268,193 @@ mod tests {
         let mut straddle = AccountHistory::default();
         week(&mut straddle, "weekly", at("2026-11-02T00:00:00Z"), 30.0, 100);
         assert_eq!(busiest(&straddle, true, at("2026-11-03T00:00:00Z")), weekly(60.0));
+        // Pool sizing counts every week exactly as `busiest` does, and as read without `pro_200`.
+        let peaks = |h: &AccountHistory, pro_200: bool, now: DateTime<Utc>| week_peaks(h, pro_200, now).0.into_values().collect::<Vec<_>>();
+        assert_eq!(peaks(&h, true, now), [90.0; 8]);
+        assert_eq!(peaks(&h, false, now), [45.0; 8]);
+        assert_eq!(peaks(&later, true, at("2026-12-02T00:00:00Z")), [45.0; 4]);
+        assert_eq!(peaks(&straddle, true, at("2026-11-03T00:00:00Z")), [60.0]);
+        // A week begun a second before the cut counts against the new allowance; one begun at the cut
+        // itself is a week of the new allowance, read as it is.
+        let edge = |end: DateTime<Utc>| {
+            let mut h = AccountHistory::default();
+            week(&mut h, "weekly", end, 30.0, 100);
+            peaks(&h, true, end + days(1))
+        };
+        assert_eq!((edge(pro_200_cut() + days(7) - Duration::seconds(1)), edge(pro_200_cut() + days(7))), (vec![60.0], vec![30.0]));
+    }
+
+    /// A Codex plan (`plan` as the Codex CLI names it: "pro" is Pro 200) read at `now`, 1% into a
+    /// week resetting in three days, with completed weeks resetting at the given times, each watched
+    /// for most of its hours.
+    fn codex_plan(id: &str, plan: &str, weeks: &[(&str, f64)], now: DateTime<Utc>) -> (AccountUsage, AccountHistory) {
+        let mut acc = codex_pro(id, 1.0, days(3), now);
+        acc.plan = Some(plan.into());
+        acc.email = Some(format!("{id}@x"));
+        let windows = weeks.iter().map(|(end, peak)| {
+            let end = at(end);
+            WindowRecord { kind: "weekly".into(), resets_at: end, peak: *peak, first_obs: end - days(7), last_obs: end - Duration::hours(1),
+                hours: 120, days: 7, idle: false, local: false }
+        }).collect();
+        (acc, AccountHistory { first_seen: Some(at("2026-10-01T00:00:00Z")), windows, ..Default::default() })
+    }
+
+    /// Plans reported at `now`, each renewing on 2026-12-07.
+    fn fleet_report(fleet: Vec<(AccountUsage, AccountHistory)>, now: DateTime<Utc>) -> Report {
+        let mut history = History::default();
+        let mut settings = Settings::default();
+        let accounts = fleet.into_iter().map(|(acc, h)| {
+            history.accounts.insert(history_key(acc.provider, &acc.id), h);
+            settings.subscriptions.insert(pref_key(acc.provider, &acc.id), crate::settings::Subscription { next_billing: "2026-12-07".parse().ok(), ..Default::default() });
+            acc
+        }).collect();
+        report(&Snapshot { accounts, updated_at: Some(now) }, &history, &settings, None, now)
+    }
+
+    /// Weeks resetting on 2026-11-04 (begun 2026-10-28, before Pro 200's allowance cut) and on the
+    /// next three Wednesdays, after it, at these peaks.
+    fn across_the_cut(peaks: [f64; 4]) -> Vec<(&'static str, f64)> {
+        ["2026-11-04T08:00:00Z", "2026-11-11T08:00:00Z", "2026-11-18T08:00:00Z", "2026-11-25T08:00:00Z"].into_iter().zip(peaks).collect()
+    }
+
+    #[test]
+    fn a_pro_200_week_before_the_cut_sizes_the_pool_against_the_new_allowance_and_keeps_the_plan_it_needs() {
+        use crate::advisor::KeptBecause;
+        let now = at("2026-11-26T12:00:00Z");
+        // 85% of the old allowance in the week begun 2026-10-28 is 170% of the new one; after the cut,
+        // 50, 20 and 98% as read. Beside it, an unused Pro 200 that renews.
+        let r = fleet_report(vec![codex_plan("busy", "pro", &across_the_cut([85.0, 50.0, 20.0, 98.0]), now),
+            codex_plan("idle", "pro", &across_the_cut([0.0; 4]), now)], now);
+        let p = &r.providers[0].pool;
+        assert!((p.demand_p90.unwrap() - 1.70).abs() < 1e-9 && (p.measured_demand_p90.unwrap() - 0.98).abs() < 1e-9, "{p:?}");
+        // Plus 20% the busiest weeks need 2.04 plans of the 2 that renew: moving the unused plan to
+        // Pro 100 would leave 1.5, so it is kept for them, and nothing is saved.
+        let a = &r.advice[0];
+        assert_eq!((a.floor, a.capacity_now, a.moves.len(), a.shortage.is_none()), (Some(2.04), 2.0, 0, true), "{a:?}");
+        let idle = r.accounts.iter().find(|e| e.id == "idle").unwrap();
+        assert_eq!((idle.advised.is_none(), idle.kept, idle.assessment.renew_wasteful), (true, Some(KeptBecause::BusiestWeeks), false));
+        assert_eq!((r.providers[0].possible_savings, a.kept_for_capacity), (0.0, 1));
+        // The estimate keeps both plans, never asks for a third: the pool fits in the 2 that renew.
+        assert_eq!((p.plans_needed, p.buffer_percent), (Some(2), 20.0));
+        assert!((p.spare_percent.unwrap() - (2.0 / 1.7 - 1.0) * 100.0).abs() < 1e-9, "{p:?}");
+        assert_eq!((a.spare_after, a.spare_after_percent), (Some(0.3), Some(17.65)));
+        // Its busiest recent week, which a smaller tier would have to fit, is that 170%; its own
+        // verdict reads the weeks at face value.
+        let busy = r.accounts.iter().find(|e| e.id == "busy").unwrap();
+        assert_eq!(busy.recent_peak(), Some(170.0));
+        assert_eq!((busy.assessment.verdict, busy.assessment.limit_weeks, busy.assessment.average_peak), (Verdict::Healthy, 0, Some(63.25)));
+        agrees_with_the_advisor(&r);
+        // Two more plans the provider is ending add to what is held, not to what the estimate may
+        // ask for: the pool still needs only the 2 that renew.
+        let ending = |id: &str| {
+            let (mut acc, h) = codex_plan(id, "pro", &across_the_cut([0.0; 4]), now);
+            acc.billing.cancels_at = Some(at("2026-12-06T00:00:00Z"));
+            (acc, h)
+        };
+        let r = fleet_report(vec![codex_plan("busy", "pro", &across_the_cut([85.0, 50.0, 20.0, 98.0]), now),
+            codex_plan("idle", "pro", &across_the_cut([0.0; 4]), now), ending("gone1"), ending("gone2")], now);
+        let p = &r.providers[0].pool;
+        assert_eq!((p.plans_held, r.advice[0].capacity_now, p.plans_needed), (4.0, 2.0, Some(2)), "{p:?}");
+        assert!(r.advice[0].moves.is_empty() && r.advice[0].shortage.is_none());
+        agrees_with_the_advisor(&r);
+    }
+
+    #[test]
+    fn a_week_an_account_was_not_watched_is_filled_in_as_counted_and_as_read() {
+        let now = at("2026-11-26T12:00:00Z");
+        // Weeks resetting from 2026-10-28 on, the first two begun before Pro 200's allowance cut.
+        let ends = ["2026-10-28T08:00:00Z", "2026-11-04T08:00:00Z", "2026-11-11T08:00:00Z", "2026-11-18T08:00:00Z", "2026-11-25T08:00:00Z"];
+        // a was not watched in the week to 2026-11-18. Its weeks count 90, 90, 50 and 50% (median 70)
+        // and read 45, 45, 50 and 50% (median 47.5): each sum is filled in from its own.
+        let a: Vec<(&str, f64)> = ends.into_iter().zip([45.0, 45.0, 50.0, 0.0, 50.0]).filter(|(end, _)| !end.starts_with("2026-11-18")).collect();
+        let b: Vec<(&str, f64)> = ends.into_iter().zip([5.0, 5.0, 5.0, 40.0, 5.0]).collect();
+        let r = fleet_report(vec![codex_plan("a", "pro", &a, now), codex_plan("b", "pro", &b, now)], now);
+        let p = &r.providers[0].pool;
+        assert_eq!((p.weeks_used, p.weeks_estimated, p.confidence), (5, 1, Confidence::Low));
+        // As counted: 0.7 + 0.4, the busiest of 1.0, 1.0, 0.55, 1.1 and 0.55; as read, 0.475 + 0.4.
+        assert!((p.demand_p90.unwrap() - 1.1).abs() < 1e-9 && (p.measured_demand_p90.unwrap() - 0.875).abs() < 1e-9, "{p:?}");
+    }
+
+    #[test]
+    fn the_estimate_may_keep_a_plan_but_never_asks_for_one() {
+        use crate::advisor::{FixAction, KeptBecause, ShortageCause};
+        let now = at("2026-11-26T12:00:00Z");
+        // Before the cut a and b read 85% and 75%: 1.6 plans as read, 3.2 of the new allowance. Plus 20%,
+        // as read they leave the unused plan to cancel (1.92 of 2); as counted they would need 3.84 of
+        // the 3 held, a shortage of the estimate's own, which is never advised.
+        let r = fleet_report(vec![codex_plan("a", "pro", &across_the_cut([85.0, 50.0, 45.0, 55.0]), now),
+            codex_plan("b", "pro", &across_the_cut([75.0, 40.0, 35.0, 30.0]), now), codex_plan("c", "pro", &across_the_cut([0.0; 4]), now)], now);
+        let (a, p) = (&r.advice[0], &r.providers[0].pool);
+        assert!((a.demand_p90.unwrap() - 3.2).abs() < 1e-9 && (a.measured_demand_p90.unwrap() - 1.6).abs() < 1e-9, "{a:?}");
+        assert!(a.moves.is_empty() && a.shortage.is_none(), "the cut stays blocked, and nothing is asked for: {a:?}");
+        assert_eq!(r.accounts.iter().find(|e| e.id == "c").unwrap().kept, Some(KeptBecause::BusiestWeeks));
+        // Nor do the pool or what is left say otherwise: the estimate uses up the spare, no more.
+        assert_eq!((p.plans_needed, p.spare_percent), (Some(3), Some(0.0)), "{p:?}");
+        assert_eq!((a.spare_after, a.spare_after_percent), (Some(0.0), Some(0.0)));
+        agrees_with_the_advisor(&r);
+        // Short on the weeks as read, the shortage is what they need, never enlarged by the estimate:
+        // 2 plans plus 20% need 0.4 more, not the 2.8 that counting the first week double would.
+        let full = |id: &str| codex_plan(id, "pro", &across_the_cut([100.0; 4]), now);
+        let r = fleet_report(vec![full("full1"), full("full2")], now);
+        let (a, p) = (&r.advice[0], &r.providers[0].pool);
+        assert!((a.demand_p90.unwrap() - 4.0).abs() < 1e-9 && (a.measured_demand_p90.unwrap() - 2.0).abs() < 1e-9, "{a:?}");
+        let s = a.shortage.as_ref().unwrap();
+        assert_eq!((s.cause, s.shortfall, s.fix.action, s.fix.to.as_str(), s.fix.monthly_cost), (ShortageCause::OverCapacity, 0.4, FixAction::Add, "Pro 100", 100.0));
+        // The pool says the same, as the shortage asks for it first, and what is left is short only as
+        // read: nothing to spare, not the 2 plans missing that the estimate would read.
+        assert_eq!((p.plans_needed, p.buffer_percent, p.spare_percent), (Some(3), 20.0, Some(50.0)), "{p:?}");
+        assert_eq!((a.spare_after, a.spare_after_percent), (Some(0.0), Some(0.0)));
+        agrees_with_the_advisor(&r);
+    }
+
+    #[test]
+    fn the_estimate_sizes_the_pool_to_the_whole_plans_that_renew_at_most() {
+        let now = at("2026-11-26T12:00:00Z");
+        // A Pro 200 that read 45% before the cut (90% of the new allowance) and 30% since, beside a Pro
+        // 100 at 20%: 1.0 plans as counted, 0.55 as read, and 1.5 that renew. Plus 20%, as counted the
+        // busiest weeks would need 2 plans, as read 1. The estimate may need the one whole plan among
+        // those that renew, never a second: 2 would read as a shortage the Advisor does not advise.
+        let r = fleet_report(vec![codex_plan("busy", "pro", &across_the_cut([45.0, 30.0, 30.0, 30.0]), now),
+            codex_plan("lite", "prolite", &across_the_cut([20.0; 4]), now)], now);
+        let (a, p) = (&r.advice[0], &r.providers[0].pool);
+        assert!((p.demand_p90.unwrap() - 1.0).abs() < 1e-9 && (p.measured_demand_p90.unwrap() - 0.55).abs() < 1e-9, "{p:?}");
+        assert_eq!((a.capacity_now, a.shortage.is_none(), p.plans_needed), (1.5, true, Some(1)), "{p:?}");
+        agrees_with_the_advisor(&r);
+    }
+
+    #[test]
+    fn weeks_since_the_cut_and_plans_other_than_pro_200_count_as_read() {
+        use crate::advisor::Action;
+        let now = at("2026-11-26T12:00:00Z");
+        // The same weeks, the first begun at the cut itself: nothing to convert, and the unused plan
+        // moves to Pro 100 before its renewal, as before.
+        let after = |peaks: [f64; 4]| -> Vec<(&'static str, f64)> {
+            ["2026-11-06T00:00:00Z", "2026-11-11T08:00:00Z", "2026-11-18T08:00:00Z", "2026-11-25T08:00:00Z"].into_iter().zip(peaks).collect()
+        };
+        let r = fleet_report(vec![codex_plan("busy", "pro", &after([85.0, 50.0, 20.0, 98.0]), now), codex_plan("idle", "pro", &after([0.0; 4]), now)], now);
+        let (a, p) = (&r.advice[0], &r.providers[0].pool);
+        assert_eq!((p.demand_p90, p.measured_demand_p90, a.floor), (Some(0.98), Some(0.98), Some(1.18)));
+        assert_eq!(a.moves.iter().map(|m| (m.id.as_str(), m.action, m.to.as_deref())).collect::<Vec<_>>(), [("idle", Action::Downgrade, Some("Pro 100"))]);
+        assert_eq!((r.providers[0].possible_savings, p.plans_needed), (100.0, Some(2)));
+        agrees_with_the_advisor(&r);
+        // Pro 100 plans kept their allowance: weeks before the cut count as read, and the unused one
+        // moves to Plus.
+        let r = fleet_report(vec![codex_plan("busy", "prolite", &across_the_cut([85.0, 50.0, 20.0, 98.0]), now), codex_plan("idle", "prolite", &across_the_cut([0.0; 4]), now)], now);
+        let (a, p) = (&r.advice[0], &r.providers[0].pool);
+        assert_eq!((p.demand_p90, p.measured_demand_p90), (Some(0.49), Some(0.49)));
+        assert_eq!(a.moves.iter().map(|m| (m.id.as_str(), m.action, m.to.as_deref())).collect::<Vec<_>>(), [("idle", Action::Downgrade, Some("Plus"))]);
+        agrees_with_the_advisor(&r);
+        // Claude's Pro is "pro" too, but no Codex plan: 98% of a Pro is 0.049 plans, as read.
+        let claude = |id: &str, peaks: [f64; 4]| {
+            let (mut acc, h) = codex_plan(id, "pro", &across_the_cut(peaks), now);
+            acc.provider = Provider::Claude;
+            acc.windows[0].window_seconds = None;
+            (acc, h)
+        };
+        let r = fleet_report(vec![claude("busy", [85.0, 50.0, 20.0, 98.0]), claude("idle", [0.0; 4])], now);
+        let p = &r.providers[0].pool;
+        assert_eq!(r.providers[0].provider, Provider::Claude);
+        assert!((p.demand_p90.unwrap() - 0.049).abs() < 1e-9 && p.measured_demand_p90 == p.demand_p90, "{p:?}");
     }
 
     #[test]
