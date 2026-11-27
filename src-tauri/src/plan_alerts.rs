@@ -205,12 +205,14 @@ pub(crate) mod tests {
 
     pub(crate) struct World { pub snapshot: Snapshot, pub history: History, pub settings: Settings }
 
-    /// Three paid Codex plans renewing on the 24th: one unused, one busy, one already cancelled.
+    /// Three paid Codex plans renewing on the 24th: one unused, one busy, one already cancelled. Their
+    /// weeks began before Pro 200's allowance cut, so busy's 40% counts as 80% of the new allowance
+    /// (`subscriptions::week_peaks`): the busiest weeks still leave the unused plan to cancel.
     pub(crate) fn world(now: DateTime<Utc>) -> World {
         let mut settings = Settings::default();
         let mut history = History::default();
         let mut accounts = vec![];
-        for (id, peak) in [("idle", 0.0), ("busy", 80.0), ("gone", 0.0)] {
+        for (id, peak) in [("idle", 0.0), ("busy", 40.0), ("gone", 0.0)] {
             accounts.push(account(id, 1.0, now + Duration::days(5)));
             history.accounts.insert(format!("Codex:{id}"), watched(peak, now));
             settings.subscriptions.insert(format!("codex:{id}"), Subscription { next_billing: Some("2026-10-24".parse().unwrap()), ..Default::default() });
@@ -320,6 +322,7 @@ pub(crate) mod tests {
         let now = at("2026-10-21T12:00:00Z");
         let mut w = world(now);
         w.settings.subscriptions.clear();
+        w.history.accounts.insert("Codex:busy".into(), watched(80.0, now));
         // Peaks of 0 and 80 in recent weeks; "gone" is cancelled. Add a Pro 200 at 50% this week
         // (exactly the new limit), one at 40%, a Pro 100 at 90% and an aliased Pro 200 at 70%.
         for (id, plan, used) in [("half", "pro", 50.0), ("light", "pro", 40.0), ("lite", "prolite", 90.0), ("named", "pro", 70.0)] {

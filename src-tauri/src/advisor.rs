@@ -20,6 +20,14 @@
 //! whose plans keep running out with little to spare, gets the cheapest fix with its monthly cost:
 //! upgrade one plan, or add one of the tier that fits. Never in the same advice as a cut.
 //!
+//! How weeks count: a Codex Pro 200 week begun before its allowance cut (the old allowance ended
+//! 2026-10-29) counts against the new allowance, about half the old
+//! (`subscriptions::PRO_200_NEW_ALLOWANCE`), in the floor, each plan's busiest week and every share,
+//! so no cut rests on room a plan no longer has. One way only: that half is a third-party estimate
+//! and weeks since the cut are measured, so a shortage rests on the weeks as read
+//! (`subscriptions::Pool::measured_demand_p90`), and the estimate may keep a plan but never asks
+//! for one.
+//!
 //! With too little history to size the pool, only clear evidence counts: plans judged unused
 //! (weeks watched near zero, or a Codex plan idle for weeks on this PC's history). SlopBar cannot
 //! change a plan; every move links to the provider's own billing page.
@@ -32,7 +40,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::accounts::Provider;
-use crate::subscriptions::{billing_page, pool_buffer, reference_plan, Basis, Confidence, Entry, PlanKind, ProviderSummary, Verdict, POOL_BUFFER};
+use crate::subscriptions::{billing_page, one_way, pool_buffer, reference_plan, Basis, Confidence, Entry, PlanKind, ProviderSummary, Verdict, POOL_BUFFER};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -157,14 +165,20 @@ pub struct ProviderAdvice {
     /// Paid plans that keep renewing, in `unit`, before and after the moves.
     pub capacity_now: f64,
     pub capacity_after: f64,
-    /// The pool's 90th-percentile week, and the least capacity any advice may leave (that + 20%,
-    /// or + 40% while any plan keeps running out; this week's use instead when the pool has too
-    /// little history).
+    /// The pool's 90th-percentile week, a Codex Pro 200 week begun before its allowance cut counted
+    /// against the new allowance, and the least capacity any advice may leave (that + 20%, or + 40%
+    /// while any plan keeps running out; this week's use instead when the pool has too little
+    /// history).
     pub demand_p90: Option<f64>,
+    /// The same week as measured, without that conversion: the only demand `shortage` rests on
+    /// (`subscriptions::Pool::measured_demand_p90`).
+    pub measured_demand_p90: Option<f64>,
     pub floor: Option<f64>,
     pub moves: Vec<Move>,
     pub monthly_saving: f64,
-    /// Capacity left over the busiest weeks after every move, in `unit` and in percent.
+    /// Capacity left over the busiest weeks after every move, in `unit` and in percent: as counted
+    /// (`demand_p90`) as far as the capacity goes, and short of it only as measured
+    /// (`subscriptions::one_way`).
     pub spare_after: Option<f64>,
     pub spare_after_percent: Option<f64>,
     /// Unused or underused plans kept because moving them would leave too little for the busiest
@@ -174,8 +188,9 @@ pub struct ProviderAdvice {
     /// the provider's last plan, a plan carrying a share, and one with no smaller tier to move to.
     /// With too little history only unused plans are weighed, so underused ones are not listed.
     pub kept: Vec<Kept>,
-    /// Too little capacity, and the cheapest fix. Only when there are no moves: a provider is
-    /// never told to cancel or downgrade and to add in the same advice.
+    /// Too little capacity for the busiest weeks as measured (`measured_demand_p90`), and the
+    /// cheapest fix. Only when there are no moves: a provider is never told to cancel or downgrade
+    /// and to add in the same advice.
     pub shortage: Option<Shortage>,
     /// Plans that could take more use once every move is made, the freest first.
     pub room: Vec<Room>,
@@ -184,10 +199,10 @@ pub struct ProviderAdvice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShortageCause {
-    /// The busiest weeks plus 20% need more than the renewing plans hold.
+    /// The busiest weeks as measured plus 20% need more than the renewing plans hold.
     OverCapacity,
-    /// Plans keep reaching their weekly limit with under 40% to spare over the busiest weeks:
-    /// use that hits a limit is cut short, so the real demand is higher than measured.
+    /// Plans keep reaching their weekly limit with under 40% to spare over the busiest weeks as
+    /// measured: use that hits a limit is cut short, so the real demand is higher than measured.
     HittingLimits,
 }
 
@@ -253,7 +268,7 @@ fn advise_provider(summary: &ProviderSummary, accounts: &[Entry]) -> ProviderAdv
     let pool = &summary.pool;
     // Plans already ending or being let lapse are capacity that is going away anyway.
     let renewing: Vec<&Entry> = accounts.iter()
-        .filter(|e| e.provider == provider && e.plan_kind == PlanKind::Personal && e.ends_at.is_none() && e.cancel_after.is_none())
+        .filter(|e| e.provider == provider && e.plan_kind == PlanKind::Personal && e.renews())
         .collect();
     let capacity_now: f64 = renewing.iter().filter_map(|e| e.plan_weight).sum();
     let evidence = if pool.demand_p90.is_some() { Evidence::Pool } else { Evidence::ClearOnly };
@@ -374,8 +389,13 @@ fn advise_provider(summary: &ProviderSummary, accounts: &[Entry]) -> ProviderAdv
         (free + 1e-9 >= ROOM_MIN).then(|| Room { id: e.id.clone(), email: e.email.clone(), alias: e.alias.clone(), plan, busiest_percent: round(busiest), free_percent: round(free) })
     }).collect();
     room.sort_by(|a, b| b.free_percent.total_cmp(&a.free_percent).then_with(|| a.id.cmp(&b.id)));
-    let demand = pool.demand_p90.or(match evidence { Evidence::ClearOnly => pool.live_demand, Evidence::Pool => None });
-    let shortage = if moves.is_empty() { shortage(provider, &candidates, capacity_now, demand, summary.exhausted) } else { None };
+    // The one-way rule (`subscriptions::Pool::measured_demand_p90`): the cuts above kept the floor of
+    // the busiest weeks as counted, a shortage rests on them as measured, and what is left over them
+    // may fall to nothing on the estimate, and below that only as measured.
+    let now_or = |d: Option<f64>| d.or(match evidence { Evidence::ClearOnly => pool.live_demand, Evidence::Pool => None });
+    let (demand, measured) = (now_or(pool.demand_p90), now_or(pool.measured_demand_p90));
+    let shortage = if moves.is_empty() { shortage(provider, &candidates, capacity_now, measured, summary.exhausted) } else { None };
+    let over = demand.zip(measured).map(|(d, m)| one_way(m, d, capacity));
     ProviderAdvice {
         provider,
         evidence,
@@ -385,11 +405,12 @@ fn advise_provider(summary: &ProviderSummary, accounts: &[Entry]) -> ProviderAdv
         capacity_now: round(capacity_now),
         capacity_after: round(capacity),
         demand_p90: pool.demand_p90,
+        measured_demand_p90: pool.measured_demand_p90,
         floor: floor.map(round),
         // An empty sum is -0.0, which would read "-0.0" in the report and here: no moves save 0.
         monthly_saving: round(moves.iter().map(|m: &Move| m.monthly_saving).sum::<f64>() + 0.0),
-        spare_after: demand.map(|d| round(capacity - d)),
-        spare_after_percent: demand.filter(|d| *d > 0.0).map(|d| round((capacity / d - 1.0) * 100.0)),
+        spare_after: over.map(|d| round(capacity - d)),
+        spare_after_percent: over.filter(|d| *d > 0.0).map(|d| round((capacity / d - 1.0) * 100.0)),
         moves,
         kept_for_capacity: kept.iter().filter(|(_, because)| because.for_capacity()).count(),
         kept: kept.iter().map(|(c, because)| Kept { id: c.entry.id.clone(), email: c.entry.email.clone(), alias: c.entry.alias.clone(), plan: c.plan.clone(), because: *because }).collect(),
