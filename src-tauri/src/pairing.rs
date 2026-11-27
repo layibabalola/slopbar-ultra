@@ -605,8 +605,20 @@ fn roster_summary(roster: &Value) -> Value {
 // ---------------------------------------------------------------------------------------------
 // Readiness
 
+/// Readiness's advice when no Edge or Chrome was found but this computer's own sign-ins open in the
+/// default browser, so `no_browser` stops none of them (see `assess`).
+const NO_BROWSER_NOTE: &str = "Sign-ins here use the default browser; other computers' sign-ins completed here (everywhere) need Edge or Chrome.";
+
 /// Whether this computer is ready for "Sign in all": what is missing, as codes, and what to do.
-pub fn assess(running: bool, desktop: Option<crate::desktop::Desktop>, browser: bool, roster: &Value) -> (bool, Vec<&'static str>, String) {
+/// `system_window` is the sign-in window setting being `system` (`signin::Window::System`): this
+/// computer's own sign-ins then open in the default browser, which needs no Edge or Chrome, so a
+/// missing one is only noted (`no_browser`, after whether sign-ins can start was decided, as
+/// `note_ssh_shell` notes its code; and with its advice, when nothing else is first to say).
+/// Another computer's sign-in completed here (`sign_in_all` everywhere) never opens in the default
+/// browser, whatever the window is: it needs Edge or Chrome for its fresh profile (or private
+/// window). With a fresh profile or a private window, which start one, a missing browser stops this
+/// computer's own sign-ins too.
+pub fn assess(running: bool, desktop: Option<crate::desktop::Desktop>, browser: bool, system_window: bool, roster: &Value) -> (bool, Vec<&'static str>, String) {
     let mut problems = Vec::new();
     if !running {
         problems.push("app_not_running");
@@ -615,7 +627,7 @@ pub fn assess(running: bool, desktop: Option<crate::desktop::Desktop>, browser: 
         None => problems.push("no_desktop_session"),
         Some(d) => problems.extend(d.problem()),
     }
-    if !browser {
+    if !browser && !system_window {
         problems.push("no_browser");
     }
     let ready = problems.is_empty();
@@ -635,7 +647,17 @@ pub fn assess(running: bool, desktop: Option<crate::desktop::Desktop>, browser: 
         Some(_) => "Ready for sign-ins at the desktop, but the account roster is not set up: pair this computer with pair_machine from a computer that has the accounts.",
         None => "Ready: someone can complete sign-ins at this computer's screen. Ask them to sit there before sign_in_all with confirm: true.",
     };
-    (ready, problems, next.into())
+    let mut next: String = next.into();
+    if !browser && system_window {
+        problems.push("no_browser");
+        // Its advice only where nothing else is first to say: with the SSH shell's and PowerShell's
+        // after it, the longest `next` must still reach an agent whole (`mcp::MAX_TEXT`).
+        if ready {
+            next.push(' ');
+            next.push_str(NO_BROWSER_NOTE);
+        }
+    }
+    (ready, problems, next)
 }
 
 /// Readiness when the app does not answer: who is at the desktop, whether a browser and SlopBar
@@ -644,7 +666,10 @@ pub fn readiness_without_app(reason: &str) -> Value {
     let desktop = crate::desktop::best(&crate::desktop::of_user());
     let browser = crate::signin::find_browser().map(|(k, _)| browser_name(k));
     let installed = std::env::var_os("LOCALAPPDATA").is_some_and(|d| std::path::Path::new(&d).join(r"SlopBar\slopbar.exe").is_file());
-    let (ready, mut problems, mut next) = assess(false, desktop, browser.is_some(), &Value::Null);
+    // The sign-in window is the app's setting, which this helper reaches only through the door, and
+    // the door does not answer. `app_not_running` stops sign-ins whatever the window is, and `assess`
+    // lists `no_browser` in the same place either way: so it is asked as for the default window.
+    let (ready, mut problems, mut next) = assess(false, desktop, browser.is_some(), false, &Value::Null);
     if reason == "unsupported_request" {
         problems.insert(0, "app_outdated");
         next = "The SlopBar running here predates readiness checks: update it, then ask again.".into();
@@ -1875,15 +1900,101 @@ mod tests {
         use crate::desktop::{Desktop, State};
         let roster = json!({ "enabled": true, "location": true, "passphrase_saved": true, "unreadable": 0 });
         let at = |state, locked| Some(Desktop { session: 1, state, locked });
-        assert_eq!(assess(true, at(State::Active, Some(false)), true, &roster).0, true);
-        let (ready, problems, next) = assess(true, None, true, &roster);
+        assert_eq!(assess(true, at(State::Active, Some(false)), true, false, &roster).0, true);
+        let (ready, problems, next) = assess(true, None, true, false, &roster);
         assert!(!ready && problems == ["no_desktop_session"] && next.contains("Nobody is signed in"));
-        assert_eq!(assess(true, at(State::Active, Some(true)), true, &roster).1, ["desktop_locked"]);
-        assert_eq!(assess(true, at(State::Disconnected, None), false, &roster).1, ["desktop_not_shown", "no_browser"]);
-        assert_eq!(assess(false, None, true, &Value::Null).1, ["app_not_running", "no_desktop_session"]);
-        let (ready, problems, _) = assess(true, at(State::Active, None), true, &json!({ "enabled": false, "unreadable": 2 }));
+        assert_eq!(assess(true, at(State::Active, Some(true)), true, false, &roster).1, ["desktop_locked"]);
+        assert_eq!(assess(true, at(State::Disconnected, None), false, false, &roster).1, ["desktop_not_shown", "no_browser"]);
+        assert_eq!(assess(false, None, true, false, &Value::Null).1, ["app_not_running", "no_desktop_session"]);
+        let (ready, problems, _) = assess(true, at(State::Active, None), true, false, &json!({ "enabled": false, "unreadable": 2 }));
         assert!(ready, "sign-ins can still run without a roster");
         assert_eq!(problems, ["roster_off", "no_sharing_location", "no_roster_key", "roster_unreadable"]);
+    }
+
+    /// With the system window this computer's own sign-ins open in the default browser, so a missing
+    /// Edge or Chrome stops none of them: `no_browser` is only noted, after what decides whether
+    /// they can start, and said (with what it still costs: another computer's sign-ins completed
+    /// here, `sign_in_all` everywhere) where nothing else is first to say.
+    #[test]
+    fn with_the_system_window_a_missing_browser_stops_no_sign_in_here() {
+        use crate::desktop::{Desktop, State};
+        let roster = json!({ "enabled": true, "location": true, "passphrase_saved": true, "unreadable": 0 });
+        let at = |state, locked| Some(Desktop { session: 1, state, locked });
+        let active = at(State::Active, Some(false));
+        let (ready, problems, next) = assess(true, active, false, true, &roster);
+        assert!(ready, "this computer's own sign-ins open in the default browser");
+        assert_eq!(problems, ["no_browser"]);
+        assert!(next.starts_with("Ready:") && next.ends_with(NO_BROWSER_NOTE), "{next}");
+        assert!(next.contains("everywhere") && next.contains("Edge or Chrome"), "what a missing browser still costs: {next}");
+        // With a browser nothing is noted, whatever the window.
+        assert_eq!(assess(true, active, true, true, &roster), assess(true, active, true, false, &roster));
+        // After the roster's problems, with the roster's advice first.
+        let (ready, problems, next) = assess(true, active, false, true, &json!({ "enabled": false, "unreadable": 2 }));
+        assert!(ready);
+        assert_eq!(problems, ["roster_off", "no_sharing_location", "no_roster_key", "roster_unreadable", "no_browser"], "noted last");
+        assert!(next.starts_with("Ready for sign-ins at the desktop, but the account roster is not set up") && next.ends_with(NO_BROWSER_NOTE), "{next}");
+        // What does stop sign-ins comes first and is all `next` says: the note waits for it.
+        for (running, desktop) in [(true, at(State::Active, Some(true))), (true, at(State::Disconnected, None)), (true, None), (false, None)] {
+            let (ready, problems, next) = assess(running, desktop, false, true, &roster);
+            let (_, blockers, said) = assess(running, desktop, true, true, &roster);
+            assert!(!ready && !blockers.is_empty());
+            assert_eq!(problems.last(), Some(&"no_browser"));
+            assert_eq!(problems[..problems.len() - 1], blockers[..], "after what stops sign-ins");
+            assert_eq!(next, said, "the blocker's own advice");
+        }
+        // With the app not running, `readiness_without_app` cannot read the setting and asks as for
+        // the default window: the window changes nothing there.
+        for desktop in [None, active, at(State::Disconnected, None)] {
+            assert_eq!(assess(false, desktop, false, true, &Value::Null), assess(false, desktop, false, false, &Value::Null), "{desktop:?}");
+        }
+    }
+
+    /// A fresh browser profile and a private window both start Edge or Chrome, so with either a
+    /// missing one still stops sign-ins here, as it always did.
+    #[test]
+    fn with_a_fresh_profile_or_a_private_window_a_missing_browser_stops_sign_ins() {
+        use crate::desktop::{Desktop, State};
+        use crate::signin::Window;
+        let roster = json!({ "enabled": true, "location": true, "passphrase_saved": true, "unreadable": 0 });
+        let active = Some(Desktop { session: 1, state: State::Active, locked: Some(false) });
+        for window in [Window::Profile, Window::Private] {
+            let (ready, problems, next) = assess(true, active, false, window == Window::System, &roster);
+            assert!(!ready, "{window:?}");
+            assert_eq!(problems, ["no_browser"], "{window:?}");
+            assert_eq!(next, "No Edge or Chrome was found for the sign-in pages: install one.", "{window:?}");
+            // First, before the roster's problems, as it decides whether sign-ins can start.
+            let (_, problems, next) = assess(true, active, false, window == Window::System, &json!({ "enabled": false }));
+            assert_eq!(problems, ["no_browser", "roster_off", "no_sharing_location", "no_roster_key"], "{window:?}");
+            assert!(next.starts_with("No Edge or Chrome") && !next.contains("default browser"), "{window:?}: {next}");
+        }
+    }
+
+    /// Every string an agent gets is cut at `mcp::MAX_TEXT`. The longest advice readiness gives is
+    /// what `assess` says, then its computer's SSH shell's, then (asked over SSH) PowerShell's: the
+    /// longest `assess` says in any state, with the note about a missing browser, leaves room for both.
+    #[test]
+    fn the_longest_readiness_advice_reaches_an_agent_whole() {
+        use crate::desktop::{Desktop, State};
+        let at = |state, locked| Some(Desktop { session: 1, state, locked });
+        let desktops = [None, at(State::Active, Some(false)), at(State::Active, Some(true)), at(State::Active, None), at(State::Disconnected, None)];
+        let rosters = [Value::Null, json!({ "enabled": true, "location": true, "passphrase_saved": true, "unreadable": 0 }), json!({ "enabled": false, "unreadable": 2 })];
+        let (mut longest, mut noted) = (String::new(), false);
+        for running in [true, false] {
+            for desktop in desktops {
+                for (browser, system_window) in [(true, false), (false, false), (false, true)] {
+                    for roster in &rosters {
+                        let (_, _, next) = assess(running, desktop, browser, system_window, roster);
+                        noted |= next.ends_with(NO_BROWSER_NOTE);
+                        if next.chars().count() > longest.chars().count() {
+                            longest = next;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(noted, "the note is among the advice checked");
+        let advice = format!("{longest} {SSH_SHELL_ADVICE} {NO_PWSH_ADVICE}");
+        assert!(advice.chars().count() <= crate::mcp::MAX_TEXT, "{} characters: {advice}", advice.chars().count());
     }
 
     #[test]
@@ -1940,8 +2051,9 @@ mod tests {
         use crate::desktop::{Desktop, State};
         let roster = json!({ "enabled": true, "location": true, "passphrase_saved": true, "unreadable": 0 });
         let at = |state, locked| Some(Desktop { session: 1, state, locked });
-        for (running, desktop, browser) in [(true, at(State::Active, Some(false)), true), (false, None, true), (true, at(State::Active, Some(true)), false), (true, at(State::Disconnected, None), true)] {
-            let (_, problems, next) = assess(running, desktop, browser, &roster);
+        for (running, desktop, browser, system_window) in [(true, at(State::Active, Some(false)), true, false), (false, None, true, false), (true, at(State::Active, Some(true)), false, false),
+            (true, at(State::Disconnected, None), true, false), (true, at(State::Active, Some(false)), false, true)] {
+            let (_, problems, next) = assess(running, desktop, browser, system_window, &roster);
             for shell in [None, Some("pwsh"), Some("cmd"), Some("other"), Some("missing")] {
                 let (mut p, mut n) = (problems.clone(), next.clone());
                 note_ssh_shell(shell, &mut p, &mut n);
