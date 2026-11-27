@@ -5176,6 +5176,9 @@ mod sign_in_tests {
         // computer's own open in the default browser (`pairing::assess`), and only the system window does.
         let readiness = function(&code, "app.rs", "async fn readiness(", T);
         let assessed = "pairing::assess(true, desktop, browser.is_some(), signin_window == signin::Window::System, &roster)";
+        // Once: the ordering below reads only the first call that matches, so a second one (given
+        // another window, or none) would go unread.
+        assert_eq!(count(readiness, "pairing::assess("), 1, "readiness assesses once, with the sign-in window it read\n{readiness}");
         assert!(matches!((find(readiness, report), find(readiness, assessed)), (Some(read), Some(assess)) if read < assess),
             "readiness assesses with the sign-in window it read, which says whether this computer's own sign-ins need Edge or Chrome\n{readiness}");
         // A window of its own only outside a run: Add account's, and a monitoring sign-in's given none.
