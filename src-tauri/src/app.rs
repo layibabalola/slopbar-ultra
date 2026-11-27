@@ -4826,13 +4826,15 @@ enum AfterRestart {
 /// again (`restart_sign_in`), from its answer: done; on to Sign in all accounts there when its run
 /// has ended, or, stopping the run left waiting, when its SlopBar does not know the request;
 /// nothing when the sign-in moved on; or the error, when the ask never reached its app (a whole
-/// run would fail the same way).
-fn after_peer_restart(answer: Result<serde_json::Value, String>) -> Result<AfterRestart, String> {
+/// run would fail the same way). That computer's app not knowing the request is told by the `code`
+/// it printed (`unsupported_request`); older computers print none, so their words are read too, as
+/// is the "Unknown tool" line of an older helper, which no computer prints a code for.
+fn after_peer_restart(answer: Result<serde_json::Value, pairing::RemoteError>) -> Result<AfterRestart, pairing::RemoteError> {
     match answer {
         Ok(a) if a["restarted"] == true => Ok(AfterRestart::Done(PeerRetry::Restarted)),
         Ok(a) if a["reason"] == "no_run" => Ok(AfterRestart::WholeRun { stop: false }),
         Ok(_) => Ok(AfterRestart::Done(PeerRetry::MovedOn)),
-        Err(e) if crate::mcp::unknown_there(&e, "restart_sign_in") => Ok(AfterRestart::WholeRun { stop: true }),
+        Err(e) if e.is("unsupported_request") || crate::mcp::unknown_there(&e.text, "restart_sign_in") => Ok(AfterRestart::WholeRun { stop: true }),
         Err(e) => Err(e),
     }
 }
@@ -4844,21 +4846,27 @@ fn whole_run_arguments(monitoring: bool, stop: bool) -> serde_json::Value {
 }
 
 /// What a card's Retry did once it asked that computer to run Sign in all accounts again (`stop`:
-/// after stopping a run left waiting there), from its answer.
-fn after_whole_run(ran: Result<serde_json::Value, String>, stop: bool) -> Result<PeerRetry, String> {
+/// after stopping a run left waiting there), from its answer. A run going there is told by the
+/// `code` that computer printed (`monitor_busy`); older computers print none, so their words are
+/// read too.
+fn after_whole_run(ran: Result<serde_json::Value, pairing::RemoteError>, stop: bool) -> Result<PeerRetry, String> {
     match ran {
         Ok(answer) if answer["started"] == false => Ok(PeerRetry::NothingMissing),
         Ok(_) => Ok(PeerRetry::Retried),
         // A run goes there now, which this Retry never stops: it moved on.
-        Err(e) if !stop && crate::mcp::code_there(&e, &["monitor_busy"]).is_some() => Ok(PeerRetry::MovedOn),
+        Err(e) if !stop && (e.is("monitor_busy") || crate::mcp::code_there(&e.text, &["monitor_busy"]).is_some()) => Ok(PeerRetry::MovedOn),
         Err(e) => Err(card_error(e)),
     }
 }
 
 /// An error from that computer as the card says it: a desktop nobody can see there by its code,
-/// which Settings words (another computer prints `explain`'s words, meant for agents).
-fn card_error(error: String) -> String {
-    crate::mcp::code_there(&error, &["desktop_locked", "desktop_not_shown"]).map_or(error, str::to_string)
+/// which Settings words (another computer prints `explain`'s words, meant for agents). The `code`
+/// it printed decides (`pairing::RemoteError`, whatever its words say); older computers print
+/// none, so their words are read, and any other error is its words as printed.
+fn card_error(error: pairing::RemoteError) -> String {
+    let unseen = ["desktop_locked", "desktop_not_shown"];
+    let code = unseen.into_iter().find(|code| error.is(code)).or_else(|| crate::mcp::code_there(&error.text, &unseen));
+    code.map_or(error.text, str::to_string)
 }
 
 /// Where a card's Retry goes before asking that computer anything, from what the card shows: its
@@ -4883,7 +4891,10 @@ fn peer_retry_first(going: bool, started_at: Option<chrono::DateTime<chrono::Utc
 /// open one), only that sign-in starts again there, in the same window, as the card says
 /// (`restart_sign_in`); nothing when it moved on. Where that run has ended, Sign in all accounts
 /// runs there again, never stopping a run going there; only where that computer's SlopBar is older
-/// does a run left waiting there stop first, as before.
+/// does a run left waiting there stop first, as before. An error from that computer keeps the
+/// `code` it printed (`pairing::RemoteError`) until `after_peer_restart`, `after_whole_run` and
+/// `card_error` have read it: they decide by the code, and by its words only for older computers,
+/// which print none (words differ between versions).
 #[tauri::command]
 async fn retry_peer_sign_in(app: AppHandle, machine_id: String, going: bool, started_at: Option<chrono::DateTime<chrono::Utc>>, step: Option<usize>) -> Result<PeerRetry, String> {
     let host = settings::app_dir().and_then(|d| pairing::host_for(&d, &machine_id)).ok_or("peer_not_paired")?;
@@ -4891,7 +4902,7 @@ async fn retry_peer_sign_in(app: AppHandle, machine_id: String, going: bool, sta
         (Some(next), ..) => next,
         (None, Some(started_at), Some(at)) => {
             let (host, arguments) = (host.clone(), serde_json::json!({ "step": at, "run_started_at": started_at }));
-            let answer = tauri::async_runtime::spawn_blocking(move || pairing::remote_call(&pairing::Ssh, &host, "restart_sign_in", &arguments).map_err(String::from))
+            let answer = tauri::async_runtime::spawn_blocking(move || pairing::remote_call(&pairing::Ssh, &host, "restart_sign_in", &arguments))
                 .await.map_err(|_| "ssh_failed".to_string())?;
             after_peer_restart(answer).map_err(card_error)?
         }
@@ -4903,7 +4914,7 @@ async fn retry_peer_sign_in(app: AppHandle, machine_id: String, going: bool, sta
             let monitoring = app.state::<AppState>().roster_seen.lock().unwrap().peers.iter()
                 .find(|p| p.machine_id == machine_id).and_then(|p| p.run.as_ref()).is_none_or(|r| r.monitoring);
             let arguments = whole_run_arguments(monitoring, stop);
-            let ran = tauri::async_runtime::spawn_blocking(move || pairing::remote_call(&pairing::Ssh, &host, "sign_in_all", &arguments).map_err(String::from))
+            let ran = tauri::async_runtime::spawn_blocking(move || pairing::remote_call(&pairing::Ssh, &host, "sign_in_all", &arguments))
                 .await.map_err(|_| "ssh_failed".to_string())?;
             after_whole_run(ran, stop)?
         }
@@ -5544,9 +5555,23 @@ mod sign_in_tests {
         assert_eq!(reasons.map(|r| serde_json::to_value(r).unwrap()), ["no_run", "everywhere", "other_run", "not_open", "not_waiting"].map(serde_json::Value::from));
     }
 
+    /// An error another computer printed with no `code`, as every computer before `code` came does:
+    /// its words alone.
+    fn words_only(text: &str) -> pairing::RemoteError {
+        pairing::RemoteError { code: None, text: text.into() }
+    }
+
+    /// An error another computer printed with its `code` in words this build does not know (they
+    /// were reworded since, or that version words it otherwise).
+    fn reworded(code: &str) -> pairing::RemoteError {
+        pairing::RemoteError { code: Some(code.into()), text: "reworded".into() }
+    }
+
     /// The card's Retry: only the sign-in it showed starts again where that computer can do so;
     /// the whole run runs again where its run ended or its SlopBar is older; nothing when the
     /// sign-in moved on (a whole run would stop a run that moved on, or one someone else started).
+    /// A computer that prints its `code` is known by it, whatever its words; one that prints none,
+    /// by its words.
     #[test]
     fn a_card_s_retry_runs_everything_again_only_where_the_run_ended_or_the_computer_is_older() {
         let said = |v: serde_json::Value| after_peer_restart(Ok(v));
@@ -5557,12 +5582,21 @@ mod sign_in_tests {
             assert_eq!(said(serde_json::json!({ "restarted": false, "reason": reason })), Ok(AfterRestart::Done(PeerRetry::MovedOn)), "{reason}");
         }
         assert_eq!(said(serde_json::json!({})), Ok(AfterRestart::Done(PeerRetry::MovedOn)), "an answer it cannot read stops nothing");
-        // An older slopbar-mcp there (`step`'s own words), or an older app behind a newer helper:
-        // as before, the run left waiting there stops and runs again.
-        assert_eq!(after_peer_restart(Err("Unknown tool: restart_sign_in".into())), Ok(AfterRestart::WholeRun { stop: true }));
-        assert_eq!(after_peer_restart(Err(crate::mcp::explained("unsupported_request"))), Ok(AfterRestart::WholeRun { stop: true }));
+        // An older slopbar-mcp there (`step`'s own words, which no computer prints a code for), or an
+        // older app behind a newer helper: as before, the run left waiting there stops and runs again.
+        assert_eq!(after_peer_restart(Err(words_only("Unknown tool: restart_sign_in"))), Ok(AfterRestart::WholeRun { stop: true }));
+        assert_eq!(after_peer_restart(Err(words_only(&crate::mcp::explained("unsupported_request")))), Ok(AfterRestart::WholeRun { stop: true }), "an older computer's words, with no code");
         for error in ["ssh_failed: Connection timed out", "SlopBar is not running", "Nothing was started: this computer's desktop is locked", "Unknown tool: sign_in_all"] {
-            assert_eq!(after_peer_restart(Err(error.into())), Err(error.into()), "a whole run would fail the same way");
+            assert_eq!(after_peer_restart(Err(words_only(error))), Err(words_only(error)), "a whole run would fail the same way");
+        }
+        // A newer computer says it by its code, whatever its words; any other code is another failure.
+        assert_eq!(after_peer_restart(Err(reworded("unsupported_request"))), Ok(AfterRestart::WholeRun { stop: true }), "known by its code, not its words");
+        for code in ["monitor_busy", "signin_busy", "desktop_locked", "desktop_not_shown"] {
+            assert_eq!(after_peer_restart(Err(reworded(code))), Err(reworded(code)), "{code}: a whole run would fail the same way");
+        }
+        // The card words a desktop nobody can see by its code, as it does for a whole run.
+        for code in ["desktop_locked", "desktop_not_shown"] {
+            assert_eq!(after_peer_restart(Err(reworded(code))).map_err(card_error), Err(code.into()), "{code}");
         }
     }
 
@@ -5573,10 +5607,20 @@ mod sign_in_tests {
         assert_eq!(after_whole_run(Ok(serde_json::json!({ "started": true, "plan": [] })), false), Ok(PeerRetry::Retried));
         assert_eq!(after_whole_run(Ok(serde_json::json!({ "started": false, "plan": [] })), true), Ok(PeerRetry::NothingMissing));
         let busy = crate::mcp::explained("monitor_busy");
-        assert_eq!(after_whole_run(Err(busy.clone()), false), Ok(PeerRetry::MovedOn), "a run going there is someone's: left alone");
-        assert_eq!(after_whole_run(Err(busy.clone()), true), Err(busy));
-        assert_eq!(after_whole_run(Err(crate::mcp::explained("desktop_locked")), false), Err("desktop_locked".into()), "worded by Settings");
-        assert_eq!(after_whole_run(Err("ssh_timeout".into()), true), Err("ssh_timeout".into()));
+        assert_eq!(after_whole_run(Err(words_only(&busy)), false), Ok(PeerRetry::MovedOn), "a run going there is someone's: left alone");
+        assert_eq!(after_whole_run(Err(words_only(&busy)), true), Err(busy));
+        assert_eq!(after_whole_run(Err(words_only(&crate::mcp::explained("desktop_locked"))), false), Err("desktop_locked".into()), "worded by Settings");
+        assert_eq!(after_whole_run(Err(words_only("ssh_timeout")), true), Err("ssh_timeout".into()));
+        // A newer computer's `code` decides, whatever its words: a run going there is left alone
+        // (never stopped unless the card meant to), and a desktop nobody can see is worded by Settings.
+        assert_eq!(after_whole_run(Err(reworded("monitor_busy")), false), Ok(PeerRetry::MovedOn), "known by its code, not its words");
+        assert_eq!(after_whole_run(Err(reworded("monitor_busy")), true), Err("reworded".into()));
+        for code in ["desktop_locked", "desktop_not_shown"] {
+            for stop in [false, true] {
+                assert_eq!(after_whole_run(Err(reworded(code)), stop), Err(code.into()), "{code}, stop {stop}");
+            }
+        }
+        assert_eq!(after_whole_run(Err(reworded("signin_busy")), false), Err("reworded".into()), "any other code is another failure, as printed");
         assert_eq!(serde_json::to_value(PeerRetry::NothingMissing).unwrap(), "nothing_missing");
         // Only a card that meant to stop the run left waiting asks for that.
         assert_eq!(whole_run_arguments(true, false), serde_json::json!({ "confirm": true, "monitoring": true, "retry": false }));
@@ -5590,6 +5634,19 @@ mod sign_in_tests {
 {arm}");
         }
         assert!(!crate::source_guard::has(retry, "\"retry\": true"), "no Retry stops a run but by `stop`");
+    }
+
+    /// Both of a card's asks hand the matchers the error as that computer printed it, with its
+    /// `code` (`pairing::RemoteError`): turned into its words (`.map_err(String::from)`) they would
+    /// decide by words again, which differ between versions.
+    #[test]
+    fn a_card_s_retry_keeps_the_code_of_what_that_computer_printed() {
+        use crate::source_guard::{count, function, has, tokens, update};
+        const T: &str = "app::sign_in_tests::a_card_s_retry_keeps_the_code_of_what_that_computer_printed";
+        let code = tokens(include_str!("app.rs"));
+        let retry = function(&code, "app.rs", "async fn retry_peer_sign_in(", T);
+        assert_eq!(count(retry, "pairing::remote_call("), 2, "the restart and the whole run are both asked here. {}\n{retry}", update(T));
+        assert!(!has(retry, "map_err(String::from)"), "an error from that computer is turned into its words, and its code is lost. {}\n{retry}", update(T));
     }
 
     /// Before asking anything: a run going on that names its start and its open sign-in asks for
